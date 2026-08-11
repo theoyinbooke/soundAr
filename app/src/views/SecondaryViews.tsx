@@ -109,7 +109,7 @@ export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
           <BrandLockup className="about-lockup" />
           <p id="about-product-name">Local open-source voice studio</p>
         </div>
-        <span className="about-version">Version 0.2.1</span>
+        <span className="about-version">Version 0.2.2</span>
       </section>
       <div className="about-details">
         <Panel className="about-section" ariaLabel="Application details">
@@ -118,6 +118,7 @@ export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
             <div><dt>Desktop shell</dt><dd>Tauri 2</dd></div>
             <div><dt>Interface</dt><dd>React 19</dd></div>
             <div><dt>Inference</dt><dd>Local Python worker</dd></div>
+            <div><dt>Updates</dt><dd>Automatic release checks</dd></div>
             <div><dt>Network fallback</dt><dd>None</dd></div>
           </dl>
         </Panel>

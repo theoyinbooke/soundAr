@@ -1,12 +1,13 @@
 use serde_json::{json, Value};
 use std::{
+    collections::VecDeque,
     env, fs,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex},
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 struct PythonProcess {
     _child: Child,
@@ -17,6 +18,7 @@ struct PythonProcess {
 #[derive(Clone)]
 struct RuntimeState {
     process: Arc<Mutex<Option<PythonProcess>>>,
+    setup_lock: Arc<Mutex<()>>,
     runtime_root: PathBuf,
     python_path: PathBuf,
 }
@@ -25,6 +27,7 @@ impl RuntimeState {
     fn new(runtime_root: PathBuf, python_path: PathBuf) -> Self {
         Self {
             process: Arc::new(Mutex::new(None)),
+            setup_lock: Arc::new(Mutex::new(())),
             runtime_root,
             python_path,
         }
@@ -88,6 +91,81 @@ impl RuntimeState {
                 .to_string())
         }
     }
+
+    fn setup(&self, app: &tauri::AppHandle) -> Result<(), String> {
+        let _setup_guard = self
+            .setup_lock
+            .lock()
+            .map_err(|_| "Runtime setup lock failed")?;
+        if self.python_path.is_file() {
+            app.emit(
+                "runtime-setup-progress",
+                "Local inference runtime is already ready.",
+            )
+            .ok();
+            return Ok(());
+        }
+
+        let script = self.runtime_root.join("setup-runtime.sh");
+        if !script.is_file() {
+            return Err(format!(
+                "The bundled runtime installer was not found at {}. Reinstall soundAr and retry.",
+                script.display()
+            ));
+        }
+
+        let mut child = Command::new("/bin/bash")
+            .arg(&script)
+            .arg(app_data_dir())
+            .current_dir(&self.runtime_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("Could not launch runtime setup: {error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("Runtime setup output is unavailable")?;
+        let mut recent_output = VecDeque::with_capacity(24);
+
+        for line in BufReader::new(stdout).lines() {
+            let line =
+                line.map_err(|error| format!("Could not read runtime setup output: {error}"))?;
+            if recent_output.len() == 24 {
+                recent_output.pop_front();
+            }
+            recent_output.push_back(line.clone());
+            if let Some(message) = line.strip_prefix("soundar:") {
+                app.emit("runtime-setup-progress", message).ok();
+            }
+        }
+
+        let status = child
+            .wait()
+            .map_err(|error| format!("Could not finish runtime setup: {error}"))?;
+        if !status.success() {
+            let detail = recent_output
+                .iter()
+                .rev()
+                .find(|line| !line.trim().is_empty() && !line.starts_with("soundar:"))
+                .map(String::as_str)
+                .unwrap_or("No installer details were returned");
+            return Err(format!("Runtime setup failed: {detail}"));
+        }
+        if !self.python_path.is_file() {
+            return Err(format!(
+                "Runtime setup completed without creating {}",
+                self.python_path.display()
+            ));
+        }
+
+        *self
+            .process
+            .lock()
+            .map_err(|_| "Python runtime lock failed")? = None;
+        Ok(())
+    }
 }
 
 fn project_root() -> PathBuf {
@@ -131,6 +209,19 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn install_kind() -> &'static str {
+    if env::var_os("APPIMAGE").is_some() {
+        "appimage"
+    } else if env::current_exe()
+        .ok()
+        .is_some_and(|path| path.starts_with("/usr"))
+    {
+        "deb"
+    } else {
+        "development"
+    }
 }
 
 fn read_json(path: PathBuf, fallback: Value) -> Value {
@@ -229,6 +320,7 @@ fn bootstrap_state(state: tauri::State<'_, RuntimeState>) -> Value {
             { "id": "amara", "name": "Amara", "style": "Clear narration", "sample_label": "Verified local sample", "sample_seconds": 31, "engines": ["Kokoro", "XTTS"], "consent": "confirmed", "state": "ready", "color": "green" },
             { "id": "studio-neutral", "name": "Studio Neutral", "style": "Utility preset", "sample_label": "Built-in voice", "sample_seconds": 0, "engines": ["Kokoro"], "consent": "not-required", "state": "preset", "color": "amber" }
         ],
+        "install_kind": install_kind(),
         "runtime": "tauri"
     })
 }
@@ -244,9 +336,23 @@ async fn synthesize(
         .map_err(|error| format!("Synthesis worker failed: {error}"))?
 }
 
+#[tauri::command]
+async fn setup_runtime(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, RuntimeState>,
+) -> Result<(), String> {
+    let runtime = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.setup(&app))
+        .await
+        .map_err(|error| format!("Runtime setup worker failed: {error}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let root = runtime_root(app.handle());
@@ -255,6 +361,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap_state,
+            setup_runtime,
             synthesize,
             read_generated_audio
         ])

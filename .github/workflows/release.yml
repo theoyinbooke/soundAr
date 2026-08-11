@@ -31,6 +31,8 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           projectPath: app
           tagName: v__VERSION__
@@ -39,9 +41,9 @@ jobs:
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true
-          uploadUpdaterJson: false
+          uploadUpdaterJson: true
           args: --bundles deb,appimage
       - name: Attach installer and runtime manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" install-linux.sh requirements-runtime.txt --clobber
+        run: gh release upload "$GITHUB_REF_NAME" install-linux.sh setup-runtime.sh requirements-runtime.txt --clobber

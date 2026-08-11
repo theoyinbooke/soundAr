@@ -164,5 +164,6 @@ export const fallbackBootstrap: BootstrapState = {
   },
   export_dir: "~/.soundAr/exports",
   voices: seedVoices,
+  install_kind: "development",
   runtime: "browser",
 };

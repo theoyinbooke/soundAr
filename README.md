@@ -38,8 +38,16 @@ chmod +x install-linux.sh
 To install a locally built package, pass its path:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.2.1_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.2.2_amd64.deb
 ```
+
+When the Debian package or AppImage is installed directly, soundAr detects a missing Python
+environment and offers the same managed runtime setup inside the application. Setup is user-space,
+retryable, and keeps model weights across application upgrades.
+
+Starting with version 0.2.2, the app checks signed GitHub Releases shortly after launch and every
+six hours. AppImage installations can update and restart in place; Debian installations receive an
+in-app release notice and continue through the system package installer.
 
 The desktop package contains the versioned engine code. Python 3.11 and model libraries live in
 `${XDG_DATA_HOME:-$HOME/.local/share}/soundar/runtime`, while downloaded model weights and exports
@@ -84,8 +92,8 @@ Linux releases are created from version tags. Keep the version in `app/package.j
 `app/src-tauri/Cargo.toml`, and `app/src-tauri/tauri.conf.json` aligned, then push a matching tag:
 
 ```bash
-git tag -a v0.2.1 -m "soundAr v0.2.1"
-git push origin v0.2.1
+git tag -a v0.2.2 -m "soundAr v0.2.2"
+git push origin v0.2.2
 ```
 
 GitHub Actions builds the Debian and AppImage artifacts, creates the release notes, and attaches

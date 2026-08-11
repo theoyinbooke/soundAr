@@ -1,0 +1,23 @@
+{
+  "identifier": "desktop-capability",
+  "platforms": [
+    "macOS",
+    "windows",
+    "linux"
+  ],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "updater:default",
+    "process:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://github.com/theoyinbooke/soundAr/releases/*"
+        }
+      ]
+    }
+  ]
+}

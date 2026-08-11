@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 - 2026-08-11
+
+- Added in-app setup when a direct package install has no managed Python runtime.
+- Bundled one idempotent runtime bootstrapper for the app and Linux installer.
+- Added visible setup progress, retry handling, and synthesis readiness guards.
+- Added CUDA and CPU-specific PyTorch installation paths.
+- Moved Kokoro English language data into setup to avoid a first-generation download.
+- Promoted required Debian runtime tools from recommendations to dependencies.
+- Added signed GitHub Release update checks with AppImage install-and-restart support.
+
 ## 0.2.1 - 2026-08-11
 
 - Added the soundAr symbol and wordmark across the desktop interface.

@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { AppShell } from "./components/AppShell";
+import { RuntimeSetupNotice } from "./components/RuntimeSetupNotice";
+import { UpdateNotice } from "./components/UpdateNotice";
 import { LoadingView } from "./components/ui";
 import { fallbackBootstrap, seedBenchmarks } from "./data";
 import { loadBootstrapState } from "./lib/bridge";
@@ -24,6 +27,7 @@ export default function App() {
   });
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [benchmarks, setBenchmarks] = useState<BenchmarkResult[]>(seedBenchmarks);
+  const [availableUpdate, setAvailableUpdate] = useState<Update>();
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -45,6 +49,26 @@ export default function App() {
 
   useEffect(() => { localStorage.setItem("soundar.voices", JSON.stringify(voices)); }, [voices]);
 
+  useEffect(() => {
+    if (bootstrap?.runtime !== "tauri") return;
+    let active = true;
+    async function checkForUpdate() {
+      try {
+        const update = await check({ timeout: 15_000 });
+        if (active && update) setAvailableUpdate(update);
+      } catch {
+        // Update checks are best-effort and should not interrupt local work.
+      }
+    }
+    const initial = window.setTimeout(checkForUpdate, 1_500);
+    const interval = window.setInterval(checkForUpdate, 6 * 60 * 60 * 1000);
+    return () => {
+      active = false;
+      window.clearTimeout(initial);
+      window.clearInterval(interval);
+    };
+  }, [bootstrap?.runtime]);
+
   function renderView(state: BootstrapState) {
     switch (current) {
       case "generate": return <GenerateView bootstrap={state} voices={voices} onGenerated={(item) => setHistory((items) => [item, ...items])} />;
@@ -61,9 +85,15 @@ export default function App() {
 
   if (!bootstrap) return <LoadingView />;
 
+  async function refreshBootstrap() {
+    setBootstrap(await loadBootstrapState());
+  }
+
   return (
     <AppShell current={current} onNavigate={setCurrent} theme={theme} onToggleTheme={() => setTheme((value) => value === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime}>
       {error ? <div className="runtime-warning">Desktop runtime unavailable. Showing the browser preview: {error}</div> : null}
+      {availableUpdate ? <UpdateNotice update={availableUpdate} installKind={bootstrap.install_kind} onDismiss={() => { void availableUpdate.close(); setAvailableUpdate(undefined); }} /> : null}
+      {bootstrap.runtime === "tauri" && !bootstrap.system.python_ready ? <RuntimeSetupNotice onReady={refreshBootstrap} /> : null}
       {renderView(bootstrap)}
     </AppShell>
   );

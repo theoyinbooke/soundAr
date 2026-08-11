@@ -3,7 +3,6 @@ set -Eeuo pipefail
 
 REPOSITORY="theoyinbooke/soundAr"
 RUNTIME_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/soundar/runtime"
-PYTHON="$RUNTIME_DIR/.venv/bin/python"
 PACKAGE_PATH="${1:-}"
 TEMP_DIR=""
 AUTH_HEADER=()
@@ -81,14 +80,27 @@ find_requirements() {
   printf '%s' "$downloaded"
 }
 
-install_uv() {
-  if command -v uv >/dev/null; then
+find_runtime_setup() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ -f "$script_dir/setup-runtime.sh" ]]; then
+    printf '%s' "$script_dir/setup-runtime.sh"
     return
   fi
-  say "Installing the uv Python runtime manager"
-  curl --fail --location --silent --show-error https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-  command -v uv >/dev/null || { echo "uv installation failed." >&2; exit 1; }
+
+  local installed
+  installed="$(dpkg-query -L sound-ar 2>/dev/null | awk '/runtime\/setup-runtime\.sh$/ { print; exit }')"
+  if [[ -n "$installed" && -f "$installed" ]]; then
+    printf '%s' "$installed"
+    return
+  fi
+
+  local downloaded="$TEMP_DIR/setup-runtime.sh"
+  curl --fail --location --show-error \
+    "${AUTH_HEADER[@]}" \
+    "https://github.com/$REPOSITORY/releases/latest/download/setup-runtime.sh" \
+    --output "$downloaded"
+  printf '%s' "$downloaded"
 }
 
 main() {
@@ -108,36 +120,12 @@ main() {
   say "Installing $(basename "$PACKAGE_PATH")"
   sudo apt-get install -y "$PACKAGE_PATH"
 
-  install_uv
   local requirements
   requirements="$(find_requirements)"
-
-  say "Creating the managed Python 3.11 runtime"
-  mkdir -p "$RUNTIME_DIR" "$HOME/.soundAr/models" "$HOME/.soundAr/state" "$HOME/.soundAr/exports"
-  uv python install 3.11
-  uv venv --python 3.11 --seed "$RUNTIME_DIR/.venv"
-
-  say "Installing the CUDA 12.4 inference stack"
-  "$PYTHON" -m pip install --upgrade pip wheel
-  # Perth still imports pkg_resources, removed in Setuptools 81.
-  "$PYTHON" -m pip install setuptools==80.9.0
-  "$PYTHON" -m pip install torch==2.6.0 torchaudio==2.6.0 \
-    --index-url https://download.pytorch.org/whl/cu124
-  "$PYTHON" -m pip install --requirement "$requirements"
-  # Chatterbox 0.1.7 declares Transformers 5.2, while XTTS currently requires the
-  # tested 4.49 compatibility line. Its inference code works with this shared pin.
-  "$PYTHON" -m pip install --no-deps chatterbox-tts==0.1.7
-
-  say "Verifying CUDA"
-  "$PYTHON" - <<'PY'
-import torch
-
-print(f"PyTorch {torch.__version__}; CUDA runtime {torch.version.cuda}")
-if torch.cuda.is_available():
-    print(f"GPU ready: {torch.cuda.get_device_name(0)}")
-else:
-    print("CUDA is not available. soundAr will use CPU inference.")
-PY
+  local runtime_setup
+  runtime_setup="$(find_runtime_setup)"
+  say "Setting up the managed local inference runtime"
+  bash "$runtime_setup" "$RUNTIME_DIR" "$requirements"
 
   say "Installation complete. Launch soundAr from your application menu."
 }

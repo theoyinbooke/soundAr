@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { fallbackBootstrap } from "../data";
 import type { BootstrapState, SynthesisRequest, SynthesisResult } from "../types";
@@ -35,6 +36,16 @@ export async function synthesizeSpeech(request: SynthesisRequest): Promise<Synth
   }
 
   return invoke<SynthesisResult>("synthesize", { request });
+}
+
+export async function setupPythonRuntime(onProgress: (message: string) => void): Promise<void> {
+  if (!hasTauriRuntime()) return;
+  const unlisten = await listen<string>("runtime-setup-progress", (event) => onProgress(event.payload));
+  try {
+    await invoke("setup_runtime");
+  } finally {
+    unlisten();
+  }
 }
 
 export async function loadGeneratedAudio(path: string, format: "wav" | "flac"): Promise<string> {

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "soundAr",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "identifier": "com.soundar.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -32,6 +32,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["deb", "appimage"],
     "category": "Music",
     "shortDescription": "Local GPU voice generation studio",
@@ -45,6 +46,7 @@
     ],
     "resources": {
       "../../bridge.py": "runtime/bridge.py",
+      "../../setup-runtime.sh": "runtime/setup-runtime.sh",
       "../../requirements-runtime.txt": "runtime/requirements-runtime.txt",
       "../../config/__init__.py": "runtime/config/__init__.py",
       "../../config/constants.py": "runtime/config/constants.py",
@@ -68,8 +70,16 @@
     },
     "linux": {
       "deb": {
-        "recommends": ["ffmpeg", "libsndfile1", "libespeak-ng1"]
+        "depends": ["curl", "ca-certificates", "python3", "util-linux", "build-essential", "ffmpeg", "libsndfile1", "libespeak-ng1"]
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE2MTcyRDUyRkE1QTc4MEQKUldRTmVGcjZVaTBYRmxNcCtNNWlWVWxUMVJlYVZLOElTNWJHVGZ5ZEJiOHkwTzc0ZmdVV2l1cDcK",
+      "endpoints": [
+        "https://github.com/theoyinbooke/soundAr/releases/latest/download/latest.json"
+      ]
     }
   }
 }

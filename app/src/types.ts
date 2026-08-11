@@ -63,6 +63,7 @@ export interface BootstrapState {
   system: SystemStatus;
   export_dir: string;
   voices: VoiceProfile[];
+  install_kind: "appimage" | "deb" | "development";
   runtime: "tauri" | "browser";
 }
 

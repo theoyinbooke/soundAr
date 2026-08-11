@@ -92,10 +92,11 @@ export function GenerateView({
 
   const selectedModel = ttsModels.find((model) => model.model_id === modelId);
   const selectedVoice = voices.find((voice) => voice.id === voiceId) ?? voices[0];
+  const runtimeReady = bootstrap.runtime === "browser" || bootstrap.system.python_ready;
   const estimatedSeconds = Math.max(2, Math.round(text.length / 13));
 
   async function generate() {
-    if (!text.trim() || !modelId || isGenerating) return;
+    if (!runtimeReady || !text.trim() || !modelId || isGenerating) return;
     setIsGenerating(true);
     setError(undefined);
     try {
@@ -232,7 +233,7 @@ export function GenerateView({
               {error ? <StatusText tone="danger">{error}</StatusText> : null}
               {!error && isGenerating ? <StatusText tone="warning">Loading model and generating locally...</StatusText> : null}
               {!error && !isGenerating ? (
-                <StatusText tone="success">{result ? `Ready / RTF ${result.rtf.toFixed(2)}x` : "Ready / first audio depends on engine"}</StatusText>
+                <StatusText tone={runtimeReady ? "success" : "warning"}>{runtimeReady ? (result ? `Ready / RTF ${result.rtf.toFixed(2)}x` : "Ready / first audio depends on engine") : "Runtime setup required"}</StatusText>
               ) : null}
             </div>
             <button className="button button-secondary" type="button" onClick={async () => setReferencePath(await pickAudioFile())}>
@@ -243,7 +244,7 @@ export function GenerateView({
               <Save aria-hidden="true" size={14} />
               Save preset
             </button>
-            <button className="button button-primary" type="button" onClick={generate} disabled={!text.trim() || !modelId || isGenerating}>
+            <button className="button button-primary" type="button" onClick={generate} disabled={!runtimeReady || !text.trim() || !modelId || isGenerating}>
               <Sparkles aria-hidden="true" size={14} />
               {isGenerating ? "Generating..." : "Generate audio"}
             </button>
@@ -256,7 +257,7 @@ export function GenerateView({
               <span className="section-label">Runtime</span>
               <strong>{selectedModel?.model_id.split("/").at(-1) ?? "No model"}</strong>
             </div>
-            <StatusText tone={selectedModel ? "success" : "warning"}>{selectedModel ? "Worker ready" : "Install a model"}</StatusText>
+            <StatusText tone={runtimeReady && selectedModel ? "success" : "warning"}>{!runtimeReady ? "Setup required" : selectedModel ? "Worker ready" : "Install a model"}</StatusText>
           </div>
 
           <MetricStrip
