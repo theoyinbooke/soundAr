@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">soundAr</title>
+  <g fill="none" stroke="#171714" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M382 144C345 93 278 70 214 80C123 95 63 181 82 270C101 358 193 413 279 383C324 367 359 335 379 295" stroke-width="72"/>
+    <path d="M379 255V407" stroke-width="72"/>
+    <path d="M110 255H142L159 226L180 285L204 202L230 305L257 222L280 286L302 240L322 268H385" stroke-width="28"/>
+    <path d="M448 233Q466 255 448 277M469 216Q498 255 469 294" stroke-width="14"/>
+  </g>
+  <circle cx="420" cy="255" r="12" fill="#171714"/>
+</svg>

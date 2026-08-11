@@ -1,5 +1,6 @@
 import { Check, ChevronDown, LoaderCircle } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { BrandMark } from "./Brand";
 
 export interface DropdownOption {
   value: string;
@@ -189,8 +190,8 @@ export function CompactField({
 export function LoadingView() {
   return (
     <div className="loading-view" role="status">
-      <LoaderCircle className="spin" aria-hidden="true" size={20} />
-      <span>Reading the local runtime…</span>
+      <BrandMark className="loading-brand" />
+      <div className="loading-status"><LoaderCircle className="spin" aria-hidden="true" size={14} /><span>Reading the local runtime...</span></div>
     </div>
   );
 }

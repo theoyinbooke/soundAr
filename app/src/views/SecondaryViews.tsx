@@ -2,6 +2,7 @@ import { Activity, Check, CircleStop, FolderOpen, Gauge, Mic, Play, Search, Slid
 import { useMemo, useState } from "react";
 import type { BootstrapState, HistoryItem, Theme } from "../types";
 import { CompactField, EmptyState, MetricStrip, PageHeader, Panel, Segmented, SelectField, StatusText } from "../components/ui";
+import { BrandLockup, BrandMark } from "../components/Brand";
 
 const levels = [22, 34, 18, 48, 28, 62, 42, 71, 38, 54, 31, 66, 45, 57, 26, 43, 20, 34];
 
@@ -94,6 +95,43 @@ export function SettingsView({ bootstrap, theme, onTheme }: { bootstrap: Bootstr
           <div className="storage-summary"><div><strong>{bootstrap.installed.length}</strong><span>Installed models</span></div><div><strong>{(bootstrap.system.vram_total_mb / 1024).toFixed(1)} GB</strong><span>GPU memory</span></div><div><strong><Check size={15} /></strong><span>Local-only mode</span></div></div>
         </Panel>
       </div>
+    </div>
+  );
+}
+
+export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
+  return (
+    <div className="page about-page">
+      <PageHeader title="About" subtitle="Application identity and local runtime details." />
+      <section className="about-identity" aria-labelledby="about-product-name">
+        <BrandMark className="about-mark" />
+        <div>
+          <BrandLockup className="about-lockup" />
+          <p id="about-product-name">Local open-source voice studio</p>
+        </div>
+        <span className="about-version">Version 0.2.1</span>
+      </section>
+      <div className="about-details">
+        <Panel className="about-section" ariaLabel="Application details">
+          <span className="section-label">Application</span>
+          <dl className="compact-definition-list settings-facts">
+            <div><dt>Desktop shell</dt><dd>Tauri 2</dd></div>
+            <div><dt>Interface</dt><dd>React 19</dd></div>
+            <div><dt>Inference</dt><dd>Local Python worker</dd></div>
+            <div><dt>Network fallback</dt><dd>None</dd></div>
+          </dl>
+        </Panel>
+        <Panel className="about-section" ariaLabel="Runtime details">
+          <span className="section-label">This machine</span>
+          <dl className="compact-definition-list settings-facts">
+            <div><dt>GPU</dt><dd>{bootstrap.system.gpu_name}</dd></div>
+            <div><dt>VRAM</dt><dd>{(bootstrap.system.vram_total_mb / 1024).toFixed(1)} GB</dd></div>
+            <div><dt>CUDA</dt><dd><StatusText tone={bootstrap.system.cuda_available ? "success" : "warning"}>{bootstrap.system.cuda_available ? "Ready" : "Unavailable"}</StatusText></dd></div>
+            <div><dt>Installed models</dt><dd>{bootstrap.installed.length}</dd></div>
+          </dl>
+        </Panel>
+      </div>
+      <footer className="about-footer"><span>soundAr</span><span>Local only</span><span>Open-source model runtime</span></footer>
     </div>
   );
 }

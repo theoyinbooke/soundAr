@@ -7,7 +7,7 @@ import type { BenchmarkResult, BootstrapState, HistoryItem, NavKey, Theme, Voice
 import { BenchmarksView } from "./views/BenchmarksView";
 import { GenerateView } from "./views/GenerateView";
 import { ModelsView } from "./views/ModelsView";
-import { CompareView, HistoryView, LiveView, SettingsView } from "./views/SecondaryViews";
+import { AboutView, CompareView, HistoryView, LiveView, SettingsView } from "./views/SecondaryViews";
 import { VoicesView } from "./views/VoicesView";
 
 const savedTheme = localStorage.getItem("soundar.theme");
@@ -55,6 +55,7 @@ export default function App() {
       case "benchmarks": return <BenchmarksView bootstrap={state} results={benchmarks} onChange={setBenchmarks} />;
       case "history": return <HistoryView history={history} />;
       case "settings": return <SettingsView bootstrap={state} theme={theme} onTheme={setTheme} />;
+      case "about": return <AboutView bootstrap={state} />;
     }
   }
 

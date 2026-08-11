@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="app/public/brand/soundar-app-icon.svg" alt="soundAr" width="112" />
+</p>
+
 # soundAr
 
 soundAr is a local-first desktop studio for generating, cloning, comparing, and benchmarking voices with open-source speech models.
@@ -34,7 +38,7 @@ chmod +x install-linux.sh
 To install a locally built package, pass its path:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.2.0_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.2.1_amd64.deb
 ```
 
 The desktop package contains the versioned engine code. Python 3.11 and model libraries live in
@@ -80,8 +84,8 @@ Linux releases are created from version tags. Keep the version in `app/package.j
 `app/src-tauri/Cargo.toml`, and `app/src-tauri/tauri.conf.json` aligned, then push a matching tag:
 
 ```bash
-git tag -a v0.2.0 -m "soundAr v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "soundAr v0.2.1"
+git push origin v0.2.1
 ```
 
 GitHub Actions builds the Debian and AppImage artifacts, creates the release notes, and attaches

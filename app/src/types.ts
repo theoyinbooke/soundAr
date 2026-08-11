@@ -8,7 +8,8 @@ export type NavKey =
   | "compare"
   | "benchmarks"
   | "history"
-  | "settings";
+  | "settings"
+  | "about";
 
 export interface CatalogModel {
   model_id: string;

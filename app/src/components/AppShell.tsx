@@ -6,16 +6,17 @@ import {
   Columns3,
   FlaskConical,
   History,
+  Info,
   Mic2,
   Moon,
   Settings,
   Sun,
   UsersRound,
-  Waves,
   type LucideIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
 import type { NavKey, SystemStatus, Theme } from "../types";
+import { BrandLockup } from "./Brand";
 
 interface NavItem {
   key: NavKey;
@@ -72,11 +73,7 @@ export function AppShell({
   return (
     <div className="app-shell">
       <header className="app-topbar">
-        <div className="brand-lockup">
-          <Waves aria-hidden="true" size={18} strokeWidth={1.8} />
-          <strong>soundAr</strong>
-          <span>Local voice studio</span>
-        </div>
+        <BrandLockup className="brand-lockup-topbar" tagline="Local voice studio" />
         <div className="topbar-status">
           <Activity aria-hidden="true" size={14} />
           <span>
@@ -98,6 +95,15 @@ export function AppShell({
           >
             <Settings aria-hidden="true" size={17} strokeWidth={1.7} />
             <span>Settings</span>
+          </button>
+          <button
+            className={`nav-item ${current === "about" ? "is-active" : ""}`}
+            onClick={() => onNavigate("about")}
+            type="button"
+            title="About soundAr"
+          >
+            <Info aria-hidden="true" size={17} strokeWidth={1.7} />
+            <span>About</span>
           </button>
           <button className="theme-button" onClick={onToggleTheme} type="button" title="Toggle color theme">
             {theme === "dark" ? <Sun aria-hidden="true" size={16} /> : <Moon aria-hidden="true" size={16} />}
@@ -122,6 +128,15 @@ export function AppShell({
         >
           <Settings aria-hidden="true" size={17} />
           <span>Settings</span>
+        </button>
+        <button
+          className={`nav-item ${current === "about" ? "is-active" : ""}`}
+          onClick={() => onNavigate("about")}
+          type="button"
+          title="About soundAr"
+        >
+          <Info aria-hidden="true" size={17} />
+          <span>About</span>
         </button>
       </nav>
     </div>

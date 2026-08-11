@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 - 2026-08-11
+
+- Added the soundAr symbol and wordmark across the desktop interface.
+- Added dark, light, white, and single-color brand asset variants.
+- Added a responsive About view with application and local runtime details.
+- Rebuilt desktop, mobile, and installer icons from the new master artwork.
+
 ## 0.2.0 - 2026-08-11
 
 - Rebuilt the desktop experience with React, Vite, and Tauri.
