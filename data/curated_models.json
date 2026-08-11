@@ -1,0 +1,301 @@
+{
+  "version": 2,
+  "catalog_name": "soundAr-v1-milestone-1",
+  "generated_on": "2026-03-29",
+  "target_platform": "Ubuntu Linux",
+  "target_gpu_profile": "NVIDIA RTX 4080 12GB VRAM",
+  "offline_policy": {
+    "inference_mode": "local_only",
+    "allow_network_for": [
+      "curated_metadata_refresh",
+      "model_download"
+    ],
+    "disallow": [
+      "cloud_inference",
+      "api_key_required_features",
+      "online_fallback",
+      "telemetry_dependent_runtime"
+    ]
+  },
+  "tiers": {
+    "smoke": "Small, fast models used for first-run validation and basic test coverage.",
+    "recommended": "Models that should work well on the target machine and represent the default curated experience.",
+    "advanced": "Heavier or more specialized models that are supported but not part of the Milestone 1 starter catalog."
+  },
+  "models": [
+    {
+      "model_id": "openai/whisper-tiny",
+      "task": "stt",
+      "engine": "transformers",
+      "tier": "smoke",
+      "recommended_for_12gb": true,
+      "languages": [
+        "multilingual"
+      ],
+      "summary": "Smallest Whisper checkpoint (39M params) for fast end-to-end offline transcription validation.",
+      "known_limitations": [
+        "Lower transcription quality than larger Whisper variants.",
+        "Long-form audio should be chunked instead of processed as a single pass."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": 30,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Treat as the default STT smoke-test model.",
+        "Use Whisper processor-driven preprocessing.",
+        "Supports multilingual transcription and speech translation, but v1 should focus on local transcription."
+      ],
+      "source_urls": [
+        "https://huggingface.co/openai/whisper-tiny"
+      ]
+    },
+    {
+      "model_id": "openai/whisper-small",
+      "task": "stt",
+      "engine": "transformers",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": [
+        "multilingual"
+      ],
+      "summary": "Mid-range Whisper (244M params) balancing speed and accuracy for multilingual transcription.",
+      "known_limitations": [
+        "Long-form audio should be chunked into 30-second segments.",
+        "Susceptible to hallucination on silence or noisy segments."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": 30,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Uses standard AutoModelForSpeechSeq2Seq loading path.",
+        "Good balance between quality and resource usage for 12GB VRAM targets.",
+        "80 Mel frequency bins (same as tiny/base/medium)."
+      ],
+      "source_urls": [
+        "https://huggingface.co/openai/whisper-small"
+      ]
+    },
+    {
+      "model_id": "openai/whisper-large-v3-turbo",
+      "task": "stt",
+      "engine": "transformers",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": [
+        "multilingual"
+      ],
+      "summary": "Pruned Whisper large-v3 (809M params, 4 decoder layers) — near large-v3 quality at much faster inference.",
+      "known_limitations": [
+        "Uses 128 Mel bins (different from smaller variants).",
+        "Larger degradation on some languages like Thai and Cantonese vs large-v3.",
+        "Susceptible to hallucination on silence."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": 30,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Uses standard AutoModelForSpeechSeq2Seq loading path.",
+        "128 Mel frequency bins — processor handles this automatically.",
+        "Decoder reduced from 32 to 4 layers for significantly faster inference.",
+        "MIT licensed."
+      ],
+      "source_urls": [
+        "https://huggingface.co/openai/whisper-large-v3-turbo"
+      ]
+    },
+    {
+      "model_id": "nvidia/parakeet-tdt-1.1b",
+      "task": "stt",
+      "engine": "nemo",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": [
+        "en"
+      ],
+      "summary": "FastConformer-TDT English ASR model used to validate first-class NeMo support.",
+      "known_limitations": [
+        "English-only output.",
+        "Model card states lowercase English transcription output."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Model card specifies 16000 Hz mono wav input.",
+        "Use as the default NeMo STT validation model.",
+        "Implementation should keep the NeMo loading path local-only."
+      ],
+      "source_urls": [
+        "https://huggingface.co/nvidia/parakeet-tdt-1.1b"
+      ]
+    },
+    {
+      "model_id": "CohereLabs/cohere-transcribe-03-2026",
+      "task": "stt",
+      "engine": "cohere",
+      "access": "gated",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": [
+        "en", "fr", "de", "it", "es", "pt", "el", "nl", "pl",
+        "zh", "ja", "ko", "vi", "ar"
+      ],
+      "summary": "State-of-the-art 2B Conformer ASR — #1 on HuggingFace Open ASR Leaderboard (5.42% avg WER).",
+      "known_limitations": [
+        "Requires explicit language tag per input — no automatic language detection.",
+        "No timestamps or speaker diarization.",
+        "Hallucination on silence — recommend VAD preprocessing.",
+        "Code-switched audio not well supported."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Uses AutoModelForSpeechSeq2Seq with trust_remote_code=True for broad transformers compat.",
+        "Conformer encoder-decoder architecture with 16k BPE tokenizer.",
+        "Apache 2.0 licensed.",
+        "Trained on 500k hours of curated audio-transcript pairs."
+      ],
+      "source_urls": [
+        "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026"
+      ]
+    },
+    {
+      "model_id": "mistralai/Voxtral-Mini-3B-2507",
+      "task": "stt",
+      "engine": "voxtral",
+      "tier": "advanced",
+      "recommended_for_12gb": true,
+      "languages": [
+        "en", "es", "fr", "pt", "hi", "de", "nl", "it"
+      ],
+      "summary": "Lightweight Voxtral 3B for speech-to-text, audio understanding, and Q&A — fits in ~9.5GB VRAM.",
+      "known_limitations": [
+        "Requires transformers >= 4.54.0.",
+        "Uses chat template format for transcription requests.",
+        "8 languages only."
+      ],
+      "test_status": "optional",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Uses VoxtralForConditionalGeneration from transformers.",
+        "Supports transcription mode and audio Q&A mode.",
+        "Apache 2.0 licensed.",
+        "Context length 32k tokens — up to 30 min transcription."
+      ],
+      "source_urls": [
+        "https://huggingface.co/mistralai/Voxtral-Mini-3B-2507"
+      ]
+    },
+    {
+      "model_id": "microsoft/speecht5_tts",
+      "task": "tts",
+      "engine": "transformers",
+      "tier": "smoke",
+      "recommended_for_12gb": true,
+      "languages": [
+        "en"
+      ],
+      "summary": "Compact baseline TTS path for validating the first Transformers-based synthesis flow.",
+      "known_limitations": [
+        "Requires a vocoder for waveform generation.",
+        "Requires speaker embeddings for voice characteristics."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Use as the default TTS smoke-test model.",
+        "Model card examples use microsoft/speecht5_hifigan plus xvector speaker embeddings.",
+        "Implementation should keep all auxiliary assets local once downloaded."
+      ],
+      "source_urls": [
+        "https://huggingface.co/microsoft/speecht5_tts"
+      ]
+    },
+    {
+      "model_id": "coqui/XTTS-v2",
+      "task": "tts",
+      "engine": "coqui",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": [
+        "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru",
+        "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi"
+      ],
+      "summary": "Multilingual Coqui XTTS model for voice cloning and 17-language synthesis at 24kHz.",
+      "known_limitations": [
+        "Heavier runtime than the smoke-test TTS path.",
+        "Voice cloning should remain optional and fully local in v1."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 24000,
+      "runtime_notes": [
+        "Model card advertises support for 17 languages.",
+        "Model card advertises 24 kHz output.",
+        "Treat as a first-class engine path."
+      ],
+      "source_urls": [
+        "https://huggingface.co/coqui/XTTS-v2"
+      ]
+    },
+    {
+      "model_id": "hexgrad/Kokoro-82M",
+      "task": "tts",
+      "engine": "kokoro",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": [
+        "en", "en-gb", "ja", "zh", "ko", "fr", "es", "hi", "it", "pt"
+      ],
+      "summary": "Lightweight 82M TTS with 54 voices across 8 languages — low-latency 24kHz output.",
+      "known_limitations": [
+        "Exact dependency pin and local runtime setup still need to be finalized.",
+        "Language and voice handling should be catalog- and runtime-driven."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 24000,
+      "runtime_notes": [
+        "Model card usage example writes audio at 24000 Hz.",
+        "Model card release table indicates 8 languages and 54 voices.",
+        "Pin the kokoro runtime dependency during implementation."
+      ],
+      "source_urls": [
+        "https://huggingface.co/hexgrad/Kokoro-82M"
+      ]
+    },
+    {
+      "model_id": "ResembleAI/chatterbox",
+      "task": "tts",
+      "engine": "chatterbox",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": [
+        "en"
+      ],
+      "summary": "State-of-the-art 500M TTS with zero-shot voice cloning and emotion control — 24kHz output.",
+      "known_limitations": [
+        "English-only (standard model). Multilingual variant available separately.",
+        "Requires ~8-16GB VRAM.",
+        "Built-in PerTh watermarking on all generated audio."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 24000,
+      "runtime_notes": [
+        "Install via: pip install chatterbox-tts",
+        "Uses ChatterboxTTS.from_pretrained(device='cuda').",
+        "Supports exaggeration (0-1) and cfg_weight (0-1) parameters for emotion control.",
+        "Zero-shot voice cloning from ~10s reference audio.",
+        "MIT licensed."
+      ],
+      "source_urls": [
+        "https://huggingface.co/ResembleAI/chatterbox",
+        "https://github.com/resemble-ai/chatterbox"
+      ]
+    }
+  ]
+}

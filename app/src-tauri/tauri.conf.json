@@ -1,0 +1,75 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "soundAr",
+  "version": "0.2.0",
+  "identifier": "com.soundar.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1421",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "soundAr",
+        "width": 1260,
+        "height": 760,
+        "minWidth": 820,
+        "minHeight": 620,
+        "resizable": true,
+        "center": true,
+        "theme": "Dark"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$HOME/.soundAr/exports/*", "$HOME/.soundAr/exports/**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "category": "Music",
+    "shortDescription": "Local GPU voice generation studio",
+    "longDescription": "Generate, clone, compare, and benchmark speech locally with open-source voice models and CUDA acceleration.",
+    "homepage": "https://github.com/theoyinbooke/soundAr",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "resources": {
+      "../../bridge.py": "runtime/bridge.py",
+      "../../requirements-runtime.txt": "runtime/requirements-runtime.txt",
+      "../../config/__init__.py": "runtime/config/__init__.py",
+      "../../config/constants.py": "runtime/config/constants.py",
+      "../../config/settings.py": "runtime/config/settings.py",
+      "../../core/__init__.py": "runtime/core/__init__.py",
+      "../../core/audio_utils.py": "runtime/core/audio_utils.py",
+      "../../core/benchmark.py": "runtime/core/benchmark.py",
+      "../../core/gpu_manager.py": "runtime/core/gpu_manager.py",
+      "../../core/hub_browser.py": "runtime/core/hub_browser.py",
+      "../../core/model_assets.py": "runtime/core/model_assets.py",
+      "../../core/model_manager.py": "runtime/core/model_manager.py",
+      "../../core/tts_engine.py": "runtime/core/tts_engine.py",
+      "../../engines/__init__.py": "runtime/engines/__init__.py",
+      "../../engines/base_tts.py": "runtime/engines/base_tts.py",
+      "../../engines/tts/__init__.py": "runtime/engines/tts/__init__.py",
+      "../../engines/tts/chatterbox_tts.py": "runtime/engines/tts/chatterbox_tts.py",
+      "../../engines/tts/coqui_tts.py": "runtime/engines/tts/coqui_tts.py",
+      "../../engines/tts/kokoro_tts.py": "runtime/engines/tts/kokoro_tts.py",
+      "../../engines/tts/transformers_tts.py": "runtime/engines/tts/transformers_tts.py",
+      "../../data/curated_models.json": "runtime/data/curated_models.json"
+    },
+    "linux": {
+      "deb": {
+        "recommends": ["ffmpeg", "libsndfile1", "libespeak-ng1"]
+      }
+    }
+  }
+}
