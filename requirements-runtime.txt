@@ -17,6 +17,6 @@ soundfile>=0.12.1
 spacy-pkuseg
 spacy[ja]>=3
 TTS==0.22.0
-transformers==4.49.0
+transformers==5.5.0
 kokoro==0.9.4
 psutil>=5.9.0
