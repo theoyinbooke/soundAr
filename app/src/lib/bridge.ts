@@ -48,14 +48,16 @@ export async function setupPythonRuntime(onProgress: (message: string) => void):
   }
 }
 
-export async function loadGeneratedAudio(path: string, format: "wav" | "flac"): Promise<string> {
+export async function loadGeneratedAudio(path: string): Promise<string> {
   if (!hasTauriRuntime()) return path;
+  const format = path.toLowerCase().endsWith(".flac") ? "flac" : "wav";
   const payload = await invoke<ArrayBuffer | Uint8Array | number[]>("read_generated_audio", { path });
-  const bytes = payload instanceof ArrayBuffer
-    ? payload
-    : payload instanceof Uint8Array
-      ? payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength)
-      : new Uint8Array(payload).buffer;
+  const bytes = payload instanceof ArrayBuffer ? new Uint8Array(payload) : Uint8Array.from(payload);
+  const expectedHeader = format === "flac" ? "fLaC" : "RIFF";
+  const header = String.fromCharCode(...bytes.subarray(0, 4));
+  if (header !== expectedHeader) {
+    throw new Error(`Generated ${format.toUpperCase()} data has an invalid header.`);
+  }
   return URL.createObjectURL(new Blob([bytes], { type: format === "flac" ? "audio/flac" : "audio/wav" }));
 }
 

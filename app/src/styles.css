@@ -249,6 +249,7 @@ select { width: 100%; height: 34px; padding: 0 28px 0 9px; appearance: none; fon
 .playback-error, .playback-loading { position: absolute; right: 48px; bottom: 6px; max-width: 260px; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .playback-error { color: var(--coral); }
 .playback-loading { color: var(--amber); }
+.history-playback-error { color: var(--coral) !important; }
 .composer-footer { flex-wrap: wrap; margin-top: 12px; }
 .composer-state { flex: 1; min-width: 160px; }
 .runtime-rail { display: flex; flex-direction: column; min-width: 0; padding: 14px; }

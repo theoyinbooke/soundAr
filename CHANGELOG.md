@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3 - 2026-08-11
+
+- Allowed generated `blob:` audio previews in the packaged desktop security policy.
+- Added audio header validation before handing generated files to the media decoder.
+- Connected History play controls to generated files with loading, pause, and error states.
+
 ## 0.2.2 - 2026-08-11
 
 - Added in-app setup when a direct package install has no managed Python runtime.

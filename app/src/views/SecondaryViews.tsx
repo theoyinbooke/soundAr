@@ -1,8 +1,9 @@
-import { Activity, Check, CircleStop, FolderOpen, Gauge, Mic, Play, Search, SlidersHorizontal } from "lucide-react";
-import { useMemo, useState } from "react";
+import { Activity, Check, CircleStop, FolderOpen, Gauge, LoaderCircle, Mic, Pause, Play, Search, SlidersHorizontal } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { BootstrapState, HistoryItem, Theme } from "../types";
 import { CompactField, EmptyState, MetricStrip, PageHeader, Panel, Segmented, SelectField, StatusText } from "../components/ui";
 import { BrandLockup, BrandMark } from "../components/Brand";
+import { loadGeneratedAudio } from "../lib/bridge";
 
 const levels = [22, 34, 18, 48, 28, 62, 42, 71, 38, 54, 31, 66, 45, 57, 26, 43, 20, 34];
 
@@ -61,13 +62,97 @@ export function CompareView({ bootstrap }: { bootstrap: BootstrapState }) {
 
 export function HistoryView({ history }: { history: HistoryItem[] }) {
   const [query, setQuery] = useState("");
+  const [activeId, setActiveId] = useState<string>();
+  const [loadingId, setLoadingId] = useState<string>();
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackError, setPlaybackError] = useState<{ id: string; message: string }>();
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const objectUrlRef = useRef<string | undefined>(undefined);
+  const requestRef = useRef(0);
   const filtered = useMemo(() => history.filter((item) => [item.title, item.voice, item.model_id, item.text].join(" ").toLowerCase().includes(query.toLowerCase())), [history, query]);
+
+  useEffect(() => () => {
+    requestRef.current += 1;
+    audioRef.current?.pause();
+    if (objectUrlRef.current?.startsWith("blob:")) URL.revokeObjectURL(objectUrlRef.current);
+  }, []);
+
+  async function toggleHistoryPlayback(item: HistoryItem) {
+    const audio = audioRef.current;
+    if (!audio || !item.audio_path) return;
+    if (activeId === item.id && audio.src) {
+      if (!audio.paused) {
+        audio.pause();
+        return;
+      }
+      try {
+        await audio.play();
+        setPlaybackError(undefined);
+      } catch (caught) {
+        setPlaybackError({ id: item.id, message: caught instanceof Error ? caught.message : "Audio playback failed" });
+      }
+      return;
+    }
+
+    const requestId = ++requestRef.current;
+    audio.pause();
+    setIsPlaying(false);
+    setLoadingId(item.id);
+    setPlaybackError(undefined);
+    try {
+      const url = await loadGeneratedAudio(item.audio_path);
+      if (requestId !== requestRef.current) {
+        if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+        return;
+      }
+      if (objectUrlRef.current?.startsWith("blob:")) URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = url;
+      audio.src = url;
+      audio.load();
+      setActiveId(item.id);
+      await audio.play();
+    } catch (caught) {
+      setPlaybackError({ id: item.id, message: caught instanceof Error ? caught.message : "Audio playback failed" });
+      setActiveId(undefined);
+    } finally {
+      if (requestId === requestRef.current) setLoadingId(undefined);
+    }
+  }
+
   return (
     <div className="page">
       <PageHeader title="History" subtitle="Reopen, audition, and export generations made on this machine." />
       <div className="data-toolbar"><label className="search-control"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search scripts, voices, and models..." /></label><StatusText tone="muted">{history.length} local generations</StatusText></div>
       <Panel className="table-panel">
-        {filtered.length ? <div className="table-scroll"><table className="data-table"><thead><tr><th>Generation</th><th>Voice</th><th>Model</th><th>Duration</th><th>RTF</th><th aria-label="Actions" /></tr></thead><tbody>{filtered.map((item) => <tr key={item.id}><td><strong>{item.title}</strong><small>{new Date(item.created_at).toLocaleString()}</small></td><td>{item.voice}</td><td className="muted-cell">{item.model_id.split("/").at(-1)}</td><td className="mono-cell">{item.duration_seconds.toFixed(1)} s</td><td className="mono-cell">{item.rtf.toFixed(2)}x</td><td><button className="icon-button" title="Play generation" type="button"><Play size={12} /></button></td></tr>)}</tbody></table></div> : <EmptyState title="No matching generations" detail="Generated audio will appear here automatically." />}
+        {filtered.length ? (
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead><tr><th>Generation</th><th>Voice</th><th>Model</th><th>Duration</th><th>RTF</th><th aria-label="Actions" /></tr></thead>
+              <tbody>{filtered.map((item) => {
+                const playing = activeId === item.id && isPlaying;
+                const loading = loadingId === item.id;
+                return (
+                  <tr key={item.id}>
+                    <td>
+                      <strong>{item.title}</strong>
+                      <small className={playbackError?.id === item.id ? "history-playback-error" : undefined}>{playbackError?.id === item.id ? playbackError.message : new Date(item.created_at).toLocaleString()}</small>
+                    </td>
+                    <td>{item.voice}</td>
+                    <td className="muted-cell">{item.model_id.split("/").at(-1)}</td>
+                    <td className="mono-cell">{item.duration_seconds.toFixed(1)} s</td>
+                    <td className="mono-cell">{item.rtf.toFixed(2)}x</td>
+                    <td>
+                      <button className="icon-button" title={playing ? "Pause generation" : "Play generation"} type="button" disabled={!item.audio_path || loading} onClick={() => void toggleHistoryPlayback(item)}>
+                        {loading ? <LoaderCircle className="spin" size={12} /> : playing ? <Pause fill="currentColor" size={12} /> : <Play fill="currentColor" size={12} />}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
+        ) : <EmptyState title="No matching generations" detail="Generated audio will appear here automatically." />}
+        <audio ref={audioRef} className="visually-hidden" preload="metadata" onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onEnded={() => setIsPlaying(false)} onError={() => activeId && setPlaybackError({ id: activeId, message: "Generated audio could not be decoded" })} />
       </Panel>
     </div>
   );
@@ -109,7 +194,7 @@ export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
           <BrandLockup className="about-lockup" />
           <p id="about-product-name">Local open-source voice studio</p>
         </div>
-        <span className="about-version">Version 0.2.2</span>
+        <span className="about-version">Version 0.2.3</span>
       </section>
       <div className="about-details">
         <Panel className="about-section" ariaLabel="Application details">

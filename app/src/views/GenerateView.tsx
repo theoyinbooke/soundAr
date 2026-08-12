@@ -57,7 +57,7 @@ export function GenerateView({
     if (!result?.audio_path) return;
 
     setIsAudioLoading(true);
-    loadGeneratedAudio(result.audio_path, outputFormat)
+    loadGeneratedAudio(result.audio_path)
       .then((url) => {
         objectUrl = url;
         if (active) setAudioUrl(url);
@@ -72,7 +72,7 @@ export function GenerateView({
       active = false;
       if (objectUrl?.startsWith("blob:")) URL.revokeObjectURL(objectUrl);
     };
-  }, [outputFormat, result?.audio_path]);
+  }, [result?.audio_path]);
 
   useEffect(() => {
     function handleShortcut(event: KeyboardEvent) {
