@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5 - 2026-08-12
+
+- Made release checksums portable after downloading assets from GitHub.
+- Added a clean-room download and checksum verification gate before release publication.
+
 ## 0.2.4 - 2026-08-12
 
 - Opened soundAr under the MIT License with contribution, security, and model-license guidance.

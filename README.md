@@ -46,7 +46,7 @@ chmod +x install-linux.sh
 To install a locally built package, pass its path:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.2.4_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.2.5_amd64.deb
 ```
 
 When the Debian package or AppImage is installed directly, soundAr detects a missing Python
@@ -101,8 +101,8 @@ Linux releases are created from version tags. Keep the version in `app/package.j
 `app/src-tauri/Cargo.toml`, and `app/src-tauri/tauri.conf.json` aligned, then push a matching tag:
 
 ```bash
-git tag -a v0.2.4 -m "soundAr v0.2.4"
-git push origin v0.2.4
+git tag -a v0.2.5 -m "soundAr v0.2.5"
+git push origin v0.2.5
 ```
 
 GitHub Actions tests the source, builds signed Debian and AppImage artifacts into a draft release,

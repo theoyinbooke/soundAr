@@ -194,7 +194,7 @@ export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
           <BrandLockup className="about-lockup" />
           <p id="about-product-name">Open-source local voice studio</p>
         </div>
-        <span className="about-version">Version 0.2.4</span>
+        <span className="about-version">Version 0.2.5</span>
       </section>
       <div className="about-details">
         <Panel className="about-section" ariaLabel="Application details">

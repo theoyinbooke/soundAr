@@ -66,12 +66,19 @@ jobs:
       - name: Create checksums
         run: |
           version="${GITHUB_REF_NAME#v}"
-          sha256sum \
-            "app/src-tauri/target/release/bundle/deb/soundAr_${version}_amd64.deb" \
-            "app/src-tauri/target/release/bundle/deb/soundAr_${version}_amd64.deb.sig" \
-            "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage" \
-            "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage.sig" \
-            install-linux.sh setup-runtime.sh requirements-runtime.txt > SHA256SUMS
+          files=(
+            "app/src-tauri/target/release/bundle/deb/soundAr_${version}_amd64.deb"
+            "app/src-tauri/target/release/bundle/deb/soundAr_${version}_amd64.deb.sig"
+            "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage"
+            "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage.sig"
+            install-linux.sh
+            setup-runtime.sh
+            requirements-runtime.txt
+          )
+          : > SHA256SUMS
+          for file in "${files[@]}"; do
+            printf '%s  %s\n' "$(sha256sum "$file" | cut -d ' ' -f1)" "$(basename "$file")" >> SHA256SUMS
+          done
       - name: Attest release packages
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
@@ -82,6 +89,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" install-linux.sh setup-runtime.sh requirements-runtime.txt SHA256SUMS --clobber
+      - name: Verify downloadable release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          download_dir="$(mktemp -d)"
+          gh release download "$GITHUB_REF_NAME" --dir "$download_dir"
+          (
+            cd "$download_dir"
+            sha256sum -c SHA256SUMS
+            bash -n install-linux.sh setup-runtime.sh
+            jq -e --arg version "${GITHUB_REF_NAME#v}" '.version == $version' latest.json >/dev/null
+          )
       - name: Verify draft release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
