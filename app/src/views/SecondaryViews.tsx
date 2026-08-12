@@ -192,9 +192,9 @@ export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
         <BrandMark className="about-mark" />
         <div>
           <BrandLockup className="about-lockup" />
-          <p id="about-product-name">Local open-source voice studio</p>
+          <p id="about-product-name">Open-source local voice studio</p>
         </div>
-        <span className="about-version">Version 0.2.3</span>
+        <span className="about-version">Version 0.2.4</span>
       </section>
       <div className="about-details">
         <Panel className="about-section" ariaLabel="Application details">
@@ -217,7 +217,7 @@ export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
           </dl>
         </Panel>
       </div>
-      <footer className="about-footer"><span>soundAr</span><span>Local only</span><span>Open-source model runtime</span></footer>
+      <footer className="about-footer"><span>soundAr</span><span>Local only</span><span>Open-source application</span></footer>
     </div>
   );
 }

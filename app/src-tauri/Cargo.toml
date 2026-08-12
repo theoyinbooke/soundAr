@@ -1,9 +1,10 @@
 [package]
 name = "soundar-desktop"
-version = "0.2.3"
-description = "Local open-source voice studio"
+version = "0.2.4"
+description = "Open-source local voice studio"
 authors = ["soundAr"]
 edition = "2021"
+license = "MIT"
 homepage = "https://github.com/theoyinbooke/soundAr"
 repository = "https://github.com/theoyinbooke/soundAr"
 

@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest a focused improvement to the local voice studio.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: Explain the user need before proposing an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: model
+    attributes:
+      label: Model or dependency considerations
+      description: Include upstream project links and license information when relevant.
+  - type: checkboxes
+    id: local
+    attributes:
+      label: Project constraints
+      options:
+        - label: This proposal preserves local inference and does not require telemetry or a hosted API.
+          required: true

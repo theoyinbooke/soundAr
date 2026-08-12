@@ -6,20 +6,29 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   linux:
+    name: Build and publish Linux
+    if: github.repository == 'theoyinbooke/soundAr'
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: app/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
       - name: Validate release version
-        run: test "v$(node -p "require('./app/package.json').version")" = "$GITHUB_REF_NAME"
+        run: ./scripts/check-release-version.sh "$GITHUB_REF_NAME"
       - name: Install Tauri build dependencies
         run: |
           sudo apt-get update
@@ -27,8 +36,15 @@ jobs:
       - name: Install frontend dependencies
         working-directory: app
         run: npm ci
+      - name: Verify source before packaging
+        run: |
+          npm run build --prefix app
+          cargo fmt --check --manifest-path app/src-tauri/Cargo.toml
+          cargo test --locked --manifest-path app/src-tauri/Cargo.toml
+          python3 -m compileall -q bridge.py config core engines
+          bash -n install-linux.sh setup-runtime.sh install.sh
       - name: Build packages and create GitHub release
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -38,12 +54,49 @@ jobs:
           tagName: v__VERSION__
           releaseName: soundAr v__VERSION__
           releaseBody: See the generated release notes and CHANGELOG.md for details.
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           generateReleaseNotes: true
           uploadUpdaterJson: true
+          uploadUpdaterSignatures: true
+          retryAttempts: 3
           args: --bundles deb,appimage
-      - name: Attach installer and runtime manifest
+      - name: Verify Linux bundles
+        run: ./scripts/verify-linux-bundles.sh "${GITHUB_REF_NAME#v}"
+      - name: Create checksums
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha256sum \
+            "app/src-tauri/target/release/bundle/deb/soundAr_${version}_amd64.deb" \
+            "app/src-tauri/target/release/bundle/deb/soundAr_${version}_amd64.deb.sig" \
+            "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage" \
+            "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage.sig" \
+            install-linux.sh setup-runtime.sh requirements-runtime.txt > SHA256SUMS
+      - name: Attest release packages
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            app/src-tauri/target/release/bundle/deb/soundAr_*.deb
+            app/src-tauri/target/release/bundle/appimage/soundAr_*.AppImage
+      - name: Attach installer, runtime manifest, and checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" install-linux.sh setup-runtime.sh requirements-runtime.txt --clobber
+        run: gh release upload "$GITHUB_REF_NAME" install-linux.sh setup-runtime.sh requirements-runtime.txt SHA256SUMS --clobber
+      - name: Verify draft release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"
+          version="${GITHUB_REF_NAME#v}"
+          for asset in \
+            "soundAr_${version}_amd64.deb" \
+            "soundAr_${version}_amd64.deb.sig" \
+            "soundAr_${version}_amd64.AppImage" \
+            "soundAr_${version}_amd64.AppImage.sig" \
+            latest.json install-linux.sh setup-runtime.sh requirements-runtime.txt SHA256SUMS; do
+            grep -Fxq "$asset" <<<"$assets" || { echo "Missing release asset: $asset" >&2; exit 1; }
+          done
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

@@ -1,0 +1,43 @@
+name: Bug report
+description: Report reproducible incorrect behavior in soundAr.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach private voice recordings, credentials, model weights, or personal data.
+  - type: input
+    id: version
+    attributes:
+      label: soundAr version
+      placeholder: 0.2.3
+    validations:
+      required: true
+  - type: dropdown
+    id: package
+    attributes:
+      label: Installation type
+      options: [Debian package, AppImage, Development checkout, Legacy PyQt]
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Include the expected behavior and exact steps to reproduce the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, GPU, driver, model ID, and relevant non-sensitive logs.
+    validations:
+      required: true
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: Data safety
+      options:
+        - label: I removed credentials, private voice data, personal data, and model weights.
+          required: true

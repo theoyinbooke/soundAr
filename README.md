@@ -4,7 +4,15 @@
 
 # soundAr
 
-soundAr is a local-first desktop studio for generating, cloning, comparing, and benchmarking voices with open-source speech models.
+soundAr is an open-source, local-first desktop studio for generating, cloning,
+comparing, and benchmarking voices with local speech models.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-f0a928.svg)](LICENSE)
+[![CI](https://github.com/theoyinbooke/soundAr/actions/workflows/ci.yml/badge.svg)](https://github.com/theoyinbooke/soundAr/actions/workflows/ci.yml)
+
+> Model availability does not imply a universal open-source or commercial-use
+> license. Review each provider's current terms before downloading or distributing
+> model artifacts. See [Model and Data Licenses](MODEL_LICENSES.md).
 
 ## Desktop App
 
@@ -38,7 +46,7 @@ chmod +x install-linux.sh
 To install a locally built package, pass its path:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.2.3_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.2.4_amd64.deb
 ```
 
 When the Debian package or AppImage is installed directly, soundAr detects a missing Python
@@ -80,6 +88,7 @@ python3 main.py
 ## Verification
 
 ```bash
+./scripts/check-release-version.sh
 cd app
 npm run build
 cd src-tauri
@@ -92,9 +101,16 @@ Linux releases are created from version tags. Keep the version in `app/package.j
 `app/src-tauri/Cargo.toml`, and `app/src-tauri/tauri.conf.json` aligned, then push a matching tag:
 
 ```bash
-git tag -a v0.2.3 -m "soundAr v0.2.3"
-git push origin v0.2.3
+git tag -a v0.2.4 -m "soundAr v0.2.4"
+git push origin v0.2.4
 ```
 
-GitHub Actions builds the Debian and AppImage artifacts, creates the release notes, and attaches
-the installer and pinned runtime manifest. See `CHANGELOG.md` for release details.
+GitHub Actions tests the source, builds signed Debian and AppImage artifacts into a draft release,
+verifies their contents, generates checksums and build provenance, and only then publishes the
+release. See `CHANGELOG.md` for release details.
+
+## Open Source
+
+soundAr source code and bundled brand assets are available under the [MIT License](LICENSE).
+Contributions are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+Please report vulnerabilities through the private process in [SECURITY.md](SECURITY.md).

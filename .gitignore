@@ -12,12 +12,35 @@ app/src-tauri/target/
 .env
 .env.*
 !.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.json
+secrets.json
+auth.json
 output.wav
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.m4a
 *.log
 
 .soundAr/
 models/
 exports/
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.onnx
+
+*.deb
+*.AppImage
+*.AppImage.sig
 
 .DS_Store
 .idea/

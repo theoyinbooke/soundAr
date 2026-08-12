@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.4 - 2026-08-12
+
+- Opened soundAr under the MIT License with contribution, security, and model-license guidance.
+- Hardened repository ignores, CI permissions, issue templates, and dependency updates.
+- Added guarded signed releases with source tests, package inspection, checksums, provenance, and draft verification.
+- Replaced mutable runtime-manager bootstrapping with a pinned, checksum-verified uv download.
+
 ## 0.2.3 - 2026-08-11
 
 - Allowed generated `blob:` audio previews in the packaged desktop security policy.

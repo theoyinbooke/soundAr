@@ -10,6 +10,8 @@ STAGING_VENV="$RUNTIME_DIR/.venv-installing"
 PREVIOUS_VENV="$RUNTIME_DIR/.venv-previous"
 UV_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/soundar/uv"
 UV_PYTHON_INSTALL_DIR="$RUNTIME_DIR/python"
+UV_VERSION="0.12.3"
+UV_X86_64_SHA256="600cf9a742aca00d292673b16b5acffaa7b8c269a364ad0c2e79498dcb1fe101"
 
 export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
 export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
@@ -48,10 +50,19 @@ if [[ -z "$UV" && -x "$HOME/.local/bin/uv" ]]; then
   UV="$HOME/.local/bin/uv"
 fi
 if [[ -z "$UV" ]]; then
-  progress "Installing the Python runtime manager..."
-  curl --fail --location --silent --show-error https://astral.sh/uv/install.sh | sh
-  UV="$(command -v uv || true)"
-  [[ -n "$UV" ]] || UV="$HOME/.local/bin/uv"
+  [[ "$(uname -m)" == "x86_64" ]] || fail "Automatic uv setup currently supports x86_64 Linux only. Install uv manually and retry."
+  progress "Installing the verified Python runtime manager..."
+  UV_ARCHIVE="$RUNTIME_DIR/uv.tar.gz"
+  curl --fail --location --silent --show-error \
+    "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+    --output "$UV_ARCHIVE"
+  printf '%s  %s\n' "$UV_X86_64_SHA256" "$UV_ARCHIVE" | sha256sum --check --status \
+    || fail "The downloaded Python runtime manager failed verification."
+  tar --extract --gzip --file "$UV_ARCHIVE" --directory "$RUNTIME_DIR"
+  install -Dm755 "$RUNTIME_DIR/uv-x86_64-unknown-linux-gnu/uv" "$RUNTIME_DIR/bin/uv"
+  rm -f "$UV_ARCHIVE"
+  rm -rf "$RUNTIME_DIR/uv-x86_64-unknown-linux-gnu"
+  UV="$RUNTIME_DIR/bin/uv"
 fi
 [[ -x "$UV" ]] || fail "The Python runtime manager could not be installed."
 
