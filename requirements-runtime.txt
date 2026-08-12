@@ -2,7 +2,7 @@
 # PyTorch is installed separately from the CUDA 12.4 wheel index.
 accelerate>=0.30.0
 conformer==0.3.2
-diffusers==0.29.0
+diffusers==0.38.0
 huggingface-hub>=0.23.0,<2
 librosa==0.11.0
 numpy>=1.26.0,<2
