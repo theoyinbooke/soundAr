@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+## 0.3.0 - 2026-08-13
+
+- Removed development preview simulations and fixture data from production frontend output with compile-time guards and a negative-tested CI/package boundary verifier.
+- Added an owned test matrix and executable release checklist covering source, UI, native, Python, package migration, GPU, physical audio, privacy, updater, and rollback evidence.
+- Added five-cycle worker crash/reopen/retry injection and an isolated offline Debian/AppImage upgrade journey that verifies schema backup and user profile preservation.
+- Rebuilt the `0.3.0` Debian/AppImage candidates and passed package inspection, offline `0.2.5` upgrade/preservation, and the packaged RTX 4080 GPU acceptance in 70.59 seconds.
+- Added a configurable packaged GPU model-switch soak with WAV decoding, lifecycle unloads, scheduler leak checks, NVIDIA VRAM sampling, deterministic OOM quarantine/recovery, and machine-readable release evidence.
+- Passed the exact `0.3.0` AppImage candidate (`bcea103c...7c96b82`) through 92 Kokoro/Whisper/Parakeet switch cycles over 1,817.42 seconds with 9,744 MB peak VRAM, unchanged 1,265 MB idle VRAM, zero real engine failures, zero final scheduler reservations, and successful controlled OOM recovery.
+- Passed real default-device capture and silent routed playback on the local PipeWire digital microphone and laptop speaker; hot-unplug and long Live-session checks remain manual release gates.
+- Kept Play visible while consolidating secondary Voice, Model, and History table actions into compact accessible three-dot menus with sticky responsive action columns.
+- Added durable parallel rendering for stale Project chapters with per-chapter model, voice, and language settings; compact pause, resume, retry, and cancel controls; restart reconciliation; and source-revision checks that never attach an outdated result after text or generation settings change.
+- Validated batch reference audio against managed, consent-backed, ready voice profiles before either ordinary or idempotent batches are persisted, including default and row-level overrides.
+- Added explicit scheduler-managed model load and unload actions, resident-model health and bootstrap state, scoped worker retirement, and active-engine mutation guards.
+- Made model loading a durable cancellable job, preserved terminal cancellation through late worker responses, and excluded intentional cancellation from worker-failure telemetry.
+- Quarantined failed model loads and CUDA OOM workers, and added measured VRAM-pressure reclamation with 512 MB cold-load headroom for large engines.
+- Extended the real RTX 4080 acceptance run through Kokoro load, health, unload, multi-engine switching, API, parallel batch, and comparison; fixed hardware-test cleanup after assertion failures.
+- Kept the expanded Models inspector inside ordinary laptop windows and revalidated all 174 route/theme/viewport Playwright cases.
+- Replaced table-row action stacks with a shared keyboard-accessible three-dot menu. History keeps only Play visible while secondary artifact actions move into the menu; Models exposes details, install or repair, and source actions there.
+- Added local WavLM speaker separation over measured transcript word windows, with GPU-aware scheduling, durable evidence, editable append-only speaker labels, and playable speaker turns.
+- Added pinned English Wav2Vec2 forced alignment for corrected transcript revisions, with immutable source timing, uncalibrated acoustic-path disclosure, compact word playback, and stale-revision protection.
+- Added explicit diarization limitations for provisional clustering, unavailable overlap detection, and unavailable turn confidence.
+- Expanded responsive coverage to 174 Playwright cases across six viewport profiles down to 320 px, including cross-route collision checks, and added real RTX 4080 generation, transcription, diarization, and alignment proofs.
+- Added a configurable route/theme soak suite and explicit Live output-disconnect reporting; a 25-cycle, 550-state local pass completed without clipping, viewport widening, console errors, or page exceptions.
+- Added durable four-level queue priority with FIFO ordering, starvation-preventing aging, scheduler telemetry, and priority-aware parallel batch execution across the desktop UI, local API, CLI, CSV, and JSONL imports.
+- Hardened cancellation at GPU worker admission so cancelled jobs cannot be revived and warm Python workers cannot be orphaned during the handoff.
+- Fixed About-screen clipping for the version badge and long GPU names, and expanded responsive tests to cover definition rows and right-edge text.
+
+- Added a bounded GPU-aware worker pool for concurrent interactive synthesis.
+- Added durable parallel batch queues with pause, resume, retry, cancellation, and restart recovery.
+- Added durable low/normal/high/urgent queue priority for interactive jobs and batch rows, with FIFO ties, 30-second aging, and live waiter telemetry.
+- Added validated TXT, CSV, and JSONL batch import with per-row model settings, compact previews,
+  and deterministic retry-safe output filenames.
+- Added idempotent asynchronous speech and batch API endpoints, resumable job events, verified audio retrieval, and matching CLI commands.
+- Added isolated pinned runtimes and qualification coverage for SpeechT5, Chatterbox, Chatterbox Turbo, XTTS, Whisper, and Parakeet alongside Kokoro.
+- Added persistent projects, voice references and consent evidence, generation artifacts, history, comparisons, benchmarks, and application settings.
+- Expanded desktop, mobile, dark, and cream-light UI coverage and improved compact table scrolling.
+- Added clean-package checks for every engine resource, executable developer tooling, playback policy, and accidental model-weight inclusion.
+
 ## 0.2.5 - 2026-08-12
 
 - Made release checksums portable after downloading assets from GitHub.

@@ -7,5 +7,8 @@ export default defineConfig({
   server: {
     port: 1421,
     strictPort: true,
+    watch: {
+      ignored: ["**/src-tauri/target/**", "**/test-results/**", "**/playwright-report/**"],
+    },
   },
 });

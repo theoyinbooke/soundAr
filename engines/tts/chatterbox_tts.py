@@ -70,11 +70,16 @@ class ChatterboxTTSEngine(BaseTTSEngine):
         language: str | None = None,
         reference_audio: np.ndarray | None = None,
         reference_sr: int | None = None,
+        controls: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, int]:
         import tempfile
         from pathlib import Path
 
-        kwargs: dict[str, Any] = {}
+        controls = controls or {}
+        kwargs: dict[str, Any] = {
+            "exaggeration": float(controls.get("exaggeration", 0.5)),
+            "cfg_weight": float(controls.get("cfg_weight", 0.5)),
+        }
 
         # If reference audio provided, write to temp file for voice cloning
         if reference_audio is not None and reference_sr is not None:

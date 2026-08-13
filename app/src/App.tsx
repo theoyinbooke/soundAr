@@ -3,51 +3,64 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { AppShell } from "./components/AppShell";
 import { RuntimeSetupNotice } from "./components/RuntimeSetupNotice";
 import { UpdateNotice } from "./components/UpdateNotice";
-import { LoadingView } from "./components/ui";
-import { fallbackBootstrap, seedBenchmarks } from "./data";
-import { loadBootstrapState } from "./lib/bridge";
-import type { BenchmarkResult, BootstrapState, HistoryItem, NavKey, Theme, VoiceProfile } from "./types";
+import { LoadingView, RuntimeFailureView } from "./components/ui";
+import { listHistory, loadBootstrapState, saveApplicationSetting } from "./lib/bridge";
+import type { ApplicationSettings, BootstrapState, HistoryItem, NavKey, ProjectRecord, Theme, TranscriptionRecord } from "./types";
 import { BenchmarksView } from "./views/BenchmarksView";
 import { GenerateView } from "./views/GenerateView";
 import { ModelsView } from "./views/ModelsView";
 import { AboutView, CompareView, HistoryView, LiveView, SettingsView } from "./views/SecondaryViews";
 import { VoicesView } from "./views/VoicesView";
-
-const savedTheme = localStorage.getItem("soundar.theme");
-const initialTheme: Theme = savedTheme === "light" ? "light" : "dark";
+import { ProjectsView } from "./views/ProjectsView";
+import { TranscribeView } from "./views/TranscribeView";
 
 export default function App() {
-  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const [settings, setSettings] = useState<ApplicationSettings>({ theme: "dark", dense_tables: true, reduced_motion: false });
   const [current, setCurrent] = useState<NavKey>("generate");
   const [bootstrap, setBootstrap] = useState<BootstrapState>();
-  const [error, setError] = useState<string>();
-  const [voices, setVoices] = useState<VoiceProfile[]>(() => {
-    try { return JSON.parse(localStorage.getItem("soundar.voices") ?? "null") ?? fallbackBootstrap.voices; }
-    catch { return fallbackBootstrap.voices; }
-  });
+  const [bootstrapError, setBootstrapError] = useState<string>();
+  const [runtimeNotice, setRuntimeNotice] = useState<string>();
+  const [bootstrapAttempt, setBootstrapAttempt] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [voices, setVoices] = useState<BootstrapState["voices"]>([]);
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [benchmarks, setBenchmarks] = useState<BenchmarkResult[]>(seedBenchmarks);
+  const [projects, setProjects] = useState<ProjectRecord[]>([]);
+  const [transcriptions, setTranscriptions] = useState<TranscriptionRecord[]>([]);
   const [availableUpdate, setAvailableUpdate] = useState<Update>();
+  const [preferredVoiceId, setPreferredVoiceId] = useState<string>();
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    localStorage.setItem("soundar.theme", theme);
-    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "dark" ? "#111412" : "#f4efe3");
-  }, [theme]);
+    document.documentElement.dataset.theme = settings.theme;
+    document.documentElement.dataset.density = settings.dense_tables ? "dense" : "comfortable";
+    document.documentElement.dataset.motion = settings.reduced_motion ? "reduced" : "full";
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", settings.theme === "dark" ? "#111412" : "#f4efe3");
+  }, [settings]);
 
   useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setBootstrapError(undefined);
     loadBootstrapState()
-      .then((state) => {
+      .then(async (state) => ({ state, history: await listHistory() }))
+      .then(({ state, history: loadedHistory }) => {
+        if (!active) return;
         setBootstrap(state);
-        if (!localStorage.getItem("soundar.voices") && state.voices.length) setVoices(state.voices);
+        setSettings(state.settings);
+        setVoices(state.voices);
+        setProjects(state.projects);
+        setTranscriptions(state.transcriptions);
+        setHistory(loadedHistory);
       })
       .catch((caught) => {
-        setError(caught instanceof Error ? caught.message : String(caught));
-        setBootstrap(fallbackBootstrap);
+        if (!active) return;
+        setBootstrap(undefined);
+        setBootstrapError(caught instanceof Error ? caught.message : String(caught));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
       });
-  }, []);
-
-  useEffect(() => { localStorage.setItem("soundar.voices", JSON.stringify(voices)); }, [voices]);
+    return () => { active = false; };
+  }, [bootstrapAttempt]);
 
   useEffect(() => {
     if (bootstrap?.runtime !== "tauri") return;
@@ -71,27 +84,49 @@ export default function App() {
 
   function renderView(state: BootstrapState) {
     switch (current) {
-      case "generate": return <GenerateView bootstrap={state} voices={voices} onGenerated={(item) => setHistory((items) => [item, ...items])} />;
-      case "voices": return <VoicesView voices={voices} onChange={setVoices} />;
-      case "models": return <ModelsView bootstrap={state} />;
+      case "generate": return <GenerateView bootstrap={state} voices={voices} preferredVoiceId={preferredVoiceId} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
+      case "projects": return <ProjectsView bootstrap={state} projects={projects} voices={voices} onChange={setProjects} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
+      case "transcribe": return <TranscribeView bootstrap={state} records={transcriptions} onChange={setTranscriptions} />;
+      case "voices": return <VoicesView bootstrap={state} voices={voices} onChange={setVoices} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} onUseVoice={(id) => { setPreferredVoiceId(id); setCurrent("generate"); }} />;
+      case "models": return <ModelsView bootstrap={state} onChanged={refreshBootstrap} />;
       case "live": return <LiveView bootstrap={state} />;
-      case "compare": return <CompareView bootstrap={state} />;
-      case "benchmarks": return <BenchmarksView bootstrap={state} results={benchmarks} onChange={setBenchmarks} />;
-      case "history": return <HistoryView history={history} />;
-      case "settings": return <SettingsView bootstrap={state} theme={theme} onTheme={setTheme} />;
+      case "compare": return <CompareView bootstrap={state} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
+      case "benchmarks": return <BenchmarksView bootstrap={state} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
+      case "history": return <HistoryView history={history} onChange={setHistory} />;
+      case "settings": return <SettingsView bootstrap={state} settings={settings} onSetting={updateSetting} />;
       case "about": return <AboutView bootstrap={state} />;
     }
   }
 
-  if (!bootstrap) return <LoadingView />;
+  if (loading) return <LoadingView />;
+  if (bootstrapError || !bootstrap) {
+    return <RuntimeFailureView error={bootstrapError ?? "The local runtime returned no application state."} onRetry={() => setBootstrapAttempt((attempt) => attempt + 1)} />;
+  }
 
   async function refreshBootstrap() {
-    setBootstrap(await loadBootstrapState());
+    try {
+      const state = await loadBootstrapState();
+      setBootstrap(state);
+      setSettings(state.settings);
+      setRuntimeNotice(undefined);
+    } catch (caught) {
+      setRuntimeNotice(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  async function updateSetting<K extends keyof ApplicationSettings>(key: K, value: ApplicationSettings[K]) {
+    setSettings((currentSettings) => ({ ...currentSettings, [key]: value }));
+    try {
+      const saved = await saveApplicationSetting(key, value);
+      setSettings(saved);
+    } catch (caught) {
+      setRuntimeNotice(caught instanceof Error ? caught.message : String(caught));
+    }
   }
 
   return (
-    <AppShell current={current} onNavigate={setCurrent} theme={theme} onToggleTheme={() => setTheme((value) => value === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime}>
-      {error ? <div className="runtime-warning">Desktop runtime unavailable. Showing the browser preview: {error}</div> : null}
+    <AppShell current={current} onNavigate={setCurrent} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features}>
+      {runtimeNotice ? <div className="runtime-warning">Local operation failed: {runtimeNotice}</div> : null}
       {availableUpdate ? <UpdateNotice update={availableUpdate} installKind={bootstrap.install_kind} onDismiss={() => { void availableUpdate.close(); setAvailableUpdate(undefined); }} /> : null}
       {bootstrap.runtime === "tauri" && !bootstrap.system.python_ready ? <RuntimeSetupNotice onReady={refreshBootstrap} /> : null}
       {renderView(bootstrap)}

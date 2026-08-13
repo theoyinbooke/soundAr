@@ -80,6 +80,7 @@ class TransformersTTS(BaseTTSEngine):
         language: str | None = None,
         reference_audio: np.ndarray | None = None,
         reference_sr: int | None = None,
+        controls: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, int]:
         device = self.get_device()
 

@@ -1,0 +1,33 @@
+# soundAr Test Matrix
+
+This matrix owns the evidence required before a soundAr release. “Owner” names the
+maintainer role responsible for keeping the layer green and investigating failures;
+it does not make a passing lower layer evidence for a higher one.
+
+| Layer | Owner | Automated evidence | Trigger | Scope and current limit |
+| --- | --- | --- | --- | --- |
+| Source, metadata, and secrets | Release owner | `./scripts/check-release-version.sh`, workflow pin checks, repository and package credential scans | Every PR and release | Version consistency, pinned actions, accidental credentials, package contents, and absence of bundled model weights. This does not replace review of model licenses. |
+| Production truth boundary | Frontend owner | `npm run build --prefix app && ./scripts/verify-production-boundary.sh && npm run test:production --prefix app` | Every PR and release | Fails when production UI imports fixture data, a preview branch lacks its development guard, emitted assets contain known simulated operations, or a production browser can reach fixture-backed workspace state. Browser preview remains development-only. |
+| Python runtime contracts | Engine-platform owner | `python3 -m unittest discover -s tests -v` | Every PR | Validation, audio utilities, registry/assets, bridge serialization, adapters, CLI/API contracts, and deterministic fixtures. Real model quality and GPU memory require hardware evidence. |
+| React and typed bridge | Frontend owner | `npm test --prefix app` | Every PR | Component state, accessibility semantics, audio loading, failure handling, development preview contracts, and Project batch revision reconciliation. Native IPC behavior belongs to Rust tests. |
+| Rendered workspace | Frontend owner | `npm run test:e2e --prefix app` | Every PR | Every route at 320, 390, 820, 1024, 1220, and 1440 px, both themes, menus, dialogs, batch/compare/history flows, collision and overflow checks. It uses the explicit development preview adapter. |
+| Rendered soak | Frontend owner | `npm run test:soak --prefix app` | Release candidate and major UI changes | Repeated route/theme navigation, exceptions, console errors, clipping, and viewport growth. It is configurable and is not an inference soak. |
+| Rust store, IPC, scheduler, and recovery | Desktop-core owner | `(cd app/src-tauri && cargo test --locked)` | Every PR | SQLite migrations/integrity, jobs, artifacts, API, scheduler, cancellation, worker supervision, and five-cycle crash/reopen/retry injection. Opt-in hardware/package tests are intentionally excluded from ordinary CI. |
+| Linux package structure | Release owner | `SOUNDAR_ALLOW_UNSIGNED=1 ./scripts/verify-linux-bundles.sh <version>` locally; signed mode in release CI | Every release candidate | Debian/AppImage resources, executable CLI, CSP media policy, no credentials, no model weights, and no preview fixture bytes. Local unsigned verification does not prove updater signing. |
+| Clean install and upgrade journey | Release owner | `xvfb-run -a ./scripts/verify-package-journey.sh <version> <previous.deb>` | Every release | Offline previous launch, clean candidate launch, schema migration with backup, and preservation of database, project, voice, model, registry, and export sentinels across Debian and AppImage. Privileged system install/uninstall remains a manual release check. |
+| Packaged GPU acceptance | Engine-platform owner | `SOUNDAR_E2E_RUNTIME_ROOT=... SOUNDAR_E2E_PYTHON=... cargo test --locked packaged_runtime_generates_playable_audio_through_native_bridge -- --ignored --nocapture` | Any engine/runtime/package change and every model release | Runs the packaged bridge/resources against qualified local engines and verifies playable artifacts, API/batch/compare paths, health/load/unload, and GPU scheduling on the RTX 4080 12 GB machine. Model downloads remain user-managed and external. |
+| Packaged GPU soak and OOM recovery | Engine-platform owner | `SOUNDAR_SOAK_DURATION_SECONDS=1800 ./scripts/run-packaged-gpu-soak.sh` | Every release candidate and scheduler/engine change | Repeatedly switches packaged Kokoro, Whisper, and Parakeet workloads; decodes each WAV; explicitly unloads each engine; samples system VRAM; requires scheduler quiescence; and runs deterministic OOM quarantine/recovery through the production worker supervisor. It writes ignored JSON evidence with package/runtime hashes, revisions, driver, timings, peak VRAM, engine health, and failures. A short run validates the harness but does not satisfy the 30-minute gate. |
+| Physical audio and Live | Audio owner | Manual checklist in `docs/release-checklist.md` plus native audio tests | Every release touching capture/routing | Microphone permission, real input/output routing, playback, capture, silence stop, and device recovery. Physical hot-unplug and long Live soaks cannot be proven by browser automation. |
+| Human quality, consent, and model licensing | Product/release owner | Model acceptance records, consent evidence, `MODEL_LICENSES.md`, and release checklist | Every newly qualified model | Listening quality, clone likeness review, consent provenance, redistribution terms, and user-facing hardware/license disclosures. Automated similarity is comparative evidence, not identity proof. |
+
+## Release Evidence Rule
+
+A release candidate must link or retain the output for every applicable row. A
+failure, skipped required row, stale package, or result from a different artifact
+keeps the release blocked. Hardware evidence must name the exact package/runtime,
+GPU, driver, model revisions, and test command.
+
+The soak defaults to 1,800 seconds. Override `SOUNDAR_E2E_RUNTIME_ROOT`,
+`SOUNDAR_E2E_PYTHON`, `SOUNDAR_SOAK_PACKAGE`, or `SOUNDAR_SOAK_REPORT` only
+when testing an intentionally different candidate. The runner rejects a missing
+package/runtime/GPU and re-validates the emitted report before returning success.

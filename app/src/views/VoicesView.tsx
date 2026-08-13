@@ -1,7 +1,9 @@
-import { FileAudio2, Play, Plus, Search, ShieldCheck, X } from "lucide-react";
-import { useDeferredValue, useMemo, useRef, useState } from "react";
-import type { VoiceProfile } from "../types";
-import { PageHeader, Panel, Segmented, StatusText } from "../components/ui";
+import { Check, FileAudio2, LoaderCircle, Pause, Play, Plus, RefreshCw, RotateCcw, Save, Scissors, Search, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import type { BootstrapState, HistoryItem, VoiceEvaluation, VoiceProfile } from "../types";
+import { CompactAudioPlayer, Dropdown, PageHeader, Panel, RowActionMenu, Segmented, StatusText } from "../components/ui";
+import { addVoiceReference, deleteVoiceProfile, importVoiceProfile, listHistory, loadGeneratedAudio, loadVoiceAudio, measureVoiceSimilarity, pickAudioFile, processVoiceReference, saveVoiceEvaluation, synthesizeSpeech, transcribeAudio, updateVoiceReferenceTranscript } from "../lib/bridge";
+import { compatibleVoicesForModel, qualifiedModels } from "../lib/capabilities";
 
 type VoiceFilter = "all" | "verified" | "draft";
 
@@ -15,11 +17,17 @@ function initials(name: string) {
 }
 
 export function VoicesView({
+  bootstrap,
   voices,
   onChange,
+  onGenerated,
+  onUseVoice,
 }: {
+  bootstrap: BootstrapState;
   voices: VoiceProfile[];
   onChange: (voices: VoiceProfile[]) => void;
+  onGenerated: (item: HistoryItem) => void;
+  onUseVoice: (id: string) => void;
 }) {
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query.trim().toLowerCase());
@@ -28,8 +36,30 @@ export function VoicesView({
   const [showAdd, setShowAdd] = useState(false);
   const [newName, setNewName] = useState("");
   const [newStyle, setNewStyle] = useState("");
-  const [sampleName, setSampleName] = useState("");
-  const fileInput = useRef<HTMLInputElement>(null);
+  const [samplePath, setSamplePath] = useState("");
+  const [relationship, setRelationship] = useState("self");
+  const [consentBasis, setConsentBasis] = useState("");
+  const [permittedUses, setPermittedUses] = useState("Personal and commercial speech generation");
+  const [sourceDate, setSourceDate] = useState(() => new Date().toISOString().slice(0, 10));
+  const [acknowledged, setAcknowledged] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState<string>();
+  const [referenceBusy, setReferenceBusy] = useState(false);
+  const [selectedReferenceId, setSelectedReferenceId] = useState("");
+  const [editingReference, setEditingReference] = useState(false);
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(0);
+  const [removeSilence, setRemoveSilence] = useState(true);
+  const [normalize, setNormalize] = useState(true);
+  const [transcript, setTranscript] = useState("");
+  const [evaluationModel, setEvaluationModel] = useState("");
+  const [evaluationBusy, setEvaluationBusy] = useState(false);
+  const [evaluationAudioUrl, setEvaluationAudioUrl] = useState<string>();
+  const [evaluationNotes, setEvaluationNotes] = useState("");
+  const [previewUrl, setPreviewUrl] = useState<string>();
+  const [previewVoiceId, setPreviewVoiceId] = useState<string>();
+  const [previewing, setPreviewing] = useState(false);
+  const audioRef = useRef<HTMLAudioElement>(null);
 
   const filtered = useMemo(() => {
     return voices.filter((voice) => {
@@ -41,26 +71,221 @@ export function VoicesView({
   }, [deferredQuery, filter, voices]);
 
   const selected = voices.find((voice) => voice.id === selectedId) ?? voices[0];
+  const selectedReference = selected?.references?.find((reference) => reference.id === selectedReferenceId)
+    ?? selected?.references?.find((reference) => reference.active)
+    ?? selected?.references?.[0];
+  const cloneModels = useMemo(() => qualifiedModels(bootstrap, "tts").filter((model) => {
+    const capability = bootstrap.engine_capabilities.find((entry) => entry.id === model.engine);
+    return capability?.voice_modes.includes("reference") && Boolean(selected) && compatibleVoicesForModel(bootstrap, model, [selected]).length > 0;
+  }), [bootstrap, selected]);
+  const transcriptionModel = qualifiedModels(bootstrap, "stt")[0];
+  const similarityModel = qualifiedModels(bootstrap, "speaker-verification")[0];
+  const selectedEvaluation = selected?.evaluations?.find((evaluation) => evaluation.model_id === evaluationModel && evaluation.reference_id === selectedReference?.id);
 
-  function addVoice() {
-    if (!newName.trim()) return;
-    const voice: VoiceProfile = {
-      id: crypto.randomUUID(),
-      name: newName.trim(),
-      style: newStyle.trim() || "Custom voice",
-      sample_label: sampleName || "Sample pending",
-      sample_seconds: sampleName ? 18 : 0,
-      engines: ["Chatterbox", "XTTS"],
-      consent: "pending",
-      state: "draft",
-      color: "coral",
-    };
-    onChange([...voices, voice]);
-    setSelectedId(voice.id);
-    setShowAdd(false);
-    setNewName("");
-    setNewStyle("");
-    setSampleName("");
+  useEffect(() => {
+    const reference = selected?.references?.find((item) => item.active) ?? selected?.references?.[0];
+    setSelectedReferenceId(reference?.id ?? "");
+    setEditingReference(false);
+    setTrimStart(reference?.processing.selection_start_seconds ?? 0);
+    setTrimEnd(reference?.processing.selection_end_seconds ?? reference?.analysis.duration_seconds ?? 0);
+    setRemoveSilence(reference?.processing.remove_silence ?? true);
+    setNormalize(reference?.processing.normalize ?? true);
+    setTranscript(reference?.transcript_text ?? "");
+    setEvaluationModel(cloneModels[0]?.model_id ?? "");
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (!selectedReference) return;
+    setTrimStart(selectedReference.processing.selection_start_seconds ?? 0);
+    setTrimEnd(selectedReference.processing.selection_end_seconds ?? selectedReference.analysis.duration_seconds ?? 0);
+    setRemoveSilence(selectedReference.processing.remove_silence ?? true);
+    setNormalize(selectedReference.processing.normalize ?? true);
+    setTranscript(selectedReference.transcript_text ?? "");
+  }, [selectedReferenceId]);
+
+  useEffect(() => {
+    if (!evaluationModel && cloneModels[0]) setEvaluationModel(cloneModels[0].model_id);
+  }, [cloneModels, evaluationModel]);
+
+  useEffect(() => {
+    setEvaluationNotes(selectedEvaluation?.notes ?? "");
+    let cancelled = false;
+    if (!selectedEvaluation) {
+      setEvaluationAudioUrl(undefined);
+      return () => { cancelled = true; };
+    }
+    void listHistory().then(async (history) => {
+      const item = history.find((entry) => entry.id === selectedEvaluation.history_id);
+      if (!item?.audio_path || item.missing || cancelled) return;
+      const url = await loadGeneratedAudio(item.audio_path);
+      if (cancelled) {
+        if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+        return;
+      }
+      setEvaluationAudioUrl((current) => {
+        if (current?.startsWith("blob:")) URL.revokeObjectURL(current);
+        return url;
+      });
+    }).catch((caught) => {
+      if (!cancelled) setFormError(caught instanceof Error ? caught.message : String(caught));
+    });
+    return () => { cancelled = true; };
+  }, [selectedEvaluation?.history_id]);
+
+  useEffect(() => () => {
+    if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
+    if (evaluationAudioUrl?.startsWith("blob:")) URL.revokeObjectURL(evaluationAudioUrl);
+  }, [previewUrl, evaluationAudioUrl]);
+
+  function replaceVoice(updated: VoiceProfile) {
+    onChange(voices.map((voice) => voice.id === updated.id ? updated : voice));
+  }
+
+  async function saveTranscript() {
+    if (!selected || !selectedReference) return;
+    setReferenceBusy(true); setFormError(undefined);
+    try { replaceVoice(await updateVoiceReferenceTranscript(selected.id, selectedReference.id, transcript, transcript.trim() ? "corrected" : "none")); }
+    catch (caught) { setFormError(caught instanceof Error ? caught.message : String(caught)); }
+    finally { setReferenceBusy(false); }
+  }
+
+  async function transcribeReference() {
+    if (!selected || !selectedReference?.processed_path || !transcriptionModel || referenceBusy) return;
+    setReferenceBusy(true); setFormError(undefined);
+    try {
+      const record = await transcribeAudio(transcriptionModel.model_id, selectedReference.processed_path);
+      setTranscript(record.text);
+      replaceVoice(await updateVoiceReferenceTranscript(selected.id, selectedReference.id, record.text, "automatic"));
+    } catch (caught) { setFormError(caught instanceof Error ? caught.message : String(caught)); }
+    finally { setReferenceBusy(false); }
+  }
+
+  async function applyReferenceEdit() {
+    if (!selected || !selectedReference || referenceBusy) return;
+    setReferenceBusy(true); setFormError(undefined);
+    try {
+      const updated = await processVoiceReference(selected.id, selectedReference.id, { trim_start_seconds: trimStart, trim_end_seconds: trimEnd, remove_silence: removeSilence, normalize, peak_target_dbfs: -1 });
+      replaceVoice(updated); setEditingReference(false);
+    } catch (caught) { setFormError(caught instanceof Error ? caught.message : String(caught)); }
+    finally { setReferenceBusy(false); }
+  }
+
+  async function runEvaluation() {
+    if (!selected || !selectedReference?.processed_path || !evaluationModel || evaluationBusy) return;
+    const model = cloneModels.find((item) => item.model_id === evaluationModel);
+    if (!model) return;
+    const script = "Names, numbers, and emotion matter. soundAr should preserve clarity at 10:45, with warmth and natural pacing.";
+    setEvaluationBusy(true); setFormError(undefined);
+    try {
+      const result = await synthesizeSpeech({ model_id: model.model_id, text: script, speaker: "default", language: model.languages[0] ?? "en", reference_audio_path: selectedReference.processed_path, speed: 1, seed: 42817, output_format: "wav", title: `${selected.name} voice evaluation`, voice_name: selected.name });
+      onGenerated(result);
+      const evaluation = await saveVoiceEvaluation({ id: crypto.randomUUID(), voice_id: selected.id, reference_id: selectedReference.id, model_id: model.model_id, history_id: result.id, script, decision: "pending", notes: "" });
+      replaceVoice({ ...selected, evaluations: [evaluation, ...(selected.evaluations ?? []).filter((item) => item.id !== evaluation.id)] });
+      if (result.audio_path) {
+        if (evaluationAudioUrl?.startsWith("blob:")) URL.revokeObjectURL(evaluationAudioUrl);
+        setEvaluationAudioUrl(await loadGeneratedAudio(result.audio_path));
+      }
+    } catch (caught) { setFormError(caught instanceof Error ? caught.message : String(caught)); }
+    finally { setEvaluationBusy(false); }
+  }
+
+  async function decideEvaluation(decision: VoiceEvaluation["decision"]) {
+    if (!selected || !selectedEvaluation) return;
+    try {
+      const updated = await saveVoiceEvaluation({ ...selectedEvaluation, decision, notes: evaluationNotes.trim() });
+      replaceVoice({ ...selected, evaluations: [updated, ...(selected.evaluations ?? []).filter((item) => item.id !== updated.id)] });
+    } catch (caught) { setFormError(caught instanceof Error ? caught.message : String(caught)); }
+  }
+
+  async function measureSimilarity() {
+    if (!selected || !selectedEvaluation || !similarityModel || evaluationBusy) return;
+    setEvaluationBusy(true); setFormError(undefined);
+    try {
+      const updated = await measureVoiceSimilarity(selectedEvaluation.id, similarityModel.model_id);
+      replaceVoice({ ...selected, evaluations: [updated, ...(selected.evaluations ?? []).filter((item) => item.id !== updated.id)] });
+    } catch (caught) { setFormError(caught instanceof Error ? caught.message : String(caught)); }
+    finally { setEvaluationBusy(false); }
+  }
+
+  async function togglePreview(voice: VoiceProfile) {
+    const path = voice.local_path;
+    if (!path) return;
+    try {
+      if (audioRef.current && previewUrl && previewVoiceId === voice.id) {
+        if (audioRef.current.paused) await audioRef.current.play(); else audioRef.current.pause();
+        return;
+      }
+      audioRef.current?.pause();
+      const url = await loadVoiceAudio(path);
+      if (previewUrl?.startsWith("blob:")) URL.revokeObjectURL(previewUrl);
+      setSelectedId(voice.id);
+      setPreviewVoiceId(voice.id);
+      setPreviewUrl(url);
+      window.setTimeout(() => void audioRef.current?.play(), 0);
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  async function addReference() {
+    if (!selected || selected.state === "preset" || referenceBusy) return;
+    const source = await pickAudioFile();
+    if (!source) return;
+    setReferenceBusy(true);
+    setFormError(undefined);
+    try {
+      const updated = await addVoiceReference(selected.id, source);
+      onChange(voices.map((voice) => voice.id === updated.id ? updated : voice));
+      setSelectedReferenceId(updated.references?.find((reference) => reference.active)?.id ?? "");
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setReferenceBusy(false);
+    }
+  }
+
+  async function addVoice() {
+    if (!newName.trim() || !samplePath || !acknowledged || !consentBasis.trim() || !permittedUses.trim()) return;
+    setSaving(true);
+    setFormError(undefined);
+    try {
+      const voice = await importVoiceProfile({
+        name: newName.trim(),
+        style: newStyle.trim() || "Custom voice",
+        source_path: samplePath,
+        consent_confirmed: acknowledged,
+        consent_basis: consentBasis.trim(),
+        speaker_relationship: relationship,
+        permitted_uses: permittedUses.trim(),
+        source_date: sourceDate,
+      });
+      onChange([...voices, voice]);
+      setSelectedId(voice.id);
+      setShowAdd(false);
+      setNewName("");
+      setNewStyle("");
+      setSamplePath("");
+      setConsentBasis("");
+      setAcknowledged(false);
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeVoice(voice: VoiceProfile) {
+    if (voice.state === "preset") return;
+    if (!window.confirm(`Delete ${voice.name} and its managed reference audio? Existing generation records will remain.`)) return;
+    try {
+      if (await deleteVoiceProfile(voice.id)) {
+        const remaining = voices.filter((item) => item.id !== voice.id);
+        onChange(remaining);
+        setSelectedId(remaining[0]?.id ?? "");
+      }
+    } catch (caught) {
+      setFormError(caught instanceof Error ? caught.message : String(caught));
+    }
   }
 
   return (
@@ -99,7 +324,8 @@ export function VoicesView({
                   <th>Engines</th>
                   <th>Consent</th>
                   <th>State</th>
-                  <th aria-label="Preview" />
+                  <th>Analysis</th>
+                  <th aria-label="Actions" />
                 </tr>
               </thead>
               <tbody>
@@ -116,9 +342,47 @@ export function VoicesView({
                     <td><StatusText tone={voice.consent === "confirmed" ? "success" : voice.consent === "pending" ? "danger" : "muted"}>{voice.consent}</StatusText></td>
                     <td><StatusText tone={voice.state === "ready" ? "success" : voice.state === "draft" ? "danger" : "warning"}>{voice.state}</StatusText></td>
                     <td>
-                      <button className="icon-button table-play" type="button" title={`Preview ${voice.name}`} onClick={(event) => event.stopPropagation()}>
-                        <Play aria-hidden="true" fill="currentColor" size={12} />
-                      </button>
+                      <StatusText tone={voice.analysis?.warnings?.length ? "warning" : voice.state === "ready" ? "success" : "muted"}>{voice.analysis?.warnings?.length ? `${voice.analysis.warnings.length} warning` : voice.state === "ready" ? "Analyzed" : "--"}</StatusText>
+                    </td>
+                    <td>
+                      <div className="table-row-actions">
+                        <button
+                          className="icon-button"
+                          type="button"
+                          title={previewing && previewVoiceId === voice.id ? `Pause ${voice.name}` : `Play ${voice.name}`}
+                          aria-label={previewing && previewVoiceId === voice.id ? `Pause ${voice.name}` : `Play ${voice.name}`}
+                          disabled={!voice.local_path}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void togglePreview(voice);
+                          }}
+                        >
+                          {previewing && previewVoiceId === voice.id ? <Pause aria-hidden="true" size={12} /> : <Play aria-hidden="true" size={12} />}
+                        </button>
+                        <RowActionMenu
+                          label={`More actions for ${voice.name}`}
+                          actions={[
+                            {
+                              label: "View details",
+                              icon: <UserRound aria-hidden="true" size={12} />,
+                              onSelect: () => setSelectedId(voice.id),
+                            },
+                            {
+                              label: "Use voice",
+                              icon: <Check aria-hidden="true" size={12} />,
+                              disabled: voice.state !== "ready" && voice.state !== "preset",
+                              onSelect: () => onUseVoice(voice.id),
+                            },
+                            {
+                              label: "Delete profile",
+                              icon: <Trash2 aria-hidden="true" size={12} />,
+                              disabled: voice.state === "preset",
+                              danger: true,
+                              onSelect: () => removeVoice(voice),
+                            },
+                          ]}
+                        />
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -139,8 +403,9 @@ export function VoicesView({
 
             <div className="sample-compact">
               <div><span className="section-label">Reference 01 / {selected.sample_seconds || "--"} sec</span><strong>{selected.sample_label}</strong></div>
-              <button className="text-button" type="button"><Play aria-hidden="true" size={11} /> Preview</button>
+              <button className="icon-button" type="button" title={previewing && previewVoiceId === selected.id ? "Pause reference" : "Play reference"} disabled={!selected.local_path} onClick={() => void togglePreview(selected)}>{previewing && previewVoiceId === selected.id ? <Pause size={12} /> : <Play size={12} />}</button>
             </div>
+            <audio ref={audioRef} className="visually-hidden" preload="metadata" src={previewUrl} onPlay={() => setPreviewing(true)} onPause={() => setPreviewing(false)} onEnded={() => setPreviewing(false)} />
 
             <span className="section-label inspector-section">Provenance</span>
             <dl className="compact-definition-list">
@@ -148,18 +413,28 @@ export function VoicesView({
               <div><dt>Consent</dt><dd><StatusText tone={selected.consent === "confirmed" ? "success" : "warning"}>{selected.consent}</StatusText></dd></div>
               <div><dt>Storage</dt><dd>Local only</dd></div>
               <div><dt>Profile</dt><dd>{selected.state}</dd></div>
+              {selected.analysis?.sample_rate ? <div><dt>Sample rate</dt><dd>{(selected.analysis.sample_rate / 1000).toFixed(1)} kHz</dd></div> : null}
+              {selected.analysis?.peak_dbfs !== undefined ? <div><dt>Peak</dt><dd>{selected.analysis.peak_dbfs.toFixed(1)} dBFS</dd></div> : null}
+              {selected.analysis?.silence_ratio !== undefined ? <div><dt>Silence</dt><dd>{Math.round(selected.analysis.silence_ratio * 100)}%</dd></div> : null}
             </dl>
 
             <span className="section-label inspector-section">Engine coverage</span>
             <div className="engine-coverage">
-              {selected.engines.map((engine) => <div key={engine}><strong>{engine}</strong><StatusText tone="success">Ready</StatusText></div>)}
+              {selected.engines.map((engine) => { const accepted = selected.evaluations?.some((item) => item.decision === "accepted" && item.model_id.toLowerCase().includes(engine.toLowerCase().split(" ")[0])); return <div key={engine}><strong>{engine}</strong><StatusText tone={accepted ? "success" : selected.state === "ready" ? "warning" : "danger"}>{accepted ? "Accepted" : selected.state === "ready" ? "Audio ready" : selected.state === "preset" ? "Preset" : "Needs review"}</StatusText></div>; })}
               {!selected.engines.includes("Kokoro") ? <div><strong>Kokoro</strong><StatusText tone="warning">Preset only</StatusText></div> : null}
             </div>
 
+            {selected.state !== "preset" ? <><span className="section-label inspector-section">Managed references</span><div className="voice-reference-list">{(selected.references ?? []).map((reference, index) => <button className={reference.id === selectedReference?.id ? "is-selected" : ""} key={reference.id} type="button" onClick={() => setSelectedReferenceId(reference.id)}><div><strong>Reference {String(index + 1).padStart(2, "0")}</strong><small>{reference.processed_path ? `${reference.analysis.duration_seconds?.toFixed(1) ?? "--"} sec / ${reference.revision_count ?? 0} revisions` : reference.analysis.processing_error ? "Processing failed" : "Processing"}</small></div><StatusText tone={reference.active ? "success" : reference.processed_path ? "warning" : "danger"}>{reference.active ? "Active" : reference.processed_path ? "Review" : "Failed"}</StatusText></button>)}</div><button className="button button-secondary add-reference-button" type="button" disabled={referenceBusy} onClick={() => void addReference()}>{referenceBusy ? <LoaderCircle className="spin" size={13} /> : <Plus size={13} />}{referenceBusy ? "Processing reference" : "Add reference"}</button></> : null}
+
+            {selected.state !== "preset" && selectedReference ? <div className="voice-lab-tools"><div className="voice-lab-heading"><span className="section-label">Reference editor</span><button className="text-button" type="button" onClick={() => setEditingReference((value) => !value)}>{editingReference ? "Close" : "Edit"}</button></div>{editingReference ? <div className="reference-editor"><div className="reference-waveform" aria-label="Reference waveform">{(selectedReference.analysis.waveform ?? []).slice(0, 72).map((peak, index) => <i key={index} style={{ height: `${Math.max(3, peak * 28)}px` }} />)}</div><div className="trim-fields"><label className="form-field"><span>Start</span><input type="number" min="0" max={trimEnd} step="0.1" value={trimStart} onChange={(event) => setTrimStart(Number(event.target.value))} /></label><label className="form-field"><span>End</span><input type="number" min={trimStart} max={selectedReference.analysis.duration_seconds} step="0.1" value={trimEnd} onChange={(event) => setTrimEnd(Number(event.target.value))} /></label></div><label className="toggle-row voice-lab-toggle"><span><strong>Remove edge silence</strong></span><input type="checkbox" checked={removeSilence} onChange={(event) => setRemoveSilence(event.target.checked)} /></label><label className="toggle-row voice-lab-toggle"><span><strong>Peak normalize</strong></span><input type="checkbox" checked={normalize} onChange={(event) => setNormalize(event.target.checked)} /></label><button className="button button-primary" type="button" title={bootstrap.runtime === "browser" ? "Reference processing requires the desktop runtime" : undefined} disabled={bootstrap.runtime === "browser" || referenceBusy || trimEnd <= trimStart} onClick={() => void applyReferenceEdit()}><Scissors size={13} />Apply as new revision</button></div> : null}<label className="form-field reference-transcript"><span>Reference transcript</span><textarea value={transcript} onChange={(event) => setTranscript(event.target.value)} placeholder="Correct what the speaker says in this reference..." /></label><div className="reference-transcript-actions"><button className="button button-secondary" type="button" disabled={referenceBusy || !transcriptionModel || !selectedReference.processed_path} onClick={() => void transcribeReference()}>{referenceBusy ? <LoaderCircle className="spin" size={13} /> : <FileAudio2 size={13} />}Transcribe</button><button className="button button-secondary" type="button" disabled={referenceBusy || transcript === (selectedReference.transcript_text ?? "")} onClick={() => void saveTranscript()}><Save size={13} />Save correction</button></div></div> : null}
+
+            {selected.state !== "preset" && selectedReference?.active ? <div className="voice-evaluation"><div className="voice-lab-heading"><span className="section-label">Engine evaluation</span>{selectedEvaluation ? <StatusText tone={selectedEvaluation.decision === "accepted" ? "success" : selectedEvaluation.decision === "rejected" ? "danger" : "warning"}>{selectedEvaluation.decision}</StatusText> : null}</div><Dropdown ariaLabel="Evaluation model" value={evaluationModel} onChange={setEvaluationModel} options={cloneModels.map((model) => ({ value: model.model_id, label: model.model_id }))} /><CompactAudioPlayer src={evaluationAudioUrl} label="voice evaluation" /><button className="button button-secondary" type="button" disabled={!evaluationModel || evaluationBusy || !cloneModels.length} onClick={() => void runEvaluation()}>{evaluationBusy ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}{evaluationBusy ? "Working" : selectedEvaluation ? "Regenerate evaluation" : "Generate evaluation"}</button>{selectedEvaluation ? <><div className="similarity-row"><div><span className="section-label">Speaker similarity</span><strong>{selectedEvaluation.speaker_similarity === null || selectedEvaluation.speaker_similarity === undefined ? "Not measured" : selectedEvaluation.speaker_similarity.toFixed(3)}</strong><small>{selectedEvaluation.similarity_model_id?.split("/").at(-1) ?? "Cosine x-vector evidence"}</small></div><button className="button button-secondary" type="button" disabled={!similarityModel || evaluationBusy} title={!similarityModel ? "Install the WavLM speaker-verification model" : "Compare normalized speaker embeddings"} onClick={() => void measureSimilarity()}>{evaluationBusy ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}{selectedEvaluation.speaker_similarity === null || selectedEvaluation.speaker_similarity === undefined ? "Measure" : "Remeasure"}</button></div>{!similarityModel ? <StatusText tone="warning">Install WavLM Speaker Verification in Models to measure likeness.</StatusText> : <small className="similarity-note">Comparative score only. Thresholds depend on the voices and recording conditions.</small>}<label className="form-field evaluation-notes"><span>Review notes</span><textarea value={evaluationNotes} onChange={(event) => setEvaluationNotes(event.target.value)} placeholder="Clarity, likeness, pacing, or pronunciation notes..." /></label><div className="evaluation-actions"><button className="button button-secondary danger-button" type="button" onClick={() => void decideEvaluation("rejected")}><X size={13} />Reject</button><button className="button button-primary" type="button" onClick={() => void decideEvaluation("accepted")}><Check size={13} />Accept</button></div></> : null}{!cloneModels.length ? <StatusText tone="warning">Install a qualified clone-capable model to evaluate this reference.</StatusText> : null}</div> : null}
+
             <div className="inspector-bottom-actions">
-              <button className="button button-secondary" type="button">Edit profile</button>
-              <button className="button button-primary" type="button">Use voice</button>
+              <button className="button button-secondary danger-button" type="button" disabled={selected.state === "preset"} onClick={() => void removeVoice(selected)}><Trash2 size={13} />Delete</button>
+              <button className="button button-primary" type="button" disabled={selected.state !== "ready" && selected.state !== "preset"} onClick={() => onUseVoice(selected.id)}>Use voice</button>
             </div>
+            {formError ? <StatusText tone="danger">{formError}</StatusText> : null}
           </Panel>
         ) : null}
       </div>
@@ -174,17 +449,21 @@ export function VoicesView({
             <div className="modal-body">
               <label className="form-field"><span>Name</span><input autoFocus value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="Voice name" /></label>
               <label className="form-field"><span>Style</span><input value={newStyle} onChange={(event) => setNewStyle(event.target.value)} placeholder="Warm documentary" /></label>
-              <input ref={fileInput} className="visually-hidden" type="file" accept="audio/*" onChange={(event) => setSampleName(event.target.files?.[0]?.name ?? "")} />
-              <button className="sample-dropzone" type="button" onClick={() => fileInput.current?.click()}>
+              <button className="sample-dropzone" type="button" onClick={async () => setSamplePath(await pickAudioFile() ?? samplePath)}>
                 <FileAudio2 aria-hidden="true" size={20} />
-                <strong>{sampleName || "Choose a clean voice sample"}</strong>
-                <span>WAV, FLAC, or MP3 / 10-30 seconds recommended</span>
+                <strong>{samplePath.split("/").at(-1) || "Choose a clean voice sample"}</strong>
+                <span>WAV, FLAC, MP3, M4A, or OGG / original copied into soundAr</span>
               </button>
-              <div className="consent-note"><ShieldCheck aria-hidden="true" size={16} /><span>Only add voices you own or have permission to use.</span></div>
+              <label className="form-field"><span>Speaker relationship</span><Dropdown ariaLabel="Speaker relationship" value={relationship} onChange={setRelationship} options={[{ value: "self", label: "My own voice" }, { value: "authorized-person", label: "Authorized speaker" }, { value: "licensed-source", label: "Licensed source" }]} /></label>
+              <label className="form-field"><span>Consent basis</span><input value={consentBasis} onChange={(event) => setConsentBasis(event.target.value)} placeholder="Recorded by me, or written permission details" /></label>
+              <label className="form-field"><span>Permitted uses</span><input value={permittedUses} onChange={(event) => setPermittedUses(event.target.value)} /></label>
+              <label className="form-field"><span>Source date</span><input type="date" value={sourceDate} onChange={(event) => setSourceDate(event.target.value)} /></label>
+              <label className="consent-note consent-check"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /><ShieldCheck aria-hidden="true" size={16} /><span>I confirm I own this voice or have explicit permission to create and use its synthetic likeness.</span></label>
+              {formError ? <StatusText tone="danger">{formError}</StatusText> : null}
             </div>
             <div className="modal-actions">
               <button className="button button-secondary" type="button" onClick={() => setShowAdd(false)}>Cancel</button>
-              <button className="button button-primary" type="button" disabled={!newName.trim()} onClick={addVoice}>Create profile</button>
+              <button className="button button-primary" type="button" disabled={saving || !newName.trim() || !samplePath || !acknowledged || !consentBasis.trim() || !permittedUses.trim()} onClick={() => void addVoice()}>{saving ? "Importing and analyzing..." : "Create profile"}</button>
             </div>
           </div>
         </div>

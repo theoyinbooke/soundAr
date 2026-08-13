@@ -31,6 +31,16 @@ class TranscriptionSegment:
 
 
 @dataclass(frozen=True)
+class TranscriptionWord:
+    """A model-aligned word with optional confidence evidence."""
+    text: str
+    start_seconds: float
+    end_seconds: float
+    confidence: float | None = None
+    end_inferred: bool = False
+
+
+@dataclass(frozen=True)
 class TranscriptionResult:
     """Complete transcription output."""
     text: str
@@ -39,6 +49,10 @@ class TranscriptionResult:
     engine: str
     duration_seconds: float
     audio_duration_seconds: float
+    words: list[TranscriptionWord]
+    detected_language: str | None
+    language_confidence: float | None
+    evidence: dict[str, Any]
 
 
 # ── STTEngine ─────────────────────────────────────────────
@@ -66,6 +80,10 @@ class STTEngine:
         if model_id is not None:
             return self._engine_impl is not None and self._model_id == model_id
         return self._engine_impl is not None
+
+    @property
+    def loaded_model_id(self) -> str | None:
+        return self._model_id if self._engine_impl is not None else None
 
     def load_model(self, model_id: str, model_path: str, engine: str) -> None:
         """Load an STT model, unloading the previous one if different."""
@@ -134,6 +152,15 @@ class STTEngine:
             engine=self._engine or "",
             duration_seconds=elapsed,
             audio_duration_seconds=audio_duration,
+            words=result.get("words", []),
+            detected_language=result.get("detected_language"),
+            language_confidence=result.get("language_confidence"),
+            evidence=result.get("evidence", {
+                "schema_version": 1,
+                "timing_source": "unavailable",
+                "language_source": "unavailable",
+                "word_confidence_source": "unavailable",
+            }),
         )
 
     # ── Internal helpers ──────────────────────────────────

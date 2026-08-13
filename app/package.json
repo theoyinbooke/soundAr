@@ -1,13 +1,19 @@
 {
   "name": "soundar-desktop",
   "private": true,
-  "version": "0.2.5",
+  "version": "0.3.0",
   "license": "MIT",
   "repository": "github:theoyinbooke/soundAr",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
+    "verify:production": "../scripts/verify-production-boundary.sh",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "test:production": "playwright test --config playwright.production.config.ts",
+    "test:soak": "playwright test --config playwright.soak.config.ts",
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri"
   },
@@ -24,11 +30,17 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tauri-apps/cli": "^2.8.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.4",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "jsdom": "^29.1.1",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vitest": "^4.1.10"
   }
 }

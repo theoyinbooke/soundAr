@@ -24,9 +24,63 @@
   },
   "models": [
     {
+      "model_id": "facebook/wav2vec2-base-960h",
+      "task": "alignment",
+      "engine": "alignment",
+      "install_status": "ready",
+      "revision": "22aad52d435eb6dbaf354bdad9b0da84ce7d6156",
+      "license": "Apache-2.0",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": ["en"],
+      "summary": "English CTC checkpoint for forced alignment of corrected transcript text to local audio.",
+      "known_limitations": [
+        "English-only character vocabulary; numerals must be written as words.",
+        "Alignment scores measure the selected acoustic path and are not calibrated word correctness probabilities.",
+        "Poor audio or text that does not match the recording can produce low scores or fail alignment."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Uses a deterministic CTC Viterbi trellis against the current transcript revision.",
+        "Stores results separately from original Whisper or NeMo timing evidence.",
+        "Model weights are downloaded only after explicit user approval."
+      ],
+      "source_urls": ["https://huggingface.co/facebook/wav2vec2-base-960h"]
+    },
+    {
+      "model_id": "microsoft/wavlm-base-plus-sv",
+      "task": "speaker-verification",
+      "engine": "speaker-verification",
+      "install_status": "ready",
+      "revision": "feb593a6c23c1cc3d9510425c29b0a14d2b07b1e",
+      "license": "CC-BY-SA-3.0",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": ["en"],
+      "summary": "WavLM x-vector checkpoint for local speaker similarity and provisional word-anchored diarization.",
+      "known_limitations": [
+        "Cosine similarity is comparative evidence, not proof of speaker identity.",
+        "Diarization uses transcript-window clustering and does not detect overlapping speech.",
+        "Automatic cluster thresholds are dataset-dependent; speaker labels remain provisional and editable."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 16000,
+      "runtime_notes": [
+        "Fine-tuned on VoxCeleb1 with an additive-margin x-vector objective.",
+        "Inputs are resampled to 16 kHz and embeddings are L2-normalized before cosine similarity.",
+        "Model weights are downloaded only after explicit user approval."
+      ],
+      "source_urls": ["https://huggingface.co/microsoft/wavlm-base-plus-sv"]
+    },
+    {
       "model_id": "openai/whisper-tiny",
       "task": "stt",
       "engine": "transformers",
+      "install_status": "ready",
+      "revision": "169d4a4341b33bc18d8881c4b69c2e104e1cc0af",
       "tier": "smoke",
       "recommended_for_12gb": true,
       "languages": [
@@ -53,6 +107,7 @@
       "model_id": "openai/whisper-small",
       "task": "stt",
       "engine": "transformers",
+      "install_status": "planned",
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
@@ -79,6 +134,7 @@
       "model_id": "openai/whisper-large-v3-turbo",
       "task": "stt",
       "engine": "transformers",
+      "install_status": "planned",
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
@@ -107,6 +163,8 @@
       "model_id": "nvidia/parakeet-tdt-1.1b",
       "task": "stt",
       "engine": "nemo",
+      "install_status": "ready",
+      "revision": "53276c6469d1f17a1352e30c4d11be3d0d7e9575",
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
@@ -118,6 +176,15 @@
         "Model card states lowercase English transcription output."
       ],
       "test_status": "required",
+      "qualification": {
+        "device": "NVIDIA GeForce RTX 4080 Laptop GPU",
+        "runtime": "NeMo 2.7.2 CUDA qualification environment",
+        "audio_duration_seconds": 2.175,
+        "inference_seconds": 0.465,
+        "rtf": 0.2139,
+        "peak_vram_mb": 8206.7,
+        "tested_at": "2026-08-12"
+      },
       "default_chunk_seconds": null,
       "default_sample_rate": 16000,
       "runtime_notes": [
@@ -133,6 +200,7 @@
       "model_id": "CohereLabs/cohere-transcribe-03-2026",
       "task": "stt",
       "engine": "cohere",
+      "install_status": "planned",
       "access": "gated",
       "tier": "recommended",
       "recommended_for_12gb": true,
@@ -164,6 +232,7 @@
       "model_id": "mistralai/Voxtral-Mini-3B-2507",
       "task": "stt",
       "engine": "voxtral",
+      "install_status": "planned",
       "tier": "advanced",
       "recommended_for_12gb": true,
       "languages": [
@@ -191,7 +260,9 @@
     {
       "model_id": "microsoft/speecht5_tts",
       "task": "tts",
-      "engine": "transformers",
+      "engine": "speecht5",
+      "install_status": "ready",
+      "revision": "30fcde30f19b87502b8435427b5f5068e401d5f6",
       "tier": "smoke",
       "recommended_for_12gb": true,
       "languages": [
@@ -203,12 +274,22 @@
         "Requires speaker embeddings for voice characteristics."
       ],
       "test_status": "required",
+      "qualification": {
+        "device": "NVIDIA GeForce RTX 4080 Laptop GPU",
+        "runtime": "isolated CUDA engine overlay",
+        "sample_rate": 16000,
+        "duration_seconds": 3.168,
+        "inference_seconds": 0.5901,
+        "rtf": 0.1863,
+        "peak_vram_mb": 890.1,
+        "tested_at": "2026-08-12"
+      },
       "default_chunk_seconds": null,
       "default_sample_rate": 16000,
       "runtime_notes": [
         "Use as the default TTS smoke-test model.",
         "Model card examples use microsoft/speecht5_hifigan plus xvector speaker embeddings.",
-        "Implementation should keep all auxiliary assets local once downloaded."
+        "The model, HiFi-GAN vocoder, and CMU Arctic xvector dataset are pinned to qualified revisions and kept local after download."
       ],
       "source_urls": [
         "https://huggingface.co/microsoft/speecht5_tts"
@@ -218,6 +299,8 @@
       "model_id": "coqui/XTTS-v2",
       "task": "tts",
       "engine": "coqui",
+      "install_status": "ready",
+      "revision": "6c2b0d75eae4b7047358e3b6bd9325f857d43f77",
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
@@ -230,6 +313,16 @@
         "Voice cloning should remain optional and fully local in v1."
       ],
       "test_status": "required",
+      "qualification": {
+        "device": "NVIDIA GeForce RTX 4080 Laptop GPU",
+        "runtime": "isolated CUDA engine overlay",
+        "sample_rate": 24000,
+        "duration_seconds": 5.7067,
+        "inference_seconds": 2.0348,
+        "rtf": 0.3566,
+        "peak_vram_mb": 10338.8,
+        "tested_at": "2026-08-12"
+      },
       "default_chunk_seconds": null,
       "default_sample_rate": 24000,
       "runtime_notes": [
@@ -245,6 +338,8 @@
       "model_id": "hexgrad/Kokoro-82M",
       "task": "tts",
       "engine": "kokoro",
+      "install_status": "ready",
+      "revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
@@ -271,6 +366,8 @@
       "model_id": "ResembleAI/chatterbox",
       "task": "tts",
       "engine": "chatterbox",
+      "install_status": "ready",
+      "revision": "5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18",
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
@@ -283,6 +380,16 @@
         "Built-in PerTh watermarking on all generated audio."
       ],
       "test_status": "required",
+      "qualification": {
+        "device": "NVIDIA GeForce RTX 4080 Laptop GPU",
+        "runtime": "isolated CUDA engine overlay",
+        "sample_rate": 24000,
+        "duration_seconds": 3.84,
+        "inference_seconds": 1.8133,
+        "rtf": 0.4722,
+        "peak_vram_mb": 3335.1,
+        "tested_at": "2026-08-12"
+      },
       "default_chunk_seconds": null,
       "default_sample_rate": 24000,
       "runtime_notes": [
@@ -294,6 +401,34 @@
       ],
       "source_urls": [
         "https://huggingface.co/ResembleAI/chatterbox",
+        "https://github.com/resemble-ai/chatterbox"
+      ]
+    },
+    {
+      "model_id": "ResembleAI/chatterbox-turbo",
+      "task": "tts",
+      "engine": "chatterbox-turbo",
+      "install_status": "ready",
+      "revision": "749d1c1a46eb10492095d68fbcf55691ccf137cd",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": ["en"],
+      "summary": "Lower-latency 350M English synthesis with voice cloning, paralinguistic tags, and 24kHz output.",
+      "known_limitations": [
+        "English only.",
+        "The qualified Python adapter returns complete audio rather than incremental chunks.",
+        "Voice cloning requires a consent-backed reference profile."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 24000,
+      "runtime_notes": [
+        "Qualified against chatterbox-tts 0.1.7.",
+        "Uses ChatterboxTurboTTS.from_local with a pinned checkpoint revision.",
+        "MIT licensed; model weights are downloaded explicitly and never bundled."
+      ],
+      "source_urls": [
+        "https://huggingface.co/ResembleAI/chatterbox-turbo",
         "https://github.com/resemble-ai/chatterbox"
       ]
     }

@@ -37,7 +37,7 @@ class BaseSTTEngine(abc.ABC):
         sr: int,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> dict[str, Any]:
-        """Transcribe audio, returning {"text": str, "segments": list[TranscriptionSegment]}."""
+        """Transcribe audio with text plus any evidence the model genuinely exposes."""
 
     @property
     def is_loaded(self) -> bool:

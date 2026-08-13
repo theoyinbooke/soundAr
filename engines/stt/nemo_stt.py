@@ -13,7 +13,7 @@ try:
 except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
-from core.stt_engine import TranscriptionSegment
+from core.stt_engine import TranscriptionSegment, TranscriptionWord
 from engines.base_stt import BaseSTTEngine
 
 logger = logging.getLogger(__name__)
@@ -93,6 +93,50 @@ class NeMoSTT(BaseSTTEngine):
 
         return str(output).strip()
 
+    @staticmethod
+    def _first_hypothesis(output: Any) -> Any | None:
+        if isinstance(output, tuple):
+            output = output[0] if output else None
+        if isinstance(output, list):
+            return output[0] if output else None
+        return output
+
+    @classmethod
+    def _extract_words(cls, output: Any) -> list[TranscriptionWord]:
+        hypothesis = cls._first_hypothesis(output)
+        timestamp = getattr(hypothesis, "timestamp", None)
+        if not isinstance(timestamp, dict):
+            timestamp = getattr(hypothesis, "timestep", None)
+        entries = timestamp.get("word", []) if isinstance(timestamp, dict) else []
+        confidences = getattr(hypothesis, "word_confidence", None)
+        words: list[TranscriptionWord] = []
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            text = str(entry.get("word") or entry.get("text") or "").strip()
+            start = entry.get("start")
+            end = entry.get("end")
+            if not text or start is None or end is None:
+                continue
+            confidence = None
+            if confidences is not None:
+                try:
+                    if index < len(confidences):
+                        value = float(confidences[index])
+                        if 0.0 <= value <= 1.0:
+                            confidence = value
+                except (TypeError, ValueError, IndexError):
+                    pass
+            try:
+                start_seconds = float(start)
+                end_seconds = float(end)
+            except (TypeError, ValueError):
+                continue
+            if start_seconds < 0 or end_seconds < start_seconds:
+                continue
+            words.append(TranscriptionWord(text, start_seconds, end_seconds, confidence))
+        return words
+
     def unload(self) -> None:
         self._model = None
         self._loaded = False
@@ -116,7 +160,15 @@ class NeMoSTT(BaseSTTEngine):
             sf.write(tmp_path, audio, sr)
 
         try:
-            output = self._model.transcribe([tmp_path])
+            try:
+                output = self._model.transcribe(
+                    [tmp_path],
+                    return_hypotheses=True,
+                    timestamps=True,
+                    verbose=False,
+                )
+            except TypeError:
+                output = self._model.transcribe([tmp_path])
             text = self._extract_text(output)
         finally:
             Path(tmp_path).unlink(missing_ok=True)
@@ -125,6 +177,7 @@ class NeMoSTT(BaseSTTEngine):
             progress_cb(1, 1)
 
         audio_duration = len(audio) / sr
+        words = self._extract_words(output)
         segments = [
             TranscriptionSegment(
                 text=text,
@@ -136,4 +189,14 @@ class NeMoSTT(BaseSTTEngine):
         return {
             "text": text,
             "segments": segments,
+            "words": words,
+            "detected_language": "en",
+            "language_confidence": None,
+            "evidence": {
+                "schema_version": 1,
+                "timing_source": "nemo-hypothesis" if words else "unavailable",
+                "language_source": "model-declared",
+                "word_confidence_source": "nemo-word-confidence" if any(word.confidence is not None for word in words) else "unavailable",
+                "language_alternatives": [],
+            },
         }

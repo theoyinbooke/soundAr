@@ -28,8 +28,10 @@ class DownloadWorker(QThread):
 
     def run(self) -> None:
         try:
-            local_path = self.model_manager.download_model(
+            plan = self.model_manager.get_install_plan(self.model_id)
+            model = self.model_manager.download_model(
                 self.model_id,
+                revision=str(plan["revision"]),
                 progress_callback=self._on_progress,
             )
         except DownloadCancelled:
@@ -49,7 +51,7 @@ class DownloadWorker(QThread):
             self.cancelled.emit()
             return
 
-        self.finished.emit(local_path)
+        self.finished.emit(str(model["local_path"]))
 
     def _on_progress(self, downloaded: float, total: float) -> None:
         if self._cancelled:

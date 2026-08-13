@@ -27,22 +27,36 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
       - name: Validate release version
         run: ./scripts/check-release-version.sh "$GITHUB_REF_NAME"
       - name: Install Tauri build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf squashfs-tools xvfb
       - name: Install frontend dependencies
         working-directory: app
         run: npm ci
+      - name: Install Playwright browser
+        working-directory: app
+        run: npx playwright install --with-deps chromium
       - name: Verify source before packaging
         run: |
           npm run build --prefix app
+          ./scripts/verify-production-boundary.sh
+          npm test --prefix app
+          npm run test:e2e --prefix app
+          npm run test:production --prefix app
           cargo fmt --check --manifest-path app/src-tauri/Cargo.toml
           cargo test --locked --manifest-path app/src-tauri/Cargo.toml
-          python3 -m compileall -q bridge.py config core engines
-          bash -n install-linux.sh setup-runtime.sh install.sh
+          python3 -m compileall -q bridge.py model_cli.py config core engines
+          python3 -m pip install --requirement requirements-test.txt
+          python3 -m unittest discover -s tests -v
+          bash -n install-linux.sh setup-runtime.sh setup-engine-runtime.sh install.sh scripts/verify-production-boundary.sh scripts/verify-linux-bundles.sh scripts/verify-package-journey.sh
       - name: Build packages and create GitHub release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
@@ -63,6 +77,16 @@ jobs:
           args: --bundles deb,appimage
       - name: Verify Linux bundles
         run: ./scripts/verify-linux-bundles.sh "${GITHUB_REF_NAME#v}"
+      - name: Verify clean install and previous-release upgrade journey
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          previous_tag="$(gh release list --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')"
+          [[ -n "$previous_tag" ]] || { echo "No previous stable release is available for upgrade verification." >&2; exit 1; }
+          previous_dir="$(mktemp -d)"
+          gh release download "$previous_tag" --pattern '*_amd64.deb' --dir "$previous_dir"
+          previous_deb="$(find "$previous_dir" -maxdepth 1 -type f -name '*_amd64.deb' -print -quit)"
+          xvfb-run -a ./scripts/verify-package-journey.sh "${GITHUB_REF_NAME#v}" "$previous_deb"
       - name: Create checksums
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -73,7 +97,17 @@ jobs:
             "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage.sig"
             install-linux.sh
             setup-runtime.sh
+            setup-engine-runtime.sh
             requirements-runtime.txt
+            requirements-engines/common.txt
+            requirements-engines/kokoro.txt
+            requirements-engines/transformers.txt
+            requirements-engines/speaker-verification.txt
+            requirements-engines/alignment.txt
+            requirements-engines/speecht5.txt
+            requirements-engines/chatterbox.txt
+            requirements-engines/coqui.txt
+            requirements-engines/nemo.txt
           )
           : > SHA256SUMS
           for file in "${files[@]}"; do
@@ -88,7 +122,7 @@ jobs:
       - name: Attach installer, runtime manifest, and checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "$GITHUB_REF_NAME" install-linux.sh setup-runtime.sh requirements-runtime.txt SHA256SUMS --clobber
+        run: gh release upload "$GITHUB_REF_NAME" install-linux.sh setup-runtime.sh setup-engine-runtime.sh requirements-runtime.txt requirements-engines/*.txt SHA256SUMS --clobber
       - name: Verify downloadable release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,7 +132,7 @@ jobs:
           (
             cd "$download_dir"
             sha256sum -c SHA256SUMS
-            bash -n install-linux.sh setup-runtime.sh
+            bash -n install-linux.sh setup-runtime.sh setup-engine-runtime.sh
             jq -e --arg version "${GITHUB_REF_NAME#v}" '.version == $version' latest.json >/dev/null
           )
       - name: Verify draft release assets
@@ -112,7 +146,9 @@ jobs:
             "soundAr_${version}_amd64.deb.sig" \
             "soundAr_${version}_amd64.AppImage" \
             "soundAr_${version}_amd64.AppImage.sig" \
-            latest.json install-linux.sh setup-runtime.sh requirements-runtime.txt SHA256SUMS; do
+            latest.json install-linux.sh setup-runtime.sh setup-engine-runtime.sh requirements-runtime.txt \
+            common.txt kokoro.txt transformers.txt speaker-verification.txt alignment.txt \
+            speecht5.txt chatterbox.txt coqui.txt nemo.txt SHA256SUMS; do
             grep -Fxq "$asset" <<<"$assets" || { echo "Missing release asset: $asset" >&2; exit 1; }
           done
       - name: Publish verified release

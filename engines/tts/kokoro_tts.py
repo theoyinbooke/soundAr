@@ -105,6 +105,7 @@ class KokoroTTSEngine(BaseTTSEngine):
         language: str | None = None,
         reference_audio: np.ndarray | None = None,
         reference_sr: int | None = None,
+        controls: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, int]:
         voice = speaker or "af_heart"
         lang_code = _KOKORO_LANG_MAP.get(language or "en", "a")
@@ -118,7 +119,8 @@ class KokoroTTSEngine(BaseTTSEngine):
 
         # Generate audio chunks and concatenate
         chunks = []
-        for result in pipeline(text, voice=str(voice_file)):
+        speed = float((controls or {}).get("speed", 1.0))
+        for result in pipeline(text, voice=str(voice_file), speed=speed):
             if result.audio is not None:
                 audio_np = (
                     result.audio.numpy()

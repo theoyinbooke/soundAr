@@ -8,6 +8,8 @@ __pycache__/
 app/node_modules/
 app/dist/
 app/src-tauri/target/
+app/test-results/
+evidence/
 
 .env
 .env.*

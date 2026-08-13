@@ -184,6 +184,7 @@ class CoquiTTSEngine(BaseTTSEngine):
         language: str | None = None,
         reference_audio: np.ndarray | None = None,
         reference_sr: int | None = None,
+        controls: dict[str, float] | None = None,
     ) -> tuple[np.ndarray, int]:
         import soundfile as sf
         import tempfile
@@ -222,6 +223,7 @@ class CoquiTTSEngine(BaseTTSEngine):
                     )
 
         try:
+            kwargs["speed"] = float((controls or {}).get("speed", 1.0))
             output = self._model.synthesize(
                 text=text,
                 config=self._config,

@@ -1,0 +1,2 @@
+-r common.txt
+nemo-toolkit[asr]==2.7.2

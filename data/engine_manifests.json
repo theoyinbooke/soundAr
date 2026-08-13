@@ -1,0 +1,168 @@
+{
+  "protocol_version": 1,
+  "engines": [
+    {
+      "id": "alignment",
+      "display_name": "Wav2Vec2 Forced Alignment",
+      "adapter_version": 1,
+      "tasks": ["alignment"],
+      "languages": ["en"],
+      "voice_modes": [],
+      "streaming": false,
+      "reference_formats": ["wav", "flac", "mp3", "m4a", "ogg"],
+      "output_formats": [],
+      "controls": {},
+      "alignment_evidence": {
+        "word_timestamps": true,
+        "acoustic_path_score": true,
+        "score_calibrated": false,
+        "source_revision_linked": true,
+        "provisional": true
+      },
+      "minimum_vram_mb": 1400,
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "speaker-verification",
+      "display_name": "WavLM Speaker Verification",
+      "adapter_version": 2,
+      "tasks": ["speaker-verification", "speaker-diarization"],
+      "languages": ["en"],
+      "voice_modes": ["reference"],
+      "streaming": false,
+      "reference_formats": ["wav", "flac", "mp3", "m4a", "ogg"],
+      "output_formats": [],
+      "controls": {},
+      "diarization_evidence": {
+        "word_anchored": true,
+        "editable_labels": true,
+        "overlap_detection": false,
+        "confidence": false,
+        "provisional": true
+      },
+      "minimum_vram_mb": 1800,
+      "license": "CC-BY-SA-3.0"
+    },
+    {
+      "id": "kokoro",
+      "display_name": "Kokoro",
+      "adapter_version": 1,
+      "tasks": ["tts"],
+      "languages": ["en", "en-gb", "ja", "zh", "ko", "fr", "es", "hi", "it", "pt"],
+      "voice_modes": ["preset"],
+      "streaming": false,
+      "reference_formats": [],
+      "output_formats": ["wav", "flac"],
+      "controls": {
+        "speed": { "type": "number", "minimum": 0.7, "maximum": 1.3, "default": 1.0 }
+      },
+      "minimum_vram_mb": 768,
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "transformers",
+      "display_name": "Whisper",
+      "adapter_version": 2,
+      "tasks": ["stt"],
+      "languages": ["multilingual"],
+      "voice_modes": [],
+      "streaming": false,
+      "reference_formats": ["wav", "flac", "mp3", "m4a", "ogg"],
+      "output_formats": [],
+      "controls": {},
+      "transcription_evidence": {
+        "word_timestamps": true,
+        "language_detection": true,
+        "declared_language": false,
+        "word_confidence": false
+      },
+      "minimum_vram_mb": 512,
+      "license": "MIT"
+    },
+    {
+      "id": "speecht5",
+      "display_name": "SpeechT5",
+      "adapter_version": 1,
+      "tasks": ["tts"],
+      "languages": ["en"],
+      "voice_modes": ["preset"],
+      "streaming": false,
+      "reference_formats": [],
+      "output_formats": ["wav", "flac"],
+      "controls": {},
+      "minimum_vram_mb": 1800,
+      "license": "MIT"
+    },
+    {
+      "id": "chatterbox",
+      "display_name": "Chatterbox",
+      "adapter_version": 1,
+      "tasks": ["tts", "voice-clone"],
+      "languages": ["en"],
+      "voice_modes": ["default", "reference"],
+      "streaming": false,
+      "reference_formats": ["wav", "flac", "mp3", "m4a", "ogg"],
+      "output_formats": ["wav", "flac"],
+      "controls": {
+        "exaggeration": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5 },
+        "cfg_weight": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5 }
+      },
+      "minimum_vram_mb": 7000,
+      "license": "MIT"
+    },
+    {
+      "id": "coqui",
+      "display_name": "XTTS v2",
+      "adapter_version": 1,
+      "tasks": ["tts", "voice-clone"],
+      "languages": ["en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi"],
+      "voice_modes": ["reference"],
+      "streaming": false,
+      "reference_formats": ["wav", "flac", "mp3", "m4a", "ogg"],
+      "output_formats": ["wav", "flac"],
+      "controls": {
+        "speed": { "type": "number", "minimum": 0.7, "maximum": 1.3, "default": 1.0 }
+      },
+      "minimum_vram_mb": 10800,
+      "license": "CPML"
+    },
+    {
+      "id": "nemo",
+      "display_name": "NVIDIA NeMo",
+      "adapter_version": 2,
+      "tasks": ["stt"],
+      "languages": ["en"],
+      "voice_modes": [],
+      "streaming": false,
+      "reference_formats": ["wav", "flac", "mp3", "m4a", "ogg"],
+      "output_formats": [],
+      "controls": {},
+      "transcription_evidence": {
+        "word_timestamps": true,
+        "language_detection": false,
+        "declared_language": true,
+        "word_confidence": true
+      },
+      "minimum_vram_mb": 8600,
+      "license": "Apache-2.0"
+    },
+    {
+      "id": "chatterbox-turbo",
+      "display_name": "Chatterbox Turbo",
+      "adapter_version": 1,
+      "tasks": ["tts", "voice-clone"],
+      "languages": ["en"],
+      "voice_modes": ["default", "reference"],
+      "streaming": false,
+      "reference_formats": ["wav", "flac", "mp3", "m4a", "ogg"],
+      "output_formats": ["wav", "flac"],
+      "controls": {
+        "temperature": { "type": "number", "minimum": 0.1, "maximum": 2.0, "default": 0.8 },
+        "top_p": { "type": "number", "minimum": 0.1, "maximum": 1.0, "default": 0.95 },
+        "repetition_penalty": { "type": "number", "minimum": 1.0, "maximum": 2.0, "default": 1.2 }
+      },
+      "minimum_vram_mb": 5000,
+      "license": "MIT"
+    }
+  ]
+}

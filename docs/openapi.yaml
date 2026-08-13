@@ -1,0 +1,373 @@
+openapi: 3.1.0
+info:
+  title: soundAr Local API
+  version: 0.3.0
+  description: Loopback-only API started explicitly from the soundAr desktop Settings screen.
+servers:
+  - url: http://127.0.0.1:17843
+security:
+  - bearerAuth: []
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      responses:
+        "200":
+          description: Local API health
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, local_only]
+                properties:
+                  status: { type: string, const: ready }
+                  local_only: { type: boolean, const: true }
+  /v1/models:
+    get:
+      operationId: listModels
+      responses:
+        "200":
+          description: Installed local models
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, data]
+                properties:
+                  object: { type: string, const: list }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, object, owned_by]
+                      properties:
+                        id: { type: string }
+                        object: { type: string, const: model }
+                        owned_by: { type: string, const: local }
+  /v1/capabilities:
+    get:
+      operationId: listCapabilities
+      responses:
+        "200": { $ref: "#/components/responses/List" }
+  /v1/voices:
+    get:
+      operationId: listVoices
+      description: Lists profile metadata without exposing managed reference paths.
+      responses:
+        "200": { $ref: "#/components/responses/List" }
+  /v1/jobs:
+    get:
+      operationId: listJobs
+      responses:
+        "200": { $ref: "#/components/responses/List" }
+  /v1/jobs/{jobId}:
+    get:
+      operationId: getJob
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema: { type: string, pattern: "^[0-9a-fA-F]{32}$" }
+      responses:
+        "200": { description: Durable job state and safe artifact metadata }
+  /v1/jobs/{jobId}/audio:
+    get:
+      operationId: getJobAudio
+      description: Returns the checksum-verified managed artifact for a completed speech job.
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema: { type: string, pattern: "^[0-9a-fA-F]{32}$" }
+      responses:
+        "200":
+          description: Generated audio
+          content:
+            audio/wav: { schema: { type: string, contentEncoding: binary } }
+            audio/flac: { schema: { type: string, contentEncoding: binary } }
+  /v1/jobs/{jobId}/events:
+    get:
+      operationId: streamJobEvents
+      description: Streams append-only durable status and progress events until the job reaches a terminal state.
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema: { type: string, pattern: "^[0-9a-fA-F]{32}$" }
+        - in: header
+          name: Last-Event-ID
+          required: false
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Server-sent job event stream
+          content:
+            text/event-stream: { schema: { type: string } }
+  /v1/runtime/scheduler:
+    get:
+      operationId: getSchedulerStatus
+      description: Reports live worker admission, VRAM reservations, and active batch coordinators.
+      responses:
+        "200":
+          description: Current local scheduler state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active_workers, max_workers, reserved_vram_mb, active_batches, waiting_jobs]
+                properties:
+                  active_workers: { type: integer, minimum: 0 }
+                  max_workers: { type: integer, minimum: 1, maximum: 8 }
+                  reserved_vram_mb: { type: integer, minimum: 0 }
+                  available_vram_budget_mb: { type: [integer, "null"], minimum: 0 }
+                  active_batches: { type: integer, minimum: 0 }
+                  waiting_jobs: { type: integer, minimum: 0 }
+  /v1/jobs/{jobId}/cancel:
+    post:
+      operationId: cancelJob
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Cancellation result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, cancelled]
+                properties:
+                  id: { type: string }
+                  cancelled: { type: boolean }
+  /v1/jobs/{jobId}/retry:
+    post:
+      operationId: retryJob
+      parameters:
+        - in: path
+          name: jobId
+          required: true
+          schema: { type: string }
+      responses:
+        "202": { description: Failed or cancelled synthesis task accepted for retry }
+  /v1/jobs/clear-finished:
+    post:
+      operationId: clearFinishedJobs
+      responses:
+        "200": { description: Completed and cancelled tasks dismissed from queue views }
+  /v1/history:
+    get:
+      operationId: listHistory
+      responses:
+        "200": { $ref: "#/components/responses/List" }
+  /v1/batches:
+    get:
+      operationId: listBatches
+      responses:
+        "200": { $ref: "#/components/responses/List" }
+    post:
+      operationId: createBatch
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          description: A client-generated key reused only when retrying the same logical batch.
+          schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              oneOf:
+                - required: [scripts]
+                - required: [rows]
+              properties:
+                name: { type: string }
+                scripts:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items: { type: string }
+                rows:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items: { $ref: "#/components/schemas/BatchRow" }
+                parallelism: { type: integer, minimum: 1, maximum: 8, default: 2 }
+                priority: { $ref: "#/components/schemas/Priority" }
+                settings: { type: object, additionalProperties: true }
+      responses:
+        "202": { description: Durable batch accepted for background execution }
+  /v1/batches/{batchId}:
+    get:
+      operationId: getBatch
+      parameters:
+        - in: path
+          name: batchId
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Batch state with per-item jobs and progress }
+  /v1/batches/{batchId}/cancel:
+    post:
+      operationId: cancelBatch
+      parameters:
+        - in: path
+          name: batchId
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Cancelled batch state }
+  /v1/batches/{batchId}/pause:
+    post:
+      operationId: pauseBatch
+      description: Stops scheduling new rows after currently running rows settle.
+      parameters:
+        - in: path
+          name: batchId
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Gracefully paused batch state }
+  /v1/batches/{batchId}/resume:
+    post:
+      operationId: resumeBatch
+      parameters:
+        - in: path
+          name: batchId
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                parallelism: { type: integer, minimum: 1, maximum: 8, default: 2 }
+                retry_failed: { type: boolean, default: false }
+      responses:
+        "202": { description: Batch rows accepted for resumed execution }
+  /v1/benchmarks:
+    get:
+      operationId: listBenchmarks
+      responses:
+        "200": { $ref: "#/components/responses/List" }
+  /v1/audio/speech:
+    post:
+      operationId: createSpeech
+      summary: OpenAI-compatible local text-to-speech generation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SpeechRequest"
+      responses:
+        "200":
+          description: Generated audio after durable job completion
+          content:
+            audio/wav: { schema: { type: string, contentEncoding: binary } }
+            audio/flac: { schema: { type: string, contentEncoding: binary } }
+        "400": { $ref: "#/components/responses/Error" }
+  /v1/audio/speech/jobs:
+    post:
+      operationId: queueSpeech
+      summary: Queue durable text-to-speech generation and return immediately
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          description: A client-generated key reused only when retrying the same logical request.
+          schema: { type: string, pattern: "^[A-Za-z0-9._-]{1,128}$" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SpeechRequest"
+      responses:
+        "202": { description: New or previously accepted durable speech job }
+        "409": { description: The idempotency key belongs to a different request }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    List:
+      description: A local list response
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [object, data]
+            properties:
+              object: { type: string, const: list }
+              data: { type: array, items: {} }
+    Error:
+      description: Structured local API error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: object
+                properties:
+                  message: { type: string }
+  schemas:
+    Priority:
+      type: string
+      enum: [low, normal, high, urgent]
+      default: normal
+      description: Durable queue priority. Waiting jobs age upward one effective level every 30 seconds.
+    BatchRow:
+      type: object
+      required: [text]
+      additionalProperties: false
+      properties:
+        text: { type: string, minLength: 1, maxLength: 20000 }
+        name: { type: string, maxLength: 120 }
+        output_name:
+          type: string
+          description: Human-friendly stem normalized to a path-safe deterministic row name.
+        priority: { $ref: "#/components/schemas/Priority" }
+        settings:
+          type: object
+          additionalProperties: false
+          properties:
+            model_id: { type: string }
+            speaker: { type: string }
+            language: { type: string }
+            speed: { type: number }
+            seed: { type: integer }
+            output_format: { type: string, enum: [wav, flac] }
+            exaggeration: { type: number }
+            cfg_weight: { type: number }
+            temperature: { type: number }
+            top_p: { type: number }
+            repetition_penalty: { type: number }
+    SpeechRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string, example: hexgrad/Kokoro-82M }
+        input: { type: string, maxLength: 20000 }
+        voice:
+          type: string
+          description: Kokoro speaker ID, "default" for Chatterbox, or a clone-ready soundAr voice profile ID.
+          default: default
+        response_format: { type: string, enum: [wav, flac], default: wav }
+        speed: { type: number, minimum: 0.5, maximum: 2.0, default: 1.0 }
+        language: { type: string, default: en }
+        seed: { type: integer, default: 42817 }
+        temperature: { type: number, minimum: 0.1, maximum: 2.0 }
+        top_p: { type: number, minimum: 0.1, maximum: 1.0 }
+        repetition_penalty: { type: number, minimum: 1.0, maximum: 2.0 }
+        priority: { $ref: "#/components/schemas/Priority" }

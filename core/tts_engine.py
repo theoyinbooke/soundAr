@@ -35,12 +35,17 @@ class TTSEngine:
             return self._engine_impl is not None and self._model_id == model_id
         return self._engine_impl is not None
 
+    @property
+    def loaded_model_id(self) -> str | None:
+        return self._model_id if self._engine_impl is not None else None
+
     def load_model(self, model_id: str, model_path: str, engine: str) -> None:
         """Load a TTS model, unloading previous if different."""
         from engines.tts.transformers_tts import TransformersTTS
         from engines.tts.coqui_tts import CoquiTTSEngine
         from engines.tts.kokoro_tts import KokoroTTSEngine
         from engines.tts.chatterbox_tts import ChatterboxTTSEngine
+        from engines.tts.chatterbox_turbo_tts import ChatterboxTurboTTSEngine
 
         with self._lock:
             if self._engine_impl is not None and self._model_id == model_id:
@@ -50,9 +55,11 @@ class TTSEngine:
 
             engine_map = {
                 "transformers": TransformersTTS,
+                "speecht5": TransformersTTS,
                 "coqui": CoquiTTSEngine,
                 "kokoro": KokoroTTSEngine,
                 "chatterbox": ChatterboxTTSEngine,
+                "chatterbox-turbo": ChatterboxTurboTTSEngine,
             }
 
             cls = engine_map.get(engine)
@@ -76,12 +83,20 @@ class TTSEngine:
         language: str | None = None,
         reference_audio: np.ndarray | None = None,
         reference_sr: int | None = None,
+        controls: dict[str, float] | None = None,
     ) -> SynthesisResult:
         """Synthesize text to speech."""
         if self._engine_impl is None:
             raise RuntimeError("No model loaded. Call load_model() first.")
 
         start_time = time.monotonic()
+        controls = controls or {}
+        seed = int(controls.get("seed", 0))
+        np.random.seed(seed)
+        if torch is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
         inference_context = torch.inference_mode() if torch is not None else nullcontext()
         with inference_context:
@@ -91,6 +106,7 @@ class TTSEngine:
                 language=language,
                 reference_audio=reference_audio,
                 reference_sr=reference_sr,
+                controls=controls,
             )
 
         elapsed = time.monotonic() - start_time
