@@ -59,6 +59,12 @@ impl Store {
             }
             migrate(&mut connection, current_version)?;
         }
+        if transcription_schema_requires_repair(&connection)? {
+            if current_version == SCHEMA_VERSION && database_path.is_file() {
+                create_migration_backup(&connection, &database_path)?;
+            }
+            repair_transcription_schema(&mut connection)?;
+        }
         verify_database_integrity(&connection)
             .map_err(|error| database_recovery_error(&database_path, &data_root, &error))?;
         backfill_voice_provenance(&connection)?;
@@ -4524,6 +4530,86 @@ fn migrate(connection: &mut Connection, from_version: i64) -> Result<(), String>
         .map_err(|error| format!("Could not commit database migration: {error}"))
 }
 
+fn transcription_schema_requires_repair(connection: &Connection) -> Result<bool, String> {
+    let present: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN (
+                'transcription_revisions',
+                'transcription_diarizations',
+                'transcription_speaker_label_revisions',
+                'transcription_alignments'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not inspect the transcription schema: {error}"))?;
+    Ok(present != 4)
+}
+
+fn repair_transcription_schema(connection: &mut Connection) -> Result<(), String> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("Could not start transcription schema repair: {error}"))?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS transcription_revisions (
+                id TEXT PRIMARY KEY,
+                transcription_id TEXT NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+                text TEXT NOT NULL,
+                segments_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS transcription_revisions_latest_idx
+                ON transcription_revisions(transcription_id, created_at DESC);
+             CREATE TABLE IF NOT EXISTS transcription_diarizations (
+                id TEXT PRIMARY KEY,
+                transcription_id TEXT NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+                job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL,
+                engine TEXT NOT NULL,
+                speakers_json TEXT NOT NULL,
+                turns_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                inference_seconds REAL NOT NULL CHECK(inference_seconds >= 0),
+                vram_peak_mb REAL NOT NULL CHECK(vram_peak_mb >= 0),
+                created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS transcription_diarizations_latest_idx
+                ON transcription_diarizations(transcription_id, created_at DESC);
+             CREATE TABLE IF NOT EXISTS transcription_speaker_label_revisions (
+                id TEXT PRIMARY KEY,
+                transcription_id TEXT NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+                diarization_id TEXT NOT NULL REFERENCES transcription_diarizations(id) ON DELETE CASCADE,
+                labels_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS transcription_speaker_label_revisions_latest_idx
+                ON transcription_speaker_label_revisions(transcription_id, diarization_id, created_at DESC);
+             CREATE TABLE IF NOT EXISTS transcription_alignments (
+                id TEXT PRIMARY KEY,
+                transcription_id TEXT NOT NULL REFERENCES transcriptions(id) ON DELETE CASCADE,
+                job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL,
+                engine TEXT NOT NULL,
+                source_revision INTEGER NOT NULL CHECK(source_revision >= 0),
+                source_text_sha256 TEXT NOT NULL,
+                words_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                mean_alignment_score REAL NOT NULL CHECK(mean_alignment_score BETWEEN 0 AND 1),
+                inference_seconds REAL NOT NULL CHECK(inference_seconds >= 0),
+                vram_peak_mb REAL NOT NULL CHECK(vram_peak_mb >= 0),
+                created_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS transcription_alignments_latest_idx
+                ON transcription_alignments(transcription_id, created_at DESC);",
+        )
+        .map_err(|error| format!("Could not repair the transcription schema: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("Could not commit transcription schema repair: {error}"))
+}
+
 fn verify_database_integrity(connection: &Connection) -> Result<(), String> {
     let mut statement = connection
         .prepare("PRAGMA quick_check")
@@ -7010,6 +7096,56 @@ mod tests {
         assert_eq!(version, super::SCHEMA_VERSION);
         drop(connection);
         drop(store);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn current_schema_repairs_missing_transcription_tables() {
+        let root = std::env::temp_dir().join(format!("soundar-schema-repair-{}", Uuid::new_v4()));
+        let data = root.join("data");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&data).expect("create repair fixture");
+        let database = data.join("soundar.sqlite3");
+        let mut connection = rusqlite::Connection::open(&database).expect("open repair fixture");
+        super::migrate(&mut connection, 0).expect("create current fixture");
+        connection
+            .execute_batch(
+                "DROP TABLE transcription_speaker_label_revisions;
+                 DROP TABLE transcription_diarizations;
+                 DROP TABLE transcription_revisions;",
+            )
+            .expect("remove transcription tables");
+        drop(connection);
+
+        let store = Store::open(data.clone(), artifacts).expect("repair current schema");
+        let connection = store.lock().expect("lock repaired fixture");
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                    'transcription_revisions',
+                    'transcription_diarizations',
+                    'transcription_speaker_label_revisions',
+                    'transcription_alignments'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect repaired tables");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read repaired schema version");
+        assert_eq!(table_count, 4);
+        assert_eq!(version, super::SCHEMA_VERSION);
+        drop(connection);
+        drop(store);
+        assert!(fs::read_dir(&data)
+            .expect("list repair backups")
+            .any(|entry| entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains("backup")));
         fs::remove_dir_all(root).ok();
     }
 
