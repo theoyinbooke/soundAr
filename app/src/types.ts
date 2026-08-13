@@ -255,7 +255,7 @@ export interface EngineCapability {
 
 export interface EngineRuntimeState {
   engine: string;
-  state: "layered" | "legacy-shared";
+  state: "layered" | "legacy-shared" | "needs-setup";
   python_path: string;
   runtime_manifest: Record<string, string | number>;
   warm_workers: number;

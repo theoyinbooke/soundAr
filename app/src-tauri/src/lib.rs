@@ -300,6 +300,10 @@ impl VoiceActivityDetector {
 }
 
 impl RuntimeState {
+    fn foundation_runtime_ready(&self) -> bool {
+        foundation_runtime_ready(&self.python_path)
+    }
+
     fn new(runtime_root: PathBuf, python_path: PathBuf) -> Result<Self, String> {
         let store = Store::open(product_state_dir(), home_dir().join(".soundAr/exports"))?;
         Ok(Self::new_with_store(runtime_root, python_path, store))
@@ -361,11 +365,13 @@ impl RuntimeState {
     }
 
     fn engine_python_path(&self, engine: &str) -> (PathBuf, bool) {
-        let isolated = app_data_dir()
-            .join("engines")
-            .join(engine)
-            .join(".venv/bin/python");
-        if isolated.is_file() {
+        let engine_root = app_data_dir().join("engines").join(engine);
+        let isolated = engine_root.join(".venv/bin/python");
+        let manifest = read_json(engine_root.join("runtime.json"), json!({}));
+        let current = cfg!(debug_assertions)
+            || (manifest.get("schema_version").and_then(Value::as_u64) == Some(2)
+                && manifest.get("foundation_schema").and_then(Value::as_u64) == Some(2));
+        if isolated.is_file() && current {
             (isolated, true)
         } else {
             (self.python_path.clone(), false)
@@ -1809,7 +1815,7 @@ impl RuntimeState {
             .setup_lock
             .lock()
             .map_err(|_| "Runtime setup lock failed")?;
-        if self.python_path.is_file() {
+        if self.foundation_runtime_ready() {
             app.emit(
                 "runtime-setup-progress",
                 "Local inference runtime is already ready.",
@@ -1865,7 +1871,7 @@ impl RuntimeState {
                 .unwrap_or("No installer details were returned");
             return Err(format!("Runtime setup failed: {detail}"));
         }
-        if !self.python_path.is_file() {
+        if !self.foundation_runtime_ready() {
             return Err(format!(
                 "Runtime setup completed without creating {}",
                 self.python_path.display()
@@ -1882,7 +1888,7 @@ impl RuntimeState {
             .setup_lock
             .lock()
             .map_err(|_| "Runtime setup lock failed")?;
-        if !self.python_path.is_file() {
+        if !self.foundation_runtime_ready() {
             return Err("Set up the soundAr foundation runtime first.".to_string());
         }
         let script = self.runtime_root.join("setup-engine-runtime.sh");
@@ -1970,7 +1976,7 @@ impl RuntimeState {
         if let Some(revision) = revision {
             validate_revision(revision)?;
         }
-        if !self.python_path.is_file() {
+        if !self.foundation_runtime_ready() {
             return Err("Set up the local inference runtime before managing models.".to_string());
         }
         let mut command = Command::new(&self.python_path);
@@ -2014,7 +2020,7 @@ impl RuntimeState {
     ) -> Result<Value, String> {
         validate_model_argument(model_id)?;
         validate_revision(revision)?;
-        if !self.python_path.is_file() {
+        if !self.foundation_runtime_ready() {
             return Err("Set up the local inference runtime before installing models.".to_string());
         }
         let catalog = read_json(
@@ -3069,7 +3075,7 @@ fn gpu_status(python: &PathBuf) -> Value {
                     "vram_used_mb": fields[2].parse::<u64>().unwrap_or(0),
                     "driver_version": fields[3],
                     "cuda_available": true,
-                    "python_ready": python.is_file()
+                    "python_ready": foundation_runtime_ready(python)
                 });
             }
         }
@@ -3080,8 +3086,23 @@ fn gpu_status(python: &PathBuf) -> Value {
         "vram_used_mb": 0,
         "driver_version": "",
         "cuda_available": false,
-        "python_ready": python.is_file()
+        "python_ready": foundation_runtime_ready(python)
     })
+}
+
+fn foundation_runtime_ready(python: &Path) -> bool {
+    if !python.is_file() {
+        return false;
+    }
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    let Some(runtime_dir) = python.parent().and_then(Path::parent) else {
+        return false;
+    };
+    let manifest = read_json(runtime_dir.join("runtime.json"), json!({}));
+    manifest.get("schema_version").and_then(Value::as_u64) == Some(2)
+        && manifest.get("transformers").and_then(Value::as_str) == Some("5.5.0")
 }
 
 fn engine_runtime_states(capabilities: &Value, worker_pool: &[PythonProcess]) -> Vec<Value> {
@@ -3095,6 +3116,14 @@ fn engine_runtime_states(capabilities: &Value, worker_pool: &[PythonProcess]) ->
             let root = app_data_dir().join("engines").join(engine);
             let python = root.join(".venv/bin/python");
             let runtime_manifest = read_json(root.join("runtime.json"), json!({}));
+            let current = runtime_manifest
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                == Some(2)
+                && runtime_manifest
+                    .get("foundation_schema")
+                    .and_then(Value::as_u64)
+                    == Some(2);
             let mut loaded_models = worker_pool
                 .iter()
                 .filter(|process| process.engine == engine)
@@ -3104,8 +3133,8 @@ fn engine_runtime_states(capabilities: &Value, worker_pool: &[PythonProcess]) ->
             loaded_models.dedup();
             Some(json!({
                 "engine": engine,
-                "state": if python.is_file() { "layered" } else { "legacy-shared" },
-                "python_path": if python.is_file() { python.to_string_lossy().to_string() } else { python_path().to_string_lossy().to_string() },
+                "state": if python.is_file() && current { "layered" } else { "needs-setup" },
+                "python_path": if python.is_file() && current { python.to_string_lossy().to_string() } else { python_path().to_string_lossy().to_string() },
                 "runtime_manifest": runtime_manifest,
                 "warm_workers": worker_pool.iter().filter(|process| process.engine == engine).count(),
                 "loaded_models": loaded_models,

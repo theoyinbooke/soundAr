@@ -411,7 +411,7 @@ export function ModelsView({ bootstrap, onChanged }: { bootstrap: BootstrapState
               <div><dt>Revision</dt><dd className="mono-cell">{compactRevision(selectedInstall?.revision)}</dd></div>
               <div><dt>Local size</dt><dd>{selectedInstall ? formatBytes(selectedInstall.installed_size_bytes) : "Not installed"}</dd></div>
               <div><dt>License</dt><dd>{selectedInstall?.license ?? "Shown before install"}</dd></div>
-              <div><dt>Runtime</dt><dd><StatusText tone={selectedRuntime?.state === "layered" ? "success" : "warning"}>{selectedRuntime?.state === "layered" ? "Pinned layer" : "Legacy shared"}</StatusText></dd></div>
+              <div><dt>Runtime</dt><dd><StatusText tone={selectedRuntime?.state === "layered" ? "success" : "warning"}>{selectedRuntime?.state === "layered" ? "Pinned layer" : selectedRuntime?.state === "needs-setup" ? "Setup needed" : "Legacy shared"}</StatusText></dd></div>
               {selectedInstall?.integrity ? <div><dt>Files</dt><dd><StatusText tone={selectedInstall.integrity.state === "ready" ? "success" : "danger"}>{selectedInstall.integrity.state === "ready" ? "Ready" : "Repair needed"}</StatusText></dd></div> : null}
             </dl>
             <div className="inspector-actions">

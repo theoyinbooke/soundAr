@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from importlib import metadata
 
 import numpy as np
 
@@ -32,10 +33,24 @@ class CoquiTTSEngine(BaseTTSEngine):
         self._model_dir: Path | None = None
 
     @staticmethod
+    def _uses_maintained_coqui() -> bool:
+        try:
+            return metadata.version("coqui-tts").startswith("0.27.")
+        except metadata.PackageNotFoundError:
+            return False
+
+    @staticmethod
     def _patch_transformers_namespace() -> None:
         try:
             import transformers
         except ImportError:
+            return
+
+        if CoquiTTSEngine._uses_maintained_coqui():
+            import transformers.pytorch_utils as pytorch_utils
+
+            if not hasattr(pytorch_utils, "isin_mps_friendly"):
+                pytorch_utils.isin_mps_friendly = torch.isin
             return
 
         symbol_sources = {
@@ -105,6 +120,8 @@ class CoquiTTSEngine(BaseTTSEngine):
 
     @staticmethod
     def _patch_tts_checkpoint_loading() -> None:
+        if CoquiTTSEngine._uses_maintained_coqui():
+            return
         import TTS.tts.models.xtts as xtts_module
         import TTS.utils.io as tts_io
 
@@ -123,6 +140,8 @@ class CoquiTTSEngine(BaseTTSEngine):
 
     @staticmethod
     def _patch_stream_generation_support() -> None:
+        if CoquiTTSEngine._uses_maintained_coqui():
+            return
         from TTS.tts.layers.xtts.stream_generator import NewGenerationMixin
         from transformers import PreTrainedModel
 

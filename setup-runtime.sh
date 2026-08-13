@@ -12,6 +12,7 @@ UV_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/soundar/uv"
 UV_PYTHON_INSTALL_DIR="$RUNTIME_DIR/python"
 UV_VERSION="0.12.3"
 UV_X86_64_SHA256="600cf9a742aca00d292673b16b5acffaa7b8c269a364ad0c2e79498dcb1fe101"
+RUNTIME_SCHEMA="2"
 
 export UV_CACHE_DIR UV_PYTHON_INSTALL_DIR
 export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
@@ -40,7 +41,11 @@ mkdir -p "$RUNTIME_DIR" "$UV_CACHE_DIR" "$HOME/.soundAr/models" "$HOME/.soundAr/
 exec 9>"$RUNTIME_DIR/setup.lock"
 flock -n 9 || fail "Another soundAr runtime setup is already running."
 
-if [[ -x "$VENV/bin/python" ]] && "$VENV/bin/python" -c 'import kokoro, soundfile, torch; import spacy.util; assert spacy.util.is_package("en_core_web_sm")' >/dev/null 2>&1; then
+requirement_hash="$(sha256sum "$REQUIREMENTS" | cut -d' ' -f1)"
+if [[ -x "$VENV/bin/python" && -f "$RUNTIME_DIR/runtime.json" ]] && \
+   grep -q "\"schema_version\": $RUNTIME_SCHEMA" "$RUNTIME_DIR/runtime.json" && \
+   grep -q "\"requirements_sha256\": \"$requirement_hash\"" "$RUNTIME_DIR/runtime.json" && \
+   "$VENV/bin/python" -c 'import kokoro, soundfile, torch, transformers; assert transformers.__version__ == "5.5.0"' >/dev/null 2>&1; then
   progress "Local inference runtime is already ready."
   exit 0
 fi
@@ -78,17 +83,16 @@ progress "Installing the speech inference foundation..."
 
 if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
   progress "Installing the CUDA 12.4 acceleration stack..."
-  "$PYTHON" -m pip install --progress-bar off torch==2.6.0 torchaudio==2.6.0 \
-    --index-url https://download.pytorch.org/whl/cu124
+  "$PYTHON" -m pip install --progress-bar off torch==2.6.0+cu124 torchaudio==2.6.0+cu124 \
+    --extra-index-url https://download.pytorch.org/whl/cu124
 else
   progress "Installing the CPU inference stack..."
-  "$PYTHON" -m pip install --progress-bar off torch==2.6.0 torchaudio==2.6.0 \
-    --index-url https://download.pytorch.org/whl/cpu
+  "$PYTHON" -m pip install --progress-bar off torch==2.6.0+cpu torchaudio==2.6.0+cpu \
+    --extra-index-url https://download.pytorch.org/whl/cpu
 fi
 
 progress "Installing open-source voice engines..."
 "$PYTHON" -m pip install --progress-bar off --requirement "$REQUIREMENTS"
-"$PYTHON" -m pip install --progress-bar off --no-deps chatterbox-tts==0.1.7
 progress "Installing English language data..."
 "$PYTHON" -m spacy download en_core_web_sm
 
@@ -110,5 +114,14 @@ if [[ -d "$VENV" ]]; then
 fi
 mv "$STAGING_VENV" "$VENV"
 rm -rf "$PREVIOUS_VENV"
-printf '1\n' > "$RUNTIME_DIR/runtime-version"
+printf '%s\n' "$RUNTIME_SCHEMA" > "$RUNTIME_DIR/runtime-version"
+cat > "$RUNTIME_DIR/runtime.json" <<EOF
+{
+  "schema_version": $RUNTIME_SCHEMA,
+  "python": "3.11",
+  "torch": "2.6.0",
+  "transformers": "5.5.0",
+  "requirements_sha256": "$requirement_hash"
+}
+EOF
 progress "Local inference runtime is ready."

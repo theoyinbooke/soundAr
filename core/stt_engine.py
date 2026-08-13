@@ -89,7 +89,6 @@ class STTEngine:
         """Load an STT model, unloading the previous one if different."""
         from engines.stt.transformers_stt import TransformersSTT
         from engines.stt.nemo_stt import NeMoSTT
-        from engines.stt.cohere_stt import CohereSTT
         from engines.stt.voxtral_stt import VoxtralSTT
 
         with self._lock:
@@ -101,7 +100,6 @@ class STTEngine:
             engine_map = {
                 "transformers": TransformersSTT,
                 "nemo": NeMoSTT,
-                "cohere": CohereSTT,
                 "voxtral": VoxtralSTT,
             }
             cls = engine_map.get(engine)

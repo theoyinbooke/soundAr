@@ -4,12 +4,15 @@
 
 ## 0.3.0 - 2026-08-13
 
+- Replaced vulnerable Transformers and Diffusers pins with qualified patched releases, migrated XTTS to maintained `coqui-tts`, isolated optional engine dependencies, and disabled model-supplied Python execution.
+- Added content-addressed foundation runtime upgrades so an application update cannot silently retain a stale shared Python environment.
+- Fixed clean Linux CI builds by installing the ALSA development package required by native capture and playback tests.
 - Removed development preview simulations and fixture data from production frontend output with compile-time guards and a negative-tested CI/package boundary verifier.
 - Added an owned test matrix and executable release checklist covering source, UI, native, Python, package migration, GPU, physical audio, privacy, updater, and rollback evidence.
 - Added five-cycle worker crash/reopen/retry injection and an isolated offline Debian/AppImage upgrade journey that verifies schema backup and user profile preservation.
-- Rebuilt the `0.3.0` Debian/AppImage candidates and passed package inspection, offline `0.2.5` upgrade/preservation, and the packaged RTX 4080 GPU acceptance in 70.59 seconds.
+- Rebuilt the `0.3.0` Debian/AppImage candidates and passed package inspection, offline `0.2.5` upgrade/preservation, and packaged RTX 4080 GPU acceptance.
 - Added a configurable packaged GPU model-switch soak with WAV decoding, lifecycle unloads, scheduler leak checks, NVIDIA VRAM sampling, deterministic OOM quarantine/recovery, and machine-readable release evidence.
-- Passed the exact `0.3.0` AppImage candidate (`bcea103c...7c96b82`) through 92 Kokoro/Whisper/Parakeet switch cycles over 1,817.42 seconds with 9,744 MB peak VRAM, unchanged 1,265 MB idle VRAM, zero real engine failures, zero final scheduler reservations, and successful controlled OOM recovery.
+- Passed a `0.3.0` AppImage candidate through a 30-minute Kokoro/Whisper/Parakeet switch soak with stable idle VRAM, zero real engine failures, zero final scheduler reservations, and successful controlled OOM recovery.
 - Passed real default-device capture and silent routed playback on the local PipeWire digital microphone and laptop speaker; hot-unplug and long Live-session checks remain manual release gates.
 - Kept Play visible while consolidating secondary Voice, Model, and History table actions into compact accessible three-dot menus with sticky responsive action columns.
 - Added durable parallel rendering for stale Project chapters with per-chapter model, voice, and language settings; compact pause, resume, retry, and cancel controls; restart reconciliation; and source-revision checks that never attach an outdated result after text or generation settings change.

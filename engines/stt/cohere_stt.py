@@ -1,7 +1,8 @@
-"""Cohere Transcribe STT engine — state-of-the-art 2B Conformer ASR.
+"""Disabled Cohere Transcribe adapter.
 
-Uses AutoModelForSpeechSeq2Seq with trust_remote_code=True for broad
-transformers compatibility. Requires explicit language parameter.
+The upstream checkpoint requires executable repository code. soundAr does not
+run model-supplied Python, so this planned adapter remains unavailable until a
+native, locally auditable implementation is qualified.
 """
 from __future__ import annotations
 
@@ -29,25 +30,10 @@ class CohereSTT(BaseSTTEngine):
         self._processor = None
 
     def load(self, model_id: str, model_path: str) -> None:
-        try:
-            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-        except ImportError as exc:
-            raise RuntimeError(
-                "transformers is required for Cohere Transcribe. "
-                "Install with: pip install transformers"
-            ) from exc
-
-        device = self.get_device()
-        dtype = torch.float16 if "cuda" in device and torch is not None else torch.float32
-
-        self._processor = AutoProcessor.from_pretrained(
-            model_path, trust_remote_code=True
+        raise RuntimeError(
+            "Cohere Transcribe is not available because its checkpoint requires "
+            "model-supplied Python code. soundAr only runs built-in, audited adapters."
         )
-        self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_path, trust_remote_code=True
-        )
-        self._model.to(device)
-        self._loaded = True
 
     def unload(self) -> None:
         self._model = None

@@ -37,7 +37,7 @@ jobs:
       - name: Install Tauri build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf squashfs-tools xvfb
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf squashfs-tools xvfb
       - name: Install frontend dependencies
         working-directory: app
         run: npm ci
@@ -56,7 +56,8 @@ jobs:
           python3 -m compileall -q bridge.py model_cli.py config core engines
           python3 -m pip install --requirement requirements-test.txt
           python3 -m unittest discover -s tests -v
-          bash -n install-linux.sh setup-runtime.sh setup-engine-runtime.sh install.sh scripts/verify-production-boundary.sh scripts/verify-linux-bundles.sh scripts/verify-package-journey.sh
+          bash -n install-linux.sh setup-runtime.sh setup-engine-runtime.sh install.sh scripts/verify-production-boundary.sh scripts/verify-runtime-security.sh scripts/verify-linux-bundles.sh scripts/verify-package-journey.sh
+          ./scripts/verify-runtime-security.sh
       - name: Build packages and create GitHub release
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:

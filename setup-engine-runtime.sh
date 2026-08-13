@@ -37,6 +37,8 @@ UV="$(command -v uv || true)"
 
 requirement_hash="$(sha256sum "$REQUIREMENTS_DIR/common.txt" "$REQUIREMENTS" | sha256sum | cut -d' ' -f1)"
 if [[ -x "$VENV/bin/python" && -f "$ENGINE_ROOT/runtime.json" ]] && \
+   grep -q '"schema_version": 2' "$ENGINE_ROOT/runtime.json" && \
+   grep -q '"foundation_schema": 2' "$ENGINE_ROOT/runtime.json" && \
    grep -q "\"requirements_sha256\": \"$requirement_hash\"" "$ENGINE_ROOT/runtime.json"; then
   progress "$ENGINE runtime is already current."
   exit 0
@@ -59,10 +61,10 @@ progress "Installing pinned $ENGINE dependencies..."
 "$PYTHON" -m pip install --progress-bar off --requirement "$REQUIREMENTS"
 case "$ENGINE" in
   kokoro) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps kokoro==0.9.4 ;;
-  transformers|speaker-verification|alignment|speecht5) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps transformers==4.49.0 accelerate==1.14.0 ;;
-  chatterbox|chatterbox-turbo) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps chatterbox-tts==0.1.7 transformers==4.49.0 diffusers==0.29.0 ;;
-  coqui) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps TTS==0.22.0 transformers==4.49.0 ;;
-  nemo) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps nemo-toolkit==2.7.2 ;;
+  transformers|speaker-verification|alignment|speecht5) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps transformers==5.5.0 accelerate==1.14.0 ;;
+  chatterbox|chatterbox-turbo) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps chatterbox-tts==0.1.7 transformers==5.5.0 diffusers==0.38.0 ;;
+  coqui) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps coqui-tts==0.27.5 transformers==5.5.0 ;;
+  nemo) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps nemo-toolkit==3.0.0 ;;
 esac
 
 progress "Verifying $ENGINE imports..."
@@ -74,7 +76,7 @@ case "$ENGINE" in
   speecht5) SOUNDAR_SPEECHT5_MODEL_PATH="${SOUNDAR_SPEECHT5_MODEL_PATH:-$HOME/.soundAr/models/microsoft__speecht5_tts}" "$PYTHON" -c 'import os; from transformers import SpeechT5ForTextToSpeech, SpeechT5Processor; import soundfile, torch; SpeechT5Processor.from_pretrained(os.environ["SOUNDAR_SPEECHT5_MODEL_PATH"], local_files_only=True)' ;;
   chatterbox) "$PYTHON" -c 'import chatterbox, soundfile, torch' ;;
   chatterbox-turbo) "$PYTHON" -c 'from chatterbox.tts_turbo import ChatterboxTurboTTS; import soundfile, torch' ;;
-  coqui) "$PYTHON" -c 'import TTS, soundfile, torch' ;;
+  coqui) "$PYTHON" -c 'import torch, transformers.pytorch_utils as pu; pu.isin_mps_friendly = torch.isin; import TTS, soundfile' ;;
   nemo) "$PYTHON" -c 'import nemo.collections.asr, soundfile, torch' ;;
 esac
 
@@ -82,7 +84,8 @@ if [[ -d "$VENV" ]]; then mv "$VENV" "$PREVIOUS"; fi
 mv "$STAGING" "$VENV"
 cat > "$ENGINE_ROOT/runtime.json" <<EOF
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "foundation_schema": 2,
   "engine": "$ENGINE",
   "isolation": "layered",
   "python": "3.11",

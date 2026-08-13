@@ -31,7 +31,7 @@ jobs:
       - name: Install Tauri build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf
       - name: Install frontend dependencies
         working-directory: app
         run: npm ci
@@ -43,6 +43,8 @@ jobs:
         run: npm run build
       - name: Verify production truth boundary
         run: ./scripts/verify-production-boundary.sh
+      - name: Verify runtime dependency policy
+        run: ./scripts/verify-runtime-security.sh
       - name: Test frontend units
         working-directory: app
         run: npm test
@@ -68,4 +70,4 @@ jobs:
           python3 -m pip install --requirement requirements-test.txt
           python3 -m unittest discover -s tests -v
       - name: Validate installer and package-verification scripts
-        run: bash -n install-linux.sh setup-runtime.sh setup-engine-runtime.sh install.sh scripts/verify-production-boundary.sh scripts/verify-linux-bundles.sh scripts/verify-package-journey.sh
+        run: bash -n install-linux.sh setup-runtime.sh setup-engine-runtime.sh install.sh scripts/verify-production-boundary.sh scripts/verify-runtime-security.sh scripts/verify-linux-bundles.sh scripts/verify-package-journey.sh

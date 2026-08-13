@@ -1,2 +1,4 @@
 -r common.txt
-nemo-toolkit[asr]==2.7.2
+nemo-toolkit[asr]==3.0.0
+transformers==5.5.0
+wget==3.2

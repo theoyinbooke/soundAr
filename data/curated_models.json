@@ -219,7 +219,7 @@
       "default_chunk_seconds": null,
       "default_sample_rate": 16000,
       "runtime_notes": [
-        "Uses AutoModelForSpeechSeq2Seq with trust_remote_code=True for broad transformers compat.",
+        "Planned only: the upstream checkpoint requires model-supplied Python, which soundAr does not execute.",
         "Conformer encoder-decoder architecture with 16k BPE tokenizer.",
         "Apache 2.0 licensed.",
         "Trained on 500k hours of curated audio-transcript pairs."
