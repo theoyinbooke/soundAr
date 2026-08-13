@@ -49,12 +49,18 @@ launch_offline() {
   local log="$journey_root/$label.log"
   local status=0
   local runtime_environment=()
+  local network_isolation=()
   if [[ -n "$runtime_root" ]]; then
     runtime_environment=(SOUNDAR_RUNTIME_ROOT="$runtime_root")
   fi
+  if unshare --user --map-root-user --net true >/dev/null 2>&1; then
+    network_isolation=(unshare --user --map-root-user --net)
+  else
+    printf '%s\n' "Kernel network namespaces are unavailable; enforcing offline library and proxy settings for $label."
+  fi
   set +e
   timeout --signal=TERM --kill-after=3s 7s \
-    unshare --user --map-root-user --net \
+    "${network_isolation[@]}" \
     env \
       HOME="$home" \
       XDG_DATA_HOME="$xdg_data" \
@@ -62,8 +68,14 @@ launch_offline() {
       XDG_CACHE_HOME="$xdg_cache" \
       "${runtime_environment[@]}" \
       SOUNDAR_PYTHON=/usr/bin/python3 \
-      NO_PROXY='*' \
-      no_proxy='*' \
+      HF_HUB_OFFLINE=1 \
+      TRANSFORMERS_OFFLINE=1 \
+      http_proxy='http://127.0.0.1:9' \
+      https_proxy='http://127.0.0.1:9' \
+      HTTP_PROXY='http://127.0.0.1:9' \
+      HTTPS_PROXY='http://127.0.0.1:9' \
+      NO_PROXY='localhost,127.0.0.1' \
+      no_proxy='localhost,127.0.0.1' \
       "$@" >"$log" 2>&1
   status=$?
   set -e
