@@ -1872,10 +1872,18 @@ impl RuntimeState {
             return Err(format!("Runtime setup failed: {detail}"));
         }
         if !self.foundation_runtime_ready() {
-            return Err(format!(
-                "Runtime setup completed without creating {}",
-                self.python_path.display()
-            ));
+            let detail = if self.python_path.is_file() {
+                format!(
+                    "Runtime setup completed, but {} is missing or incompatible",
+                    app_data_dir().join("runtime.json").display()
+                )
+            } else {
+                format!(
+                    "Runtime setup completed without creating {}",
+                    self.python_path.display()
+                )
+            };
+            return Err(detail);
         }
 
         self.stop_active_worker()?;
@@ -3091,13 +3099,21 @@ fn gpu_status(python: &PathBuf) -> Value {
 }
 
 fn foundation_runtime_ready(python: &Path) -> bool {
+    foundation_runtime_ready_for_install(python, cfg!(debug_assertions))
+}
+
+fn foundation_runtime_ready_for_install(python: &Path, allow_unmanaged: bool) -> bool {
     if !python.is_file() {
         return false;
     }
-    if cfg!(debug_assertions) {
+    if allow_unmanaged {
         return true;
     }
-    let Some(runtime_dir) = python.parent().and_then(Path::parent) else {
+    let Some(runtime_dir) = python
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    else {
         return false;
     };
     let manifest = read_json(runtime_dir.join("runtime.json"), json!({}));
@@ -5539,10 +5555,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_audio_thread, cold_load_needs_idle_reclamation, gpu_status, home_dir,
-        parse_project_script, read_batch_import, read_json, resample_mono, scheduler_rank,
-        sha256_path, validate_model_argument, validate_revision, write_json_atomically,
-        ActivePlayback, ActiveRecording, RuntimeState, SchedulerWaiter, VoiceActivityDetector,
+        capture_audio_thread, cold_load_needs_idle_reclamation,
+        foundation_runtime_ready_for_install, gpu_status, home_dir, parse_project_script,
+        read_batch_import, read_json, resample_mono, scheduler_rank, sha256_path,
+        validate_model_argument, validate_revision, write_json_atomically, ActivePlayback,
+        ActiveRecording, RuntimeState, SchedulerWaiter, VoiceActivityDetector,
         GPU_COLD_LOAD_HEADROOM_MB, MAX_RPC_REQUEST_BYTES,
     };
     use crate::store::Store;
@@ -5570,6 +5587,26 @@ mod tests {
             self.0.stop_api_server().ok();
             self.0.stop_active_worker().ok();
         }
+    }
+
+    #[test]
+    fn packaged_foundation_runtime_reads_manifest_from_runtime_root() {
+        let root = std::env::temp_dir().join(format!("soundar-runtime-ready-{}", Uuid::new_v4()));
+        let python = root.join(".venv/bin/python");
+        fs::create_dir_all(python.parent().expect("python parent"))
+            .expect("create runtime fixture");
+        fs::write(&python, b"python fixture").expect("write python fixture");
+        fs::write(
+            root.join("runtime.json"),
+            r#"{"schema_version":2,"transformers":"5.5.0"}"#,
+        )
+        .expect("write runtime manifest");
+
+        assert!(foundation_runtime_ready_for_install(&python, false));
+        fs::rename(root.join("runtime.json"), root.join(".venv/runtime.json"))
+            .expect("move manifest to the formerly checked location");
+        assert!(!foundation_runtime_ready_for_install(&python, false));
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
