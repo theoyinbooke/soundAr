@@ -409,7 +409,9 @@ fn queue_background(runtime: &RuntimeState, kind: &str, request: Value) -> Resul
 fn discover_codex() -> Option<(PathBuf, String)> {
     let mut candidates = Vec::new();
     if let Some(path) = env::var_os("SOUNDAR_CODEX_BIN").or_else(|| env::var_os("CODEX_BIN")) {
-        candidates.push(PathBuf::from(path));
+        // An explicit override is authoritative, including when the caller is
+        // intentionally validating an older or pre-release Codex build.
+        return validate_codex_candidate(PathBuf::from(path));
     }
     if let Some(path) = env::var_os("PATH") {
         candidates.extend(env::split_paths(&path).map(|directory| directory.join("codex")));
@@ -458,21 +460,63 @@ fn discover_codex() -> Option<(PathBuf, String)> {
         collect_named(&root, "codex", 6, &mut candidates);
     }
     let mut seen = HashSet::new();
-    candidates.into_iter().find_map(|candidate| {
-        let canonical = fs::canonicalize(&candidate).ok()?;
-        if !seen.insert(canonical.clone()) || !is_executable(&canonical) {
-            return None;
-        }
-        let output = Command::new(&canonical).arg("--version").output().ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        version
-            .to_ascii_lowercase()
-            .contains("codex")
-            .then_some((canonical, version))
-    })
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let canonical = fs::canonicalize(&candidate).ok()?;
+            if !seen.insert(canonical.clone()) {
+                return None;
+            }
+            validate_codex_candidate(canonical)
+        })
+        // Desktop launchers do not reliably inherit shell-manager PATH entries
+        // (NVM, fnm, mise, and similar). Choose the newest valid installation
+        // found across every supported location instead of the first PATH hit.
+        .max_by_key(|(_, version)| codex_version_key(version))
+}
+
+fn validate_codex_candidate(candidate: PathBuf) -> Option<(PathBuf, String)> {
+    let canonical = fs::canonicalize(candidate).ok()?;
+    if !is_executable(&canonical) {
+        return None;
+    }
+    let output = Command::new(&canonical).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    version
+        .to_ascii_lowercase()
+        .contains("codex")
+        .then_some((canonical, version))
+}
+
+fn codex_version_key(version: &str) -> (u64, u64, u64, bool) {
+    let raw = version
+        .split_whitespace()
+        .find(|part| {
+            part.chars()
+                .next()
+                .is_some_and(|value| value.is_ascii_digit())
+        })
+        .unwrap_or_default();
+    let stable = !raw.contains('-');
+    let mut numeric = raw.split('-').next().unwrap_or_default().split('.');
+    (
+        numeric
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        numeric
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        numeric
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        stable,
+    )
 }
 
 fn collect_named(root: &Path, name: &str, depth: usize, output: &mut Vec<PathBuf>) {
@@ -501,7 +545,7 @@ fn is_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{discover_codex, dynamic_tools};
+    use super::{codex_version_key, discover_codex, dynamic_tools};
 
     #[test]
     fn dynamic_tool_catalog_supports_access_changes_without_resetting_the_thread() {
@@ -527,5 +571,17 @@ mod tests {
                 assert!(version.to_ascii_lowercase().contains("codex"));
             }
         }
+    }
+
+    #[test]
+    fn compares_codex_versions_independently_of_installation_order() {
+        assert!(codex_version_key("codex-cli 0.150.1") > codex_version_key("codex-cli 0.134.0"));
+        assert!(
+            codex_version_key("codex-cli 0.150.1")
+                > codex_version_key("codex-cli 0.147.0-alpha.6.6")
+        );
+        assert!(
+            codex_version_key("codex-cli 0.151.0") > codex_version_key("codex-cli 0.151.0-alpha.6")
+        );
     }
 }

@@ -48,7 +48,7 @@ The installer adds the Debian package and prepares soundAr's managed Python runt
 To install a package built locally:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.5.0_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.5.1_amd64.deb
 ```
 
 ### Storage and updates
@@ -68,7 +68,7 @@ Independent generations, project chapters, and batch rows use one durable schedu
 
 ## Creative Producer
 
-The optional Assistant pane connects to an existing Codex CLI installation and uses the ChatGPT account already managed by Codex. soundAr never installs Codex, reads its credential files, or asks for an API key. It searches the ordinary Linux executable locations and common Node, Rust, Flatpak, Snap, mise, nvm, fnm, pnpm, and user-local locations; when no valid installation is found, the pane explains what is missing without changing the machine.
+The optional Assistant pane connects to an existing Codex CLI installation and uses the ChatGPT account already managed by Codex. soundAr never installs Codex, reads its credential files, or asks for an API key. It searches the ordinary Linux executable locations and common Node, Rust, Flatpak, Snap, mise, nvm, fnm, pnpm, and user-local locations, then selects the newest valid installation so a stale launcher PATH cannot hide the current model catalog. `SOUNDAR_CODEX_BIN` or `CODEX_BIN` can intentionally pin an exact executable. When no valid installation is found, the pane explains what is missing without changing the machine.
 
 The assistant is designed for goals, not just exact generation commands. It can:
 

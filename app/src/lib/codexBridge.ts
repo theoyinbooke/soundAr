@@ -22,7 +22,7 @@ export interface CodexModel {
   supportedReasoningEfforts: Array<{ reasoningEffort: ReasoningEffort; description?: string }>;
 }
 
-export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type AgentAccess = "read-only" | "workspace-write" | "danger-full-access";
 
 export interface CodexEvent {
@@ -32,8 +32,10 @@ export interface CodexEvent {
 }
 
 const previewModels: CodexModel[] = [
-  { id: "gpt-5.6-codex", model: "gpt-5.6-codex", displayName: "GPT-5.6 Codex", description: "Best for studio planning and tool use", isDefault: true, hidden: false, defaultReasoningEffort: "high", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
-  { id: "gpt-5.5-codex-mini", model: "gpt-5.5-codex-mini", displayName: "GPT-5.5 Codex Mini", description: "Fast studio assistance", isDefault: false, hidden: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
+  { id: "gpt-5.6-sol", model: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", description: "Latest frontier agentic model", isDefault: true, hidden: false, defaultReasoningEffort: "low", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
+  { id: "gpt-5.6-terra", model: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", description: "Balanced model for everyday studio work", isDefault: false, hidden: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
+  { id: "gpt-5.6-luna", model: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", description: "Fast model for lightweight studio work", isDefault: false, hidden: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
+  { id: "gpt-5.5", model: "gpt-5.5", displayName: "GPT-5.5", description: "Frontier model for complex work", isDefault: false, hidden: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
 ];
 
 export async function getCodexStatus(): Promise<CodexStatus> {

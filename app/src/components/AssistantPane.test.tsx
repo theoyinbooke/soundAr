@@ -17,7 +17,7 @@ describe("AssistantPane", () => {
   it("loads Codex controls and completes the preview conversation flow", async () => {
     render(<AssistantPane open onClose={vi.fn()} />);
     expect(await screen.findByRole("complementary", { name: "soundAr assistant" })).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: /GPT-5.6 Codex/i })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /GPT-5.6-Sol/i })).toBeInTheDocument();
     const composer = screen.getByRole("textbox", { name: "Message soundAr assistant" });
     await userEvent.type(composer, "Create a short ambient cue{enter}");
     expect(screen.getByText("Create a short ambient cue")).toBeInTheDocument();

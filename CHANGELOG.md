@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.5.1 - 2026-08-27
+
+- Fixed Codex discovery on Linux desktops with multiple installations by selecting the newest valid CLI across PATH, NVM, npm, system, Flatpak, Snap, and other supported locations.
+- Preserved explicit `SOUNDAR_CODEX_BIN` and `CODEX_BIN` overrides for intentional testing while preventing stale PATH entries from hiding GPT-5.6 Sol, Terra, and Luna.
+- Updated the development preview and reasoning selector contract for the live GPT-5.6 Sol, Terra, and Luna catalog, including Max and Ultra reasoning where the server offers them.
+
 ## 0.5.0 - 2026-08-27
 
 - Added a dockable Creative Producer powered by the user's existing Codex CLI and Codex-owned ChatGPT login, without bundling Codex or reading its credential files.
