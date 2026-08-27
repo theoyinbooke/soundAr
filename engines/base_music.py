@@ -33,10 +33,11 @@ class BaseMusicEngine(abc.ABC):
         self,
         prompt: str,
         duration_seconds: float,
-        controls: dict[str, float | int] | None = None,
+        controls: dict[str, object] | None = None,
         *,
         lyrics: str | None = None,
         vocal_language: str | None = None,
+        advanced: dict[str, object] | None = None,
     ) -> tuple[np.ndarray, int]:
         """Generate float32 frames (mono or frames × channels) and its sample rate."""
 

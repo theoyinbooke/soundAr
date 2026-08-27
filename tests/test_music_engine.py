@@ -38,8 +38,9 @@ class _FakeMusicEngine(BaseMusicEngine):
         *,
         lyrics: str | None = None,
         vocal_language: str | None = None,
+        advanced: dict[str, object] | None = None,
     ) -> tuple[np.ndarray, int]:
-        del prompt, duration_seconds, controls, lyrics, vocal_language
+        del prompt, duration_seconds, controls, lyrics, vocal_language, advanced
         return np.array([[0.0, 0.25, -0.25, 0.0]], dtype=np.float32), 4
 
 

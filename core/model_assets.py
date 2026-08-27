@@ -74,6 +74,29 @@ def _required_model_files(path: Path, engine: str) -> tuple[list[str], list[list
             "pytorch_model.bin.index.json",
         ]]
     if engine == "acestep":
+        if (path / "acestep-v15-turbo/config.json").is_file():
+            return [
+                "acestep-v15-turbo/config.json",
+                "acestep-v15-turbo/model.safetensors",
+                "acestep-v15-turbo/silence_latent.pt",
+                "acestep-5Hz-lm-1.7B/config.json",
+                "acestep-5Hz-lm-1.7B/model.safetensors",
+                "Qwen3-Embedding-0.6B/config.json",
+                "Qwen3-Embedding-0.6B/model.safetensors",
+                "Qwen3-Embedding-0.6B/tokenizer.json",
+                "vae/config.json",
+                "vae/diffusion_pytorch_model.safetensors",
+            ], []
+        if (path / "config.json").is_file() and (
+            path / "modeling_acestep_v15_base.py"
+        ).is_file():
+            return [
+                "config.json",
+                "model.safetensors",
+                "configuration_acestep_v15.py",
+                "modeling_acestep_v15_base.py",
+                "silence_latent.pt",
+            ], []
         return [
             "model_index.json",
             "transformer/config.json",

@@ -48,28 +48,28 @@ test("Settings and About expose manual update checks with explicit feedback", as
 
   await openRoute(page, "About");
   await expect(page.getByRole("button", { name: "Check for updates" })).toBeVisible();
-  await expect(page.getByText("Version 0.3.2", { exact: true })).toBeVisible();
+  await expect(page.getByText("Version 0.4.0", { exact: true })).toBeVisible();
 });
 
-test("text-to-music stays bounded and never fabricates browser audio", async ({ page }) => {
+test("Music Studio previews the complete workflow without fabricating browser audio", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Music", exact: true }).click();
 
   await expect(page.getByRole("heading", { name: "New music generation" })).toBeVisible();
-  await expect(page.getByRole("textbox", { name: "Music direction" })).toBeVisible();
-  await expect(page.getByRole("textbox", { name: "Lyrics or text to sing" })).toBeVisible();
-  await page.getByRole("button", { name: "Music generation information" }).click();
-  await expect(page.getByText("Local text-to-music")).toBeVisible();
-  await expect(page.getByText(/Direction and lyrics stay separate/i)).toBeVisible();
-  await expect(page.getByText(/source audio, and batch music are outside this release/i)).toBeVisible();
-  await expect(page.getByText("Stereo / 48 kHz")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Preview music flow" })).toBeEnabled();
+  await expect(page.getByRole("textbox", { name: "Direction" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Verse 1 lyrics" })).toBeVisible();
+  await page.getByRole("button", { name: "Music studio information" }).click();
+  await expect(page.getByText("Local music studio")).toBeVisible();
+  await expect(page.getByText(/Song, instrumental, extend, and region edit/i)).toBeVisible();
+  await expect(page.getByText(/references, variations, timing, and stems/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Preview 2 variations" })).toBeEnabled();
 
-  await page.getByRole("button", { name: "Preview music flow" }).click();
-  await expect(page.getByText("Browser preview has no rendered audio")).toBeVisible();
+  await page.getByRole("button", { name: "Preview 2 variations" }).click();
+  await expect(page.locator(".music-result-card")).toHaveCount(2);
+  await expect(page.getByRole("button", { name: /^Play / }).first()).toBeDisabled();
   await expect(page.locator("audio[src]")).toHaveCount(0);
 
-  const bounds = await page.locator(".generate-layout").evaluate((layout) => ({
+  const bounds = await page.locator(".music-studio-layout").evaluate((layout) => ({
     clientWidth: layout.clientWidth,
     scrollWidth: layout.scrollWidth,
     left: layout.getBoundingClientRect().left,
@@ -335,7 +335,7 @@ test("every route keeps controls inside its layout in both themes", async ({ pag
       expect(overflow, `${theme} ${route} overflow`).toEqual([]);
 
       if (route === "About") {
-        await expect(page.getByText("Version 0.3.2", { exact: true })).toBeVisible();
+        await expect(page.getByText("Version 0.4.0", { exact: true })).toBeVisible();
         const runtimeDetails = page.getByRole("region", { name: "This machine" });
         await expect(runtimeDetails.getByText(/NVIDIA GeForce|No compatible GPU/)).toBeVisible();
       }

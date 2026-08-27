@@ -27,12 +27,14 @@ export function GenerateView({
   onVoicesChange,
   onGenerated,
   preferredVoiceId,
+  onOpenModels,
 }: {
   bootstrap: BootstrapState;
   voices: VoiceProfile[];
   onVoicesChange: (voices: VoiceProfile[]) => void;
   onGenerated: (item: HistoryItem) => void;
   preferredVoiceId?: string;
+  onOpenModels?: () => void;
 }) {
   const ttsModels = useMemo(() => qualifiedModels(bootstrap, "tts"), [bootstrap]);
   const [generationKind, setGenerationKind] = useState<"speech" | "music">("speech");
@@ -582,11 +584,11 @@ export function GenerateView({
   const activeGenerationCount = jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length;
   const generationCapacityReached = activeGenerationCount >= scheduler.max_workers;
   const musicInformationControl = <details className="music-info-disclosure music-header-info">
-    <summary role="button" title="Music generation information" aria-label="Music generation information"><Info aria-hidden="true" size={14} /></summary>
+    <summary role="button" title="Music studio information" aria-label="Music studio information"><Info aria-hidden="true" size={14} /></summary>
     <div className="music-info-card" role="note">
-      <strong>Local text-to-music</strong>
-      <span>Direction + optional lyrics</span>
-      <p>Direction and lyrics stay separate. The active model and duration determine the lyric limit; voice references, melody uploads, source audio, and batch music are outside this release.</p>
+      <strong>Local music studio</strong>
+      <span>Song, instrumental, extend, and region edit</span>
+      <p>Direction, structured lyrics, references, variations, timing, and stems stay attached to one local workflow.</p>
     </div>
   </details>;
   const generationToolbar = generationKind === "music" ? <>{musicInformationControl}{generationTypeControl}</> : generationTypeControl;
@@ -636,19 +638,7 @@ export function GenerateView({
     return (
       <div className="page generate-page">
         <PageHeader title="New music generation" actions={generationToolbar} />
-        <div className="music-generation-layout">
-        <MusicGeneratePanel bootstrap={bootstrap} onGenerated={(item) => { onGenerated(item); setRecentOutputs((items) => [item, ...items.filter((existing) => existing.id !== item.id)].slice(0, 6)); }} />
-        <div className="generation-activity-slot"><Panel className="runtime-rail generation-activity-drawer" ariaLabel="Generation activity">
-          <div className="rail-heading">
-            <div><span className="section-label">Activity</span><strong>Local generation queue</strong></div>
-            <span className="rail-heading-actions"><StatusText tone={activeTaskCount ? "warning" : "muted"}>{activeTaskCount ? `${activeTaskCount} active` : "Ready"}</StatusText></span>
-          </div>
-          <div className="activity-stage-tabs">{activityStageControl}</div>
-          {renderActivityRows()}
-          <audio ref={recentAudioRef} className="visually-hidden" onEnded={() => setRecentPlayingId(undefined)} onPause={() => setRecentPlayingId(undefined)} />
-          <div className="output-block"><strong>Local-only processing</strong><span>Music and speech outputs remain on this computer.</span></div>
-        </Panel></div>
-        </div>
+        <MusicGeneratePanel bootstrap={bootstrap} onOpenModels={onOpenModels} onGenerated={(item) => { onGenerated(item); setRecentOutputs((items) => [item, ...items.filter((existing) => existing.id !== item.id)].slice(0, 6)); }} />
       </div>
     );
   }

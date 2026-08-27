@@ -12,6 +12,7 @@ const bridge = vi.hoisted(() => ({
   createBatchRun: vi.fn(),
   generateMusic: vi.fn(),
   getAudioRecordingStatus: vi.fn(),
+  getHistoryRequest: vi.fn(),
   getSchedulerStatus: vi.fn(),
   importVoiceProfile: vi.fn(),
   importBatchInput: vi.fn(),
@@ -22,6 +23,7 @@ const bridge = vi.hoisted(() => ({
   pauseBatchRun: vi.fn(),
   pickAudioFile: vi.fn(),
   pickBatchInputFile: vi.fn(),
+  pickMusicAudioFile: vi.fn(),
   queueBatchRun: vi.fn(),
   queueMusicGeneration: vi.fn(),
   queueSynthesis: vi.fn(),
@@ -32,6 +34,7 @@ const bridge = vi.hoisted(() => ({
   stopAudioRecording: vi.fn(),
   synthesizeSpeech: vi.fn(),
   updateBatchItem: vi.fn(),
+  updateHistoryMetadata: vi.fn(),
 }));
 
 vi.mock("../lib/bridge", () => bridge);
@@ -97,34 +100,35 @@ describe("Generation batch import", () => {
     bridge.listHistory.mockResolvedValue([]);
     bridge.listBatchRuns.mockResolvedValue([]);
     bridge.getSchedulerStatus.mockResolvedValue(bootstrap.scheduler);
-    bridge.queueMusicGeneration.mockResolvedValue({
-      id: "music-job-1", kind: "music-generation", status: "preparing", progress: 0.05,
+    bridge.queueMusicGeneration.mockImplementation(async (request) => ({
+      id: `music-job-${request.variation_index + 1}`, kind: "music-generation", status: "preparing", progress: 0.05,
       attempt: 1, priority: "normal", title: "Warm indie-pop", model_id: "ACE-Step/acestep-v15-xl-turbo-diffusers",
       created_at: "2026-08-13T00:00:00Z", updated_at: "2026-08-13T00:00:00Z",
-    });
+    }));
 
     render(<GenerateView bootstrap={bootstrap} voices={bootstrap.voices} onVoicesChange={vi.fn()} onGenerated={vi.fn()} />);
     await user.click(screen.getByRole("button", { name: "Music" }));
-    const information = screen.getByLabelText("Music generation information");
+    const information = screen.getByLabelText("Music studio information");
     expect(information.closest(".page-actions")).not.toBeNull();
     expect(document.querySelector(".music-info-row")).toBeNull();
-    expect(screen.getByRole("textbox", { name: "Music direction" })).toBeVisible();
-    const lyrics = screen.getByRole("textbox", { name: "Lyrics or text to sing" });
-    expect(lyrics).toBeVisible();
-    fireEvent.change(lyrics, { target: { value: "[Verse]\nHold the light until morning comes" } });
-    await user.click(screen.getByRole("button", { name: "Queue music" }));
+    expect(screen.getByRole("textbox", { name: "Direction" })).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Verse 1 lyrics" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Generate 2 variations" }));
 
-    await waitFor(() => expect(bridge.queueMusicGeneration).toHaveBeenCalledTimes(1));
-    expect(bridge.queueMusicGeneration).toHaveBeenCalledWith(expect.objectContaining({
-      model_id: "ACE-Step/acestep-v15-xl-turbo-diffusers",
+    await waitFor(() => expect(bridge.queueMusicGeneration).toHaveBeenCalledTimes(2));
+    expect(bridge.queueMusicGeneration).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      model_id: "ACE-Step/Ace-Step1.5",
       prompt: expect.stringContaining("Warm, intimate indie-pop"),
-      lyrics: "[Verse]\nHold the light until morning comes",
+      lyrics: expect.stringContaining("[Verse 1]"),
       vocal_language: "en",
-      duration_seconds: 20,
+      duration_seconds: 90,
       inference_steps: 8,
       shift: 3,
       bpm: 0,
       output_format: "wav",
+      planner_enabled: true,
+      variations: 2,
+      variation_index: 0,
     }));
     expect(bridge.queueMusicGeneration.mock.calls[0][0]).not.toHaveProperty("reference_audio_path");
     expect(bridge.queueMusicGeneration.mock.calls[0][0]).not.toHaveProperty("speaker");
@@ -144,8 +148,61 @@ describe("Generation batch import", () => {
     await user.click(screen.getByRole("combobox", { name: "Music model" }));
     await user.click(screen.getByRole("option", { name: "facebook/musicgen-small" }));
 
-    expect(screen.getByText(/instrumental-only\. Choose ACE-Step or clear the lyric field/i)).toBeVisible();
-    expect(screen.getByRole("button", { name: "Queue music" })).toBeDisabled();
+    expect(screen.getByText(/instrumental-only\. Choose ACE-Step or switch to Instrumental/i)).toBeVisible();
+    expect(screen.getByRole("button", { name: "Generate 2 variations" })).toBeDisabled();
+  });
+
+  it("shows model cost, fit, license, speed, and capabilities before setup", async () => {
+    const user = userEvent.setup();
+    bridge.listJobs.mockResolvedValue([]);
+    bridge.listHistory.mockResolvedValue([]);
+    bridge.listBatchRuns.mockResolvedValue([]);
+    bridge.getSchedulerStatus.mockResolvedValue(fallbackBootstrap.scheduler);
+
+    render(<GenerateView bootstrap={fallbackBootstrap} voices={fallbackBootstrap.voices} onVoicesChange={vi.fn()} onGenerated={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Music" }));
+    await user.click(screen.getByRole("button", { name: "Studio setup" }));
+
+    expect(screen.getByRole("dialog", { name: "Music studio setup" })).toBeVisible();
+    expect(screen.getByText("~9 GB download")).toBeVisible();
+    expect(screen.getByText("Near real time after warm-up")).toBeVisible();
+    expect(screen.getByText("Songs · lyrics · references · extend · repaint")).toBeVisible();
+    expect(screen.getAllByText(/MIT · public/i).length).toBeGreaterThan(0);
+  });
+
+  it("requires and forwards provenance for reference-guided source editing", async () => {
+    const user = userEvent.setup();
+    const bootstrap = { ...fallbackBootstrap, runtime: "tauri" as const };
+    bridge.listJobs.mockResolvedValue([]);
+    bridge.listHistory.mockResolvedValue([]);
+    bridge.listBatchRuns.mockResolvedValue([]);
+    bridge.getSchedulerStatus.mockResolvedValue(bootstrap.scheduler);
+    bridge.pickMusicAudioFile.mockResolvedValueOnce("/audio/source.wav").mockResolvedValueOnce("/audio/reference.wav");
+    bridge.queueMusicGeneration.mockImplementation(async (request) => ({
+      id: `music-edit-${request.variation_index + 1}`, kind: "music-generation", status: "preparing", progress: 0.05,
+      attempt: 1, priority: "normal", title: "Reference edit", model_id: "ACE-Step/Ace-Step1.5",
+      created_at: "2026-08-27T00:00:00Z", updated_at: "2026-08-27T00:00:00Z",
+    }));
+
+    render(<GenerateView bootstrap={bootstrap} voices={bootstrap.voices} onVoicesChange={vi.fn()} onGenerated={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "Music" }));
+    await user.click(screen.getByRole("button", { name: "Extend" }));
+    await user.click(screen.getByRole("button", { name: /Choose source audio/i }));
+    await user.click(screen.getByRole("button", { name: /Add style reference/i }));
+
+    expect(screen.getByRole("button", { name: "Generate 2 variations" })).toBeDisabled();
+    await user.click(screen.getByRole("checkbox", { name: /I own or have permission/i }));
+    await user.type(screen.getByRole("textbox", { name: "Reference audio permission basis" }), "My original studio recording");
+    await user.click(screen.getByRole("button", { name: "Generate 2 variations" }));
+
+    await waitFor(() => expect(bridge.queueMusicGeneration).toHaveBeenCalledTimes(2));
+    expect(bridge.queueMusicGeneration).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      mode: "extend",
+      source_audio_path: "/audio/source.wav",
+      reference_audio_path: "/audio/reference.wav",
+      reference_consent_confirmed: true,
+      reference_consent_basis: "My original studio recording",
+    }));
   });
 
   it("previews imported rows and preserves structured overrides when queued", async () => {

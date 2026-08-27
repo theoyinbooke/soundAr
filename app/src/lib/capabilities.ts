@@ -2,7 +2,7 @@ import type { BootstrapState, EngineCapability, InstalledModel, RouteIntent, Voi
 
 export function capabilityForModel(
   bootstrap: BootstrapState,
-  model: InstalledModel | undefined,
+  model: Pick<InstalledModel, "engine"> | undefined,
 ): EngineCapability | undefined {
   return bootstrap.engine_capabilities.find((capability) => capability.id === model?.engine);
 }

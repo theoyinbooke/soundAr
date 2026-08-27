@@ -202,6 +202,7 @@ export interface JobRecord {
   kind: string;
   status: "queued" | "preparing" | "running" | "completed" | "failed" | "cancelled";
   progress: number;
+  stage?: "queued" | "preparing" | "planning" | "rendering" | "decoding" | "finalizing" | "completed";
   attempt: number;
   error?: string | null;
   title?: string;
@@ -221,6 +222,15 @@ export interface EngineControl {
 export interface MusicFeatureCapability {
   lyrics: boolean;
   instrumental_when_lyrics_empty: boolean;
+  planner?: boolean;
+  reference_audio?: boolean;
+  cover?: boolean;
+  repaint?: boolean;
+  extend?: boolean;
+  lyric_timing?: boolean;
+  stems?: boolean;
+  max_variations?: number;
+  max_duration_seconds?: number;
   max_lyrics_characters?: number;
   max_lyrics_characters_per_second?: number;
   sample_rate: number;
@@ -729,7 +739,14 @@ export interface SynthesisRequest {
 export interface MusicGenerationRequest {
   model_id: string;
   prompt: string;
+  mode?: MusicStudioMode;
+  quality_profile?: "balanced" | "highest";
+  planner_enabled?: boolean;
+  variations?: 1 | 2 | 4;
+  variation_index?: number;
   lyrics?: string;
+  song_sections?: MusicSongSection[];
+  lyric_timing?: MusicLyricTiming[];
   vocal_language?: string;
   duration_seconds: number;
   guidance_scale?: number;
@@ -739,10 +756,40 @@ export interface MusicGenerationRequest {
   inference_steps?: number;
   shift?: number;
   bpm?: number;
+  key_scale?: string;
+  time_signature?: string;
+  reference_audio_path?: string;
+  source_audio_path?: string;
+  reference_consent_confirmed?: boolean;
+  reference_consent_basis?: string;
+  repainting_start?: number;
+  repainting_end?: number;
+  audio_cover_strength?: number;
+  stem_type?: "vocals" | "drums" | "bass" | "guitar" | "piano" | "other";
+  return_lyric_timing?: boolean;
+  return_stems?: boolean;
+  parent_history_id?: string;
   seed: number;
   output_format: "wav" | "flac";
   title?: string;
   priority?: QueuePriority;
+}
+
+export type MusicStudioMode = "song" | "instrumental" | "extend" | "edit-region" | "cover" | "extract";
+
+export interface MusicSongSection {
+  id: string;
+  type: "intro" | "verse" | "pre-chorus" | "chorus" | "bridge" | "instrumental" | "outro";
+  label: string;
+  lyrics: string;
+  duration_seconds?: number;
+}
+
+export interface MusicLyricTiming {
+  id: string;
+  text: string;
+  start_seconds: number;
+  end_seconds: number;
 }
 
 export type GenerationRequest = SynthesisRequest | MusicGenerationRequest;

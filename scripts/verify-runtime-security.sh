@@ -31,6 +31,7 @@ done < <(
   find requirements-engines -maxdepth 1 -type f \
     ! -name breeze.txt \
     ! -name fish-speech.txt \
+    ! -name acestep.txt \
     -print | sort
 )
 
@@ -53,6 +54,20 @@ for requirement_file in "${qualified_legacy_engines[@]}"; do
     exit 1
   fi
 done
+
+# ACE-Step 1.5 is an isolated, source-pinned runtime whose official inference
+# stack currently requires Transformers 4.57.6. Keep the exception exact and
+# verify that both upstream source and local model loading remain constrained.
+[[ "$(grep -Ec '^transformers==4\.57\.6$' requirements-engines/acestep.txt)" == "1" ]] \
+  || { printf 'Qualified ACE-Step Transformers pin changed.\n' >&2; exit 1; }
+[[ "$(grep -Ec '^transformers' requirements-engines/acestep.txt)" == "1" ]] \
+  || { printf 'Unexpected Transformers pin in the ACE-Step runtime.\n' >&2; exit 1; }
+contains_fixed 'ACESTEP_SOURCE_REVISION="14c0211d5a0653b0f63e27686f4c3f151b4d8629"' setup-engine-runtime.sh \
+  || { printf 'The qualified ACE-Step source revision changed.\n' >&2; exit 1; }
+contains_fixed 'ACESTEP_SOURCE_SHA256="cdf69c060ed3a6bfddebbf21dd0c548ea7ddfdf0f3cebc20d2a572085970586e"' setup-engine-runtime.sh \
+  || { printf 'The qualified ACE-Step source archive checksum changed.\n' >&2; exit 1; }
+contains_fixed 'local_files_only=True' engines/music/acestep.py \
+  || { printf 'ACE-Step must continue loading only verified local model assets.\n' >&2; exit 1; }
 contains_fixed 'if [[ "$ENGINE" == "breeze" || "$ENGINE" == "fish-speech" ]]; then' setup-engine-runtime.sh \
   || { printf 'Qualified compatibility runtimes must remain standalone.\n' >&2; exit 1; }
 contains_fixed 'BREEZE_SOURCE_REVISION="ca632ce6c4d05f7985da4eab29b1a5d445b43f7b"' setup-engine-runtime.sh \

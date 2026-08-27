@@ -2933,8 +2933,8 @@ fn prepare_music_generation_request(mut request: Value) -> Result<Value, String>
     }
     if let Some(lyrics) = request.get("lyrics") {
         let lyrics = lyrics.as_str().ok_or("Lyrics must be plain text")?.trim();
-        if lyrics.chars().count() > 1_200 {
-            return Err("Lyrics are limited to 1,200 characters".to_string());
+        if lyrics.chars().count() > 4_096 {
+            return Err("Lyrics are limited to 4,096 characters".to_string());
         }
     }
     if let Some(language) = request.get("vocal_language") {
@@ -2950,15 +2950,143 @@ fn prepare_music_generation_request(mut request: Value) -> Result<Value, String>
         .filter(|value| !value.is_empty())
         .ok_or("A music model is required")?;
     validate_model_argument(model_id)?;
-    for field in [
-        "reference_audio_path",
-        "source_audio_path",
-        "src_audio",
-        "reference_audio",
-        "audio_codes",
-    ] {
-        if request.get(field).is_some_and(|value| !value.is_null()) {
-            return Err("Text-to-music accepts direction and lyrics only; audio conditioning is not enabled".to_string());
+    let mode = request
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("song");
+    if !matches!(
+        mode,
+        "song" | "instrumental" | "extend" | "edit-region" | "cover" | "extract"
+    ) {
+        return Err("The music workflow is not supported".to_string());
+    }
+    let source_path = request
+        .get("source_audio_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let reference_path = request
+        .get("reference_audio_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let is_acestep = model_id.starts_with("ACE-Step/");
+    if !is_acestep && !matches!(mode, "song" | "instrumental") {
+        return Err("Advanced music workflows require an ACE-Step model".to_string());
+    }
+    if !is_acestep && (source_path.is_some() || reference_path.is_some()) {
+        return Err("MusicGen does not accept audio conditioning".to_string());
+    }
+    if matches!(mode, "extend" | "edit-region" | "cover" | "extract") && source_path.is_none() {
+        return Err(format!("The {mode} workflow requires a source audio file"));
+    }
+    if source_path.is_some() && !matches!(mode, "extend" | "edit-region" | "cover" | "extract") {
+        return Err(
+            "Source audio is only accepted by an extend, edit-region, cover, or extract workflow"
+                .to_string(),
+        );
+    }
+    for path in [source_path, reference_path].into_iter().flatten() {
+        let candidate = Path::new(path);
+        let extension = candidate
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase);
+        if !candidate.is_absolute()
+            || !candidate.is_file()
+            || !extension
+                .as_deref()
+                .is_some_and(|value| matches!(value, "wav" | "flac" | "mp3" | "m4a" | "ogg"))
+        {
+            return Err("Music reference and source audio must be an existing WAV, FLAC, MP3, M4A, or OGG file".to_string());
+        }
+    }
+    if reference_path.is_some() {
+        if request
+            .get("reference_consent_confirmed")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return Err(
+                "Confirm that you own or have permission to use the reference audio".to_string(),
+            );
+        }
+        let basis = request
+            .get("reference_consent_basis")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if basis.is_empty() || basis.chars().count() > 240 {
+            return Err("Provide a short permission basis for the reference audio".to_string());
+        }
+    }
+    let variations = request
+        .get("variations")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    if !matches!(variations, 1 | 2 | 4) {
+        return Err("Music variations must be 1, 2, or 4".to_string());
+    }
+    if let Some(sections) = request.get("song_sections") {
+        let sections = sections.as_array().ok_or("Song sections must be a list")?;
+        if sections.len() > 24 {
+            return Err("A song can contain at most 24 sections".to_string());
+        }
+        for section in sections {
+            let section = section
+                .as_object()
+                .ok_or("Song section entries must be objects")?;
+            let section_type = section.get("type").and_then(Value::as_str).unwrap_or("");
+            if !matches!(
+                section_type,
+                "intro" | "verse" | "pre-chorus" | "chorus" | "bridge" | "instrumental" | "outro"
+            ) {
+                return Err("A song section has an invalid type".to_string());
+            }
+            if section
+                .get("lyrics")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .count()
+                > 1_200
+            {
+                return Err("A song section is limited to 1,200 lyric characters".to_string());
+            }
+        }
+    }
+    if let Some(timing) = request.get("lyric_timing") {
+        let timing = timing.as_array().ok_or("Lyric timing must be a list")?;
+        if timing.len() > 400 {
+            return Err("Lyric timing is limited to 400 lines".to_string());
+        }
+        let mut previous_start = -1.0_f64;
+        for line in timing {
+            let start = line
+                .get("start_seconds")
+                .and_then(Value::as_f64)
+                .ok_or("Lyric timing start must be a number")?;
+            let end = line
+                .get("end_seconds")
+                .and_then(Value::as_f64)
+                .ok_or("Lyric timing end must be a number")?;
+            if start < previous_start || end <= start {
+                return Err("Lyric timing must be ordered with positive durations".to_string());
+            }
+            previous_start = start;
+        }
+    }
+    if mode == "edit-region" {
+        let start = request
+            .get("repainting_start")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let end = request
+            .get("repainting_end")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        if start < 0.0 || end <= start {
+            return Err("The edit region must have an ordered positive duration".to_string());
         }
     }
     if let Some(format) = request.get("output_format").and_then(Value::as_str) {
@@ -7362,7 +7490,7 @@ for line in sys.stdin:
             "reference_audio_path": "/private/reference.wav",
         }))
         .expect_err("reference audio must be rejected");
-        assert!(reference_error.contains("audio conditioning is not enabled"));
+        assert!(reference_error.contains("does not accept audio conditioning"));
 
         let lyric_request = super::prepare_music_generation_request(json!({
             "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",

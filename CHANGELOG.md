@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-27
+
+- Added the pinned official ACE-Step 1.5 Studio runtime with the 2B Turbo song model, local 1.7B planner, verified source archive, isolated dependencies, and automatic CPU offload for 12 GB GPUs.
+- Rebuilt Music generation around Song, Instrumental, Extend, and Edit region workflows with structured Intro, Verse, Pre-chorus, Chorus, Bridge, Instrumental, and Outro sections.
+- Added section regeneration, reference and source audio conditioning, cover and repaint controls, explicit reference-audio consent provenance, and editable synchronized lyric timing.
+- Added one, two, or four concurrent variations with persistent inline playback, measured waveforms, seeds, model and timing metadata, and direct Extend, Remix, Edit, Keep, and output actions.
+- Added multi-track stem extraction for vocals, drums, bass, and other layers through ACE-Step Base Tools, with grouped playable stem results in Generate.
+- Replaced generic progress with Prepare, Plan, Render, Decode, and Finish stages, local-slot capacity, ETA, GPU-memory feedback, cancellation, retry, and completed results that remain available without opening History.
+- Added a pre-install Music Studio setup experience that discloses download size, hardware fit, expected speed, license, access, installed state, and capabilities for every available music model.
+- Added Rust, Python, React, provenance, responsive, visual, and isolated-runtime qualification coverage for the complete music workflow.
+
 ## 0.3.2 - 2026-08-26
 
 - Added Breeze TTS 2 and Fish Speech 1.5 as pinned, isolated local synthesis engines with real RTX 4080 qualification evidence.

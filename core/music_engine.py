@@ -77,10 +77,11 @@ class MusicEngine:
         self,
         prompt: str,
         duration_seconds: float,
-        controls: dict[str, float | int] | None = None,
+        controls: dict[str, object] | None = None,
         *,
         lyrics: str | None = None,
         vocal_language: str | None = None,
+        advanced: dict[str, object] | None = None,
     ) -> MusicGenerationResult:
         if self._engine_impl is None:
             raise RuntimeError("No music model is loaded. Call load_model() first.")
@@ -102,6 +103,7 @@ class MusicEngine:
                 values,
                 lyrics=lyrics,
                 vocal_language=vocal_language,
+                advanced=advanced,
             )
         elapsed = time.monotonic() - started
         normalized = np.asarray(audio, dtype=np.float32)

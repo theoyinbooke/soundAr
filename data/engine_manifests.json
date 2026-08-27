@@ -226,29 +226,41 @@
     },
     {
       "id": "acestep",
-      "display_name": "ACE-Step 1.5 XL Turbo",
-      "adapter_version": 1,
+      "display_name": "ACE-Step 1.5 Studio",
+      "adapter_version": 2,
       "tasks": ["music"],
-      "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "ru"],
+      "languages": ["en", "zh", "ja", "ko", "es", "fr", "de", "it", "pt", "ru", "ar", "hi"],
       "voice_modes": [],
       "streaming": false,
-      "reference_formats": [],
+      "reference_formats": ["wav", "flac", "mp3", "m4a", "ogg"],
       "output_formats": ["wav", "flac"],
       "controls": {
-        "duration_seconds": { "type": "number", "minimum": 10.0, "maximum": 30.0, "default": 20.0 },
-        "inference_steps": { "type": "number", "minimum": 4, "maximum": 8, "default": 8 },
-        "shift": { "type": "number", "minimum": 1.0, "maximum": 3.0, "default": 3.0 },
-        "bpm": { "type": "number", "minimum": 0, "maximum": 240, "default": 0 }
+        "duration_seconds": { "type": "number", "minimum": 10.0, "maximum": 600.0, "default": 90.0 },
+        "inference_steps": { "type": "number", "minimum": 1, "maximum": 200, "default": 8 },
+        "shift": { "type": "number", "minimum": 1.0, "maximum": 5.0, "default": 3.0 },
+        "bpm": { "type": "number", "minimum": 0, "maximum": 300, "default": 0 },
+        "audio_cover_strength": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5 },
+        "repainting_start": { "type": "number", "minimum": 0.0, "maximum": 600.0, "default": 0.0 },
+        "repainting_end": { "type": "number", "minimum": -1.0, "maximum": 600.0, "default": -1.0 }
       },
       "music_features": {
         "lyrics": true,
         "instrumental_when_lyrics_empty": true,
-        "max_lyrics_characters": 1200,
-        "max_lyrics_characters_per_second": 30,
+        "planner": true,
+        "reference_audio": true,
+        "cover": true,
+        "repaint": true,
+        "extend": true,
+        "lyric_timing": true,
+        "stems": true,
+        "max_variations": 8,
+        "max_duration_seconds": 600,
+        "max_lyrics_characters": 4096,
+        "max_lyrics_characters_per_second": 36,
         "sample_rate": 48000,
         "channels": 2
       },
-      "minimum_vram_mb": 10240,
+      "minimum_vram_mb": 4096,
       "license": "MIT"
     }
   ]

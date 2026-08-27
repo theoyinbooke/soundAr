@@ -92,17 +92,28 @@ class EngineContractRegistry:
             raise ValueError("The music prompt is empty.")
         if len(prompt) > 1_000:
             raise ValueError("A music prompt is limited to 1,000 characters.")
-        for field in (
-            "reference_audio_path",
-            "source_audio_path",
-            "src_audio",
-            "reference_audio",
-            "audio_codes",
-        ):
-            if request.get(field):
-                raise ValueError(
-                    f"{manifest['display_name']} does not accept audio conditioning for text-to-music."
-                )
+        mode = str(request.get("mode") or "song")
+        allowed_modes = {"song", "instrumental"}
+        if engine == "acestep":
+            allowed_modes.update({"extend", "edit-region", "cover", "extract"})
+        if mode not in allowed_modes:
+            raise ValueError(f"{manifest['display_name']} does not support the '{mode}' music workflow.")
+
+        reference_audio = str(request.get("reference_audio_path") or "").strip()
+        source_audio = str(request.get("source_audio_path") or "").strip()
+        if engine != "acestep" and (reference_audio or source_audio):
+            raise ValueError(
+                f"{manifest['display_name']} does not accept audio conditioning for text-to-music."
+            )
+        if mode in {"extend", "edit-region", "cover", "extract"} and not source_audio:
+            raise ValueError(f"The {mode} workflow requires a source audio file.")
+        if source_audio and mode not in {"extend", "edit-region", "cover", "extract"}:
+            raise ValueError("Source audio is only accepted by an extend, edit-region, cover, or extract workflow.")
+        if reference_audio and request.get("reference_consent_confirmed") is not True:
+            raise ValueError("Confirm that you own or have permission to use the reference audio.")
+        consent_basis = str(request.get("reference_consent_basis") or "").strip()
+        if reference_audio and not consent_basis:
+            raise ValueError("Record the permission basis for the reference audio.")
 
         raw_lyrics = request.get("lyrics", "")
         if raw_lyrics is not None and not isinstance(raw_lyrics, str):
@@ -161,6 +172,42 @@ class EngineContractRegistry:
                         f"Lyrics are too long for a {rendered_duration:g}-second render. "
                         f"Use at most {lyric_budget} characters or increase the duration."
                     )
+
+        raw_variations = request.get("variations", 1) or 1
+        try:
+            variations = int(raw_variations)
+        except (TypeError, ValueError) as error:
+            raise ValueError("variations must be 1, 2, or 4.") from error
+        if isinstance(raw_variations, bool) or (isinstance(raw_variations, float) and not raw_variations.is_integer()):
+            raise ValueError("variations must be 1, 2, or 4.")
+        maximum_variations = int(music_features.get("max_variations", 1) or 1)
+        if variations not in {1, 2, 4} or variations > maximum_variations:
+            raise ValueError(f"{manifest['display_name']} supports 1, 2, or 4 variations for this workflow.")
+
+        sections = request.get("song_sections", [])
+        if sections is not None:
+            if not isinstance(sections, list) or len(sections) > 24:
+                raise ValueError("A song can contain at most 24 structured sections.")
+            allowed_sections = {"intro", "verse", "pre-chorus", "chorus", "bridge", "instrumental", "outro"}
+            for section in sections:
+                if not isinstance(section, dict) or str(section.get("type")) not in allowed_sections:
+                    raise ValueError("A song section has an invalid type.")
+                if len(str(section.get("lyrics") or "")) > 1_200:
+                    raise ValueError("A single song section is limited to 1,200 lyric characters.")
+
+        timing = request.get("lyric_timing", [])
+        if timing is not None:
+            if not isinstance(timing, list) or len(timing) > 400:
+                raise ValueError("Lyric timing is limited to 400 lines.")
+            previous_start = -1.0
+            for line in timing:
+                if not isinstance(line, dict):
+                    raise ValueError("Lyric timing entries must be objects.")
+                start = float(line.get("start_seconds", 0))
+                end = float(line.get("end_seconds", 0))
+                if start < previous_start or end <= start:
+                    raise ValueError("Lyric timing must be ordered and each line must have a positive duration.")
+                previous_start = start
 
         raw_seed = request.get("seed", 0)
         try:

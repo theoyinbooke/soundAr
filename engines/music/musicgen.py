@@ -94,16 +94,19 @@ class MusicGenEngine(BaseMusicEngine):
         self,
         prompt: str,
         duration_seconds: float,
-        controls: dict[str, float | int] | None = None,
+        controls: dict[str, object] | None = None,
         *,
         lyrics: str | None = None,
         vocal_language: str | None = None,
+        advanced: dict[str, object] | None = None,
     ) -> tuple[np.ndarray, int]:
         if self._processor is None or self._model is None or torch is None:
             raise RuntimeError("MusicGen is not loaded.")
         if lyrics and lyrics.strip():
             raise RuntimeError("MusicGen does not support lyric conditioning. Choose ACE-Step for sung text.")
         del vocal_language
+        if advanced and str(advanced.get("mode") or "song") not in {"song", "instrumental"}:
+            raise RuntimeError("MusicGen supports new instrumental drafts only.")
         values = controls or {}
         device = self.get_device()
         inputs = self._processor(text=[prompt], padding=True, return_tensors="pt")

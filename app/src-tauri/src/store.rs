@@ -1942,11 +1942,29 @@ impl Store {
             .query_map([], |row| {
                 let request_json: String = row.get(8)?;
                 let request = serde_json::from_str::<Value>(&request_json).unwrap_or_else(|_| json!({}));
+                let status = row.get::<_, String>(2)?;
+                let progress = row.get::<_, f64>(3)?;
+                let stage = if status == "queued" {
+                    "queued"
+                } else if status == "completed" {
+                    "completed"
+                } else if progress < 0.12 {
+                    "preparing"
+                } else if progress < 0.30 {
+                    "planning"
+                } else if progress < 0.78 {
+                    "rendering"
+                } else if progress < 0.94 {
+                    "decoding"
+                } else {
+                    "finalizing"
+                };
                 Ok(json!({
                     "id": row.get::<_, String>(0)?,
                     "kind": row.get::<_, String>(1)?,
-                    "status": row.get::<_, String>(2)?,
-                    "progress": row.get::<_, f64>(3)?,
+                    "status": status,
+                    "progress": progress,
+                    "stage": stage,
                     "attempt": row.get::<_, i64>(4)?,
                     "error": row.get::<_, Option<String>>(5)?,
                     "created_at": row.get::<_, String>(6)?,

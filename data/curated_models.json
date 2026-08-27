@@ -548,16 +548,75 @@
       ]
     },
     {
+      "model_id": "ACE-Step/Ace-Step1.5",
+      "task": "music",
+      "engine": "acestep",
+      "install_status": "ready",
+      "revision": "19671f406d603126926c1b7e2adc169acbcade22",
+      "license": "MIT (ACE-Step); Apache-2.0 (Qwen3 text encoder)",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": ["en", "zh", "ja", "ko", "es", "fr", "de", "it", "pt", "ru", "ar", "hi"],
+      "summary": "ACE-Step 1.5 Studio: the 2B Turbo song model, 1.7B local planner, 48 kHz stereo VAE, and text encoder in one pinned local pack.",
+      "known_limitations": [
+        "The complete studio pack is a large download. On a 12 GB GPU soundAr uses CPU offload so planning and decoding remain reliable.",
+        "Reference, cover, and repaint workflows require audio you own or have permission to use; soundAr records that confirmation with the request.",
+        "Stem extraction and multi-track completion use the separate ACE-Step Base Tools checkpoint.",
+        "Generated lyrics and timing should be reviewed before release; model output is not a transcript guarantee."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 48000,
+      "runtime_notes": [
+        "Uses the official ACE-Step 1.5 source pinned to commit 14c0211d5a0653b0f63e27686f4c3f151b4d8629.",
+        "The 1.7B 5 Hz language model plans metadata, structure, lyrics, and semantic audio codes before the DiT render.",
+        "Supports 10-second to 10-minute generation, up to eight variations, reference audio, cover, repaint, and lyric timing.",
+        "Model weights are downloaded only after explicit user approval and remain local."
+      ],
+      "source_urls": [
+        "https://huggingface.co/ACE-Step/Ace-Step1.5",
+        "https://github.com/ace-step/ACE-Step-1.5/tree/14c0211d5a0653b0f63e27686f4c3f151b4d8629"
+      ]
+    },
+    {
+      "model_id": "ACE-Step/acestep-v15-base",
+      "task": "music",
+      "engine": "acestep",
+      "install_status": "ready",
+      "revision": "e432212fec32b8965a14ffa57ae653438d6abd14",
+      "license": "MIT",
+      "tier": "advanced",
+      "recommended_for_12gb": false,
+      "languages": ["en", "zh", "ja", "ko", "es", "fr", "de", "it", "pt", "ru", "ar", "hi"],
+      "summary": "ACE-Step Base Tools for vocal/instrument extraction, layer generation, accompaniment completion, and deeper edits.",
+      "known_limitations": [
+        "This checkpoint is an editing companion, not the default song generator.",
+        "It requires the ACE-Step Studio pack for the shared VAE, text encoder, and local planner.",
+        "Base-model operations use more diffusion steps and are substantially slower than Turbo on a 12 GB GPU."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 48000,
+      "runtime_notes": [
+        "Selected automatically for stem separation and multi-track tools when installed.",
+        "Uses CPU offload on 12 GB GPUs and preserves the original mix as a separate artifact."
+      ],
+      "source_urls": [
+        "https://huggingface.co/ACE-Step/acestep-v15-base",
+        "https://github.com/ace-step/ACE-Step-1.5/tree/14c0211d5a0653b0f63e27686f4c3f151b4d8629"
+      ]
+    },
+    {
       "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
       "task": "music",
       "engine": "acestep",
       "install_status": "ready",
       "revision": "200ba991ae448051e14b0183157e35c2d27c9fb0",
       "license": "MIT (ACE-Step); Apache-2.0 (Qwen3 text encoder)",
-      "tier": "recommended",
-      "recommended_for_12gb": true,
+      "tier": "advanced",
+      "recommended_for_12gb": false,
       "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "ru"],
-      "summary": "ACE-Step 1.5 XL Turbo lyric-conditioned music at 48 kHz stereo, using separate direction and lyric inputs.",
+      "summary": "ACE-Step 1.5 XL Turbo quality tier for slower 48 kHz stereo renders with CPU offload.",
       "known_limitations": [
         "The local checkpoint is approximately 11.1 GB; soundAr uses model CPU offload on 12 GB NVIDIA GPUs, which increases render time.",
         "Lyrics are a generation condition, not a transcript guarantee; review the audible words before use.",

@@ -108,7 +108,7 @@ export async function queueSynthesis(request: SynthesisRequest): Promise<JobReco
 export async function generateMusic(request: MusicGenerationRequest): Promise<HistoryItem> {
   if (import.meta.env.DEV && !hasTauriRuntime()) {
     await new Promise((resolve) => window.setTimeout(resolve, 1200));
-    const aceStep = request.model_id === "ACE-Step/acestep-v15-xl-turbo-diffusers";
+    const aceStep = request.model_id.startsWith("ACE-Step/");
     const result: HistoryItem = {
       id: crypto.randomUUID(),
       model_id: request.model_id,
@@ -267,6 +267,16 @@ export async function queueBatchRun(name: string, rows: string[] | BatchInputRow
 export async function pickBatchInputFile(): Promise<string | undefined> {
   if (import.meta.env.DEV && !hasTauriRuntime()) return undefined;
   const selected = await open({ multiple: false, directory: false, filters: [{ name: "Batch", extensions: ["txt", "csv", "jsonl"] }] });
+  return typeof selected === "string" ? selected : undefined;
+}
+
+export async function pickMusicAudioFile(): Promise<string | undefined> {
+  if (import.meta.env.DEV && !hasTauriRuntime()) return "/home/theoyinbooke/Music/reference.wav";
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "Audio", extensions: ["wav", "flac", "mp3", "m4a", "ogg"] }],
+  });
   return typeof selected === "string" ? selected : undefined;
 }
 

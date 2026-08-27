@@ -40,6 +40,12 @@ The final implementation was evaluated at 1860 × 1168 CSS pixels with device sc
 - Selected application icon on About: `/home/theoyinbooke/.codex/visualizations/2026/08/27/01a040b9-67bf-7df3-a14d-17e873fc9db4/soundar-ui-audit/32-selected-app-icon-about.png`
 - Rebuilt About layout with the sidebar deliberately open at a constrained desktop width: `/home/theoyinbooke/.codex/visualizations/2026/08/27/01a040b9-67bf-7df3-a14d-17e873fc9db4/soundar-ui-audit/33-about-rebuilt-sidebar-open.png`
 - Compact music workspace with full-width composer and paired Runtime/Activity panels: `/home/theoyinbooke/.codex/visualizations/2026/08/27/01a040b9-67bf-7df3-a14d-17e873fc9db4/soundar-ui-audit/34-music-compact-responsive.png`
+- ACE-Step Music Studio at the 1860 × 1168 reference viewport: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/music-studio-1860x1168.png`
+- Same-input Codex reference / Music Studio comparison at matched 1860 × 1168 source dimensions: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/codex-reference-vs-music-studio.png`
+- Compact Music Studio at 1024 × 768: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/music-studio-1024x768.png`
+- Narrow Music Studio at 760 × 700 with the mobile dock and no horizontal overflow: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/music-studio-760x700-viewport.png`
+- Model setup dialog at 1024 × 768: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/music-setup-1024x768.png`
+- Persistent inline music variations at 760 × 700: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/music-results-760x700.png`
 
 Each comparison places the reference and implementation in the same image before judgment. Responsive checks also covered 1024 × 768 and 760 × 900.
 
@@ -59,6 +65,7 @@ Each comparison places the reference and implementation in the same image before
 - Rebuilt the compact window strip, grouped sidebar, account footer/popover, page headers, master/detail patterns, settings shell, modal system, empty/loading/error states, tables, and responsive navigation.
 - Removed the immature product logo from the application chrome and removed sparkle icons from generation actions.
 - Replaced decorative waveform UI with a restrained linear transport, progress head, and input-level meter.
+- Added a restrained, data-derived result waveform only where it improves music auditioning; it carries playhead progress and seek behavior instead of acting as decoration.
 - Standardized route composition across Generate, Music, Projects, Voices, Models, Compare, Benchmarks, History, Settings, and About; removed the visible Transcribe and Live routes to focus the application on text-to-audio workflows.
 - Aligned Generate and Music headings to the exact left and right edges of their working canvases, removed their supporting descriptions, and kept Voice and Music together on the title row.
 - Made generation activity permanently visible in a compact right rail with Queued, In progress, and Completed stages, concurrent-capacity feedback, artifact playback, and per-job action menus.
@@ -73,13 +80,16 @@ Each comparison places the reference and implementation in the same image before
 - Removed duplicated route icons and route names from the desktop title strip; it now contains only sidebar/history controls, native menus, runtime status, and window controls.
 - Replaced every generated desktop/mobile/package icon variation with the selected neutral text-to-audio mark, preserving alpha corners and using the same master for the preview favicon, startup state, and About identity.
 - Preserved soundAr terminology, local-runtime status, queue behavior, audio controls, model/voice data, and Tauri native window actions.
+- Rebuilt Music into a complete local studio with structured song sections, source/reference provenance, editable lyric timing, concurrent variations, section editing, stems, stage-aware progress, and persistent inline results.
+- Added model-selection disclosure for download size, hardware fit, expected speed, license, access, installed state, and capabilities before a user commits to setup.
+- Fixed a browser-preview polling race found during visual QA so inline variation results remain visible and playable after runtime refreshes.
 
 ## Final rubric
 
 - Typography: pass — Inter-based hierarchy, restrained weights, compact labels, and readable supporting copy align with the source density.
 - Spacing and layout: pass — compact chrome, 248 px navigation rail, centered workspace columns, bordered row groups, and modal/popover geometry are internally consistent and visibly source-aligned.
 - Colors and borders: pass — fully light default, neutral white/gray surfaces, low-contrast dividers, dark primary actions, accessible focus rings, and subtle shadows. Sidebar selections, record selections, and cards use no accent-colored edge or fill.
-- Icons and assets: pass — Lucide line icons are consistently sized; no custom logo, sparkle icon, emoji, CSS illustration, or decorative waveform remains in the visible experience.
+- Icons and assets: pass — Lucide line icons are consistently sized; no custom logo, sparkle icon, emoji, or CSS illustration remains. The music result waveform is a functional, data-derived seek surface.
 - Responsive behavior: pass — no horizontal overflow at desktop, compact, or mobile breakpoints; the desktop sidebar remains user-controlled, while the dedicated phone breakpoint changes navigation into a mobile dock so primary tasks remain usable.
 - Interaction and accessibility: pass — route navigation, account menu, settings navigation, modal open/close and focus, labeled inputs/buttons, toggles, selected states, and disabled actions were exercised. The final route has one H1, no overflow, no sparkle text, and no unnamed buttons.
 - Product fidelity: pass — Codex structure and restraint are adopted while soundAr-specific audio, model, runtime, project, queue, and benchmark semantics remain intact.

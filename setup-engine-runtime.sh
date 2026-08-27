@@ -70,7 +70,48 @@ progress "Installing pinned $ENGINE dependencies..."
 case "$ENGINE" in
   kokoro) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps kokoro==0.9.4 ;;
   transformers|speaker-verification|alignment|speecht5|musicgen) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps transformers==5.5.0 accelerate==1.14.0 ;;
-  acestep) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps diffusers==0.38.0 transformers==5.5.0 accelerate==1.14.0 safetensors==0.8.0 ;;
+  acestep)
+    "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps diffusers==0.38.0 transformers==4.57.6 accelerate==1.14.0 safetensors==0.8.0
+    command -v curl >/dev/null || fail "curl is required to install the pinned ACE-Step Studio source."
+    ACESTEP_SOURCE_REVISION="14c0211d5a0653b0f63e27686f4c3f151b4d8629"
+    ACESTEP_SOURCE_SHA256="cdf69c060ed3a6bfddebbf21dd0c548ea7ddfdf0f3cebc20d2a572085970586e"
+    ACESTEP_ARCHIVE="$STAGING/acestep-source.zip"
+    progress "Installing verified ACE-Step 1.5 Studio source..."
+    curl --fail --location --silent --show-error \
+      "https://github.com/ace-step/ACE-Step-1.5/archive/${ACESTEP_SOURCE_REVISION}.zip" \
+      --output "$ACESTEP_ARCHIVE"
+    printf '%s  %s\n' "$ACESTEP_SOURCE_SHA256" "$ACESTEP_ARCHIVE" | sha256sum --check --status \
+      || fail "The ACE-Step source failed verification."
+    "$PYTHON" - "$ACESTEP_ARCHIVE" "$STAGING/acestep-source" "$OVERLAY_SITE" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+from zipfile import ZipFile
+
+archive, destination, site_packages = map(Path, sys.argv[1:])
+destination.mkdir(parents=True, exist_ok=True)
+with ZipFile(archive) as bundle:
+    members = bundle.infolist()
+    roots = {Path(member.filename).parts[0] for member in members if Path(member.filename).parts}
+    if len(roots) != 1:
+        raise RuntimeError("Unexpected ACE-Step source archive layout")
+    root = next(iter(roots))
+    for member in members:
+        relative = Path(member.filename)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError("Unsafe ACE-Step source archive path")
+    bundle.extractall(destination)
+source_root = destination / root
+if not (source_root / "acestep/handler.py").is_file() or not (source_root / "acestep/inference.py").is_file():
+    raise RuntimeError("ACE-Step Studio source is incomplete")
+target = site_packages / "acestep"
+if target.exists():
+    shutil.rmtree(target)
+shutil.copytree(source_root / "acestep", target)
+shutil.rmtree(destination)
+archive.unlink()
+PY
+    ;;
   breeze)
     command -v curl >/dev/null || fail "curl is required to install the pinned Breeze inference source."
     BREEZE_SOURCE_REVISION="ca632ce6c4d05f7985da4eab29b1a5d445b43f7b"
@@ -167,7 +208,7 @@ case "$ENGINE" in
   alignment) "$PYTHON" -c 'from transformers import AutoModelForCTC, AutoProcessor; import soundfile, torch' ;;
   speecht5) SOUNDAR_SPEECHT5_MODEL_PATH="${SOUNDAR_SPEECHT5_MODEL_PATH:-$HOME/.soundAr/models/microsoft__speecht5_tts}" "$PYTHON" -c 'import os; from transformers import SpeechT5ForTextToSpeech, SpeechT5Processor; import soundfile, torch; SpeechT5Processor.from_pretrained(os.environ["SOUNDAR_SPEECHT5_MODEL_PATH"], local_files_only=True)' ;;
   musicgen) "$PYTHON" -c 'from transformers import AutoProcessor, MusicgenForConditionalGeneration; import soundfile, torch' ;;
-  acestep) "$PYTHON" -c 'from diffusers import AceStepPipeline; import soundfile, torch' ;;
+  acestep) "$PYTHON" -c 'from acestep.handler import AceStepHandler; from acestep.inference import GenerationConfig, GenerationParams, generate_music; from acestep.llm_inference import LLMHandler; from diffusers import AceStepPipeline; import soundfile, torch' ;;
   breeze) "$PYTHON" -c 'from breeze_infer.runtime import load_runtime; from models.fast_streaming import FastBreezeStreamingRuntime; from qwen_tts import Qwen3TTSTokenizer; import soundfile, torch; assert torch.__version__.startswith("2.9.1")' ;;
   fish-speech) "$PYTHON" -c 'from fish_speech.inference_engine import TTSInferenceEngine; from fish_speech.models.text2semantic.inference import load_model; import soundfile, torch; assert torch.__version__.startswith("2.4.1")' ;;
   chatterbox) "$PYTHON" -c 'import chatterbox, soundfile, torch' ;;

@@ -176,7 +176,7 @@ class EngineContractTests(unittest.TestCase):
                 "prompt": "short cue", "duration_seconds": 8, "output_format": "wav",
                 "reference_audio_path": "/tmp/reference.wav",
             })
-        with self.assertRaisesRegex(ValueError, "does not accept audio conditioning"):
+        with self.assertRaisesRegex(ValueError, "only accepted by an extend"):
             self.registry.validate_music_generation("acestep", {
                 "prompt": "short cue", "duration_seconds": 10, "output_format": "wav",
                 "source_audio_path": "/tmp/source.wav",
@@ -212,13 +212,39 @@ class EngineContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "does not support lyric language"):
             self.registry.validate_music_generation("acestep", {
-                "prompt": "bright pop", "lyrics": "[Verse] text", "vocal_language": "ar",
+                "prompt": "bright pop", "lyrics": "[Verse] text", "vocal_language": "xx-invalid",
                 "duration_seconds": 10, "output_format": "wav",
             })
-        with self.assertRaisesRegex(ValueError, "too long for a 10-second render"):
+        with self.assertRaisesRegex(ValueError, "limited to 4096 characters"):
             self.registry.validate_music_generation("acestep", {
-                "prompt": "bright pop", "lyrics": "a" * 301, "vocal_language": "en",
+                "prompt": "bright pop", "lyrics": "a" * 4097, "vocal_language": "en",
                 "duration_seconds": 10, "output_format": "wav",
+            })
+
+    def test_acestep_validates_advanced_music_workflows_and_provenance(self) -> None:
+        self.registry.validate_music_generation("acestep", {
+            "prompt": "Continue the arrangement into a restrained outro",
+            "mode": "extend",
+            "source_audio_path": "/tmp/source.wav",
+            "duration_seconds": 45,
+            "variations": 4,
+            "output_format": "wav",
+        })
+        with self.assertRaisesRegex(ValueError, "requires a source audio"):
+            self.registry.validate_music_generation("acestep", {
+                "prompt": "Replace the bridge", "mode": "edit-region",
+                "duration_seconds": 30, "output_format": "wav",
+            })
+        with self.assertRaisesRegex(ValueError, "own or have permission"):
+            self.registry.validate_music_generation("acestep", {
+                "prompt": "Use this production texture", "reference_audio_path": "/tmp/reference.wav",
+                "duration_seconds": 30, "output_format": "wav",
+            })
+        with self.assertRaisesRegex(ValueError, "permission basis"):
+            self.registry.validate_music_generation("acestep", {
+                "prompt": "Use this production texture", "reference_audio_path": "/tmp/reference.wav",
+                "reference_consent_confirmed": True,
+                "duration_seconds": 30, "output_format": "wav",
             })
 
     def test_non_music_engine_is_rejected_for_music_generation(self) -> None:

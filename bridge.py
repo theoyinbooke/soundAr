@@ -783,6 +783,27 @@ class Runtime:
             if lyrics
             else None
         )
+        advanced_fields = (
+            "mode",
+            "quality_profile",
+            "planner_enabled",
+            "reference_audio_path",
+            "source_audio_path",
+            "repainting_start",
+            "repainting_end",
+            "audio_cover_strength",
+            "key_scale",
+            "time_signature",
+            "stem_type",
+            "return_lyric_timing",
+            "return_stems",
+            "parent_history_id",
+        )
+        advanced = {
+            name: request[name]
+            for name in advanced_fields
+            if name in request and request[name] is not None
+        }
 
         self.engine.unload_model()
         self.stt_engine.unload_model()
@@ -797,6 +818,7 @@ class Runtime:
             controls=controls,
             lyrics=lyrics or None,
             vocal_language=vocal_language,
+            advanced=advanced,
         )
         metrics = collector.stop(model_id, engine_name, "music", result.duration_seconds)
         return self._write_generated_audio(
