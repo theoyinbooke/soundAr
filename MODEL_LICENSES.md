@@ -50,6 +50,8 @@ rules that apply to their use.
 | Breeze TTS 2 | `c1c8ca18b70b30822735633991d9ebf4898e47d4` | BreezeBlue Research and Non-Commercial License 1.0 | No |
 | Fish Speech 1.5 | `275a984d33c33659e39eed41ff5bcd6e67517f4c` | CC BY-NC-SA 4.0 | No |
 | MusicGen Small | `47e682ccac550edc80b042ca977074aee86306e7` | CC BY-NC 4.0 | No |
+| ACE-Step 1.5 Studio | `19671f406d603126926c1b7e2adc169acbcade22` | MIT for ACE-Step weights; Apache 2.0 for bundled Qwen3 text encoder | No |
+| ACE-Step Base Tools | `e432212fec32b8965a14ffa57ae653438d6abd14` | MIT | No |
 | ACE-Step 1.5 XL Turbo | `200ba991ae448051e14b0183157e35c2d27c9fb0` | MIT for ACE-Step weights; Apache 2.0 for bundled Qwen3 text encoder | No |
 | WavLM Base Plus SV | `feb593a6c23c1cc3d9510425c29b0a14d2b07b1e` | CC BY-SA 3.0 per the upstream license link | No |
 | Wav2Vec2 Base 960h | `22aad52d435eb6dbaf354bdad9b0da84ce7d6156` | Apache 2.0 | No |

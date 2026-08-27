@@ -2167,6 +2167,22 @@ input[type="checkbox"]:checked::before { transform: translateX(12px); }
   .page.generate-page > .page-header,
   .page.generate-page > .generate-layout,
   .music-studio-layout { width: calc(100% - 28px); margin-inline: 14px; }
+  .generate-layout,
+  .music-studio-layout { grid-template-columns: minmax(0, 1fr); }
   .generate-page .runtime-rail,
   .generate-page .runtime-rail.generation-activity-drawer { min-height: 320px; }
+}
+
+@media (max-width: 540px) {
+  .generation-options .route-control > .segmented {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+    overflow: visible;
+  }
+  .generation-options .route-control > .segmented button {
+    min-width: 0;
+    padding-inline: 5px;
+    white-space: normal;
+  }
 }

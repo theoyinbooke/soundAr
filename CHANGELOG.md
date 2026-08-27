@@ -8,6 +8,7 @@
 - Kept ACE-Step Studio verified after its pinned runtime synchronizes two model-side Python files by accepting only the exact qualified source hashes.
 - Qualified the recommended ACE-Step 1.5 Studio checkpoint through consecutive cold and warm native-bridge music generations on a 12 GB RTX 4080.
 - Restored native resizing for the frameless Linux window and made speech and music workspaces fluid at full-screen widths while reflowing cleanly in compact desktop windows.
+- Refreshed the GitHub presentation with the selected soundAr icon, current Music Studio workflows, local-first architecture, installation guidance, and synchronized model and release documentation.
 
 ## 0.4.0 - 2026-08-27
 

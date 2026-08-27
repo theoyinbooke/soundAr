@@ -1,41 +1,40 @@
 <p align="center">
-  <img src="app/public/brand/soundar-app-icon.svg" alt="soundAr" width="112" />
+  <img src="app/public/soundar-app-icon.png" alt="soundAr app icon" width="120" />
 </p>
 
-# soundAr
+<h1 align="center">soundAr</h1>
 
-soundAr is an open-source, local-first desktop studio for generating, cloning,
-comparing, and benchmarking voices, plus bounded short music drafts, with local models.
+<p align="center">
+  A local-first Linux studio for turning text into speech and music.
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-f0a928.svg)](LICENSE)
-[![CI](https://github.com/theoyinbooke/soundAr/actions/workflows/ci.yml/badge.svg)](https://github.com/theoyinbooke/soundAr/actions/workflows/ci.yml)
+<p align="center">
+  <a href="https://github.com/theoyinbooke/soundAr/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/theoyinbooke/soundAr?display_name=tag&style=flat-square&color=18181b" /></a>
+  <a href="https://github.com/theoyinbooke/soundAr/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/theoyinbooke/soundAr/ci.yml?branch=main&style=flat-square&label=CI" /></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/source-MIT-18181b?style=flat-square" /></a>
+  <img alt="Linux" src="https://img.shields.io/badge/platform-Linux-18181b?style=flat-square" />
+</p>
 
-> Model availability does not imply a universal open-source or commercial-use
-> license. Review each provider's current terms before downloading or distributing
-> model artifacts. See [Model and Data Licenses](MODEL_LICENSES.md).
+soundAr is an open-source desktop application for high-quality, private audio generation. It keeps inference, projects, model files, and generated audio on your machine. There is no cloud inference, API-key dependency, telemetry requirement, or online fallback.
 
-## Desktop App
+![soundAr Music Studio](design-qa/music-studio-1860x1168.png)
 
-The current desktop experience lives in `app/` and uses React 19, Vite 7, and Tauri 2. Tauri keeps the native shell small while a bounded pool of isolated Python workers reuses engine adapters and keeps recently used models warm between generations.
+## What you can do
 
-```bash
-cd app
-npm install
-npm run tauri dev
-```
+- Generate speech from plain text, SSML, or batch inputs with local voice models.
+- Build longer work in chapter-based Projects and render chapters independently.
+- Create songs or instrumentals with ACE-Step 1.5 Studio, including structured sections and editable lyric timing.
+- Extend audio, edit a selected region, use permitted style or source references, and generate multiple variations.
+- Play, compare, keep, retry, export, or separate completed results without leaving Generate.
+- Manage installed models and isolated runtimes without bundling model weights into the app.
+- Review generation history, compare voices, and run reproducible local benchmarks.
+- Queue independent jobs through a durable, GPU-aware scheduler or the optional loopback API.
 
-For frontend-only development with simulated synthesis results:
+The interface is designed for Linux as a compact, resizable, light-first desktop workspace. Tauri 2 provides the native shell; React 19 renders the application UI; isolated Python workers keep supported models warm between jobs.
 
-```bash
-cd app
-npm run dev
-```
+## Install on Linux
 
-Open `http://localhost:1421`.
-
-## Linux Installation
-
-Install the latest Debian release and its managed CUDA runtime:
+Download and run the installer from the latest signed GitHub release:
 
 ```bash
 curl -fsSLO https://github.com/theoyinbooke/soundAr/releases/latest/download/install-linux.sh
@@ -43,155 +42,116 @@ chmod +x install-linux.sh
 ./install-linux.sh
 ```
 
-To install a locally built package, pass its path:
+The installer adds the Debian package and prepares soundAr's managed Python runtime. Administrative authentication is requested by the system package installer when required. Runtime and model data remain outside the application package, so upgrades preserve installed models, projects, and generated audio.
+
+To install a package built locally:
 
 ```bash
 ./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.4.1_amd64.deb
 ```
 
-When the Debian package or AppImage is installed directly, soundAr detects a missing Python
-environment and offers the same managed runtime setup inside the application. Setup is user-space,
-retryable, and keeps model weights across application upgrades.
+### Storage and updates
 
-Starting with version 0.2.2, the app checks signed GitHub Releases shortly after launch and every
-six hours. AppImage installations can update and restart in place; Debian installations receive an
-in-app release notice and continue through the system package installer.
+- Managed Python runtimes: `${XDG_DATA_HOME:-$HOME/.local/share}/soundar/runtime`
+- Model weights, the SQLite library, and exports: `~/.soundAr`
+- AppImage builds can update and restart in place after signature verification.
+- Debian builds show an update notice and continue through the system package installer.
 
-The desktop package contains the versioned engine code. Python 3.11 and model libraries live in
-`${XDG_DATA_HOME:-$HOME/.local/share}/soundar/runtime`, while downloaded model weights and exports
-remain under `~/.soundAr`. Upgrading the desktop does not redownload models.
+Installing, opening, or updating soundAr never downloads model weights. A model download starts only after you review its upstream source, pinned revision, license, access conditions, storage requirement, and hardware fit in Models.
 
-### Model Downloads
+## Speech studio
 
-soundAr installers and application updates do not contain model weights. After runtime setup, the
-user chooses a model in the Models screen and approves its separate download from the documented
-upstream provider. Before downloading, soundAr must show the source, pinned revision, license and
-access conditions, expected disk use, and hardware requirements. Installing, launching, or updating
-soundAr must never start a model-weight download in the background.
+Generate speech with model-aware controls for voice, language, pacing, sampling, cloning support, and output format. The current curated catalog includes Kokoro-82M, Chatterbox and Chatterbox Turbo, SpeechT5, Breeze TTS 2, and Fish Speech 1.5. Availability and allowed use differ by model.
 
-The Models screen records the resolved upstream commit and file-size manifest for each new
-installation. Health checks revalidate those files before an engine can use them. A damaged install
-stays visible as **Repair needed**, can be repaired from its pinned revision, or can be removed
-without deleting projects and generated audio. Older installs receive a structural compatibility
-check until they are repaired or reinstalled with a pinned manifest.
+Independent generations, project chapters, and batch rows use one durable scheduler. Jobs move through queued, in-progress, and completed states; supported actions include pause, resume, cancel, retry, dismiss, playback, and export. The default concurrency ceiling is four workers and can be changed from 1 to 8 with `SOUNDAR_MAX_PARALLEL_JOBS`; GPU admission is additionally bounded by declared VRAM requirements and current free memory.
 
-The managed runtime is separate from model content: runtime setup may download Python, PyTorch, and
-engine libraries after the user starts setup. Already-downloaded models remain local and are not
-removed or replaced by an application update.
+## Music Studio
 
-Before a SQLite schema upgrade, soundAr creates and verifies a consistent backup beside
-`soundar.sqlite3`, including committed WAL data. Startup also runs an integrity check before and
-after migration. If that check fails, soundAr leaves the database untouched and reports the exact
-database and backup directory instead of silently resetting local work.
+ACE-Step 1.5 Studio is the recommended music route. Its pinned local pack combines the 2B Turbo song model, 1.7B planner, 48 kHz stereo VAE, and text encoder. On a qualified 12 GB NVIDIA GPU, soundAr uses CPU offload to keep planning and decoding within the hardware envelope.
 
-Generated audio is registered with its byte length and SHA-256 checksum. History reports missing or
-size-modified files immediately, and playback verifies the checksum before returning audio so a file
-changed outside soundAr is never presented as the original generation.
+Music workflows include:
 
-## Architecture
+- **Song** — direction, structured Intro/Verse/Pre-chorus/Chorus/Bridge/Instrumental/Outro sections, lyrics, and editable LRC timing.
+- **Instrumental** — direction-only generation without presenting text as lyrics.
+- **Extend** — continue a generated or user-provided source after explicit source-rights confirmation.
+- **Edit region** — repaint a selected time range while preserving the rest of the source.
+- **Variations** — render one, two, or four alternatives concurrently and retain their seed, timing, model, and playback metadata.
+- **Stems** — separate vocals, drums, bass, and other layers when the optional ACE-Step Base Tools checkpoint is installed.
 
-- `app/src/`: compact React workspace with a neutral light-first desktop design system and an optional dark appearance
-- `app/src-tauri/`: SQLite state, GPU-aware parallel scheduler, native audio, local API, and desktop integration
-- `bridge.py`: persistent JSON-lines inference worker with an engine-scoped warm model cache
-- `core/`: model registry, audio utilities, benchmarking, and unified TTS/STT/music APIs
-- `engines/`: model-specific open-source inference adapters
-- `data/curated_models.json`: curated local model catalog
+The runtime reports Prepare, Plan, Render, Decode, and Finish stages, plus local slot use, ETA, GPU-memory feedback, cancellation, and completed playable results. The recommended Studio pack supports work from short drafts through longer compositions; actual speed depends on duration, workflow, model tier, and GPU.
 
-The application performs inference locally after model download. There is no cloud inference, API-key dependency, telemetry requirement, or online fallback.
+MusicGen Small remains available for short instrumental drafts. Its weights are CC BY-NC 4.0 and it does not condition on lyrics. soundAr rejects unsupported lyric requests instead of presenting the result as sung text.
 
-### Text-to-Music Beta
+## Model and privacy policy
 
-Music generation uses two deliberately separate text conditions: **Music direction**
-describes the intended genre, instruments, arrangement, mood, tempo, and vocal character;
-optional **Lyrics or text to sing** supplies the words and section markers such as
-`[Verse]` and `[Chorus]`. They are persisted independently in the durable request and
-History record, so a retry never turns a lyric into a style prompt or vice versa.
+The MIT License covers soundAr's original source and bundled brand assets, not third-party models, datasets, or generated content. A catalog entry means the model has a qualified local integration; it does not mean the model is open source or cleared for every use.
 
-ACE-Step 1.5 XL Turbo is the local lyric-conditioned route. It uses an isolated runtime,
-a user-approved pinned checkpoint, and the official local Diffusers pipeline to render
-short 48 kHz stereo WAV or FLAC music. Lyrics are a generation condition—not a transcript
-guarantee—so every render needs a listening review. ACE-Step requires CUDA in this release;
-the 12 GB target uses model CPU offload and must pass the packaged GPU acceptance gate before
-release.
+- Model weights are never committed to this repository or bundled in a Debian/AppImage release.
+- Downloads are explicit, revision-pinned, and recorded with a file manifest.
+- Health checks validate installed files before an engine can use them.
+- Generated artifacts are registered with byte length and SHA-256 checksum.
+- Database upgrades create and verify a backup before migration.
+- Voice or audio references require the rights and consent applicable to your use.
 
-MusicGen Small remains available for short 32 kHz instrumental drafts. It cannot condition
-on lyrics, and soundAr rejects a lyric request sent to it instead of pretending the text was
-sung. Its weights are CC BY-NC 4.0, so it must not be presented as commercial-use ready.
-Source-audio cover/remix/repaint, melody conditioning, voice/reference uploads, and batch
-music are deliberately out of scope until each has its own consent, safety, and hardware
-qualification.
+Read [Model and Data Licenses](MODEL_LICENSES.md) before downloading or distributing model artifacts.
 
-### Parallel Jobs and Batch API
+## Development
 
-Independent generations and batch rows run through the same durable scheduler. The default ceiling is four concurrent workers and can be changed from 1 to 8 with `SOUNDAR_MAX_PARALLEL_JOBS`; actual GPU admission is additionally bounded by each engine's declared VRAM envelope and current free memory. Low, normal, high, and urgent priority are durable across restarts. Waiting work ages upward one effective level every 30 seconds so repeated urgent submissions cannot permanently starve older jobs. Every batch row has its own job, status, error, history artifact, and cancellation target.
+Prerequisites are a current Node.js toolchain, Rust, Python 3.11, and the Linux libraries required by Tauri and native audio. Start the complete desktop application with:
 
-Batch execution uses a guarded rolling queue: only one coordinator can own a batch, and each worker takes the next row as soon as it is free. `GET /v1/runtime/scheduler` (or `./soundar_cli.py scheduler`) reports active workers, the configured ceiling, reserved VRAM, and active batches.
+```bash
+cd app
+npm install
+npm run tauri dev
+```
 
-After explicitly starting the loopback API in Settings, submit and monitor a batch with:
+For frontend development with simulated generation results:
+
+```bash
+cd app
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:1421`.
+
+### Repository map
+
+| Path | Purpose |
+| --- | --- |
+| `app/src/` | React workspace, design system, routes, and interaction state |
+| `app/src-tauri/` | Native window, SQLite state, scheduler, updater, audio, and local API |
+| `bridge.py` | Persistent JSON-lines inference worker with an engine-scoped warm cache |
+| `core/` | Engine contracts, model registry, audio utilities, and benchmarks |
+| `engines/` | Model-specific local speech and music adapters |
+| `data/curated_models.json` | Versioned model catalog and qualification metadata |
+| `docs/openapi.yaml` | Optional loopback API contract |
+
+## Batch and local API
+
+The Batch workspace and CLI accept TXT, CSV, and JSONL. Structured files can define a row name, deterministic output name, priority, model, voice, and supported generation settings. See [Batch input formats](docs/batch-formats.md).
+
+After explicitly enabling the loopback API in Settings, use the token shown by soundAr:
 
 ```bash
 export SOUNDAR_API_TOKEN='<token shown by soundAr>'
 ./soundar_cli.py batch scripts.txt --parallelism 2 --priority high
+./soundar_cli.py scheduler
 ```
 
-The Batch workspace and CLI accept TXT (one item per non-empty line), CSV, and JSONL. Structured
-files can set a row name, deterministic output name, and supported model settings without changing
-the batch defaults. See [Batch input formats](docs/batch-formats.md) for examples and validation
-rules.
-
-Batch pause is graceful: active rows finish while queued rows remain restart-safe. Resume queued
-work or explicitly retry failed rows without regenerating successful artifacts:
-
-```bash
-./soundar_cli.py pause-batch <batch-id>
-./soundar_cli.py resume-batch <batch-id> --parallelism 2
-./soundar_cli.py resume-batch <batch-id> --retry-failed
-```
-
-Failed or cancelled standalone generations are retryable with their original settings, while
-finished queue rows can be dismissed without deleting history or audio:
-
-```bash
-./soundar_cli.py retry <job-id>
-./soundar_cli.py clear-finished
-```
-
-For non-blocking integrations, queue an idempotent speech job and optionally wait for its verified
-artifact. Reusing a key with the same request returns the original job; using it for different
-content is rejected:
+Queue, inspect, and retry durable jobs without blocking the client:
 
 ```bash
 ./soundar_cli.py queue "A durable local generation" --output output.wav
-./soundar_cli.py queue "A durable local generation" --idempotency-key my-request --no-wait
 ./soundar_cli.py job <job-id>
+./soundar_cli.py retry <job-id>
 ```
 
-Local clients can follow durable progress without polling through
-`GET /v1/jobs/<job-id>/events`, a resumable server-sent event stream. Generated audio remains an
-atomic completed artifact; chunked audio streaming is not advertised by engines that have not
-passed latency and soak qualification.
-
-Inference workers write to a managed `.partial` file. The native store validates the audio,
-atomically publishes it, records its size and SHA-256 checksum, and only then completes the job.
-On restart, interrupted publications are rolled back and shown as retryable failures rather than
-appearing as valid history.
-
-The versioned API contract is in [`docs/openapi.yaml`](docs/openapi.yaml). Model weights are not bundled with the app or release artifacts.
-
-On NVIDIA systems, the runtime uses CUDA 12.4 PyTorch wheels, keeps the selected model warm,
-enables TF32 on supported GPUs, and uses the expandable CUDA allocator to reduce fragmentation.
-
-## Legacy PyQt App
-
-The original PyQt interface remains available while the Tauri desktop app matures:
-
-```bash
-bash install.sh
-source .venv/bin/activate
-python3 main.py
-```
+The versioned API is documented in [`docs/openapi.yaml`](docs/openapi.yaml). Local clients can follow progress through resumable server-sent events at `GET /v1/jobs/<job-id>/events`.
 
 ## Verification
+
+Run the source and desktop checks with:
 
 ```bash
 ./scripts/check-release-version.sh
@@ -208,40 +168,24 @@ cd src-tauri
 cargo test --locked
 ```
 
-On a prepared NVIDIA machine with the qualified models installed, run the
-release-candidate model-switch and OOM-recovery soak with:
+GPU qualification uses the packaged runtime and user-installed pinned models. The ACE-Step acceptance script verifies consecutive cold and warm native-bridge renders, playable 48 kHz stereo output, durable history metadata, unload, and scheduler quiescence:
 
 ```bash
-SOUNDAR_SOAK_DURATION_SECONDS=1800 ./scripts/run-packaged-gpu-soak.sh
+./scripts/run-packaged-acestep-acceptance.sh
 ```
 
-The command writes machine-readable evidence under `evidence/`, which is ignored
-because it contains machine-specific paths and runtime identifiers. A shortened
-duration verifies the harness only; release evidence requires the full 30 minutes.
-
-The owned evidence layers and manual release gates are defined in
-[`docs/test-matrix.md`](docs/test-matrix.md) and
-[`docs/release-checklist.md`](docs/release-checklist.md).
+Release evidence ownership and manual gates are documented in the [test matrix](docs/test-matrix.md) and [release checklist](docs/release-checklist.md).
 
 ## Releases
 
-Linux releases are created from version tags. Keep the version in `app/package.json`,
-`app/src-tauri/Cargo.toml`, and `app/src-tauri/tauri.conf.json` aligned, then push a matching tag:
+Version tags build signed Debian and AppImage artifacts in GitHub Actions. The release workflow runs source, UI, native, package, and clean-download checks; generates checksums and build provenance; and publishes only after those gates pass.
 
-```bash
-git tag -a v0.4.1 -m "soundAr v0.4.1"
-git push origin v0.4.1
-```
+- [Latest release](https://github.com/theoyinbooke/soundAr/releases/latest)
+- [Changelog](CHANGELOG.md)
+- [Roadmap](ROADMAP.md)
 
-GitHub Actions tests the source, builds signed Debian and AppImage artifacts into a draft release,
-verifies their contents, generates checksums and build provenance, and only then publishes the
-release. See `CHANGELOG.md` for release details.
+## Contributing and security
 
-## Open Source
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report vulnerabilities through the private process in [SECURITY.md](SECURITY.md), not a public issue.
 
 soundAr source code and bundled brand assets are available under the [MIT License](LICENSE).
-Contributions are welcome; read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
-Please report vulnerabilities through the private process in [SECURITY.md](SECURITY.md).
-
-The prioritized product plan, architecture milestones, acceptance tests, and release gates are in
-[ROADMAP.md](ROADMAP.md).
