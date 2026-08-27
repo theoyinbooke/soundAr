@@ -34,4 +34,19 @@ describe("AssistantPane", () => {
     await userEvent.click(screen.getByRole("menuitemradio", { name: /Full access/i }));
     expect(screen.getByRole("button", { name: /Full access/i })).toBeInTheDocument();
   });
+
+  it("keeps context controls left and reasoning beside the send action", async () => {
+    render(<AssistantPane open onClose={vi.fn()} />);
+    const model = await screen.findByRole("button", { name: /GPT-5.6-Sol/i });
+    const access = screen.getByRole("button", { name: /Studio access/i });
+    const effort = screen.getByRole("button", { name: /Low/i });
+    const send = screen.getByRole("button", { name: "Send message" });
+
+    expect(model.compareDocumentPosition(access) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(access.compareDocumentPosition(effort) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(effort.compareDocumentPosition(send) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await userEvent.click(effort);
+    expect(screen.getByRole("menu", { name: "Reasoning effort" })).toHaveClass("picker-effort");
+  });
 });

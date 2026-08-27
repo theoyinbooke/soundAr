@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.5.2 - 2026-08-27
+
+- Reorganized the assistant composer so model and Studio access stay together while reasoning sits beside the Send action.
+- Replaced full-width assistant sheets with compact trigger-anchored model, reasoning, and access popovers, including hidden scroll chrome.
+- Removed false canvas overflow and nonessential sidebar/assistant scroll tracks while preserving scrolling when content genuinely exceeds the viewport.
+
 ## 0.5.1 - 2026-08-27
 
 - Fixed Codex discovery on Linux desktops with multiple installations by selecting the newest valid CLI across PATH, NVM, npm, system, Flatpak, Snap, and other supported locations.

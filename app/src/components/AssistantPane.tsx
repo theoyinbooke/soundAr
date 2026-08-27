@@ -266,14 +266,24 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       <div className="assistant-composer">
         <textarea ref={composerRef} aria-label="Message soundAr assistant" placeholder={account ? "Ask soundAr to create anything" : "Connect Codex to begin"} value={draft} disabled={!account || sending} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
         <div className="assistant-composer-bar">
-          <button type="button" className="assistant-control" disabled={!models.length} onClick={() => setMenu(menu === "model" ? undefined : "model")}><span>{selectedModel?.displayName ?? "Model"}</span><ChevronDown size={12} /></button>
-          <button type="button" className="assistant-control" disabled={!selectedModel} onClick={() => setMenu(menu === "effort" ? undefined : "effort")}><span>{humanize(effort)}</span><ChevronDown size={12} /></button>
-          <button type="button" className="assistant-control is-access" onClick={() => setMenu(menu === "access" ? undefined : "access")}><ShieldCheck size={12} /><span>{access === "danger-full-access" ? "Full access" : access === "workspace-write" ? "Studio access" : "Read only"}</span><ChevronDown size={12} /></button>
-          <button className="assistant-send" type="button" aria-label={sending ? "Stop response" : "Send message"} disabled={!sending && (!draft.trim() || !account)} onClick={() => sending ? void interrupt() : void send()}>{sending ? <CircleStop size={16} /> : <ArrowUp size={16} />}</button>
+          <div className="assistant-control-cluster is-context">
+            <div className="assistant-control-slot is-model">
+              <button type="button" className="assistant-control" aria-haspopup="menu" aria-expanded={menu === "model"} disabled={!models.length} onClick={() => setMenu(menu === "model" ? undefined : "model")}><span>{selectedModel?.displayName ?? "Model"}</span><ChevronDown size={12} /></button>
+              {menu === "model" ? <div className="assistant-picker picker-model" role="menu" aria-label="Model">{models.map((model) => <button type="button" role="menuitemradio" aria-checked={model.id === modelId} key={model.id} onClick={() => { setModelId(model.id); setEffort(model.defaultReasoningEffort); setMenu(undefined); }}><span><strong>{model.displayName}</strong><small>{model.description}</small></span>{model.id === modelId ? <Check size={14} /> : null}</button>)}</div> : null}
+            </div>
+            <div className="assistant-control-slot is-access">
+              <button type="button" className="assistant-control is-access" aria-haspopup="menu" aria-expanded={menu === "access"} onClick={() => setMenu(menu === "access" ? undefined : "access")}><ShieldCheck size={12} /><span>{access === "danger-full-access" ? "Full access" : access === "workspace-write" ? "Studio access" : "Read only"}</span><ChevronDown size={12} /></button>
+              {menu === "access" ? <div className="assistant-picker picker-access" role="menu" aria-label="Access level">{(["read-only", "workspace-write", "danger-full-access"] as AgentAccess[]).map((value) => <button type="button" role="menuitemradio" aria-checked={value === access} key={value} onClick={() => { setAccess(value); setMenu(undefined); }}><span><strong>{value === "danger-full-access" ? "Full access" : value === "workspace-write" ? "Studio access" : "Read only"}</strong><small>{value === "danger-full-access" ? "Can use the machine with approvals" : value === "workspace-write" ? "Can research and manage soundAr work" : "Can inspect and plan only"}</small></span>{value === access ? <Check size={14} /> : null}</button>)}</div> : null}
+            </div>
+          </div>
+          <div className="assistant-control-cluster is-actions">
+            <div className="assistant-control-slot is-effort">
+              <button type="button" className="assistant-control" aria-haspopup="menu" aria-expanded={menu === "effort"} disabled={!selectedModel} onClick={() => setMenu(menu === "effort" ? undefined : "effort")}><span>{humanize(effort)}</span><ChevronDown size={12} /></button>
+              {menu === "effort" ? <div className="assistant-picker picker-effort" role="menu" aria-label="Reasoning effort">{efforts.map((value) => <button type="button" role="menuitemradio" aria-checked={value === effort} key={value} onClick={() => { setEffort(value); setMenu(undefined); }}><span><strong>{humanize(value)}</strong><small>{effortDescription(value)}</small></span>{value === effort ? <Check size={14} /> : null}</button>)}</div> : null}
+            </div>
+            <button className="assistant-send" type="button" aria-label={sending ? "Stop response" : "Send message"} disabled={!sending && (!draft.trim() || !account)} onClick={() => sending ? void interrupt() : void send()}>{sending ? <CircleStop size={16} /> : <ArrowUp size={16} />}</button>
+          </div>
         </div>
-        {menu === "model" ? <div className="assistant-picker picker-model" role="menu" aria-label="Model">{models.map((model) => <button type="button" role="menuitemradio" aria-checked={model.id === modelId} key={model.id} onClick={() => { setModelId(model.id); setEffort(model.defaultReasoningEffort); setMenu(undefined); }}><span><strong>{model.displayName}</strong><small>{model.description}</small></span>{model.id === modelId ? <Check size={14} /> : null}</button>)}</div> : null}
-        {menu === "effort" ? <div className="assistant-picker picker-effort" role="menu" aria-label="Reasoning effort">{efforts.map((value) => <button type="button" role="menuitemradio" aria-checked={value === effort} key={value} onClick={() => { setEffort(value); setMenu(undefined); }}><span><strong>{humanize(value)}</strong><small>{effortDescription(value)}</small></span>{value === effort ? <Check size={14} /> : null}</button>)}</div> : null}
-        {menu === "access" ? <div className="assistant-picker picker-access" role="menu" aria-label="Access level">{(["read-only", "workspace-write", "danger-full-access"] as AgentAccess[]).map((value) => <button type="button" role="menuitemradio" aria-checked={value === access} key={value} onClick={() => { setAccess(value); setMenu(undefined); }}><span><strong>{value === "danger-full-access" ? "Full access" : value === "workspace-write" ? "Studio access" : "Read only"}</strong><small>{value === "danger-full-access" ? "Can use the machine with approvals" : value === "workspace-write" ? "Can research and manage soundAr work" : "Can inspect and plan only"}</small></span>{value === access ? <Check size={14} /> : null}</button>)}</div> : null}
       </div>
       <span className="assistant-disclaimer">Codex can make mistakes. Review actions before approval.</span>
     </footer>
@@ -329,7 +339,7 @@ function previewCreativeResponse(prompt: string): { message: string; plan: PlanS
     ],
   };
 }
-function effortDescription(value: string) { return ({ none: "Answers without extended reasoning", minimal: "Fastest responses", low: "Quick tasks", medium: "Balanced planning", high: "Deeper planning and execution", xhigh: "Most thorough reasoning" } as Record<string, string>)[value] ?? "Reasoning level"; }
+function effortDescription(value: string) { return ({ none: "Answers without extended reasoning", minimal: "Fastest responses", low: "Quick tasks", medium: "Balanced planning", high: "Deeper planning and execution", xhigh: "Most thorough reasoning", max: "Maximum reasoning depth", ultra: "Extended maximum reasoning" } as Record<string, string>)[value] ?? "Reasoning level"; }
 function sandboxPolicy(access: AgentAccess) {
   if (access === "danger-full-access") return { type: "dangerFullAccess" };
   if (access === "read-only") return { type: "readOnly" };

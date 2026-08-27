@@ -103,4 +103,36 @@ Each comparison places the reference and implementation in the same image before
 
 No P0, P1, or P2 visual mismatch remains in the audited states. Remaining differences are intentional product-semantic differences rather than design-system drift.
 
+
+## Assistant compact-control addendum — 2026-08-27
+
+- Source visual truth: `/tmp/codex-clipboard-3a551862-209b-49a2-9782-047502e3d29c.png`, supported by the access and model states in `/tmp/codex-clipboard-c9b6821d-0e88-438f-abc2-4a3777d90efc.png` and `/tmp/codex-clipboard-cbc0cde3-e75e-40f0-96b9-25cdf9a92517.png`.
+- Implementation screenshot: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/assistant-compact-implementation.jpg`.
+- Comparison board: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/assistant-compact-comparison.png`.
+- Viewport: source 1920 × 1200; implementation 1280 × 720 CSS pixels at 1× density.
+- Normalization: the assistant composer and open reasoning menu were cropped from each capture and normalized to 470 × 370 pixels before being placed side by side.
+- State: light theme, Generate route, assistant open, reasoning menu open, no generation active.
+
+### Full-view and focused evidence
+
+The implementation keeps the assistant as a dedicated right pane and no longer creates a false page scroll in the inspected state. At 1280 × 720, the main canvas, assistant thread, and sidebar each reported `scrollHeight === clientHeight`. The focused board verifies that model and Studio access form the left context cluster, while reasoning sits immediately beside Send. The menus are trigger-anchored and content-sized: 310 px for model, 260 px for Studio access, and 220 px for reasoning. Scrolling remains functional without a painted track.
+
+### Comparison history
+
+1. P1: all three menus stretched between the composer edges. Fixed by moving each menu into a trigger-owned slot with a bounded natural width.
+2. P1: reasoning sat between model and Studio access. Fixed by keeping model + Studio access on the left and moving reasoning beside Send.
+3. P2: sidebar, assistant thread, picker, and app canvas exposed scroll tracks; Generate also overflowed by 26 px despite fitting visually. Fixed by suppressing nonessential scroll chrome and correcting assistant-open page height and padding. Post-fix measurements are exact at the inspected viewport.
+
+### Required fidelity surfaces
+
+- Fonts and typography: pass — Inter hierarchy, weights, compact descriptions, truncation, and label casing remain consistent with the established neutral system.
+- Spacing and layout rhythm: pass — trigger clusters, compact row heights, radii, elevation, and popover offsets match the requested density.
+- Colors and tokens: pass — no accent was introduced; established neutral surface, border, text, muted-text, and shadow tokens are used.
+- Image and asset quality: pass — this interaction contains no raster assets or custom illustrations; existing icon-library assets remain sharp and consistent.
+- Copy and content: pass — current labels remain intact, and Max/Ultra now have useful descriptions instead of generic filler.
+
+### Interactions and final findings
+
+Model, reasoning, and Studio access menus were opened; ordering, checked states, popover geometry, and scrollbar suppression were verified. The browser-rendered interaction produced no relevant console error. No actionable P0, P1, or P2 difference remains. Reasoning is intentionally farther right than in the supplied reference because that is the user's explicit correction.
+
 final result: passed
