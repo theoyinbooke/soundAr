@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.5.4 - 2026-08-27
+
+- Kept the populated Projects workspace within 320–390 px phone viewports and prevented controls inside a closed Production panel from overlapping mobile navigation.
+
 ## 0.5.3 - 2026-08-27
 
 - Recovered legacy assistant-created project masters into soundAr's managed artifact history so existing projects and assembled audio resurface automatically.

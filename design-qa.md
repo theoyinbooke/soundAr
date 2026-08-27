@@ -158,6 +158,7 @@ final result: passed
 - Colors and borders: pass — no accent edge or fill was introduced; the player, activity disclosure, and project selection use the established neutral tokens.
 - Copy and information architecture: pass — “Project master,” duration, format, sample rate, Play, and Export copy are visible inside Projects instead of exposing an internal path.
 - Interaction: pass — project selection, Production disclosure, master playback surface, export action state, assistant prompt submission, plan visibility, and collapsed activity were exercised in the running preview.
+- Responsive behavior: pass — the populated Projects workspace remains within 320–390 px phone viewports, and controls inside the closed Production disclosure are removed from layout so none can overlap the mobile navigation.
 - Persistence: pass — a Rust recovery test starts with the exact legacy state (project document contains only a raw master path) and proves that listing projects attaches a registered playable artifact without losing the project or its chapters.
 
 No actionable P0, P1, or P2 mismatch remains in the audited project-master and assistant-workflow states.
