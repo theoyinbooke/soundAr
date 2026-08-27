@@ -1,4 +1,6 @@
-# Exact standalone inference stack qualified with Fish Speech source tag v1.5.1 (58046eaa).
+# Isolated compatibility stack qualified with Fish Speech source tag v1.5.1 (58046eaa).
+# Transformers 4.57.3 remains confined to this pinned, standalone local model
+# runtime until the qualified Fish Speech release supports Transformers 5.x.
 huggingface-hub==0.36.0
 librosa==0.11.0
 numpy==1.26.4
