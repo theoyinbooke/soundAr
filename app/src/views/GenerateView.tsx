@@ -582,7 +582,7 @@ export function GenerateView({
   const activeGenerationCount = jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length;
   const generationCapacityReached = activeGenerationCount >= scheduler.max_workers;
   const musicInformationControl = <details className="music-info-disclosure music-header-info">
-    <summary title="Music generation information" aria-label="Music generation information"><Info aria-hidden="true" size={14} /></summary>
+    <summary role="button" title="Music generation information" aria-label="Music generation information"><Info aria-hidden="true" size={14} /></summary>
     <div className="music-info-card" role="note">
       <strong>Local text-to-music</strong>
       <span>Direction + optional lyrics</span>
@@ -617,7 +617,7 @@ export function GenerateView({
       {stagedBatches.slice(0, 4).map((batch) => {
         const expanded = expandedBatchId === batch.id;
         const settling = batch.items.some((item) => item.status === "running") && batch.status === "paused";
-        return <div className="batch-queue-entry" key={batch.id}><div className="queue-row batch-queue-row"><button className="batch-toggle" type="button" aria-expanded={expanded} onClick={() => setExpandedBatchId(expanded ? undefined : batch.id)}>{expanded ? <ChevronDown aria-hidden="true" size={13} /> : <ChevronRight aria-hidden="true" size={13} />}<span><strong>{batch.name}</strong><StatusText tone={batch.status === "completed" ? "success" : batch.status === "failed" ? "danger" : batch.status === "cancelled" ? "muted" : "warning"}>{batch.completed_items}/{batch.total_items} · {batch.status}</StatusText></span></button><RowActionMenu label={`More options for ${batch.name}`} actions={[
+        return <div className="batch-queue-entry" key={batch.id}><div className="queue-row batch-queue-row"><button className="batch-toggle" type="button" aria-expanded={expanded} onClick={() => setExpandedBatchId(expanded ? undefined : batch.id)}>{expanded ? <ChevronDown aria-hidden="true" size={13} /> : <ChevronRight aria-hidden="true" size={13} />}<span><strong>{batch.name}</strong><StatusText tone={batch.status === "completed" ? "success" : batch.status === "failed" ? "danger" : batch.status === "cancelled" ? "muted" : "warning"}>{batch.completed_items}/{batch.total_items} · {batch.status}{batch.priority !== "normal" ? ` · ${batch.priority}` : ""}</StatusText></span></button><RowActionMenu label={`More options for ${batch.name}`} actions={[
           { label: expanded ? "Hide batch rows" : "View batch rows", icon: expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />, onSelect: () => setExpandedBatchId(expanded ? undefined : batch.id) },
           ...(["queued", "running"].includes(batch.status) ? [{ label: "Pause batch", icon: <Pause size={12} />, onSelect: () => pauseBatch(batch) }, { label: "Cancel batch", icon: <X size={12} />, danger: true, onSelect: () => cancelBatch(batch) }] : []),
           ...(["paused", "failed"].includes(batch.status) ? [{ label: batch.status === "failed" ? "Retry failed rows" : "Resume batch", icon: <RotateCcw size={12} />, disabled: settling, onSelect: () => resumeBatch(batch) }, { label: "Cancel batch", icon: <X size={12} />, danger: true, onSelect: () => cancelBatch(batch) }] : []),

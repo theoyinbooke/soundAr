@@ -1,10 +1,15 @@
 import { expect, test } from "@playwright/test";
 
-const routes = ["Generate", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History", "Settings", "About"];
+const routes = ["Generate", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History"];
+const allRoutes = [...routes, "Settings", "About"];
 const mobileDirectRoutes = new Set(["Generate", "Projects", "Voices", "History"]);
 
 async function openRoute(page: import("@playwright/test").Page, route: string) {
-  if (page.viewportSize()!.width <= 820) {
+  const mobile = page.viewportSize()!.width <= 820;
+  if (mobile && route !== "Settings" && await page.locator(".settings-shell").count()) {
+    await page.getByRole("button", { name: "Back to soundAr" }).click();
+  }
+  if (mobile) {
     const dock = page.locator(".mobile-nav");
     if (mobileDirectRoutes.has(route)) {
       await dock.getByRole("button", { name: route, exact: true }).click();
@@ -12,16 +17,22 @@ async function openRoute(page: import("@playwright/test").Page, route: string) {
       await dock.getByRole("button", { name: "More navigation" }).click();
       await page.locator(".mobile-more-menu").getByRole("button", { name: route, exact: true }).click();
     }
+  } else if (route === "Settings") {
+    await page.getByRole("banner").getByRole("button", { name: "File", exact: true }).click();
+    await page.getByRole("menuitem", { name: "Settings" }).click();
+  } else if (route === "About") {
+    await page.getByRole("banner").getByRole("button", { name: "Help", exact: true }).click();
+    await page.getByRole("menuitem", { name: "About soundAr" }).click();
   } else {
     await page.locator(".sidebar").getByRole("button", { name: route, exact: true }).click();
   }
-  const heading = route === "Generate" ? /New (music )?generation/ : route === "Settings" ? "General" : route;
+  const heading = route === "Generate" ? /New (music )?generation/ : route === "Settings" ? "General" : route === "About" ? "About soundAr" : route;
   await expect(page.getByRole("heading", { name: heading }).first()).toBeVisible();
 }
 
 test("workspace is explicit about preview and native capability boundaries", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByText("Preview", { exact: true })).toBeVisible();
+  await expect(page.locator(".topbar-status em")).toHaveText("Preview");
   await expect(page.getByRole("heading", { name: "New generation" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Transcribe", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Live", exact: true })).toHaveCount(0);
@@ -31,6 +42,7 @@ test("workspace is explicit about preview and native capability boundaries", asy
 test("Settings and About expose manual update checks with explicit feedback", async ({ page }) => {
   await page.goto("/");
   await openRoute(page, "Settings");
+  await page.getByRole("button", { name: "Runtime & updates" }).click();
   await page.getByRole("button", { name: "Check for updates" }).click();
   await expect(page.getByRole("status")).toContainText("available in the installed desktop app");
 
@@ -43,18 +55,19 @@ test("text-to-music stays bounded and never fabricates browser audio", async ({ 
   await page.goto("/");
   await page.getByRole("button", { name: "Music", exact: true }).click();
 
-  await expect(page.getByRole("heading", { name: "Generate music" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "New music generation" })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Music direction" })).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Lyrics or text to sing" })).toBeVisible();
-  await expect(page.getByText("Text-to-music / local only")).toBeVisible();
+  await page.getByRole("button", { name: "Music generation information" }).click();
+  await expect(page.getByText("Local text-to-music")).toBeVisible();
   await expect(page.getByText(/Direction and lyrics stay separate/i)).toBeVisible();
-  await expect(page.getByText(/source audio, and batch generation are intentionally outside this release/i)).toBeVisible();
+  await expect(page.getByText(/source audio, and batch music are outside this release/i)).toBeVisible();
   await expect(page.getByText("Stereo / 48 kHz")).toBeVisible();
   await expect(page.getByRole("button", { name: "Preview music flow" })).toBeEnabled();
 
   await page.getByRole("button", { name: "Preview music flow" }).click();
   await expect(page.getByText("Browser preview has no rendered audio")).toBeVisible();
-  await expect(page.locator("audio")).toHaveCount(0);
+  await expect(page.locator("audio[src]")).toHaveCount(0);
 
   const bounds = await page.locator(".generate-layout").evaluate((layout) => ({
     clientWidth: layout.clientWidth,
@@ -77,7 +90,7 @@ test("implemented routes remain usable at the target viewport", async ({ page })
 
 test("workspace controls do not collide at the target viewport", async ({ page }) => {
   await page.goto("/");
-  for (const route of routes) {
+  for (const route of allRoutes) {
     await openRoute(page, route);
     const collisions = await page.locator("main").evaluate((main) => {
       const candidates = [...main.querySelectorAll<HTMLElement>(
@@ -85,7 +98,12 @@ test("workspace controls do not collide at the target viewport", async ({ page }
       )].filter((element) => {
         const style = getComputedStyle(element);
         const box = element.getBoundingClientRect();
-        return style.display !== "none" && style.visibility !== "hidden" && box.width > 0 && box.height > 0;
+        return style.display !== "none"
+          && style.visibility !== "hidden"
+          && !element.closest("details:not([open])")
+          && element.getClientRects().length > 0
+          && box.width > 0
+          && box.height > 0;
       });
       const overlaps: string[] = [];
       for (let leftIndex = 0; leftIndex < candidates.length; leftIndex += 1) {
@@ -108,10 +126,11 @@ test("workspace controls do not collide at the target viewport", async ({ page }
   }
 });
 
-test("collapsed navigation keeps unambiguous route names", async ({ page }) => {
+test("desktop navigation stays open and keeps unambiguous route names", async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 768 });
   await page.goto("/");
 
+  await expect(page.locator(".app-shell")).not.toHaveClass(/is-sidebar-collapsed/);
   for (const route of routes) {
     const button = page.locator(".sidebar").getByRole("button", { name: route, exact: true });
     await expect(button).toHaveCount(1);
@@ -123,7 +142,7 @@ test("phone workspace never expands beyond the viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
 
-  for (const route of routes) {
+  for (const route of allRoutes) {
     await openRoute(page, route);
     const dimensions = await page.evaluate(() => ({
       documentWidth: document.documentElement.scrollWidth,
@@ -187,7 +206,7 @@ test("phone navigation never covers workspace controls", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
 
-  for (const route of routes) {
+  for (const route of [...routes, "About"]) {
     await openRoute(page, route);
     const initialClearance = await page.evaluate(() => {
       const content = document.querySelector<HTMLElement>(".app-content")!.getBoundingClientRect();
@@ -256,12 +275,15 @@ test("projects support create, edit, undo, redo, and local save", async ({ page 
   await page.getByRole("button", { name: "Redo chapter edit" }).click();
   await expect(page.getByLabel("Script")).toHaveValue("A durable chapter edited through the real workspace.");
   await page.getByRole("button", { name: "Save", exact: true }).click();
-  await expect(page.getByText("Saved locally", { exact: true })).toBeVisible();
+  const savedProject = page.locator(".project-row").filter({ hasText: "Responsive release narration" });
+  await expect(savedProject).toContainText("1 chapter / 0 rendered");
+  await expect(page.getByLabel("Not saved yet")).toHaveCount(0);
   await page.getByText("Production and export").click();
   await page.getByRole("button", { name: "Render changed (1)" }).click();
-  await expect(page.getByText(/0\/1 complete.*queued/i)).toBeVisible();
+  await expect(page.getByText(/0\/1 rendered.*queued/i)).toBeVisible();
   await page.getByRole("button", { name: "Cancel project rendering" }).click();
-  await expect(page.getByText("Project rendering cancelled", { exact: true })).toBeVisible();
+  await expect(page.locator(".chapter-row")).toContainText("Cancelled");
+  await expect(page.getByText(/0\/1 rendered.*cancelled/i)).toBeVisible();
 });
 
 test("browser preview reports model installation boundary without a stranded dialog", async ({ page }) => {
@@ -276,10 +298,14 @@ test("browser preview reports model installation boundary without a stranded dia
 test("every route keeps controls inside its layout in both themes", async ({ page }) => {
   await page.goto("/");
 
-  for (const theme of ["dark", "light"] as const) {
-    if (theme === "light") await page.getByRole("button", { name: "Cream light" }).filter({ visible: true }).click();
+  for (const theme of ["light", "dark"] as const) {
+    const currentTheme = await page.locator("html").getAttribute("data-theme");
+    if (currentTheme !== theme) {
+      await page.getByRole("banner").getByRole("button", { name: "View", exact: true }).click();
+      await page.getByRole("menuitem", { name: theme === "light" ? "Light appearance" : "Dark appearance" }).click();
+    }
 
-    for (const route of routes) {
+    for (const route of allRoutes) {
       await openRoute(page, route);
 
       const overflow = await page.locator("main").evaluate((main, currentRoute) => {
@@ -291,6 +317,7 @@ test("every route keeps controls inside its layout in both themes", async ({ pag
         ].join(",");
 
         return [...main.querySelectorAll<HTMLElement>(selectors)].flatMap((element) => {
+          if (element.closest("details:not([open])") || element.getClientRects().length === 0) return [];
           const box = element.getBoundingClientRect();
           const clipped = element.scrollWidth > element.clientWidth + 2 || element.scrollHeight > element.clientHeight + 2;
           const outside = box.left < -1 || box.right > window.innerWidth + 1;
@@ -309,7 +336,7 @@ test("every route keeps controls inside its layout in both themes", async ({ pag
 
       if (route === "About") {
         await expect(page.getByText("Version 0.3.2", { exact: true })).toBeVisible();
-        const runtimeDetails = page.getByLabel("Runtime details");
+        const runtimeDetails = page.getByRole("region", { name: "This machine" });
         await expect(runtimeDetails.getByText(/NVIDIA GeForce|No compatible GPU/)).toBeVisible();
       }
     }
@@ -366,6 +393,7 @@ test("custom dropdowns stay compact and selectable", async ({ page }) => {
   await expect(model).toHaveCSS("font-size", "11px");
 
   await page.getByRole("button", { name: "Batch" }).click();
+  await page.getByText("Advanced settings", { exact: true }).click();
   await expect(page.getByLabel("Parallel jobs")).toBeVisible();
   await expect(page.getByRole("button", { name: "Start batch" })).toBeVisible();
 });
@@ -380,6 +408,7 @@ test("mobile routes reset scroll and overlays stay above navigation", async ({ p
   expect(await content.evaluate((element) => element.scrollTop)).toBe(0);
 
   await openRoute(page, "Generate");
+  await page.getByText("Advanced settings", { exact: true }).click();
   const output = page.getByRole("combobox", { name: "Output format" });
   await output.evaluate((element) => element.scrollIntoView({ block: "end" }));
   await output.click();
@@ -419,9 +448,14 @@ test("preview batch reaches a coherent completed state", async ({ page }) => {
   await page.getByRole("button", { name: "Batch" }).click();
   await page.getByLabel("Script").fill("First preview row.\nSecond preview row.");
   await page.getByRole("button", { name: "Start batch" }).click();
-  await expect(page.getByText("2/2 complete")).toBeVisible({ timeout: 10_000 });
+  const completed = page.getByRole("group", { name: "Activity stage" }).getByRole("button", { name: "Completed 2" });
+  await expect(completed).toBeVisible({ timeout: 10_000 });
+  await completed.click();
   await expect(page.getByRole("button", { name: "Cancel batch" })).toHaveCount(0);
-  await page.getByRole("button", { name: "Show batch rows" }).click();
+  const completedBatch = page.locator(".batch-queue-entry").first();
+  await expect(completedBatch).toContainText("2/2 · completed");
+  await completedBatch.getByRole("button", { name: /More options for/ }).click();
+  await page.getByRole("menuitem", { name: "View batch rows" }).click();
   const rows = page.getByLabel(/Batch .* rows/).locator(".batch-item-row");
   await expect(rows).toHaveCount(2);
   await expect(rows.filter({ hasText: "completed" })).toHaveCount(2);
@@ -429,6 +463,7 @@ test("preview batch reaches a coherent completed state", async ({ page }) => {
 
 test("queue priority is compact and remains visible on a batch", async ({ page }) => {
   await page.goto("/");
+  await page.getByText("Advanced settings", { exact: true }).click();
   const priority = page.getByRole("combobox", { name: "Queue priority" });
   await expect(priority).toHaveCSS("font-size", "11px");
   await priority.click();
@@ -436,13 +471,16 @@ test("queue priority is compact and remains visible on a batch", async ({ page }
   await page.getByRole("button", { name: "Batch" }).click();
   await page.getByLabel("Script").fill("Priority preview row.");
   await page.getByRole("button", { name: "Start batch" }).click();
+  const completed = page.getByRole("group", { name: "Activity stage" }).getByRole("button", { name: "Completed 1" });
+  await expect(completed).toBeVisible({ timeout: 10_000 });
+  await completed.click();
   await expect(page.locator(".batch-queue-entry").first()).toContainText("urgent");
 });
 
 test("Voice Lab remains compact with the reference editor expanded", async ({ page }) => {
   await page.goto("/");
   await openRoute(page, "Voices");
-  await page.getByRole("button", { name: "Edit" }).click();
+  await page.getByLabel("Selected voice details").getByRole("button", { name: "Edit" }).click();
   await expect(page.getByLabel("Reference waveform")).toBeVisible();
   await expect(page.getByRole("button", { name: "Apply as new revision" })).toBeDisabled();
 

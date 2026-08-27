@@ -13,11 +13,6 @@ export default defineConfig({
     reuseExistingServer: false,
   },
   projects: [
-    { name: "narrow-phone", use: { viewport: { width: 320, height: 720 } } },
-    { name: "phone", use: { viewport: { width: 390, height: 844 } } },
-    { name: "compact", use: { viewport: { width: 820, height: 620 } } },
-    { name: "medium", use: { viewport: { width: 1024, height: 768 } } },
-    { name: "windowed", use: { viewport: { width: 1220, height: 720 } } },
     { name: "desktop", use: { viewport: { width: 1440, height: 900 } } },
   ],
 });
