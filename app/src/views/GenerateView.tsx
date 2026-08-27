@@ -1,12 +1,12 @@
-import { ChevronDown, ChevronRight, FileInput, FolderOpen, MoreHorizontal, Pause, Play, RotateCcw, Save, Sparkles, X } from "lucide-react";
+import { ChevronDown, ChevronRight, FileInput, FolderOpen, Info, Pause, Play, Plus, RotateCcw, Save, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { cancelBatchRun, cancelJob, clearFinishedJobs, createBatchRun, getSchedulerStatus, importBatchInput, listBatchRuns, listHistory, listJobs, loadGeneratedAudio, pauseBatchRun, pickBatchInputFile, queueBatchRun, queueSynthesis, resumeBatchRun, retryJob, saveGenerationPreset, synthesizeSpeech, updateBatchItem } from "../lib/bridge";
+import { cancelBatchRun, cancelJob, clearFinishedJobs, createBatchRun, deleteHistoryItem, getSchedulerStatus, importBatchInput, listBatchRuns, listHistory, listJobs, loadGeneratedAudio, pauseBatchRun, pickBatchInputFile, queueBatchRun, queueSynthesis, resumeBatchRun, retryJob, saveGenerationPreset, synthesizeSpeech, updateBatchItem } from "../lib/bridge";
 import { capabilityForModel, compatibleVoicesForModel, qualifiedModels, recommendModel } from "../lib/capabilities";
 import type { BatchImportResult, BatchInputRow, BatchRunRecord, BootstrapState, HistoryItem, JobRecord, QueuePriority, RouteIntent, SynthesisRequest, SynthesisResult, VoiceProfile } from "../types";
-import { CompactField, Dropdown, MetricStrip, PageHeader, Panel, Segmented, SelectField, StatusText } from "../components/ui";
-
-const idleWaveform = Array.from({ length: 64 }, (_, index) => 0.12 + Math.abs(Math.sin(index * 0.31)) * 0.13);
+import { CompactField, Dropdown, MetricStrip, PageHeader, Panel, RowActionMenu, Segmented, SelectField, StatusText } from "../components/ui";
+import { VoiceProfileDialog } from "../components/VoiceProfileDialog";
+import { MusicGeneratePanel } from "./MusicGeneratePanel";
 
 function formatPlaybackTime(seconds: number) {
   if (!Number.isFinite(seconds)) return "0:00.0";
@@ -14,18 +14,28 @@ function formatPlaybackTime(seconds: number) {
   return `${minutes}:${(seconds % 60).toFixed(1).padStart(4, "0")}`;
 }
 
+function jobFailureSummary(error?: string | null) {
+  if (!error) return undefined;
+  const normalized = error.toLowerCase();
+  if (normalized.includes("out of memory") || normalized.includes("cuda oom")) return "Not enough free GPU memory";
+  return error.split(/\r?\n/)[0].slice(0, 96);
+}
+
 export function GenerateView({
   bootstrap,
   voices,
+  onVoicesChange,
   onGenerated,
   preferredVoiceId,
 }: {
   bootstrap: BootstrapState;
   voices: VoiceProfile[];
+  onVoicesChange: (voices: VoiceProfile[]) => void;
   onGenerated: (item: HistoryItem) => void;
   preferredVoiceId?: string;
 }) {
   const ttsModels = useMemo(() => qualifiedModels(bootstrap, "tts"), [bootstrap]);
+  const [generationKind, setGenerationKind] = useState<"speech" | "music">("speech");
   const [mode, setMode] = useState<"text" | "ssml" | "batch">("text");
   const [text, setText] = useState("The best voices feel present before they sound perfect.\nStart with clarity, then shape pace, warmth, and intent.");
   const [modelId, setModelId] = useState(ttsModels.find((model) => model.engine === "kokoro")?.model_id ?? ttsModels[0]?.model_id ?? "");
@@ -61,10 +71,16 @@ export function GenerateView({
   const [expandedBatchId, setExpandedBatchId] = useState<string>();
   const [jobs, setJobs] = useState<JobRecord[]>(bootstrap.jobs);
   const [scheduler, setScheduler] = useState(bootstrap.scheduler);
+  const [showAddVoice, setShowAddVoice] = useState(false);
+  const [recentOutputs, setRecentOutputs] = useState<HistoryItem[]>([]);
+  const [recentPlayingId, setRecentPlayingId] = useState<string>();
+  const [activityStage, setActivityStage] = useState<"queued" | "progress" | "completed">("progress");
   const audioRef = useRef<HTMLAudioElement>(null);
+  const recentAudioRef = useRef<HTMLAudioElement>(null);
   const cancelRequested = useRef(false);
   const submittedJobIds = useRef(new Set<string>());
   const deliveredHistoryIds = useRef(new Set<string>());
+  const pendingCreatedVoiceId = useRef<string | undefined>(undefined);
   const selectedModel = ttsModels.find((model) => model.model_id === modelId);
   const capability = capabilityForModel(bootstrap, selectedModel);
   const libraryVoices = compatibleVoicesForModel(bootstrap, selectedModel, voices);
@@ -75,6 +91,20 @@ export function GenerateView({
   const selectedVoice = compatibleVoices.find((voice) => voice.id === voiceId);
   const referenceRequired = capability?.voice_modes.length === 1 && capability.voice_modes[0] === "reference";
   const voiceReady = !referenceRequired || Boolean(selectedVoice?.local_path);
+
+  function useCreatedVoice(voice: VoiceProfile) {
+    pendingCreatedVoiceId.current = voice.id;
+    onVoicesChange([...voices, voice]);
+    const currentModelSupportsVoice = selectedModel
+      ? compatibleVoicesForModel(bootstrap, selectedModel, [voice]).length > 0
+      : false;
+    const compatibleModel = currentModelSupportsVoice
+      ? selectedModel
+      : ttsModels.find((model) => compatibleVoicesForModel(bootstrap, model, [voice]).length > 0);
+    if (compatibleModel) setModelId(compatibleModel.model_id);
+    setVoiceId(voice.id);
+    setShowAddVoice(false);
+  }
 
   function applyRoute(intent: RouteIntent) {
     setRouteIntent(intent);
@@ -108,7 +138,12 @@ export function GenerateView({
     const nextVoices = nextCapability?.voice_modes.includes("default")
       ? ["__engine_default__", ...nextLibraryVoices.map((voice) => voice.id)]
       : nextLibraryVoices.map((voice) => voice.id);
-    if (!nextVoices.includes(voiceId)) setVoiceId(nextVoices[0] ?? "");
+    if (pendingCreatedVoiceId.current && nextVoices.includes(pendingCreatedVoiceId.current)) {
+      setVoiceId(pendingCreatedVoiceId.current);
+      pendingCreatedVoiceId.current = undefined;
+    } else if (!nextVoices.includes(voiceId)) {
+      setVoiceId(nextVoices[0] ?? "");
+    }
   }, [bootstrap, modelId, voices, voiceId]);
 
   useEffect(() => {
@@ -149,6 +184,7 @@ export function GenerateView({
         setJobs(nextJobs);
         setBatches(nextBatches);
         setScheduler(nextScheduler);
+        setRecentOutputs(nextHistory.slice(0, 6));
         nextBatches.flatMap((batch) => batch.items).forEach((item) => { if (item.job_id) submittedJobIds.current.add(item.job_id); });
         const activeIds = new Set(nextJobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).map((job) => job.id));
         setIsGenerating(activeIds.size > 0);
@@ -171,6 +207,12 @@ export function GenerateView({
   }, [bootstrap.runtime]);
 
   useEffect(() => {
+    if (bootstrap.runtime === "tauri") return;
+    void listHistory().then((items) => setRecentOutputs(items.slice(0, 6))).catch(() => undefined);
+  }, [bootstrap.runtime]);
+
+  useEffect(() => {
+    if (generationKind !== "speech") return;
     function handleShortcut(event: KeyboardEvent) {
       if (!(event.ctrlKey || event.metaKey)) return;
       if (event.key === "Enter") {
@@ -184,7 +226,7 @@ export function GenerateView({
     }
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [audioUrl, isGenerating, isPlaying, modelId, mode, outputFormat, seed, speed, text, voiceId]);
+  }, [audioUrl, generationKind, isGenerating, isPlaying, modelId, mode, outputFormat, seed, speed, text, voiceId]);
   const runtimeReady = bootstrap.runtime === "browser" || bootstrap.system.python_ready;
   const estimatedSeconds = Math.max(2, Math.round(text.length / 13));
 
@@ -204,6 +246,10 @@ export function GenerateView({
 
   async function generate() {
     if (!runtimeReady || !text.trim() || !modelId || !voiceReady) return;
+    if (jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length >= scheduler.max_workers) {
+      setError(`All ${scheduler.max_workers} generation slots are in use. Wait for one to finish before starting another.`);
+      return;
+    }
     cancelRequested.current = false;
     setError(undefined);
     const rows: BatchInputRow[] = mode === "batch"
@@ -269,6 +315,7 @@ export function GenerateView({
       const { latest, failed } = await runScripts(scripts.map((line, itemIndex) => ({ line, itemIndex })), settings, batch?.id);
       if (latest) {
         setResult(latest);
+        setRecentOutputs((items) => [latest, ...items.filter((item) => item.id !== latest.id)].slice(0, 6));
         setPlaybackError(undefined);
         setIsPlaying(false);
       }
@@ -295,7 +342,7 @@ export function GenerateView({
   async function clearFinishedQueue() {
     try {
       await clearFinishedJobs();
-      setJobs((items) => items.filter((job) => !["completed", "cancelled"].includes(job.status)));
+      setJobs((items) => items.filter((job) => !["completed", "failed", "cancelled"].includes(job.status)));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
@@ -336,6 +383,7 @@ export function GenerateView({
         });
         latest = next;
         onGenerated(next);
+        setRecentOutputs((items) => [next, ...items.filter((item) => item.id !== next.id)].slice(0, 6));
         if (batchId) {
           const nextBatch = await updateBatchItem(batchId, itemIndex, "completed", next.id);
           setBatches((items) => [nextBatch, ...items.filter((item) => item.id !== nextBatch.id)]);
@@ -487,12 +535,127 @@ export function GenerateView({
     setPlaybackTime(audio.currentTime);
   }
 
-  const waveform = result?.waveform?.length ? result.waveform : idleWaveform;
+  async function playRecentOutput(item: HistoryItem) {
+    const audio = recentAudioRef.current;
+    if (!audio || !item.audio_path) return;
+    if (recentPlayingId === item.id && !audio.paused) {
+      audio.pause();
+      setRecentPlayingId(undefined);
+      return;
+    }
+    try {
+      audio.pause();
+      audio.src = await loadGeneratedAudio(item.audio_path);
+      await audio.play();
+      setRecentPlayingId(item.id);
+      setPlaybackError(undefined);
+    } catch (caught) {
+      setPlaybackError(caught instanceof Error ? caught.message : "Audio playback failed");
+      setRecentPlayingId(undefined);
+    }
+  }
+
+  async function deleteRecentOutput(item: HistoryItem) {
+    if (!window.confirm(`Delete “${item.title}” and its generated audio?`)) return;
+    try {
+      if (await deleteHistoryItem(item.id, true)) {
+        if (recentPlayingId === item.id) recentAudioRef.current?.pause();
+        setRecentOutputs((items) => items.filter((candidate) => candidate.id !== item.id));
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
   const playbackProgress = playbackDuration > 0 ? playbackTime / playbackDuration : 0;
+  const generationTypeControl = <Segmented
+    label="Generation type"
+    value={generationKind}
+    onChange={setGenerationKind}
+    options={[
+      { value: "speech", label: "Voice" },
+      { value: "music", label: "Music" },
+    ]}
+  />;
+  const activeTaskCount = jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length
+    + batches.filter((batch) => ["queued", "running", "paused"].includes(batch.status)).length;
+  const activeGenerationCount = jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length;
+  const generationCapacityReached = activeGenerationCount >= scheduler.max_workers;
+  const musicInformationControl = <details className="music-info-disclosure music-header-info">
+    <summary title="Music generation information" aria-label="Music generation information"><Info aria-hidden="true" size={14} /></summary>
+    <div className="music-info-card" role="note">
+      <strong>Local text-to-music</strong>
+      <span>Direction + optional lyrics</span>
+      <p>Direction and lyrics stay separate. The active model and duration determine the lyric limit; voice references, melody uploads, source audio, and batch music are outside this release.</p>
+    </div>
+  </details>;
+  const generationToolbar = generationKind === "music" ? <>{musicInformationControl}{generationTypeControl}</> : generationTypeControl;
+  const stagedJobs = jobs.filter((job) => activityStage === "queued"
+    ? job.status === "queued"
+    : activityStage === "progress"
+      ? ["preparing", "running"].includes(job.status)
+      : ["failed", "cancelled"].includes(job.status));
+  const stagedBatches = batches.filter((batch) => activityStage === "queued"
+    ? batch.status === "queued"
+    : activityStage === "progress"
+      ? ["running", "paused"].includes(batch.status)
+      : ["completed", "failed", "cancelled"].includes(batch.status));
+  const activityStageControl = <Segmented label="Activity stage" value={activityStage} onChange={setActivityStage} options={[
+    { value: "queued", label: `Queued ${jobs.filter((job) => job.status === "queued").length + batches.filter((batch) => batch.status === "queued").length}` },
+    { value: "progress", label: `In progress ${jobs.filter((job) => ["preparing", "running"].includes(job.status)).length + batches.filter((batch) => ["running", "paused"].includes(batch.status)).length}` },
+    { value: "completed", label: `Completed ${recentOutputs.length + jobs.filter((job) => ["failed", "cancelled"].includes(job.status)).length}` },
+  ]} />;
+
+  function renderActivityRows() {
+    const hasRows = stagedJobs.length > 0 || stagedBatches.length > 0 || (activityStage === "completed" && recentOutputs.length > 0);
+    return <div className="queue-list staged-queue-list">
+      {stagedJobs.slice(0, 6).map((job) => <div className="queue-row" key={job.id}><div><strong>{job.title?.slice(0, 32) || job.kind}</strong><StatusText tone={job.status === "failed" ? "danger" : job.status === "completed" ? "success" : job.status === "cancelled" ? "muted" : "warning"}>{job.status === "running" ? "Generating" : job.status}{job.priority && job.priority !== "normal" ? ` · ${job.priority}` : ""}</StatusText>{job.status === "failed" && jobFailureSummary(job.error) ? <small className="queue-error" title={job.error ?? undefined}>{jobFailureSummary(job.error)}</small> : null}</div><RowActionMenu label={`More options for ${job.title || job.kind}`} actions={[
+        ...(["queued", "preparing", "running"].includes(job.status) ? [{ label: "Cancel generation", icon: <X size={12} />, danger: true, onSelect: async () => { await cancelJob(job.id); } }] : []),
+        ...(["failed", "cancelled"].includes(job.status) && ["synthesis", "api-synthesis"].includes(job.kind) ? [{ label: "Retry generation", icon: <RotateCcw size={12} />, onSelect: () => retryQueuedJob(job) }] : []),
+        ...(["completed", "failed", "cancelled"].includes(job.status) ? [{ label: "Clear finished task list", icon: <Trash2 size={12} />, danger: true, onSelect: clearFinishedQueue }] : []),
+      ]} /></div>)}
+      {stagedBatches.slice(0, 4).map((batch) => {
+        const expanded = expandedBatchId === batch.id;
+        const settling = batch.items.some((item) => item.status === "running") && batch.status === "paused";
+        return <div className="batch-queue-entry" key={batch.id}><div className="queue-row batch-queue-row"><button className="batch-toggle" type="button" aria-expanded={expanded} onClick={() => setExpandedBatchId(expanded ? undefined : batch.id)}>{expanded ? <ChevronDown aria-hidden="true" size={13} /> : <ChevronRight aria-hidden="true" size={13} />}<span><strong>{batch.name}</strong><StatusText tone={batch.status === "completed" ? "success" : batch.status === "failed" ? "danger" : batch.status === "cancelled" ? "muted" : "warning"}>{batch.completed_items}/{batch.total_items} · {batch.status}</StatusText></span></button><RowActionMenu label={`More options for ${batch.name}`} actions={[
+          { label: expanded ? "Hide batch rows" : "View batch rows", icon: expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />, onSelect: () => setExpandedBatchId(expanded ? undefined : batch.id) },
+          ...(["queued", "running"].includes(batch.status) ? [{ label: "Pause batch", icon: <Pause size={12} />, onSelect: () => pauseBatch(batch) }, { label: "Cancel batch", icon: <X size={12} />, danger: true, onSelect: () => cancelBatch(batch) }] : []),
+          ...(["paused", "failed"].includes(batch.status) ? [{ label: batch.status === "failed" ? "Retry failed rows" : "Resume batch", icon: <RotateCcw size={12} />, disabled: settling, onSelect: () => resumeBatch(batch) }, { label: "Cancel batch", icon: <X size={12} />, danger: true, onSelect: () => cancelBatch(batch) }] : []),
+        ]} /></div>{expanded ? <div className="batch-item-list" aria-label={`${batch.name} rows`}>{batch.items.map((item) => <div className="batch-item-row" key={item.id}><span className="batch-item-index">{String(item.item_index + 1).padStart(2, "0")}</span><span className="batch-item-script" title={item.text}>{item.name || item.text}</span><StatusText tone={item.status === "completed" ? "success" : item.status === "failed" ? "danger" : item.status === "cancelled" ? "muted" : "warning"}>{item.status}</StatusText></div>)}</div> : null}</div>;
+      })}
+      {activityStage === "completed" ? recentOutputs.slice(0, 6).map((item) => <div className="queue-row recent-output-row" key={item.id}><button className="recent-output-play" type="button" disabled={!item.audio_path || item.missing} onClick={() => void playRecentOutput(item)} aria-label={`${recentPlayingId === item.id ? "Pause" : "Play"} ${item.title}`}>{recentPlayingId === item.id ? <Pause aria-hidden="true" fill="currentColor" size={11} /> : <Play aria-hidden="true" fill="currentColor" size={11} />}</button><div><strong>{item.title}</strong><StatusText tone="success">{item.generation_kind === "music" ? "Music" : item.voice} · {item.duration_seconds.toFixed(1)} s</StatusText></div><RowActionMenu label={`More options for ${item.title}`} actions={[
+        { label: recentPlayingId === item.id ? "Pause audio" : "Play audio", icon: recentPlayingId === item.id ? <Pause size={12} /> : <Play size={12} />, disabled: !item.audio_path || item.missing, onSelect: () => playRecentOutput(item) },
+        { label: "Open output folder", icon: <FolderOpen size={12} />, disabled: !item.audio_path || item.missing, onSelect: async () => { if (item.audio_path) await revealItemInDir(item.audio_path); } },
+        { label: "Delete generated audio", icon: <Trash2 size={12} />, danger: true, onSelect: () => deleteRecentOutput(item) },
+      ]} /></div>) : null}
+      {!hasRows ? <div className="queue-empty-state"><strong>{activityStage === "queued" ? "Nothing queued" : activityStage === "progress" ? "No generation in progress" : "No completed audio"}</strong><span>{activityStage === "completed" ? "Finished speech and music appear here." : "New work will move here automatically."}</span></div> : null}
+    </div>;
+  }
+
+  if (generationKind === "music") {
+    return (
+      <div className="page generate-page">
+        <PageHeader title="New music generation" actions={generationToolbar} />
+        <div className="music-generation-layout">
+        <MusicGeneratePanel bootstrap={bootstrap} onGenerated={(item) => { onGenerated(item); setRecentOutputs((items) => [item, ...items.filter((existing) => existing.id !== item.id)].slice(0, 6)); }} />
+        <div className="generation-activity-slot"><Panel className="runtime-rail generation-activity-drawer" ariaLabel="Generation activity">
+          <div className="rail-heading">
+            <div><span className="section-label">Activity</span><strong>Local generation queue</strong></div>
+            <span className="rail-heading-actions"><StatusText tone={activeTaskCount ? "warning" : "muted"}>{activeTaskCount ? `${activeTaskCount} active` : "Ready"}</StatusText></span>
+          </div>
+          <div className="activity-stage-tabs">{activityStageControl}</div>
+          {renderActivityRows()}
+          <audio ref={recentAudioRef} className="visually-hidden" onEnded={() => setRecentPlayingId(undefined)} onPause={() => setRecentPlayingId(undefined)} />
+          <div className="output-block"><strong>Local-only processing</strong><span>Music and speech outputs remain on this computer.</span></div>
+        </Panel></div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="page generate-page">
-      <PageHeader title="Generate" subtitle="Create, queue, preview, and export speech from local open-source engines." />
+      <PageHeader title="New generation" actions={generationToolbar} />
 
       <div className="generate-layout">
         <Panel className="composer-panel" ariaLabel="Generation composer">
@@ -524,9 +687,15 @@ export function GenerateView({
           </div>
           {mode === "batch" && batchImport ? <div className="batch-import-summary"><FileInput aria-hidden="true" size={13} /><strong>{batchImport.name}</strong><span>{batchImport.rows.length} rows / {batchImport.source_format.toUpperCase()}</span><button className="text-button" type="button" onClick={() => setBatchImport(undefined)}>Use edited lines</button></div> : null}
 
+          <div className="generation-options">
           <div className="selector-grid">
             <SelectField label="Model" value={modelId} onChange={setModelId} status={selectedModel ? "Ready" : undefined} options={ttsModels.map((model) => ({ value: model.model_id, label: model.model_id }))} />
-            <SelectField label="Voice" value={voiceId} onChange={setVoiceId} status={selectedVoice ? `${selectedVoice.sample_seconds || "Preset"}` : undefined} options={compatibleVoices.map((voice) => ({ value: voice.id, label: `${voice.name} - ${voice.style}` }))} />
+            <div className="voice-select-with-action">
+              <SelectField label="Voice" value={voiceId} onChange={setVoiceId} status={selectedVoice ? `${selectedVoice.sample_seconds || "Preset"}` : undefined} options={compatibleVoices.map((voice) => ({ value: voice.id, label: `${voice.name} - ${voice.style}` }))} />
+              <button className="icon-button" type="button" title="Add voice profile" aria-label="Add voice profile from Generate" onClick={() => setShowAddVoice(true)}>
+                <Plus aria-hidden="true" size={14} />
+              </button>
+            </div>
           </div>
 
           <div className="route-control">
@@ -535,8 +704,9 @@ export function GenerateView({
             {routeReason ? <StatusText tone={routeReason.startsWith("No installed") ? "warning" : "muted"}>{routeReason}</StatusText> : null}
           </div>
 
-          <span className="section-label">Generation settings</span>
-          <div className="settings-grid">
+          <details className="generation-advanced">
+            <summary><span><strong>Advanced settings</strong><small>Priority, pacing, sampling, language, and output</small></span><ChevronDown aria-hidden="true" size={14} /></summary>
+            <div className="settings-grid">
             <CompactField label="Priority"><Dropdown ariaLabel="Queue priority" value={priority} onChange={(value) => setPriority(value as QueuePriority)} options={[{ value: "low", label: "Low" }, { value: "normal", label: "Normal" }, { value: "high", label: "High" }, { value: "urgent", label: "Urgent" }]} /></CompactField>
             {mode === "batch" ? <CompactField label="Parallel jobs">
               <div className="range-value">
@@ -557,30 +727,31 @@ export function GenerateView({
             {capability?.controls.repetition_penalty ? <CompactField label="Repetition"><div className="range-value"><input aria-label="Repetition penalty" min={capability.controls.repetition_penalty.minimum} max={capability.controls.repetition_penalty.maximum} step="0.05" type="range" value={repetitionPenalty} onChange={(event) => setRepetitionPenalty(Number(event.target.value))} /><strong>{repetitionPenalty.toFixed(2)}</strong></div></CompactField> : null}
             {capability && capability.languages.length > 1 ? <CompactField label="Language"><Dropdown ariaLabel="Language" value={language} onChange={setLanguage} options={capability.languages.map((value) => ({ value, label: value.toUpperCase() }))} /></CompactField> : null}
             <CompactField label="Seed">
-              <input type="number" value={seed} onChange={(event) => setSeed(Number(event.target.value))} />
+              <input aria-label="Seed" type="number" value={seed} onChange={(event) => setSeed(Number(event.target.value))} />
             </CompactField>
             <CompactField label="Output">
               <Dropdown ariaLabel="Output format" value={outputFormat} onChange={(value) => setOutputFormat(value as "wav" | "flac")} options={[{ value: "wav", label: "WAV / source rate" }, { value: "flac", label: "FLAC / source rate" }]} />
             </CompactField>
+            </div>
+          </details>
           </div>
 
-          <div className="waveform-panel">
+          {audioUrl || isAudioLoading || playbackError ? <div className="waveform-panel">
             <div className="waveform-meta">
               <span className="section-label">Preview</span>
               <span>{formatPlaybackTime(playbackTime)} / {formatPlaybackTime(playbackDuration)}</span>
             </div>
             <button className="audio-waveform" type="button" aria-label="Seek audio preview" disabled={!audioUrl} onClick={seekPlayback}>
-              {waveform.map((peak, index) => (
-                <i className={(index + 1) / waveform.length <= playbackProgress ? "is-played" : ""} key={`${index}-${peak}`} style={{ height: `${Math.max(4, Math.round(peak * 32))}px` }} />
-              ))}
+              <span className="audio-track-progress" style={{ width: `${playbackProgress * 100}%` }} />
+              <span className="audio-track-head" style={{ left: `${playbackProgress * 100}%` }} />
             </button>
             {audioUrl ? <audio ref={audioRef} className="visually-hidden" preload="auto" src={audioUrl} onCanPlay={() => setPlaybackError(undefined)} onLoadedMetadata={(event) => setPlaybackDuration(event.currentTarget.duration)} onTimeUpdate={(event) => setPlaybackTime(event.currentTarget.currentTime)} onError={() => setPlaybackError("Generated audio could not be decoded") } onEnded={(event) => { setIsPlaying(false); setPlaybackTime(event.currentTarget.duration); }} /> : null}
-            <button className="icon-button preview-play" type="button" title={isPlaying ? "Pause preview" : "Play preview"} disabled={!audioUrl || isAudioLoading} onClick={togglePlayback}>
+            <button className="icon-button preview-play" type="button" aria-label={isPlaying ? "Pause preview" : "Play preview"} title={isPlaying ? "Pause preview" : "Play preview"} disabled={!audioUrl || isAudioLoading} onClick={togglePlayback}>
               {isPlaying ? <Pause aria-hidden="true" fill="currentColor" size={13} /> : <Play aria-hidden="true" fill="currentColor" size={13} />}
             </button>
             {isAudioLoading ? <span className="playback-loading">Loading audio...</span> : null}
             {playbackError ? <span className="playback-error">{playbackError}</span> : null}
-          </div>
+          </div> : null}
 
           <div className="composer-footer">
             <div className="composer-state">
@@ -596,21 +767,20 @@ export function GenerateView({
               Save preset
             </button>
             {isGenerating ? <button className="button button-secondary danger-button" type="button" onClick={() => void cancelGeneration()}><Pause aria-hidden="true" size={14} />Cancel all</button> : null}
-            <button className="button button-primary" type="button" onClick={generate} disabled={!runtimeReady || !text.trim() || !modelId || !voiceReady}>
-              <Sparkles aria-hidden="true" size={14} />
-              {mode === "batch" ? "Start batch" : "Queue audio"}
+            <button className="button button-primary" type="button" onClick={generate} disabled={!runtimeReady || !text.trim() || !modelId || !voiceReady || generationCapacityReached} title={generationCapacityReached ? `All ${scheduler.max_workers} generation slots are in use` : undefined}>
+              {mode === "batch" ? "Start batch" : "Generate audio"}
             </button>
           </div>
           {presetState ? <div className="composer-message"><StatusText tone={presetState.startsWith("Saved") ? "success" : "danger"}>{presetState}</StatusText></div> : null}
         </Panel>
 
-        <Panel className="runtime-rail" ariaLabel="Runtime and output queue">
+        <div className="generation-activity-slot"><Panel className="runtime-rail generation-activity-drawer" ariaLabel="Runtime and output queue">
           <div className="rail-heading">
             <div>
               <span className="section-label">Runtime</span>
               <strong>{selectedModel?.model_id.split("/").at(-1) ?? "No model"}</strong>
             </div>
-            <StatusText tone={runtimeReady && selectedModel ? "success" : "warning"}>{!runtimeReady ? "Setup required" : selectedModel ? `${scheduler.active_workers}/${scheduler.max_workers} active` : "Install a model"}</StatusText>
+            <span className="rail-heading-actions"><StatusText tone={runtimeReady && selectedModel ? "success" : "warning"}>{!runtimeReady ? "Setup required" : selectedModel ? `${activeGenerationCount}/${scheduler.max_workers} active` : "Install a model"}</StatusText></span>
           </div>
 
           <MetricStrip
@@ -621,45 +791,9 @@ export function GenerateView({
             ]}
           />
 
-          <div className="queue-heading"><span className="section-label rail-section">Queue</span>{jobs.some((job) => ["completed", "cancelled"].includes(job.status)) ? <button className="text-button" type="button" onClick={() => void clearFinishedQueue()}>Clear finished</button> : null}</div>
-          <div className="queue-list">
-            {jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).slice(0, 5).map((job) => (
-              <div className="queue-row" key={job.id}>
-                <div><strong>{job.title?.slice(0, 28) || job.kind}</strong><StatusText tone="warning">{job.status === "running" ? "Generating" : job.status}{job.priority && job.priority !== "normal" ? ` / ${job.priority}` : ""}</StatusText></div>
-                <button className="icon-button" type="button" title="Cancel task" onClick={() => void cancelJob(job.id)}><Pause aria-hidden="true" size={13} /></button>
-              </div>
-            ))}
-            {jobs.filter((job) => ["failed", "cancelled"].includes(job.status) && ["synthesis", "api-synthesis"].includes(job.kind)).slice(0, 3).map((job) => (
-              <div className="queue-row" key={job.id}><div><strong>{job.title?.slice(0, 28) || job.kind}</strong><StatusText tone={job.status === "failed" ? "danger" : "muted"}>{job.status}{job.attempt > 1 ? ` / attempt ${job.attempt}` : ""}</StatusText></div><button className="text-button queue-resume" type="button" onClick={() => void retryQueuedJob(job)}><RotateCcw aria-hidden="true" size={12} />Retry</button></div>
-            ))}
-            {!jobs.some((job) => ["queued", "preparing", "running"].includes(job.status)) ? <div className="queue-row"><div><strong>{text.split(/[.!?]/)[0].slice(0, 28) || "Current script"}</strong><StatusText tone={result ? "success" : "muted"}>{result ? "Ready" : "Draft"}</StatusText></div><MoreHorizontal aria-hidden="true" size={16} /></div> : null}
-            {batches.slice(0, 4).map((batch) => {
-              const expanded = expandedBatchId === batch.id;
-              const settling = batch.items.some((item) => item.status === "running") && batch.status === "paused";
-              const statusTone = batch.status === "completed" ? "success" : batch.status === "failed" ? "danger" : batch.status === "cancelled" ? "muted" : "warning";
-              return <div className="batch-queue-entry" key={batch.id}>
-                <div className="queue-row batch-queue-row">
-                  <button className="batch-toggle" type="button" aria-expanded={expanded} aria-label={expanded ? "Hide batch rows" : "Show batch rows"} title={expanded ? "Hide batch rows" : "Show batch rows"} onClick={() => setExpandedBatchId(expanded ? undefined : batch.id)}>
-                    {expanded ? <ChevronDown aria-hidden="true" size={13} /> : <ChevronRight aria-hidden="true" size={13} />}
-                    <span><strong>{batch.name}</strong><StatusText tone={statusTone}>{batch.completed_items}/{batch.total_items} complete{batch.failed_items ? ` / ${batch.failed_items} failed` : ""} / {batch.status}{batch.priority && batch.priority !== "normal" ? ` / ${batch.priority}` : ""}</StatusText></span>
-                  </button>
-                  <span className="queue-actions">
-                    {["queued", "running"].includes(batch.status) ? <><button className="icon-button" type="button" title="Pause batch" onClick={() => void pauseBatch(batch)}><Pause aria-hidden="true" size={13} /></button><button className="icon-button danger-button" type="button" title="Cancel batch" onClick={() => void cancelBatch(batch)}><X aria-hidden="true" size={13} /></button></> : null}
-                    {["paused", "failed"].includes(batch.status) ? <button className="text-button queue-resume" type="button" disabled={settling} title={settling ? "Waiting for active rows to finish" : batch.status === "failed" ? "Retry failed rows" : "Resume queued rows"} onClick={() => void resumeBatch(batch)}><RotateCcw aria-hidden="true" size={12} />{settling ? "Pausing" : batch.status === "failed" ? "Retry failed" : "Resume"}</button> : null}
-                    {batch.status === "paused" ? <button className="icon-button danger-button" type="button" title="Cancel batch" onClick={() => void cancelBatch(batch)}><X aria-hidden="true" size={13} /></button> : null}
-                  </span>
-                </div>
-                {expanded ? <div className="batch-item-list" aria-label={`${batch.name} rows`}>
-                  {batch.items.map((item) => <div className="batch-item-row" key={item.id}>
-                    <span className="batch-item-index">{String(item.item_index + 1).padStart(2, "0")}</span>
-                    <span className="batch-item-script" title={item.text}>{item.name || item.text}</span>
-                    <StatusText tone={item.status === "completed" ? "success" : item.status === "failed" ? "danger" : item.status === "cancelled" ? "muted" : "warning"}>{item.status}{item.priority && item.priority !== "normal" ? ` / ${item.priority}` : ""}</StatusText>
-                    {item.error ? <small title={item.error}>{item.error}</small> : null}
-                  </div>)}
-                </div> : null}
-              </div>;
-            })}
-          </div>
+          <div className="activity-stage-tabs">{activityStageControl}</div>
+          {renderActivityRows()}
+          <audio ref={recentAudioRef} className="visually-hidden" onEnded={() => setRecentPlayingId(undefined)} onPause={() => setRecentPlayingId(undefined)} />
 
           <span className="section-label rail-section">Output</span>
           <div className="output-block">
@@ -673,8 +807,9 @@ export function GenerateView({
               Open output
             </button>
           </div>
-        </Panel>
+        </Panel></div>
       </div>
+      {showAddVoice ? <VoiceProfileDialog onClose={() => setShowAddVoice(false)} onCreated={useCreatedVoice} /> : null}
     </div>
   );
 }

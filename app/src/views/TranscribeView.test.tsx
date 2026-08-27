@@ -116,7 +116,7 @@ describe("Transcribe workflow", () => {
     );
 
     await user.click(
-      screen.getByRole("button", { name: /Choose audio to transcribe/ }),
+      screen.getByRole("button", { name: /Choose an audio file/ }),
     );
     await user.click(screen.getByRole("checkbox", { name: "Speech cleanup" }));
     await user.click(screen.getByRole("button", { name: "Transcribe audio" }));

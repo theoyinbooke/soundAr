@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-const routes = ["Generate", "Projects", "Transcribe", "Voices", "Models", "Live", "Compare", "Benchmarks", "History", "Settings", "About"];
+const routes = ["Generate", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History", "Settings", "About"];
 const cycles = Math.max(1, Number.parseInt(process.env.SOUNDAR_SOAK_CYCLES ?? "25", 10) || 25);
 
 test("repeated route and theme changes remain bounded and error-free", async ({ page }) => {

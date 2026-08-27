@@ -5,7 +5,7 @@
 # soundAr
 
 soundAr is an open-source, local-first desktop studio for generating, cloning,
-comparing, and benchmarking voices with local speech models.
+comparing, and benchmarking voices, plus bounded short music drafts, with local models.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-f0a928.svg)](LICENSE)
 [![CI](https://github.com/theoyinbooke/soundAr/actions/workflows/ci.yml/badge.svg)](https://github.com/theoyinbooke/soundAr/actions/workflows/ci.yml)
@@ -46,7 +46,7 @@ chmod +x install-linux.sh
 To install a locally built package, pass its path:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.3.0_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.3.2_amd64.deb
 ```
 
 When the Debian package or AppImage is installed directly, soundAr detects a missing Python
@@ -90,14 +90,36 @@ changed outside soundAr is never presented as the original generation.
 
 ## Architecture
 
-- `app/src/`: compact React workspace with dark and cream-light themes
+- `app/src/`: compact React workspace with a neutral light-first desktop design system and an optional dark appearance
 - `app/src-tauri/`: SQLite state, GPU-aware parallel scheduler, native audio, local API, and desktop integration
 - `bridge.py`: persistent JSON-lines inference worker with an engine-scoped warm model cache
-- `core/`: model registry, audio utilities, benchmarking, and unified TTS/STT APIs
+- `core/`: model registry, audio utilities, benchmarking, and unified TTS/STT/music APIs
 - `engines/`: model-specific open-source inference adapters
 - `data/curated_models.json`: curated local model catalog
 
 The application performs inference locally after model download. There is no cloud inference, API-key dependency, telemetry requirement, or online fallback.
+
+### Text-to-Music Beta
+
+Music generation uses two deliberately separate text conditions: **Music direction**
+describes the intended genre, instruments, arrangement, mood, tempo, and vocal character;
+optional **Lyrics or text to sing** supplies the words and section markers such as
+`[Verse]` and `[Chorus]`. They are persisted independently in the durable request and
+History record, so a retry never turns a lyric into a style prompt or vice versa.
+
+ACE-Step 1.5 XL Turbo is the local lyric-conditioned route. It uses an isolated runtime,
+a user-approved pinned checkpoint, and the official local Diffusers pipeline to render
+short 48 kHz stereo WAV or FLAC music. Lyrics are a generation condition—not a transcript
+guarantee—so every render needs a listening review. ACE-Step requires CUDA in this release;
+the 12 GB target uses model CPU offload and must pass the packaged GPU acceptance gate before
+release.
+
+MusicGen Small remains available for short 32 kHz instrumental drafts. It cannot condition
+on lyrics, and soundAr rejects a lyric request sent to it instead of pretending the text was
+sung. Its weights are CC BY-NC 4.0, so it must not be presented as commercial-use ready.
+Source-audio cover/remix/repaint, melody conditioning, voice/reference uploads, and batch
+music are deliberately out of scope until each has its own consent, safety, and hardware
+qualification.
 
 ### Parallel Jobs and Batch API
 
@@ -207,8 +229,8 @@ Linux releases are created from version tags. Keep the version in `app/package.j
 `app/src-tauri/Cargo.toml`, and `app/src-tauri/tauri.conf.json` aligned, then push a matching tag:
 
 ```bash
-git tag -a v0.3.0 -m "soundAr v0.3.0"
-git push origin v0.3.0
+git tag -a v0.3.2 -m "soundAr v0.3.2"
+git push origin v0.3.2
 ```
 
 GitHub Actions tests the source, builds signed Debian and AppImage artifacts into a draft release,

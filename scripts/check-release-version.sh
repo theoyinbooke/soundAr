@@ -8,7 +8,11 @@ package_version="$(node -p "require('$ROOT/app/package.json').version")"
 lock_version="$(node -p "require('$ROOT/app/package-lock.json').version")"
 tauri_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$ROOT/app/src-tauri/tauri.conf.json")"
 cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT/app/src-tauri/Cargo.toml" | head -1)"
-about_version="$(sed -n 's/.*Version \([0-9][0-9.]*\).*/\1/p' "$ROOT/app/src/views/SecondaryViews.tsx" | head -1)"
+about_version=""
+if grep -Fq 'Version {__APP_VERSION__}' "$ROOT/app/src/views/SecondaryViews.tsx" \
+  && grep -Fq '__APP_VERSION__: JSON.stringify(packageMetadata.version)' "$ROOT/app/vite.config.ts"; then
+  about_version="$package_version"
+fi
 
 for entry in \
   "package.json:$package_version" \

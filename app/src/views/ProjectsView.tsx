@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronUp, CircleStop, Download, FileInput, FolderPlus, Layers3, LoaderCircle, Pause, Play, Plus, RotateCcw, Save, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronUp, Circle, CircleStop, Download, FileInput, FolderPlus, Layers3, LoaderCircle, Pause, Play, Plus, Redo2, RotateCcw, Save, Trash2, Undo2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { BatchInputRow, BatchRunRecord, BootstrapState, HistoryItem, ProjectChapter, ProjectMasterSettings, ProjectRecord, ProjectRenderBatch, SynthesisRequest, VoiceProfile } from "../types";
 import { cancelBatchRun, deleteProject, exportProjectMaster, getBatchRun, importProjectScript, listHistory, loadGeneratedAudio, pauseBatchRun, pickProjectScript, queueBatchRun, resumeBatchRun, saveProject, synthesizeSpeech } from "../lib/bridge";
@@ -7,6 +7,66 @@ import { EmptyState, PageHeader, Panel, SelectField, StatusText } from "../compo
 
 function newChapter(position: number): ProjectChapter {
   return { id: crypto.randomUUID(), title: `Chapter ${position + 1}`, text: "", language: "en" };
+}
+
+function ProjectSetupDialog({
+  initialName = "",
+  mode,
+  onClose,
+  onImport,
+  onSubmit,
+}: {
+  initialName?: string;
+  mode: "create" | "rename";
+  onClose: () => void;
+  onImport?: () => void;
+  onSubmit: (name: string) => void;
+}) {
+  const [value, setValue] = useState(initialName);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
+    <form className="modal project-setup-dialog" role="dialog" aria-modal="true" aria-labelledby="project-setup-title" onSubmit={(event) => { event.preventDefault(); if (value.trim()) onSubmit(value.trim()); }}>
+      <header className="modal-header">
+        <div><h2 id="project-setup-title">{mode === "create" ? "Create project" : "Rename project"}</h2><p>{mode === "create" ? "Set up a focused workspace for a long-form voice production." : "Update the name shown in your local project library."}</p></div>
+        <button className="icon-button" type="button" aria-label="Close project setup" onClick={onClose}><X aria-hidden="true" size={15} /></button>
+      </header>
+      <div className="modal-body">
+        <label className="form-field"><span>Project name</span><input ref={inputRef} value={value} onChange={(event) => setValue(event.target.value)} placeholder="e.g. Product launch narration" /></label>
+        {mode === "create" ? <><div className="project-dialog-note"><FolderPlus aria-hidden="true" size={16} /><span><strong>Local by default</strong><small>Scripts, chapter settings, and rendered audio stay on this computer.</small></span></div><button className="project-dialog-import" type="button" onClick={onImport}><FileInput aria-hidden="true" size={14} /><span><strong>Import an existing script</strong><small>Start a project from a TXT, Markdown, or Fountain document.</small></span></button></> : null}
+      </div>
+      <footer className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" type="submit" disabled={!value.trim()}>{mode === "create" ? "Create project" : "Save name"}</button></footer>
+    </form>
+  </div>;
+}
+
+function ChapterSetupDialog({ position, onClose, onSubmit }: { position: number; onClose: () => void; onSubmit: (title: string, text: string) => void }) {
+  const [title, setTitle] = useState(`Chapter ${position + 1}`);
+  const [text, setText] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}>
+    <form className="modal chapter-setup-dialog" role="dialog" aria-modal="true" aria-labelledby="chapter-setup-title" onSubmit={(event) => { event.preventDefault(); onSubmit(title.trim() || `Chapter ${position + 1}`, text); }}>
+      <header className="modal-header"><div><h2 id="chapter-setup-title">Add chapter</h2><p>Start with a title and, optionally, paste the first draft.</p></div><button className="icon-button" type="button" aria-label="Close chapter setup" onClick={onClose}><X aria-hidden="true" size={15} /></button></header>
+      <div className="modal-body"><label className="form-field"><span>Chapter title</span><input ref={inputRef} value={title} onChange={(event) => setTitle(event.target.value)} /></label><label className="form-field"><span>Starting script <small>Optional</small></span><textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="Paste a draft or leave this blank to begin in the editor." /></label></div>
+      <footer className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" type="submit">Add chapter</button></footer>
+    </form>
+  </div>;
 }
 
 export function reconcileProjectBatchChapters(
@@ -61,6 +121,8 @@ export function ProjectsView({
   const [playing, setPlaying] = useState(false);
   const [undoStack, setUndoStack] = useState<ProjectChapter[][]>([]);
   const [redoStack, setRedoStack] = useState<ProjectChapter[][]>([]);
+  const [projectDialogMode, setProjectDialogMode] = useState<"create" | "rename">();
+  const [chapterDialogOpen, setChapterDialogOpen] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const deliveredHistoryIds = useRef(new Set<string>());
   const selectedIdRef = useRef(selectedId);
@@ -98,12 +160,13 @@ export function ProjectsView({
     setUndoStack([]); setRedoStack([]); setState(undefined);
   }
 
-  function createNew() {
+  function createNew(projectName = "Untitled project") {
     const first = newChapter(0);
     selectedIdRef.current = "";
-    setSelectedId(""); setName("Untitled project"); setChapters([first]); setActiveChapterId(first.id);
+    setSelectedId(""); setName(projectName); setChapters([first]); setActiveChapterId(first.id);
     setRenderBatch(undefined); setBatchState(undefined);
     setUndoStack([]); setRedoStack([]); setState("New draft");
+    setProjectDialogMode(undefined);
   }
 
   function commit(next: ProjectChapter[]) {
@@ -130,9 +193,10 @@ export function ProjectsView({
     setUndoStack((items) => [...items, chapters]); setRedoStack((items) => items.slice(0, -1)); setChapters(next);
   }
 
-  function addChapter() {
-    const chapter = newChapter(chapters.length);
+  function addChapter(title = `Chapter ${chapters.length + 1}`, text = "") {
+    const chapter = { ...newChapter(chapters.length), title, text };
     commit([...chapters, chapter]); setActiveChapterId(chapter.id);
+    setChapterDialogOpen(false);
   }
 
   function moveChapter(direction: -1 | 1) {
@@ -340,7 +404,12 @@ export function ProjectsView({
     try {
       if (await deleteProject(selected.id)) {
         const remaining = projects.filter((project) => project.id !== selected.id); onChange(remaining);
-        if (remaining[0]) loadProject(remaining[0]); else createNew();
+        if (remaining[0]) loadProject(remaining[0]);
+        else {
+          selectedIdRef.current = "";
+          setSelectedId(""); setName(""); setChapters([]); setActiveChapterId("");
+          setRenderBatch(undefined); setBatchState(undefined); setState(undefined);
+        }
       }
     } catch (caught) { setState(caught instanceof Error ? caught.message : String(caught)); }
   }
@@ -374,42 +443,64 @@ export function ProjectsView({
   const writtenChapters = chapters.filter((chapter) => chapter.text.trim());
   const canMaster = Boolean(selectedId) && writtenChapters.length > 0 && writtenChapters.every((chapter) => chapter.history_id);
 
-  return <div className="page projects-page">
-    <PageHeader title="Projects" subtitle="Build long-form work from independently editable, selectively rendered chapters." actions={<><button className="button button-secondary" type="button" disabled={!undoStack.length} onClick={undo}>Undo</button><button className="button button-secondary" type="button" disabled={!redoStack.length} onClick={redo}>Redo</button><button className="button button-secondary" type="button" onClick={() => void importScript()}><FileInput size={14} />Import</button><button className="button button-primary" type="button" onClick={createNew}><FolderPlus size={14} />New project</button></>} />
-    <div className="projects-layout">
-      <Panel className="project-list table-panel" ariaLabel="Project list">
-        <div className="project-list-heading"><span className="section-label">Projects</span><button className="icon-button" title="Add project" type="button" onClick={createNew}><Plus size={13} /></button></div>
-        <div className="project-rows">{projects.length ? projects.map((project) => <button className={`project-row ${project.id === selectedId ? "is-selected" : ""}`} key={project.id} type="button" onClick={() => loadProject(project)}><strong>{project.name}</strong><span>{project.document.chapters.length} chapters / {project.document.chapters.filter((chapter) => chapter.history_id).length} rendered</span><small>{new Date(project.updated_at).toLocaleString()}</small></button>) : <EmptyState title="No projects yet" detail="Create a project to begin a long-form production." />}</div>
-      </Panel>
-      <Panel className="project-studio" ariaLabel="Project studio">
-        <div className="project-studio-bar"><label className="form-field project-name"><span>Project name</span><input value={name} onChange={(event) => { setName(event.target.value); setState("Unsaved changes"); }} /></label><button className="button button-secondary" type="button" onClick={addChapter}><Plus size={13} />Chapter</button><button className="button button-primary" type="button" onClick={() => void save()}><Save size={13} />Save</button></div>
-        <div className="chapter-workspace">
-          <div className="chapter-list"><div className="chapter-list-tools"><span className="section-label">Chapters</span><div><button className="icon-button" title="Move chapter up" type="button" disabled={activeIndex <= 0} onClick={() => moveChapter(-1)}><ChevronUp size={12} /></button><button className="icon-button" title="Move chapter down" type="button" disabled={activeIndex < 0 || activeIndex >= chapters.length - 1} onClick={() => moveChapter(1)}><ChevronDown size={12} /></button></div></div>{chapters.map((chapter, index) => {
-            const batchItem = batchItemsByChapter.get(chapter.id);
-            const label = chapter.history_id ? "Rendered" : batchItem?.status === "running" ? "Rendering" : batchItem?.status === "queued" ? "Queued" : batchItem?.status === "failed" ? "Failed" : batchItem?.status === "cancelled" ? "Cancelled" : chapter.text.trim() ? "Stale" : "Empty";
-            const tone = chapter.history_id ? "success" : batchItem?.status === "failed" ? "danger" : chapter.text.trim() ? "warning" : "muted";
-            return <button className={`chapter-row ${chapter.id === activeChapterId ? "is-selected" : ""}`} type="button" key={chapter.id} onClick={() => setActiveChapterId(chapter.id)}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{chapter.title || "Untitled chapter"}</strong><small title={batchItem?.error ?? undefined}>{batchItem?.error ?? `${chapter.text.length} characters`}</small></div><StatusText tone={tone}>{label}</StatusText></button>;
-          })}</div>
-          {active ? <div className="chapter-editor"><div className="chapter-title-row"><label className="form-field"><span>Chapter title</span><input value={active.title} onChange={(event) => updateActive({ title: event.target.value })} /></label><button className="icon-button danger-button" title="Delete chapter" type="button" disabled={chapters.length <= 1} onClick={() => { const next = chapters.filter((chapter) => chapter.id !== active.id); commit(next); setActiveChapterId(next[Math.max(0, activeIndex - 1)]?.id ?? ""); }}><Trash2 size={13} /></button></div><label className="form-field project-script"><span>Script</span><textarea value={active.text} onChange={(event) => updateActive({ text: event.target.value })} placeholder="Write this chapter..." /></label><div className="chapter-settings"><SelectField label="Model" value={activeModel?.model_id ?? ""} onChange={(model_id) => updateActive({ model_id, voice_id: undefined, history_id: undefined })} options={ttsModels.map((model) => ({ value: model.model_id, label: model.model_id }))} /><SelectField label="Voice" value={active.voice_id ?? selectableVoices[0]?.value ?? ""} onChange={(voice_id) => updateActive({ voice_id, history_id: undefined })} options={selectableVoices} /><SelectField label="Language" value={active.language ?? activeCapability?.languages[0] ?? "en"} onChange={(language) => updateActive({ language, history_id: undefined })} options={(activeCapability?.languages ?? ["en"]).map((language) => ({ value: language, label: language.toUpperCase() }))} /></div><div className="chapter-actions"><StatusText tone={state === "Saved locally" ? "success" : state?.includes("requires") ? "danger" : "muted"}>{activeChapterIsQueued ? "Queued in chapter render" : state ?? (active.history_id ? "Rendered artifact linked" : "Ready to render")}</StatusText>{audioUrl ? <audio className="visually-hidden" ref={audioRef} src={audioUrl} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} /> : null}<button className="icon-button" title={playing ? "Pause chapter" : "Play latest chapter"} type="button" disabled={!audioUrl} onClick={() => audioRef.current && (audioRef.current.paused ? void audioRef.current.play() : audioRef.current.pause())}>{playing ? <Pause size={13} /> : <Play size={13} />}</button><button className="button button-primary" type="button" disabled={!active.text.trim() || !activeModel || Boolean(renderingId) || activeChapterIsQueued || (referenceRequired && !activeVoice?.local_path)} onClick={() => void renderChapter()}>{renderingId ? <LoaderCircle className="spin" size={13} /> : <Play size={13} />}{renderingId ? "Rendering" : active.history_id ? "Regenerate clip" : "Render clip"}</button></div></div> : <EmptyState title="No chapter selected" detail="Add a chapter to begin writing." />}
-        </div>
-        <div className="project-render-bar">
-          <div className="project-render-summary"><Layers3 size={14} /><span><strong>Chapter queue</strong><small>{batchState ? `${batchState.completed_items}/${batchState.total_items} complete${batchState.failed_items ? ` / ${batchState.failed_items} failed` : ""} / ${batchState.status}` : `${staleChapters.length} stale chapter${staleChapters.length === 1 ? "" : "s"}`}</small></span></div>
-          <SelectField label="Parallel" value={String(parallelism)} onChange={(value) => setParallelism(Number(value))} disabled={Boolean(batchActive)} options={Array.from({ length: Math.min(4, bootstrap.scheduler.max_workers) }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} />
-          {batchState && ["queued", "running"].includes(batchState.status) ? <button className="icon-button" title="Pause project rendering" type="button" disabled={batchBusy} onClick={() => void pauseProjectBatch()}><Pause size={13} /></button> : null}
-          {batchState && ["paused", "failed"].includes(batchState.status) ? <button className="button button-secondary" type="button" disabled={batchBusy} onClick={() => void resumeProjectBatch()}><RotateCcw size={13} />{batchState.status === "failed" ? "Retry failed" : "Resume"}</button> : null}
-          {batchActive ? <button className="icon-button danger-button" title="Cancel project rendering" type="button" disabled={batchBusy} onClick={() => void cancelProjectBatch()}><CircleStop size={13} /></button> : null}
-          <button className="button button-primary" type="button" disabled={!staleChapters.length || Boolean(batchActive) || batchBusy} onClick={() => void renderStaleChapters()}>{batchBusy ? <LoaderCircle className="spin" size={13} /> : <Layers3 size={13} />}{batchBusy ? "Updating" : `Render stale${staleChapters.length ? ` (${staleChapters.length})` : ""}`}</button>
-        </div>
-        <div className="project-master-bar">
-          <span className="section-label">Master</span>
-          <SelectField label="Format" value={masterSettings.format} onChange={(format) => setMasterSettings((current) => ({ ...current, format: format as "wav" | "flac" }))} options={[{ value: "wav", label: "WAV" }, { value: "flac", label: "FLAC" }]} />
-          <SelectField label="Rate" value={String(masterSettings.sample_rate)} onChange={(sample_rate) => setMasterSettings((current) => ({ ...current, sample_rate: Number(sample_rate) as ProjectMasterSettings["sample_rate"] }))} options={[{ value: "24000", label: "24 kHz" }, { value: "44100", label: "44.1 kHz" }, { value: "48000", label: "48 kHz" }]} />
-          <label className="form-field"><span>Gap</span><input type="number" min="0" max="5000" step="50" value={masterSettings.gap_ms} onChange={(event) => setMasterSettings((current) => ({ ...current, gap_ms: Number(event.target.value) }))} /></label>
-          <label className="form-field"><span>LUFS</span><input type="number" min="-24" max="-9" step="1" value={masterSettings.target_lufs} onChange={(event) => setMasterSettings((current) => ({ ...current, target_lufs: Number(event.target.value) }))} /></label>
-          <button className="button button-primary" title={canMaster ? "Export mastered project" : "Render every written chapter before mastering"} type="button" disabled={!canMaster || mastering} onClick={() => void masterProject()}>{mastering ? <LoaderCircle className="spin" size={13} /> : <Download size={13} />}{mastering ? "Mastering" : "Export master"}</button>
-        </div>
-        <div className="project-editor-footer"><StatusText tone={state?.startsWith("Master exported") ? "success" : "muted"}>{state?.startsWith("Master exported") ? state : `${chapters.length} chapters / ${chapters.filter((chapter) => chapter.history_id).length} rendered / ${chapters.filter((chapter) => chapter.text.trim() && !chapter.history_id).length} stale`}</StatusText><button className="button button-secondary danger-button" type="button" disabled={!selected} onClick={() => void removeProject()}><Trash2 size={13} />Delete project</button></div>
-      </Panel>
+  const workspaceOpen = Boolean(selected || chapters.length || state === "New draft");
+
+  return <>
+    <div className="page projects-page">
+      <PageHeader title="Projects" subtitle="Build long-form voice work in focused, chapter-based workspaces." actions={<button className="button button-primary" type="button" onClick={() => setProjectDialogMode("create")}><FolderPlus aria-hidden="true" size={14} />New project</button>} />
+      <div className="projects-layout">
+        <Panel className="project-list table-panel" ariaLabel="Project library">
+          <div className="project-list-heading"><span><strong>Library</strong><small>{projects.length + (!selectedId && chapters.length ? 1 : 0)} project{projects.length + (!selectedId && chapters.length ? 1 : 0) === 1 ? "" : "s"}</small></span></div>
+          <div className="project-rows">
+            {!selectedId && chapters.length ? <button className="project-row is-selected" type="button"><strong>{name}</strong><span className="project-row-meta"><span>{chapters.length} chapter{chapters.length === 1 ? "" : "s"} / new draft</span><span className="project-row-state" role="img" aria-label="Not saved yet" title="Not saved yet"><Circle aria-hidden="true" size={7} fill="currentColor" /></span></span></button> : null}
+            {projects.map((project) => <button className={`project-row ${project.id === selectedId ? "is-selected" : ""}`} key={project.id} type="button" onClick={() => loadProject(project)}><strong>{project.name}</strong><span className="project-row-meta"><span>{project.document.chapters.length} chapters / {project.document.chapters.filter((chapter) => chapter.history_id).length} rendered</span><small>{new Date(project.updated_at).toLocaleDateString()}</small></span></button>)}
+            {!projects.length && !chapters.length ? <EmptyState title="No projects yet" detail="Use New project in the top-right when you are ready to begin." /> : null}
+          </div>
+        </Panel>
+
+        {workspaceOpen ? <Panel className="project-studio" ariaLabel="Project workspace">
+          <header className="project-document-header">
+            <button className="project-title-button" type="button" title="Rename project" onClick={() => setProjectDialogMode("rename")}><strong>{name}</strong></button>
+            <div className="project-document-actions">
+              <button className="icon-button" aria-label="Undo chapter edit" title="Undo" type="button" disabled={!undoStack.length} onClick={undo}><Undo2 aria-hidden="true" size={14} /></button>
+              <button className="icon-button" aria-label="Redo chapter edit" title="Redo" type="button" disabled={!redoStack.length} onClick={redo}><Redo2 aria-hidden="true" size={14} /></button>
+              <button className="button button-secondary" type="button" onClick={() => setChapterDialogOpen(true)}><Plus aria-hidden="true" size={13} />Add chapter</button>
+              <button className="button button-primary" type="button" onClick={() => void save()}><Save aria-hidden="true" size={13} />Save</button>
+            </div>
+          </header>
+
+          <div className="chapter-workspace">
+            <aside className="chapter-list">
+              <div className="chapter-list-tools"><span><strong>Chapters</strong><small>· {chapters.length}</small></span><div><button className="icon-button" aria-label="Move chapter up" title="Move chapter up" type="button" disabled={activeIndex <= 0} onClick={() => moveChapter(-1)}><ChevronUp aria-hidden="true" size={12} /></button><button className="icon-button" aria-label="Move chapter down" title="Move chapter down" type="button" disabled={activeIndex < 0 || activeIndex >= chapters.length - 1} onClick={() => moveChapter(1)}><ChevronDown aria-hidden="true" size={12} /></button></div></div>
+              <div className="chapter-rows">{chapters.map((chapter) => {
+                const batchItem = batchItemsByChapter.get(chapter.id);
+                const label = chapter.history_id ? "Rendered" : batchItem?.status === "running" ? "Rendering" : batchItem?.status === "queued" ? "Queued" : batchItem?.status === "failed" ? "Failed" : batchItem?.status === "cancelled" ? "Cancelled" : chapter.text.trim() ? "Changed" : "Empty";
+                const tone = batchItem?.status === "failed" ? "danger" : "muted";
+                return <button className={`chapter-row ${chapter.id === activeChapterId ? "is-selected" : ""}`} type="button" key={chapter.id} onClick={() => setActiveChapterId(chapter.id)}><div><strong>{chapter.title || "Untitled chapter"}</strong><small title={batchItem?.error ?? undefined}>{batchItem?.error ?? `${chapter.text.length} characters`}</small></div><StatusText tone={tone}>{label}</StatusText></button>;
+              })}</div>
+              <button className="chapter-add-row" type="button" onClick={() => setChapterDialogOpen(true)}><Plus aria-hidden="true" size={13} />Add chapter</button>
+            </aside>
+
+            {active ? <article className="chapter-editor">
+              <div className="chapter-title-row"><label><span className="visually-hidden">Chapter title</span><input className="chapter-title-input" value={active.title} onChange={(event) => updateActive({ title: event.target.value })} /></label><button className="icon-button danger-button" aria-label="Delete chapter" title="Delete chapter" type="button" disabled={chapters.length <= 1} onClick={() => { const next = chapters.filter((chapter) => chapter.id !== active.id); commit(next); setActiveChapterId(next[Math.max(0, activeIndex - 1)]?.id ?? ""); }}><Trash2 aria-hidden="true" size={13} /></button></div>
+              <label className="project-script"><span className="visually-hidden">Script</span><textarea aria-label="Script" value={active.text} onChange={(event) => updateActive({ text: event.target.value })} placeholder="Write this chapter…" /></label>
+              <details className="chapter-voice-settings"><summary><span><strong>Voice and model</strong><small>{activeModel?.model_id.split("/").at(-1) ?? "No model"} · {activeVoice?.name ?? "Engine default"}</small></span><ChevronDown aria-hidden="true" size={14} /></summary><div className="chapter-settings"><SelectField label="Model" value={activeModel?.model_id ?? ""} onChange={(model_id) => updateActive({ model_id, voice_id: undefined, history_id: undefined })} options={ttsModels.map((model) => ({ value: model.model_id, label: model.model_id }))} /><SelectField label="Voice" value={active.voice_id ?? selectableVoices[0]?.value ?? ""} onChange={(voice_id) => updateActive({ voice_id, history_id: undefined })} options={selectableVoices} /><SelectField label="Language" value={active.language ?? activeCapability?.languages[0] ?? "en"} onChange={(language) => updateActive({ language, history_id: undefined })} options={(activeCapability?.languages ?? ["en"]).map((language) => ({ value: language, label: language.toUpperCase() }))} /></div></details>
+              <div className="chapter-actions"><StatusText tone={state?.includes("requires") ? "danger" : "muted"}>{activeChapterIsQueued ? "Queued in project render" : active.history_id ? "Rendered clip linked" : active.text.trim() ? "Ready to render" : "Start writing to enable rendering"}</StatusText>{audioUrl ? <audio className="visually-hidden" ref={audioRef} src={audioUrl} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} /> : null}<button className="icon-button" aria-label={playing ? "Pause chapter" : "Play latest chapter"} title={playing ? "Pause chapter" : "Play latest chapter"} type="button" disabled={!audioUrl} onClick={() => audioRef.current && (audioRef.current.paused ? void audioRef.current.play() : audioRef.current.pause())}>{playing ? <Pause aria-hidden="true" size={13} /> : <Play aria-hidden="true" size={13} />}</button><button className="button button-primary" type="button" disabled={!active.text.trim() || !activeModel || Boolean(renderingId) || activeChapterIsQueued || (referenceRequired && !activeVoice?.local_path)} onClick={() => void renderChapter()}>{renderingId ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <Play aria-hidden="true" size={13} />}{renderingId ? "Rendering" : active.history_id ? "Regenerate" : "Render chapter"}</button></div>
+            </article> : <div className="project-empty-editor"><EmptyState title="Add your first chapter" detail="Chapters keep long-form scripts focused and independently renderable." action={<button className="button button-primary" type="button" onClick={() => setChapterDialogOpen(true)}>Add chapter</button>} /></div>}
+          </div>
+
+          <details className="project-production-drawer">
+            <summary><span><strong>Production and export</strong><small>{batchState ? `${batchState.completed_items}/${batchState.total_items} rendered · ${batchState.status}` : `${staleChapters.length} chapter${staleChapters.length === 1 ? "" : "s"} ready to render`}</small></span><ChevronDown aria-hidden="true" size={15} /></summary>
+            <div className="project-production-content">
+              <section className="project-render-section"><div className="project-render-summary"><Layers3 aria-hidden="true" size={14} /><span><strong>Chapter queue</strong><small>Render changed chapters together without blocking the editor.</small></span></div><SelectField label="Parallel jobs" value={String(parallelism)} onChange={(value) => setParallelism(Number(value))} disabled={Boolean(batchActive)} options={Array.from({ length: Math.min(4, bootstrap.scheduler.max_workers) }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} />{batchState && ["queued", "running"].includes(batchState.status) ? <button className="icon-button" aria-label="Pause project rendering" title="Pause project rendering" type="button" disabled={batchBusy} onClick={() => void pauseProjectBatch()}><Pause aria-hidden="true" size={13} /></button> : null}{batchState && ["paused", "failed"].includes(batchState.status) ? <button className="button button-secondary" type="button" disabled={batchBusy} onClick={() => void resumeProjectBatch()}><RotateCcw aria-hidden="true" size={13} />{batchState.status === "failed" ? "Retry failed" : "Resume"}</button> : null}{batchActive ? <button className="icon-button danger-button" aria-label="Cancel project rendering" title="Cancel project rendering" type="button" disabled={batchBusy} onClick={() => void cancelProjectBatch()}><CircleStop aria-hidden="true" size={13} /></button> : null}<button className="button button-primary" type="button" disabled={!staleChapters.length || Boolean(batchActive) || batchBusy} onClick={() => void renderStaleChapters()}>{batchBusy ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <Layers3 aria-hidden="true" size={13} />}{batchBusy ? "Updating" : `Render changed${staleChapters.length ? ` (${staleChapters.length})` : ""}`}</button></section>
+              <section className="project-master-section"><div><strong>Master export</strong><small>Join rendered chapters into one delivery file.</small></div><SelectField label="Format" value={masterSettings.format} onChange={(format) => setMasterSettings((current) => ({ ...current, format: format as "wav" | "flac" }))} options={[{ value: "wav", label: "WAV" }, { value: "flac", label: "FLAC" }]} /><SelectField label="Rate" value={String(masterSettings.sample_rate)} onChange={(sample_rate) => setMasterSettings((current) => ({ ...current, sample_rate: Number(sample_rate) as ProjectMasterSettings["sample_rate"] }))} options={[{ value: "24000", label: "24 kHz" }, { value: "44100", label: "44.1 kHz" }, { value: "48000", label: "48 kHz" }]} /><label className="form-field"><span>Gap</span><input type="number" min="0" max="5000" step="50" value={masterSettings.gap_ms} onChange={(event) => setMasterSettings((current) => ({ ...current, gap_ms: Number(event.target.value) }))} /></label><label className="form-field"><span>LUFS</span><input type="number" min="-24" max="-9" step="1" value={masterSettings.target_lufs} onChange={(event) => setMasterSettings((current) => ({ ...current, target_lufs: Number(event.target.value) }))} /></label><button className="button button-primary" title={canMaster ? "Export mastered project" : "Render every written chapter before mastering"} type="button" disabled={!canMaster || mastering} onClick={() => void masterProject()}>{mastering ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <Download aria-hidden="true" size={13} />}{mastering ? "Mastering" : "Export master"}</button></section>
+              <footer className="project-management"><StatusText tone="muted">{state?.startsWith("Master exported") ? state : `${chapters.length} chapters · ${chapters.filter((chapter) => chapter.history_id).length} rendered · ${chapters.filter((chapter) => chapter.text.trim() && !chapter.history_id).length} changed`}</StatusText><button className="text-button danger-button" type="button" disabled={!selected} onClick={() => void removeProject()}><Trash2 aria-hidden="true" size={13} />Delete project</button></footer>
+            </div>
+          </details>
+        </Panel> : <Panel className="project-empty-workspace" ariaLabel="Empty project workspace"><EmptyState title="Select a project" detail="Choose a local project from the library, or use New project in the top-right." /></Panel>}
+      </div>
     </div>
-  </div>;
+    {projectDialogMode ? <ProjectSetupDialog mode={projectDialogMode} initialName={projectDialogMode === "rename" ? name : ""} onClose={() => setProjectDialogMode(undefined)} onImport={projectDialogMode === "create" ? () => { setProjectDialogMode(undefined); void importScript(); } : undefined} onSubmit={(nextName) => { if (projectDialogMode === "create") createNew(nextName); else { setName(nextName); setState("Unsaved changes"); setProjectDialogMode(undefined); } }} /> : null}
+    {chapterDialogOpen ? <ChapterSetupDialog position={chapters.length} onClose={() => setChapterDialogOpen(false)} onSubmit={addChapter} /> : null}
+  </>;
 }

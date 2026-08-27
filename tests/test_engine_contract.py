@@ -114,6 +114,119 @@ class EngineContractTests(unittest.TestCase):
                 "reference_audio_path": "/tmp/reference.wav",
             })
 
+    def test_breeze_declares_bilingual_reference_free_voice_design(self) -> None:
+        language = self.registry.validate_synthesis("breeze", {
+            "text": "(sigh) Welcome aboard.",
+            "language": "en-US",
+            "instruction": "A warm, thoughtful voice with a calm delivery.",
+            "cfg_scale": 4,
+            "output_format": "wav",
+        })
+        self.assertEqual(language, "en")
+        self.assertEqual(self.registry.normalize_language("breeze", "zh-CN"), "zh")
+        with self.assertRaisesRegex(ValueError, "cfg_scale must be between"):
+            self.registry.validate_synthesis("breeze", {
+                "text": "hello", "language": "en", "cfg_scale": 5,
+                "output_format": "wav",
+            })
+        with self.assertRaisesRegex(ValueError, "does not accept reference audio"):
+            self.registry.validate_synthesis("breeze", {
+                "text": "hello", "language": "en", "output_format": "wav",
+                "reference_audio_path": "/tmp/reference.wav",
+            })
+
+    def test_fish_speech_declares_multilingual_reference_free_generation(self) -> None:
+        language = self.registry.validate_synthesis("fish-speech", {
+            "text": "Welcome aboard.",
+            "language": "en-US",
+            "temperature": 0.7,
+            "top_p": 0.7,
+            "repetition_penalty": 1.2,
+            "output_format": "wav",
+        })
+        self.assertEqual(language, "en")
+        self.assertEqual(self.registry.normalize_language("fish-speech", "zh-CN"), "zh")
+        with self.assertRaisesRegex(ValueError, "temperature must be between"):
+            self.registry.validate_synthesis("fish-speech", {
+                "text": "hello", "language": "en", "temperature": 1.1,
+                "output_format": "wav",
+            })
+        with self.assertRaisesRegex(ValueError, "does not accept reference audio"):
+            self.registry.validate_synthesis("fish-speech", {
+                "text": "hello", "language": "en", "output_format": "wav",
+                "reference_audio_path": "/tmp/reference.wav",
+            })
+    def test_musicgen_has_a_bounded_text_to_music_contract(self) -> None:
+        self.registry.validate_music_generation("musicgen", {
+            "prompt": "Warm instrumental ambient music with slowly evolving analog synths.",
+            "duration_seconds": 10,
+            "guidance_scale": 3,
+            "temperature": 1,
+            "top_k": 250,
+            "top_p": 0,
+            "seed": 42817,
+            "output_format": "wav",
+        })
+        with self.assertRaisesRegex(ValueError, "duration_seconds must be between"):
+            self.registry.validate_music_generation("musicgen", {
+                "prompt": "short cue", "duration_seconds": 31, "output_format": "wav",
+            })
+        with self.assertRaisesRegex(ValueError, "does not accept audio conditioning"):
+            self.registry.validate_music_generation("musicgen", {
+                "prompt": "short cue", "duration_seconds": 8, "output_format": "wav",
+                "reference_audio_path": "/tmp/reference.wav",
+            })
+        with self.assertRaisesRegex(ValueError, "does not accept audio conditioning"):
+            self.registry.validate_music_generation("acestep", {
+                "prompt": "short cue", "duration_seconds": 10, "output_format": "wav",
+                "source_audio_path": "/tmp/source.wav",
+            })
+        with self.assertRaisesRegex(ValueError, "top_k must be an integer"):
+            self.registry.validate_music_generation("musicgen", {
+                "prompt": "short cue", "duration_seconds": 8, "top_k": 10.5,
+                "output_format": "wav",
+            })
+        with self.assertRaisesRegex(ValueError, "seed must be an integer"):
+            self.registry.validate_music_generation("musicgen", {
+                "prompt": "short cue", "duration_seconds": 8, "seed": 9.5,
+                "output_format": "wav",
+            })
+        with self.assertRaisesRegex(ValueError, "does not support lyric conditioning"):
+            self.registry.validate_music_generation("musicgen", {
+                "prompt": "close-mic vocal pop", "lyrics": "A line that must not be ignored",
+                "duration_seconds": 8, "output_format": "wav",
+            })
+
+    def test_acestep_accepts_separate_direction_and_lyrics(self) -> None:
+        self.registry.validate_music_generation("acestep", {
+            "prompt": "Warm indie-pop, brushed drums, soft electric piano, close-mic lead vocal.",
+            "lyrics": "[Verse]\nThe city hums beneath the rain\n\n[Chorus]\nHold the light until morning comes",
+            "vocal_language": "en-US",
+            "duration_seconds": 20,
+            "inference_steps": 8,
+            "shift": 3,
+            "bpm": 96,
+            "seed": 42817,
+            "output_format": "flac",
+        })
+
+        with self.assertRaisesRegex(ValueError, "does not support lyric language"):
+            self.registry.validate_music_generation("acestep", {
+                "prompt": "bright pop", "lyrics": "[Verse] text", "vocal_language": "ar",
+                "duration_seconds": 10, "output_format": "wav",
+            })
+        with self.assertRaisesRegex(ValueError, "too long for a 10-second render"):
+            self.registry.validate_music_generation("acestep", {
+                "prompt": "bright pop", "lyrics": "a" * 301, "vocal_language": "en",
+                "duration_seconds": 10, "output_format": "wav",
+            })
+
+    def test_non_music_engine_is_rejected_for_music_generation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not registered for music generation"):
+            self.registry.validate_music_generation("kokoro", {
+                "prompt": "warm pads", "duration_seconds": 8, "output_format": "wav",
+            })
+
 
 if __name__ == "__main__":
     unittest.main()

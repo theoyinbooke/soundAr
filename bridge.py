@@ -33,6 +33,7 @@ from core.gpu_manager import GPUManager
 from core.engine_contract import EngineContractRegistry
 from core.hub_browser import HubBrowser
 from core.model_manager import ModelManager
+from core.music_engine import MusicEngine
 from core.tts_engine import TTSEngine
 from core.stt_engine import STTEngine
 from core.speaker_verifier import SpeakerVerifier
@@ -56,6 +57,7 @@ class Runtime:
         self.manager = ModelManager(self.settings, self.hub)
         self.gpu = GPUManager()
         self.engine = TTSEngine(self.gpu)
+        self.music_engine = MusicEngine(self.gpu)
         self.stt_engine = STTEngine(self.gpu)
         self.speaker_verifier = SpeakerVerifier(self.gpu)
         self.forced_aligner = ForcedAligner(self.gpu)
@@ -65,6 +67,8 @@ class Runtime:
         operation = str(request.get("operation", "synthesize"))
         if operation == "synthesize":
             return self.synthesize(request)
+        if operation == "generate_music":
+            return self.generate_music(request)
         if operation == "load":
             return self.load(request)
         if operation == "unload":
@@ -104,6 +108,7 @@ class Runtime:
             model_id
             for model_id in (
                 self.engine.loaded_model_id,
+                self.music_engine.loaded_model_id,
                 self.stt_engine.loaded_model_id,
                 self.speaker_verifier.loaded_model_id,
                 self.forced_aligner.loaded_model_id,
@@ -114,6 +119,7 @@ class Runtime:
     def unload(self) -> dict[str, object]:
         unloaded = self.loaded_models()
         self.engine.unload_model()
+        self.music_engine.unload_model()
         self.stt_engine.unload_model()
         self.speaker_verifier.unload_model()
         self.forced_aligner.unload_model()
@@ -138,6 +144,8 @@ class Runtime:
         self.unload()
         if task == "tts":
             self.engine.load_model(model_id, model_path, engine_name)
+        elif task == "music":
+            self.music_engine.load_model(model_id, model_path, engine_name)
         elif task == "stt":
             self.stt_engine.load_model(model_id, model_path, engine_name)
         elif task == "speaker-verification":
@@ -720,42 +728,137 @@ class Runtime:
                 "temperature": float(request.get("temperature", 0.8)),
                 "top_p": float(request.get("top_p", 0.95)),
                 "repetition_penalty": float(request.get("repetition_penalty", 1.2)),
+                "cfg_scale": float(request.get("cfg_scale", 1.0)),
+                "instruction": str(request.get("instruction") or "Speak clearly and naturally."),
                 "seed": int(request.get("seed", 0)),
             },
         )
         metrics = collector.stop(model_id, engine_name, "tts", result.duration_seconds)
 
+        return self._write_generated_audio(
+            request=request,
+            model_id=model_id,
+            engine_name=engine_name,
+            audio=result.audio,
+            sample_rate=result.sample_rate,
+            duration_seconds=result.duration_seconds,
+            metrics=metrics,
+            generation_kind="speech",
+        )
+
+    def generate_music(self, request: dict[str, object]) -> dict[str, object]:
+        """Generate a short local music draft from a text prompt."""
+        prompt = str(request.get("prompt", "")).strip()
+        lyrics = str(request.get("lyrics") or "").strip()
+        model_id = str(request.get("model_id", "")).strip()
+        installed = self.manager.get_downloaded_model(model_id)
+        if installed is None:
+            raise ValueError(f"Model is not installed: {model_id}")
+        if str(installed.get("task", "")) != "music":
+            raise ValueError(f"{model_id} is not a music-generation model.")
+
+        engine_name = str(installed.get("engine", self.manager.detect_engine(model_id)))
+        self._validate_scope(engine_name)
+        self.contracts.validate_music_generation(engine_name, request)
+        model_path = str(installed.get("local_path", ""))
+        manifest_controls = self.contracts.get(engine_name).get("controls", {})
+        duration_seconds = float(
+            request.get(
+                "duration_seconds",
+                manifest_controls.get("duration_seconds", {}).get("default", 10.0),
+            )
+        )
+        integer_controls = {"top_k", "inference_steps", "bpm"}
+        controls: dict[str, float | int] = {"seed": int(request.get("seed", 0))}
+        for name in manifest_controls:
+            if name not in request:
+                continue
+            controls[name] = (
+                int(request[name]) if name in integer_controls else float(request[name])
+            )
+        vocal_language = (
+            self.contracts.normalize_language(
+                engine_name, str(request.get("vocal_language") or "en")
+            )
+            if lyrics
+            else None
+        )
+
+        self.engine.unload_model()
+        self.stt_engine.unload_model()
+        self.speaker_verifier.unload_model()
+        self.forced_aligner.unload_model()
+        self.music_engine.load_model(model_id, model_path, engine_name)
+        collector = BenchmarkCollector(self.gpu)
+        collector.start()
+        result = self.music_engine.generate(
+            prompt=prompt,
+            duration_seconds=duration_seconds,
+            controls=controls,
+            lyrics=lyrics or None,
+            vocal_language=vocal_language,
+        )
+        metrics = collector.stop(model_id, engine_name, "music", result.duration_seconds)
+        return self._write_generated_audio(
+            request=request,
+            model_id=model_id,
+            engine_name=engine_name,
+            audio=result.audio,
+            sample_rate=result.sample_rate,
+            duration_seconds=result.duration_seconds,
+            metrics=metrics,
+            generation_kind="music",
+        )
+
+    def _write_generated_audio(
+        self,
+        *,
+        request: dict[str, object],
+        model_id: str,
+        engine_name: str,
+        audio: np.ndarray,
+        sample_rate: int,
+        duration_seconds: float,
+        metrics: object,
+        generation_kind: str,
+    ) -> dict[str, object]:
+        """Stage an artifact for native checksum verification and atomic publication."""
+        output_format = str(request.get("output_format", "wav")).lower()
         export_dir = Path.home() / ".soundAr" / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
         result_id = uuid.uuid4().hex
         output_name = str(request.get("output_name") or "").strip()
         if output_name:
-            if len(output_name) > 96 or not all(character.isascii() and (character.isalnum() or character in "-_") for character in output_name):
+            if len(output_name) > 96 or not all(
+                character.isascii() and (character.isalnum() or character in "-_")
+                for character in output_name
+            ):
                 raise ValueError("Output name may contain only ASCII letters, numbers, hyphens, and underscores")
             filename = f"{output_name}.{output_format}"
         else:
-            filename = f"soundar-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{result_id[:6]}.{output_format}"
+            prefix = "soundar-music" if generation_kind == "music" else "soundar"
+            filename = f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{result_id[:6]}.{output_format}"
         output_path = export_dir / filename
         temporary_path = output_path.with_suffix(output_path.suffix + ".partial")
         try:
-            save_audio(temporary_path, result.audio, result.sample_rate, output_format)
+            save_audio(temporary_path, audio, sample_rate, output_format)
         except Exception:
             temporary_path.unlink(missing_ok=True)
             raise
-        waveform_bins = max(48, min(240, round(result.duration_seconds * 14)))
-        waveform = compute_waveform_envelope(result.audio, waveform_bins)
-
+        waveform_bins = max(48, min(240, round(duration_seconds * 14)))
+        waveform = compute_waveform_envelope(audio, waveform_bins)
         return {
             "id": result_id,
             "model_id": model_id,
             "engine": engine_name,
+            "generation_kind": generation_kind,
             "audio_path": str(output_path),
             "staging_path": str(temporary_path),
-            "sample_rate": result.sample_rate,
-            "duration_seconds": result.duration_seconds,
-            "inference_seconds": metrics.inference_seconds,
-            "rtf": metrics.rtf,
-            "vram_peak_mb": metrics.vram_peak_mb,
+            "sample_rate": sample_rate,
+            "duration_seconds": duration_seconds,
+            "inference_seconds": getattr(metrics, "inference_seconds"),
+            "rtf": getattr(metrics, "rtf"),
+            "vram_peak_mb": getattr(metrics, "vram_peak_mb"),
             "waveform": [round(float(value), 4) for value in waveform],
             "created_at": datetime.now(timezone.utc).isoformat(),
             "preview": False,

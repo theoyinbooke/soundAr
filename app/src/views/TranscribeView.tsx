@@ -1,4 +1,4 @@
-import { FileAudio2, LoaderCircle, Play, RotateCcw, Save, Sparkles, TextCursorInput, UsersRound } from "lucide-react";
+import { LoaderCircle, Play, RotateCcw, Save, TextCursorInput, Upload, UsersRound } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { BootstrapState, TranscriptionRecord } from "../types";
 import {
@@ -277,11 +277,7 @@ export function TranscribeView({
             disabled={!modelId || !audioPath || running}
             onClick={() => void run()}
           >
-            {running ? (
-              <LoaderCircle className="spin" size={14} />
-            ) : (
-              <Sparkles size={14} />
-            )}
+            {running ? <LoaderCircle className="spin" size={14} /> : null}
             {running ? "Transcribing" : "Transcribe audio"}
           </button>
         }
@@ -324,13 +320,12 @@ export function TranscribeView({
               setAudioPath((await pickAudioFile()) ?? audioPath)
             }
           >
-            <FileAudio2 size={20} />
-            <strong>
-              {audioPath ? sourceName(audioPath) : "Choose audio to transcribe"}
-            </strong>
-            <span>
-              WAV, FLAC, MP3, M4A, or OGG / copied into managed local storage
+            <span className="source-picker-icon"><Upload aria-hidden="true" size={16} /></span>
+            <span className="source-picker-copy">
+              <strong>{audioPath ? sourceName(audioPath) : "Choose an audio file"}</strong>
+              <small>WAV, FLAC, MP3, M4A, or OGG · copied to local storage</small>
             </span>
+            <span className="source-picker-action">Browse</span>
           </button>
           {error ? <StatusText tone="danger">{error}</StatusText> : null}
           <span className="section-label">Recent transcripts</span>

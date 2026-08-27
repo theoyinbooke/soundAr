@@ -735,7 +735,9 @@ impl RuntimeState {
             | "prepare_transcription_audio"
             | "master_audio"
             | "compare_speakers" => 120,
-            "transcribe" | "synthesize" | "diarize" | "align_transcript" => 1_800,
+            "transcribe" | "synthesize" | "generate_music" | "diarize" | "align_transcript" => {
+                1_800
+            }
             _ => 300,
         };
         let read_result = wait_for_worker_output(&mut process, timeout_seconds).and_then(|_| {
@@ -813,6 +815,7 @@ impl RuntimeState {
                 operation,
                 "load"
                     | "synthesize"
+                    | "generate_music"
                     | "transcribe"
                     | "compare_speakers"
                     | "diarize"
@@ -822,7 +825,7 @@ impl RuntimeState {
                     process.loaded_models = vec![model_id.to_string()];
                 }
             }
-            if operation == "synthesize" {
+            if matches!(operation, "synthesize" | "generate_music") {
                 let elapsed = runtime_started.elapsed().as_secs_f64();
                 let inference = result
                     .get("inference_seconds")
@@ -2857,6 +2860,20 @@ fn prepare_api_synthesis_request(
             None,
             requested_voice.to_string(),
         )
+    } else if engine == "speecht5" && requested_voice == "default" {
+        ("default".to_string(), None, "SpeechT5 default".to_string())
+    } else if engine == "breeze" && requested_voice == "default" {
+        (
+            "default".to_string(),
+            None,
+            "Breeze TTS 2 default".to_string(),
+        )
+    } else if engine == "fish-speech" && requested_voice == "default" {
+        (
+            "default".to_string(),
+            None,
+            "Fish Speech 1.5 default".to_string(),
+        )
     } else if requested_voice == "default" && matches!(engine, "chatterbox" | "chatterbox-turbo") {
         (
             "default".to_string(),
@@ -2884,7 +2901,7 @@ fn prepare_api_synthesis_request(
         "priority": payload.get("priority").cloned().unwrap_or_else(|| json!("normal")),
     });
     priority_value(request.get("priority"))?;
-    for control in ["temperature", "top_p", "repetition_penalty"] {
+    for control in ["temperature", "top_p", "repetition_penalty", "cfg_scale"] {
         if let Some(value) = payload.get(control).filter(|value| !value.is_null()) {
             request
                 .as_object_mut()
@@ -2892,7 +2909,79 @@ fn prepare_api_synthesis_request(
                 .insert(control.to_string(), value.clone());
         }
     }
+    if let Some(instruction) = payload.get("instruction").and_then(Value::as_str) {
+        if instruction.chars().count() > 1_000 {
+            return Err("Voice instructions are limited to 1,000 characters".to_string());
+        }
+        request
+            .as_object_mut()
+            .expect("API synthesis request is an object")
+            .insert("instruction".to_string(), json!(instruction));
+    }
     Ok((request, response_format.to_string()))
+}
+
+fn prepare_music_generation_request(mut request: Value) -> Result<Value, String> {
+    let prompt = request
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("A music prompt is required")?;
+    if prompt.chars().count() > 1_000 {
+        return Err("A music prompt is limited to 1,000 characters".to_string());
+    }
+    if let Some(lyrics) = request.get("lyrics") {
+        let lyrics = lyrics.as_str().ok_or("Lyrics must be plain text")?.trim();
+        if lyrics.chars().count() > 1_200 {
+            return Err("Lyrics are limited to 1,200 characters".to_string());
+        }
+    }
+    if let Some(language) = request.get("vocal_language") {
+        let language = language.as_str().ok_or("Vocal language must be text")?;
+        if language.trim().chars().count() > 32 {
+            return Err("Vocal language is too long".to_string());
+        }
+    }
+    let model_id = request
+        .get("model_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("A music model is required")?;
+    validate_model_argument(model_id)?;
+    for field in [
+        "reference_audio_path",
+        "source_audio_path",
+        "src_audio",
+        "reference_audio",
+        "audio_codes",
+    ] {
+        if request.get(field).is_some_and(|value| !value.is_null()) {
+            return Err("Text-to-music accepts direction and lyrics only; audio conditioning is not enabled".to_string());
+        }
+    }
+    if let Some(format) = request.get("output_format").and_then(Value::as_str) {
+        if !matches!(format, "wav" | "flac") {
+            return Err("Music output format must be wav or flac".to_string());
+        }
+    }
+    if let Some(operation) = request.get("operation").and_then(Value::as_str) {
+        if operation != "generate_music" {
+            return Err("A music request cannot override its runtime operation".to_string());
+        }
+    }
+    if let Some(kind) = request.get("generation_kind").and_then(Value::as_str) {
+        if kind != "music" {
+            return Err("A music request must use generation_kind music".to_string());
+        }
+    }
+    let object = request
+        .as_object_mut()
+        .ok_or("A music request must be a JSON object")?;
+    object.insert("operation".to_string(), json!("generate_music"));
+    object.insert("generation_kind".to_string(), json!("music"));
+    Ok(request)
 }
 
 fn write_http_response(
@@ -2945,6 +3034,10 @@ fn validate_engine_argument(engine: &str) -> Result<(), String> {
             | "chatterbox-turbo"
             | "coqui"
             | "nemo"
+            | "musicgen"
+            | "acestep"
+            | "breeze"
+            | "fish-speech"
     ) {
         Ok(())
     } else {
@@ -3249,6 +3342,30 @@ async fn synthesize(
 }
 
 #[tauri::command]
+async fn generate_music(
+    state: tauri::State<'_, RuntimeState>,
+    request: Value,
+) -> Result<Value, String> {
+    let request = prepare_music_generation_request(request)?;
+    let runtime = state.inner().clone();
+    let job_id = runtime.store.create_job("music-generation", &request)?;
+    runtime.store.update_job(&job_id, "preparing", 0.05)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        match runtime.request_for_job(request.clone(), &job_id) {
+            Ok(result) => runtime.store.complete_synthesis(&job_id, &request, &result),
+            Err(error) => {
+                if runtime.store.job_status(&job_id)?.as_deref() != Some("cancelled") {
+                    runtime.store.fail_job(&job_id, &error)?;
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+    .map_err(|error| format!("Music generation worker failed: {error}"))?
+}
+
+#[tauri::command]
 fn queue_synthesis(state: tauri::State<'_, RuntimeState>, request: Value) -> Result<Value, String> {
     let runtime = state.inner().clone();
     if let Some(reference) = request.get("reference_audio_path").and_then(Value::as_str) {
@@ -3271,6 +3388,41 @@ fn queue_synthesis(state: tauri::State<'_, RuntimeState>, request: Value) -> Res
     Ok(json!({
         "id": queued_id,
         "kind": "synthesis",
+        "status": "preparing",
+        "progress": 0.05,
+        "attempt": 1,
+        "priority": queued_priority,
+        "title": queued_title,
+        "model_id": queued_model,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "updated_at": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+#[tauri::command]
+fn queue_music_generation(
+    state: tauri::State<'_, RuntimeState>,
+    request: Value,
+) -> Result<Value, String> {
+    let request = prepare_music_generation_request(request)?;
+    let runtime = state.inner().clone();
+    let job_id = runtime.store.create_job("music-generation", &request)?;
+    runtime.store.update_job(&job_id, "preparing", 0.05)?;
+    let queued_id = job_id.clone();
+    let queued_title = request
+        .get("title")
+        .or_else(|| request.get("prompt"))
+        .cloned();
+    let queued_model = request.get("model_id").cloned();
+    let queued_priority = request
+        .get("priority")
+        .and_then(Value::as_str)
+        .unwrap_or("normal")
+        .to_string();
+    runtime.start_background_synthesis(job_id, request)?;
+    Ok(json!({
+        "id": queued_id,
+        "kind": "music-generation",
         "status": "preparing",
         "progress": 0.05,
         "attempt": 1,
@@ -5471,7 +5623,9 @@ pub fn run() {
             start_developer_api,
             stop_developer_api,
             synthesize,
+            generate_music,
             queue_synthesis,
+            queue_music_generation,
             transcribe_audio,
             update_transcription,
             diarize_transcription,
@@ -5646,6 +5800,16 @@ mod tests {
         request: &Value,
     ) -> Result<Value, String> {
         let job = runtime.store.create_job("synthesis", request)?;
+        runtime.store.update_job(&job, "running", 0.2)?;
+        let result = runtime.request_for_job(request.clone(), &job)?;
+        runtime.store.complete_synthesis(&job, request, &result)
+    }
+
+    fn generate_music_and_publish_result(
+        runtime: &RuntimeState,
+        request: &Value,
+    ) -> Result<Value, String> {
+        let job = runtime.store.create_job("music-generation", request)?;
         runtime.store.update_job(&job, "running", 0.2)?;
         let result = runtime.request_for_job(request.clone(), &job)?;
         runtime.store.complete_synthesis(&job, request, &result)
@@ -7180,6 +7344,88 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn music_requests_are_scoped_to_text_to_music_before_queueing() {
+        let prepared = super::prepare_music_generation_request(json!({
+            "model_id": "facebook/musicgen-small",
+            "prompt": "Warm instrumental ambient music",
+            "duration_seconds": 10,
+            "output_format": "wav",
+            "priority": "normal",
+        }))
+        .expect("prepare music request");
+        assert_eq!(prepared["operation"], "generate_music");
+        assert_eq!(prepared["generation_kind"], "music");
+
+        let reference_error = super::prepare_music_generation_request(json!({
+            "model_id": "facebook/musicgen-small",
+            "prompt": "Warm instrumental ambient music",
+            "reference_audio_path": "/private/reference.wav",
+        }))
+        .expect_err("reference audio must be rejected");
+        assert!(reference_error.contains("audio conditioning is not enabled"));
+
+        let lyric_request = super::prepare_music_generation_request(json!({
+            "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+            "prompt": "Intimate indie-pop with close-mic vocals",
+            "lyrics": "[Verse]\nHold the light until the morning comes",
+            "vocal_language": "en",
+            "duration_seconds": 10,
+        }))
+        .expect("direction and lyrics are accepted as independent text fields");
+        assert_eq!(
+            lyric_request["prompt"],
+            "Intimate indie-pop with close-mic vocals"
+        );
+        assert_eq!(
+            lyric_request["lyrics"],
+            "[Verse]\nHold the light until the morning comes"
+        );
+
+        let operation_error = super::prepare_music_generation_request(json!({
+            "model_id": "facebook/musicgen-small",
+            "prompt": "Warm instrumental ambient music",
+            "operation": "synthesize",
+        }))
+        .expect_err("cross-task operation must be rejected");
+        assert!(operation_error.contains("cannot override"));
+    }
+
+    #[test]
+    fn developer_api_prepares_speecht5_with_its_builtin_voice() {
+        let root = std::env::temp_dir().join(format!("soundar-api-speecht5-{}", Uuid::new_v4()));
+        let registry_path = root.join("models.json");
+        fs::create_dir_all(&root).expect("create SpeechT5 API fixture");
+        fs::write(
+            &registry_path,
+            r#"{"models":[{"model_id":"microsoft/speecht5_tts","engine":"speecht5"}]}"#,
+        )
+        .expect("write SpeechT5 registry");
+        let store = Store::open(root.join("state"), root.join("artifacts")).expect("test store");
+        let runtime = RuntimeState::new_with_store_and_registry(
+            root.clone(),
+            PathBuf::from("/missing/python"),
+            registry_path,
+            store,
+        );
+
+        let (request, format) = super::prepare_api_synthesis_request(
+            &runtime,
+            &json!({
+                "model": "microsoft/speecht5_tts",
+                "input": "SpeechT5 uses its built-in speaker.",
+                "voice": "default"
+            }),
+        )
+        .expect("prepare SpeechT5 request without a clone profile");
+
+        assert_eq!(request["speaker"], "default");
+        assert!(request["reference_audio_path"].is_null());
+        assert_eq!(request["voice_name"], "SpeechT5 default");
+        assert_eq!(format, "wav");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn developer_api_control_plane_uses_durable_store_and_rejects_remote_origins() {
         let root = std::env::temp_dir().join(format!("soundar-api-control-{}", Uuid::new_v4()));
         let store = Store::open(root.join("state"), root.join("artifacts")).expect("test store");
@@ -8030,6 +8276,176 @@ for line in sys.stdin:
                 report["failure"].as_str().unwrap_or("unknown failure")
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires the packaged MusicGen runtime, an NVIDIA GPU, and an installed facebook/musicgen-small checkpoint"]
+    fn packaged_runtime_generates_playable_music_through_native_bridge() {
+        let runtime_root = PathBuf::from(
+            std::env::var("SOUNDAR_E2E_RUNTIME_ROOT")
+                .expect("SOUNDAR_E2E_RUNTIME_ROOT must point to packaged runtime resources"),
+        );
+        let python_path = PathBuf::from(
+            std::env::var("SOUNDAR_E2E_PYTHON")
+                .expect("SOUNDAR_E2E_PYTHON must point to managed Python"),
+        );
+        assert!(runtime_root.join("core/music_engine.py").is_file());
+        assert!(runtime_root.join("engines/music/musicgen.py").is_file());
+        let test_root = std::env::temp_dir().join(format!("soundar-music-gpu-{}", Uuid::new_v4()));
+        let store = Store::open(test_root.join("state"), home_dir().join(".soundAr/exports"))
+            .expect("open isolated MusicGen GPU test store");
+        let runtime = RuntimeState::new_with_store(runtime_root, python_path, store);
+        let _cleanup = RuntimeCleanup(runtime.clone());
+        let generated_artifacts = Arc::new(Mutex::new(Vec::new()));
+        let _artifact_cleanup = GeneratedArtifactCleanup(Arc::clone(&generated_artifacts));
+        let request = json!({
+            "operation": "generate_music",
+            "generation_kind": "music",
+            "model_id": "facebook/musicgen-small",
+            "prompt": "Warm instrumental ambient music with slowly evolving analog synths, sparse piano, and no vocals.",
+            "duration_seconds": 4,
+            "guidance_scale": 3.0,
+            "temperature": 1.0,
+            "top_k": 250,
+            "top_p": 0.0,
+            "seed": 42817,
+            "output_format": "wav",
+            "title": "Packaged MusicGen smoke",
+            "priority": "urgent",
+        });
+        let cold = generate_music_and_publish_result(&runtime, &request)
+            .expect("generate packaged MusicGen audio");
+        let cold_audio =
+            verify_playable_wav(&runtime, &cold).expect("decode packaged MusicGen WAV");
+        let cold_path = cold["audio_path"]
+            .as_str()
+            .expect("MusicGen artifact path")
+            .to_string();
+        generated_artifacts
+            .lock()
+            .expect("music artifact cleanup lock")
+            .push(PathBuf::from(&cold_path));
+        assert_eq!(cold["generation_kind"], "music");
+        assert_eq!(cold["voice"], "Not applicable");
+        assert_eq!(cold["engine"], "musicgen");
+        assert_eq!(cold["sample_rate"], 32_000);
+        assert_eq!(cold["runtime_worker_state"], "cold");
+        assert!(cold["duration_seconds"].as_f64().unwrap_or(0.0) >= 3.5);
+        assert!(cold_audio["frames"].as_u64().unwrap_or(0) > 0);
+        let history_request = runtime
+            .store
+            .history_request(cold["id"].as_str().expect("music history id"))
+            .expect("read durable music request");
+        assert_eq!(history_request["generation_kind"], "music");
+        assert_eq!(history_request["prompt"], request["prompt"]);
+
+        let warm = generate_music_and_publish_result(&runtime, &request)
+            .expect("generate warm packaged MusicGen audio");
+        let warm_path = warm["audio_path"]
+            .as_str()
+            .expect("warm MusicGen artifact path")
+            .to_string();
+        generated_artifacts
+            .lock()
+            .expect("music artifact cleanup lock")
+            .push(PathBuf::from(warm_path));
+        assert_eq!(warm["runtime_worker_state"], "warm");
+        verify_playable_wav(&runtime, &warm).expect("decode warm packaged MusicGen WAV");
+
+        runtime
+            .unload_model_runtime("facebook/musicgen-small")
+            .expect("unload MusicGen worker");
+        require_quiescent_scheduler(&runtime).expect("release MusicGen scheduler reservation");
+        runtime.stop_active_worker().expect("stop MusicGen worker");
+        fs::remove_dir_all(test_root).ok();
+    }
+
+    #[test]
+    #[ignore = "requires the packaged ACE-Step runtime, an NVIDIA GPU, and an installed ACE-Step/acestep-v15-xl-turbo-diffusers checkpoint"]
+    fn packaged_runtime_generates_playable_lyric_music_through_native_bridge() {
+        let runtime_root = PathBuf::from(
+            std::env::var("SOUNDAR_E2E_RUNTIME_ROOT")
+                .expect("SOUNDAR_E2E_RUNTIME_ROOT must point to packaged runtime resources"),
+        );
+        let python_path = PathBuf::from(
+            std::env::var("SOUNDAR_E2E_PYTHON")
+                .expect("SOUNDAR_E2E_PYTHON must point to managed Python"),
+        );
+        assert!(runtime_root.join("core/music_engine.py").is_file());
+        assert!(runtime_root.join("engines/music/acestep.py").is_file());
+        let test_root =
+            std::env::temp_dir().join(format!("soundar-acestep-gpu-{}", Uuid::new_v4()));
+        let store = Store::open(test_root.join("state"), home_dir().join(".soundAr/exports"))
+            .expect("open isolated ACE-Step GPU test store");
+        let runtime = RuntimeState::new_with_store(runtime_root, python_path, store);
+        let _cleanup = RuntimeCleanup(runtime.clone());
+        let generated_artifacts = Arc::new(Mutex::new(Vec::new()));
+        let _artifact_cleanup = GeneratedArtifactCleanup(Arc::clone(&generated_artifacts));
+        let request = json!({
+            "operation": "generate_music",
+            "generation_kind": "music",
+            "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+            "prompt": "Warm, intimate indie-pop with brushed drums, soft electric piano, a restrained build, and a close-mic vocal performance.",
+            "lyrics": "[Verse]\nThe city hums beneath the rain\nI trace your name across the windowpane\n\n[Chorus]\nHold the light until the morning comes",
+            "vocal_language": "en",
+            "duration_seconds": 10,
+            "inference_steps": 8,
+            "shift": 3.0,
+            "bpm": 96,
+            "seed": 42817,
+            "output_format": "wav",
+            "title": "Packaged ACE-Step lyric smoke",
+            "priority": "urgent",
+        });
+        let cold = generate_music_and_publish_result(&runtime, &request)
+            .expect("generate packaged ACE-Step lyric music");
+        let cold_audio =
+            verify_playable_wav(&runtime, &cold).expect("decode packaged ACE-Step WAV");
+        let cold_path = cold["audio_path"]
+            .as_str()
+            .expect("ACE-Step artifact path")
+            .to_string();
+        generated_artifacts
+            .lock()
+            .expect("ACE-Step artifact cleanup lock")
+            .push(PathBuf::from(&cold_path));
+        assert_eq!(cold["generation_kind"], "music");
+        assert_eq!(cold["voice"], "Not applicable");
+        assert_eq!(cold["engine"], "acestep");
+        assert_eq!(cold["sample_rate"], 48_000);
+        assert_eq!(cold["runtime_worker_state"], "cold");
+        assert!(cold["duration_seconds"].as_f64().unwrap_or(0.0) >= 9.5);
+        assert_eq!(cold_audio["sample_rate"], 48_000);
+        assert_eq!(cold_audio["channels"], 2);
+        assert!(cold_audio["frames"].as_u64().unwrap_or(0) > 0);
+        let history_request = runtime
+            .store
+            .history_request(cold["id"].as_str().expect("ACE-Step music history id"))
+            .expect("read durable ACE-Step music request");
+        assert_eq!(history_request["generation_kind"], "music");
+        assert_eq!(history_request["prompt"], request["prompt"]);
+        assert_eq!(history_request["lyrics"], request["lyrics"]);
+        assert_eq!(history_request["vocal_language"], "en");
+
+        let warm = generate_music_and_publish_result(&runtime, &request)
+            .expect("generate warm packaged ACE-Step lyric music");
+        let warm_path = warm["audio_path"]
+            .as_str()
+            .expect("warm ACE-Step artifact path")
+            .to_string();
+        generated_artifacts
+            .lock()
+            .expect("ACE-Step artifact cleanup lock")
+            .push(PathBuf::from(warm_path));
+        assert_eq!(warm["runtime_worker_state"], "warm");
+        verify_playable_wav(&runtime, &warm).expect("decode warm packaged ACE-Step WAV");
+
+        runtime
+            .unload_model_runtime("ACE-Step/acestep-v15-xl-turbo-diffusers")
+            .expect("unload ACE-Step worker");
+        require_quiescent_scheduler(&runtime).expect("release ACE-Step scheduler reservation");
+        runtime.stop_active_worker().expect("stop ACE-Step worker");
+        fs::remove_dir_all(test_root).ok();
     }
 
     #[test]

@@ -109,6 +109,8 @@ jobs:
             requirements-engines/chatterbox.txt
             requirements-engines/coqui.txt
             requirements-engines/nemo.txt
+            requirements-engines/musicgen.txt
+            requirements-engines/acestep.txt
           )
           : > SHA256SUMS
           for file in "${files[@]}"; do
@@ -149,7 +151,7 @@ jobs:
             "soundAr_${version}_amd64.AppImage.sig" \
             latest.json install-linux.sh setup-runtime.sh setup-engine-runtime.sh requirements-runtime.txt \
             common.txt kokoro.txt transformers.txt speaker-verification.txt alignment.txt \
-            speecht5.txt chatterbox.txt coqui.txt nemo.txt SHA256SUMS; do
+            speecht5.txt chatterbox.txt coqui.txt nemo.txt musicgen.txt acestep.txt SHA256SUMS; do
             grep -Fxq "$asset" <<<"$assets" || { echo "Missing release asset: $asset" >&2; exit 1; }
           done
       - name: Publish verified release

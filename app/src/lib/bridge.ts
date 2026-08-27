@@ -14,6 +14,7 @@ import type {
   BatchInputRow,
   ComparisonRecord,
   GenerationPreset,
+  GenerationRequest,
   HistoryItem,
   HistoryFilters,
   HistoryExportReceipt,
@@ -23,6 +24,7 @@ import type {
   ModelInstallPlan,
   ModelIntegrity,
   ModelRuntimeAction,
+  MusicGenerationRequest,
   MeasuredBenchmarkRun,
   ProjectRecord,
   ProjectMasterResult,
@@ -56,7 +58,7 @@ async function previewBootstrap() {
 let previewBatches: BatchRunRecord[] = [];
 let previewComparisons: ComparisonRecord[] = [];
 let previewHistory: HistoryItem[] = [];
-const previewHistoryRequests = new Map<string, SynthesisRequest>();
+const previewHistoryRequests = new Map<string, GenerationRequest>();
 
 export async function loadBootstrapState(): Promise<BootstrapState> {
   if (import.meta.env.DEV && !hasTauriRuntime()) {
@@ -88,6 +90,7 @@ export async function synthesizeSpeech(request: SynthesisRequest): Promise<Histo
       title: request.title ?? request.text.split(/[.!?]/)[0].slice(0, 56) ?? "Untitled generation",
       voice: request.voice_name ?? request.speaker,
       text: request.text,
+      generation_kind: "speech",
     };
     previewHistory = [result, ...previewHistory.filter((item) => item.id !== result.id)];
     previewHistoryRequests.set(result.id, { ...request });
@@ -100,6 +103,43 @@ export async function synthesizeSpeech(request: SynthesisRequest): Promise<Histo
 export async function queueSynthesis(request: SynthesisRequest): Promise<JobRecord> {
   if (import.meta.env.DEV && !hasTauriRuntime()) throw new Error("Background generation is available in the soundAr desktop app.");
   return invoke<JobRecord>("queue_synthesis", { request });
+}
+
+export async function generateMusic(request: MusicGenerationRequest): Promise<HistoryItem> {
+  if (import.meta.env.DEV && !hasTauriRuntime()) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    const aceStep = request.model_id === "ACE-Step/acestep-v15-xl-turbo-diffusers";
+    const result: HistoryItem = {
+      id: crypto.randomUUID(),
+      model_id: request.model_id,
+      engine: aceStep ? "acestep" : "musicgen",
+      audio_path: null,
+      sample_rate: aceStep ? 48000 : 32000,
+      duration_seconds: request.duration_seconds,
+      inference_seconds: request.duration_seconds * 0.42,
+      rtf: 0.42,
+      vram_peak_mb: aceStep ? 10_240 : 6144,
+      waveform: Array.from({ length: 96 }, (_, index) => 0.16 + Math.abs(Math.sin(index * 0.37) * Math.cos(index * 0.11)) * 0.78),
+      created_at: new Date().toISOString(),
+      preview: true,
+      title: request.title ?? (request.prompt.slice(0, 56) || "Untitled music draft"),
+      voice: "Not applicable",
+      text: request.prompt,
+      generation_kind: "music",
+    };
+    previewHistory = [result, ...previewHistory.filter((item) => item.id !== result.id)];
+    previewHistoryRequests.set(result.id, { ...request });
+    return result;
+  }
+
+  return invoke<HistoryItem>("generate_music", { request });
+}
+
+export async function queueMusicGeneration(request: MusicGenerationRequest): Promise<JobRecord> {
+  if (import.meta.env.DEV && !hasTauriRuntime()) {
+    throw new Error("Background music generation is available in the soundAr desktop app.");
+  }
+  return invoke<JobRecord>("queue_music_generation", { request });
 }
 
 export async function cancelActiveSynthesis(): Promise<boolean> {
@@ -145,7 +185,7 @@ export async function listHistory(query = "", filters: HistoryFilters = {}): Pro
   if (import.meta.env.DEV && !hasTauriRuntime()) {
     const search = query.trim().toLowerCase();
     return previewHistory.filter((item) => {
-      if (search && ![item.title, item.voice, item.model_id, item.text, item.notes].join(" ").toLowerCase().includes(search)) return false;
+      if (search && ![item.title, item.voice, item.model_id, item.generation_kind, item.text, item.notes].join(" ").toLowerCase().includes(search)) return false;
       if (filters.model_id && item.model_id !== filters.model_id) return false;
       if (filters.voice && item.voice !== filters.voice) return false;
       if (filters.favorite && !item.favorite) return false;
@@ -195,13 +235,13 @@ export async function updateHistoryMetadata(id: string, changes: Pick<Partial<Hi
   return invoke<HistoryItem>("update_history_metadata", { id, changes });
 }
 
-export async function getHistoryRequest(id: string): Promise<SynthesisRequest> {
+export async function getHistoryRequest(id: string): Promise<GenerationRequest> {
   if (import.meta.env.DEV && !hasTauriRuntime()) {
     const request = previewHistoryRequests.get(id);
     if (!request) throw new Error("Preview generation settings not found.");
     return { ...request };
   }
-  return invoke<SynthesisRequest>("history_request", { id });
+  return invoke<GenerationRequest>("history_request", { id });
 }
 
 function batchRows(rows: string[] | BatchInputRow[]): BatchInputRow[] {

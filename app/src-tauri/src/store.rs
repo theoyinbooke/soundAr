@@ -10,7 +10,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_VERSION: i64 = 31;
 const HISTORY_RESULT_LIMIT: i64 = 500;
 
 pub struct Store {
@@ -229,7 +229,7 @@ impl Store {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| format!("Could not read application settings: {error}"))?;
-        let mut settings = json!({"theme": "dark", "dense_tables": true, "reduced_motion": false});
+        let mut settings = json!({"theme": "light", "dense_tables": true, "reduced_motion": false});
         for row in rows {
             let (key, raw) =
                 row.map_err(|error| format!("Could not read an application setting: {error}"))?;
@@ -573,18 +573,40 @@ impl Store {
             .and_then(Value::as_str)
             .unwrap_or(job_id)
             .to_string();
-        let text = request.get("text").and_then(Value::as_str).unwrap_or("");
+        let generation_kind = request
+            .get("generation_kind")
+            .and_then(Value::as_str)
+            .unwrap_or("speech");
+        if !matches!(generation_kind, "speech" | "music") {
+            return Err("The generation request has an unsupported kind".to_string());
+        }
+        let result_generation_kind = result
+            .get("generation_kind")
+            .and_then(Value::as_str)
+            .unwrap_or(generation_kind);
+        if result_generation_kind != generation_kind {
+            return Err("The inference engine returned the wrong generation kind".to_string());
+        }
+        let text = request
+            .get("text")
+            .or_else(|| request.get("prompt"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let title = request
             .get("title")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| title_from_text(text));
-        let voice = request
-            .get("voice_name")
-            .and_then(Value::as_str)
-            .or_else(|| request.get("speaker").and_then(Value::as_str))
-            .unwrap_or("Default voice");
+        let voice = if generation_kind == "music" {
+            "Not applicable"
+        } else {
+            request
+                .get("voice_name")
+                .and_then(Value::as_str)
+                .or_else(|| request.get("speaker").and_then(Value::as_str))
+                .unwrap_or("Default voice")
+        };
         let created_at = result
             .get("created_at")
             .and_then(Value::as_str)
@@ -700,9 +722,9 @@ impl Store {
             .map_err(|error| format!("Could not store the audio artifact: {error}"))?;
         transaction
             .execute(
-                "INSERT INTO history (id, job_id, artifact_id, title, voice, text, model_id, engine, audio_path, sample_rate, duration_seconds, inference_seconds, rtf, vram_peak_mb, waveform_json, created_at, runtime_worker_state, end_to_end_seconds, runtime_overhead_seconds)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-                params![history_id, job_id, artifact_id, title, voice, text, model_id, engine, audio_path.to_string_lossy(), sample_rate, duration, inference, rtf, vram, waveform, created_at, runtime_worker_state, end_to_end_seconds, runtime_overhead_seconds],
+                "INSERT INTO history (id, job_id, artifact_id, title, voice, text, model_id, engine, generation_kind, audio_path, sample_rate, duration_seconds, inference_seconds, rtf, vram_peak_mb, waveform_json, created_at, runtime_worker_state, end_to_end_seconds, runtime_overhead_seconds)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                params![history_id, job_id, artifact_id, title, voice, text, model_id, engine, generation_kind, audio_path.to_string_lossy(), sample_rate, duration, inference, rtf, vram, waveform, created_at, runtime_worker_state, end_to_end_seconds, runtime_overhead_seconds],
             )
             .map_err(|error| format!("Could not store generation history: {error}"))?;
         transaction
@@ -734,6 +756,7 @@ impl Store {
             text,
             model_id,
             engine,
+            generation_kind,
             &audio_path,
             sample_rate,
             duration,
@@ -1595,9 +1618,9 @@ impl Store {
         }
         let mut statement = connection
             .prepare(
-                "SELECT h.id, h.job_id, h.title, h.voice, h.text, h.model_id, h.engine, h.audio_path, h.sample_rate, h.duration_seconds, h.inference_seconds, h.rtf, h.vram_peak_mb, h.waveform_json, h.created_at, h.favorite, h.notes, h.runtime_worker_state, h.end_to_end_seconds, h.runtime_overhead_seconds, a.size_bytes
+                "SELECT h.id, h.job_id, h.title, h.voice, h.text, h.model_id, h.engine, h.generation_kind, h.audio_path, h.sample_rate, h.duration_seconds, h.inference_seconds, h.rtf, h.vram_peak_mb, h.waveform_json, h.created_at, h.favorite, h.notes, h.runtime_worker_state, h.end_to_end_seconds, h.runtime_overhead_seconds, a.size_bytes
                  FROM history h JOIN artifacts a ON a.id = h.artifact_id
-                 WHERE lower(title || ' ' || voice || ' ' || model_id || ' ' || text || ' ' || notes) LIKE ?1
+                 WHERE lower(title || ' ' || voice || ' ' || model_id || ' ' || generation_kind || ' ' || text || ' ' || notes) LIKE ?1
                  AND (?2 IS NULL OR h.model_id = ?2)
                  AND (?3 IS NULL OR h.voice = ?3)
                  AND (?4 IS NULL OR h.favorite = ?4)
@@ -1606,9 +1629,9 @@ impl Store {
             .map_err(|error| format!("Could not prepare history search: {error}"))?;
         let rows = statement
             .query_map(params![search, model_id, voice, favorite], |row| {
-                let path: String = row.get(7)?;
-                let waveform: String = row.get(13)?;
-                let artifact_state = artifact_file_state(Path::new(&path), row.get(20)?);
+                let path: String = row.get(8)?;
+                let waveform: String = row.get(14)?;
+                let artifact_state = artifact_file_state(Path::new(&path), row.get(21)?);
                 Ok(history_value(
                     &row.get::<_, String>(0)?,
                     &row.get::<_, String>(1)?,
@@ -1617,20 +1640,21 @@ impl Store {
                     &row.get::<_, String>(4)?,
                     &row.get::<_, String>(5)?,
                     &row.get::<_, String>(6)?,
+                    &row.get::<_, String>(7)?,
                     Path::new(&path),
-                    row.get(8)?,
                     row.get(9)?,
                     row.get(10)?,
                     row.get(11)?,
                     row.get(12)?,
+                    row.get(13)?,
                     serde_json::from_str(&waveform).unwrap_or_else(|_| json!([])),
-                    &row.get::<_, String>(14)?,
+                    &row.get::<_, String>(15)?,
                     &artifact_state,
-                    row.get::<_, i64>(15)? != 0,
-                    &row.get::<_, String>(16)?,
+                    row.get::<_, i64>(16)? != 0,
                     &row.get::<_, String>(17)?,
-                    row.get(18)?,
+                    &row.get::<_, String>(18)?,
                     row.get(19)?,
+                    row.get(20)?,
                 ))
             })
             .map_err(|error| format!("Could not search history: {error}"))?;
@@ -1660,23 +1684,24 @@ impl Store {
         let connection = self.lock()?;
         connection
             .query_row(
-                "SELECT h.id, h.job_id, h.title, h.voice, h.text, h.model_id, h.engine, h.audio_path, h.sample_rate, h.duration_seconds, h.inference_seconds, h.rtf, h.vram_peak_mb, h.waveform_json, h.created_at, h.favorite, h.notes, h.runtime_worker_state, h.end_to_end_seconds, h.runtime_overhead_seconds, a.size_bytes
+                "SELECT h.id, h.job_id, h.title, h.voice, h.text, h.model_id, h.engine, h.generation_kind, h.audio_path, h.sample_rate, h.duration_seconds, h.inference_seconds, h.rtf, h.vram_peak_mb, h.waveform_json, h.created_at, h.favorite, h.notes, h.runtime_worker_state, h.end_to_end_seconds, h.runtime_overhead_seconds, a.size_bytes
                  FROM history h JOIN artifacts a ON a.id = h.artifact_id WHERE h.id = ?1",
                 [id],
                 |row| {
-                    let path: String = row.get(7)?;
-                    let waveform: String = row.get(13)?;
-                    let artifact_state = artifact_file_state(Path::new(&path), row.get(20)?);
+                    let path: String = row.get(8)?;
+                    let waveform: String = row.get(14)?;
+                    let artifact_state = artifact_file_state(Path::new(&path), row.get(21)?);
                     Ok(history_value(
                         &row.get::<_, String>(0)?, &row.get::<_, String>(1)?,
                         &row.get::<_, String>(2)?, &row.get::<_, String>(3)?,
                         &row.get::<_, String>(4)?, &row.get::<_, String>(5)?,
-                        &row.get::<_, String>(6)?, Path::new(&path), row.get(8)?,
-                        row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?,
+                        &row.get::<_, String>(6)?, &row.get::<_, String>(7)?,
+                        Path::new(&path), row.get(9)?, row.get(10)?, row.get(11)?,
+                        row.get(12)?, row.get(13)?,
                         serde_json::from_str(&waveform).unwrap_or_else(|_| json!([])),
-                        &row.get::<_, String>(14)?, &artifact_state,
-                        row.get::<_, i64>(15)? != 0, &row.get::<_, String>(16)?,
-                        &row.get::<_, String>(17)?, row.get(18)?, row.get(19)?,
+                        &row.get::<_, String>(15)?, &artifact_state,
+                        row.get::<_, i64>(16)? != 0, &row.get::<_, String>(17)?,
+                        &row.get::<_, String>(18)?, row.get(19)?, row.get(20)?,
                     ))
                 },
             )
@@ -1806,8 +1831,8 @@ impl Store {
                 params![artifact_id, job_id, destination.to_string_lossy(), extension, bytes.len() as i64, sha256_bytes(&bytes), timestamp],
             ).map_err(|error| format!("Could not store the duplicate artifact: {error}"))?;
             transaction.execute(
-                "INSERT INTO history (id, job_id, artifact_id, title, voice, text, model_id, engine, audio_path, sample_rate, duration_seconds, inference_seconds, rtf, vram_peak_mb, waveform_json, created_at, favorite, notes)
-                 SELECT ?1, ?2, ?3, ?4, voice, text, model_id, engine, ?5, sample_rate, duration_seconds, inference_seconds, rtf, vram_peak_mb, waveform_json, ?6, 0, notes FROM history WHERE id = ?7",
+                "INSERT INTO history (id, job_id, artifact_id, title, voice, text, model_id, engine, generation_kind, audio_path, sample_rate, duration_seconds, inference_seconds, rtf, vram_peak_mb, waveform_json, created_at, favorite, notes)
+                 SELECT ?1, ?2, ?3, ?4, voice, text, model_id, engine, generation_kind, ?5, sample_rate, duration_seconds, inference_seconds, rtf, vram_peak_mb, waveform_json, ?6, 0, notes FROM history WHERE id = ?7",
                 params![history_id, job_id, artifact_id, title, destination.to_string_lossy(), timestamp, id],
             ).map_err(|error| format!("Could not store the duplicate history record: {error}"))?;
             transaction
@@ -1926,7 +1951,7 @@ impl Store {
                     "error": row.get::<_, Option<String>>(5)?,
                     "created_at": row.get::<_, String>(6)?,
                     "updated_at": row.get::<_, String>(7)?,
-                    "title": request.get("title").and_then(Value::as_str).or_else(|| request.get("text").and_then(Value::as_str)).unwrap_or("Untitled task"),
+                    "title": request.get("title").and_then(Value::as_str).or_else(|| request.get("text").and_then(Value::as_str)).or_else(|| request.get("prompt").and_then(Value::as_str)).unwrap_or("Untitled task"),
                     "model_id": request.get("model_id").and_then(Value::as_str),
                     "priority": priority_name(row.get::<_, i64>(9)?),
                 }))
@@ -1964,7 +1989,7 @@ impl Store {
                         "error": row.get::<_, Option<String>>(5)?,
                         "created_at": row.get::<_, String>(6)?,
                         "updated_at": row.get::<_, String>(7)?,
-                        "title": request.get("title").and_then(Value::as_str).or_else(|| request.get("text").and_then(Value::as_str)).unwrap_or("Untitled task"),
+                        "title": request.get("title").and_then(Value::as_str).or_else(|| request.get("text").and_then(Value::as_str)).or_else(|| request.get("prompt").and_then(Value::as_str)).unwrap_or("Untitled task"),
                         "model_id": request.get("model_id").and_then(Value::as_str),
                         "priority": priority_name(row.get::<_, i64>(13)?),
                         "result": format.map(|format| json!({
@@ -2045,11 +2070,16 @@ impl Store {
         let Some((kind, status, request_json)) = job else {
             return Err("The selected task was not found".to_string());
         };
-        if !matches!(kind.as_str(), "synthesis" | "api-synthesis") {
+        if !matches!(
+            kind.as_str(),
+            "synthesis" | "api-synthesis" | "music-generation"
+        ) {
             return Err("This task must be retried from its owning workflow".to_string());
         }
         if !matches!(status.as_str(), "failed" | "cancelled") {
-            return Err("Only failed or cancelled synthesis tasks can be retried".to_string());
+            return Err(
+                "Only failed or cancelled audio generation tasks can be retried".to_string(),
+            );
         }
         let request = serde_json::from_str::<Value>(&request_json)
             .map_err(|error| format!("The stored task request is invalid: {error}"))?;
@@ -2076,7 +2106,7 @@ impl Store {
         let connection = self.lock()?;
         connection
             .execute(
-                "UPDATE jobs SET dismissed = 1, updated_at = ?1 WHERE dismissed = 0 AND status IN ('completed', 'cancelled')",
+                "UPDATE jobs SET dismissed = 1, updated_at = ?1 WHERE dismissed = 0 AND status IN ('completed', 'failed', 'cancelled')",
                 [now()],
             )
             .map_err(|error| format!("Could not clear finished tasks: {error}"))
@@ -3940,6 +3970,7 @@ fn migrate(connection: &mut Connection, from_version: i64) -> Result<(), String>
                 text TEXT NOT NULL,
                 model_id TEXT NOT NULL,
                 engine TEXT NOT NULL,
+                generation_kind TEXT NOT NULL DEFAULT 'speech' CHECK(generation_kind IN ('speech', 'music')),
                 audio_path TEXT NOT NULL,
                 sample_rate INTEGER NOT NULL,
                 duration_seconds REAL NOT NULL,
@@ -4522,6 +4553,28 @@ fn migrate(connection: &mut Connection, from_version: i64) -> Result<(), String>
             )
             .map_err(|error| format!("Could not add forced-alignment evidence: {error}"))?;
     }
+    if from_version < 31 {
+        let generation_kind_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('history') WHERE name = 'generation_kind')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Could not inspect durable generation kinds: {error}"))?;
+        if !generation_kind_exists {
+            transaction
+                .execute(
+                    "ALTER TABLE history ADD COLUMN generation_kind TEXT NOT NULL DEFAULT 'speech' CHECK(generation_kind IN ('speech', 'music'))",
+                    [],
+                )
+                .map_err(|error| format!("Could not add durable generation kinds: {error}"))?;
+        }
+        transaction
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS history_generation_kind_created_idx ON history(generation_kind, created_at DESC);",
+            )
+            .map_err(|error| format!("Could not index durable generation kinds: {error}"))?;
+    }
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|error| format!("Could not record database schema version: {error}"))?;
@@ -5066,6 +5119,7 @@ fn history_value(
     text: &str,
     model_id: &str,
     engine: &str,
+    generation_kind: &str,
     audio_path: &Path,
     sample_rate: i64,
     duration_seconds: f64,
@@ -5089,6 +5143,7 @@ fn history_value(
         "text": text,
         "model_id": model_id,
         "engine": engine,
+        "generation_kind": generation_kind,
         "audio_path": audio_path.to_string_lossy(),
         "sample_rate": sample_rate,
         "duration_seconds": duration_seconds,
@@ -5628,7 +5683,7 @@ mod tests {
         let defaults = store.application_settings().expect("default settings");
         assert_eq!(
             defaults,
-            json!({"theme": "dark", "dense_tables": true, "reduced_motion": false})
+            json!({"theme": "light", "dense_tables": true, "reduced_motion": false})
         );
         store
             .save_application_setting("theme", &json!("light"))
@@ -6235,6 +6290,77 @@ mod tests {
     }
 
     #[test]
+    fn music_generation_is_durable_distinct_from_speech_and_retryable() {
+        let (store, root) = test_store();
+        let final_path = root.join("artifacts/music-generation.wav");
+        let staging_path = root.join("artifacts/music-generation.wav.partial");
+        fs::write(&staging_path, b"RIFF\x04\x00\x00\x00WAVEmusic").expect("write staged music");
+        let request = json!({
+            "operation": "generate_music",
+            "generation_kind": "music",
+            "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+            "prompt": "A warm indie-pop track with sparse piano and close-mic lead vocal",
+            "lyrics": "[Verse]\nHold the light until the morning comes",
+            "vocal_language": "en",
+            "duration_seconds": 20,
+            "output_format": "wav",
+        });
+        let job = store
+            .create_job("music-generation", &request)
+            .expect("create music job");
+        store.start_job(&job).expect("start music job");
+
+        let history = store
+            .complete_synthesis(
+                &job,
+                &request,
+                &json!({
+                    "id": "music-history", "generation_kind": "music",
+                    "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers", "engine": "acestep",
+                    "audio_path": final_path, "staging_path": staging_path,
+                    "sample_rate": 48000, "duration_seconds": 20.0,
+                    "inference_seconds": 4.0, "rtf": 0.2, "vram_peak_mb": 10240,
+                    "waveform": [0.2, 0.5],
+                }),
+            )
+            .expect("complete music generation");
+        assert_eq!(history["generation_kind"], "music");
+        assert_eq!(history["voice"], "Not applicable");
+        assert_eq!(history["text"], request["prompt"]);
+
+        let persisted = store
+            .get_history("music-history")
+            .expect("read music history")
+            .expect("music history exists");
+        assert_eq!(persisted["generation_kind"], "music");
+        let persisted_request = store
+            .history_request("music-history")
+            .expect("read durable lyric music request");
+        assert_eq!(persisted_request["prompt"], request["prompt"]);
+        assert_eq!(persisted_request["lyrics"], request["lyrics"]);
+        assert_eq!(persisted_request["vocal_language"], "en");
+        let duplicate = store
+            .duplicate_history("music-history")
+            .expect("duplicate music history");
+        assert_eq!(duplicate["generation_kind"], "music");
+
+        let failed = store
+            .create_job("music-generation", &request)
+            .expect("create failed music job");
+        store
+            .fail_job(&failed, "worker stopped")
+            .expect("fail music job");
+        let (retried, stored_request) = store
+            .retry_synthesis_job(&failed)
+            .expect("retry music generation");
+        assert_eq!(retried["status"], "preparing");
+        assert_eq!(stored_request, request);
+
+        drop(store);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn startup_rolls_back_interrupted_artifact_publication() {
         let (store, root) = test_store();
         let data = root.join("data");
@@ -6302,17 +6428,23 @@ mod tests {
         store
             .update_job(&completed, "completed", 1.0)
             .expect("complete job");
-        assert_eq!(store.clear_finished_jobs().expect("clear finished"), 2);
+        let terminal_failure = store
+            .create_job("synthesis", &request)
+            .expect("create terminal failure");
+        store
+            .fail_job(&terminal_failure, "not enough GPU memory")
+            .expect("fail terminal job");
+        assert_eq!(store.clear_finished_jobs().expect("clear finished"), 3);
         assert!(store.list_jobs().expect("visible jobs").is_empty());
         let connection = store.connection.lock().expect("database");
         let retained: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM jobs WHERE id IN (?1, ?2) AND dismissed = 1",
-                (&failed, &completed),
+                "SELECT COUNT(*) FROM jobs WHERE id IN (?1, ?2, ?3) AND dismissed = 1",
+                (&failed, &completed, &terminal_failure),
                 |row| row.get(0),
             )
             .expect("count retained jobs");
-        assert_eq!(retained, 2);
+        assert_eq!(retained, 3);
         drop(connection);
 
         drop(store);

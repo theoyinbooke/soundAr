@@ -65,7 +65,7 @@ export function BenchmarksView({
           model_revision: install?.revision,
           gpu_name: bootstrap.system.gpu_name,
           driver_version: bootstrap.system.driver_version,
-          app_version: "0.3.0",
+          app_version: __APP_VERSION__,
         }));
       }
       setRuns((current) => [...measured, ...current]);

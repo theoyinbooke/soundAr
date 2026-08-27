@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.2 - 2026-08-26
+
+- Added Breeze TTS 2 and Fish Speech 1.5 as pinned, isolated local synthesis engines with real RTX 4080 qualification evidence.
+- Added local text-to-music foundations and expanded packaged engine resources.
+- Reworked the desktop shell around a compact structural title strip, with page titles and actions kept inside each workspace and the sidebar left open until the user explicitly collapses it.
+- Rebuilt the cross-platform icon family from the selected soundAr mark, including transparent Linux, Windows, macOS, Android, browser, loading, and About variants.
+- Refined About into a centered product and local-runtime overview using the same restrained settings-row anatomy as the rest of the application.
+- Added a deliberate compact music workspace: the composer takes the full working width, Runtime and Activity share the next row, and the information control stays in the title actions.
+- Added manual update checks to Settings and About and synchronized the displayed application version with package metadata.
+
 ## 0.3.0 - 2026-08-13
 
 - Replaced vulnerable Transformers and Diffusers pins with qualified patched releases, migrated XTTS to maintained `coqui-tts`, isolated optional engine dependencies, and disabled model-supplied Python execution.

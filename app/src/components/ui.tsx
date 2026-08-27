@@ -1,7 +1,6 @@
-import { AlertTriangle, Check, ChevronDown, Ellipsis, LoaderCircle, Pause, Play, RefreshCw } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, CircleDashed, Ellipsis, LoaderCircle, Pause, Play, RefreshCw } from "lucide-react";
 import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { BrandMark } from "./Brand";
 
 export interface DropdownOption {
   value: string;
@@ -14,16 +13,18 @@ export function PageHeader({
   actions,
 }: {
   title: string;
-  subtitle: string;
+  subtitle?: string;
   actions?: ReactNode;
 }) {
   return (
     <header className="page-header">
+    <div className="page-header-content">
       <div className="page-heading">
         <h1>{title}</h1>
-        <p>{subtitle}</p>
+        {subtitle ? <p>{subtitle}</p> : null}
       </div>
       {actions ? <div className="page-actions">{actions}</div> : null}
+    </div>
     </header>
   );
 }
@@ -353,7 +354,8 @@ export function CompactField({
 export function LoadingView() {
   return (
     <div className="loading-view" role="status">
-      <BrandMark className="loading-brand" />
+      <img className="loading-app-icon" src="/soundar-app-icon.png" alt="" aria-hidden="true" />
+      <strong className="loading-wordmark">soundAr</strong>
       <div className="loading-status"><LoaderCircle className="spin" aria-hidden="true" size={14} /><span>Reading the local runtime...</span></div>
     </div>
   );
@@ -362,7 +364,8 @@ export function LoadingView() {
 export function RuntimeFailureView({ error, onRetry }: { error: string; onRetry: () => void }) {
   return (
     <main className="runtime-failure-view">
-      <BrandMark className="loading-brand" />
+      <img className="loading-app-icon" src="/soundar-app-icon.png" alt="" aria-hidden="true" />
+      <strong className="loading-wordmark">soundAr</strong>
       <div className="runtime-failure-heading">
         <AlertTriangle aria-hidden="true" size={16} />
         <h1>Local runtime unavailable</h1>
@@ -449,11 +452,13 @@ export function CompactAudioPlayer({ src, label }: { src?: string; label: string
   );
 }
 
-export function EmptyState({ title, detail }: { title: string; detail: string }) {
+export function EmptyState({ title, detail, action }: { title: string; detail: string; action?: ReactNode }) {
   return (
     <div className="empty-state">
+      <span className="empty-state-icon"><CircleDashed aria-hidden="true" size={21} strokeWidth={1.6} /></span>
       <strong>{title}</strong>
       <span>{detail}</span>
+      {action ? <div className="empty-state-action">{action}</div> : null}
     </div>
   );
 }

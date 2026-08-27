@@ -1,0 +1,6 @@
+-r common.txt
+accelerate==1.14.0
+diffusers==0.38.0
+safetensors==0.8.0
+sentencepiece==0.2.1
+transformers==5.5.0

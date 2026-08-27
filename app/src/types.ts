@@ -1,14 +1,13 @@
 export type Theme = "dark" | "light";
 export type FeatureState = "stable" | "beta" | "experimental" | "disabled";
 export type QueuePriority = "low" | "normal" | "high" | "urgent";
+export type GenerationKind = "speech" | "music";
 
 export type NavKey =
   | "generate"
   | "projects"
-  | "transcribe"
   | "voices"
   | "models"
-  | "live"
   | "compare"
   | "benchmarks"
   | "history"
@@ -17,7 +16,7 @@ export type NavKey =
 
 export interface CatalogModel {
   model_id: string;
-  task: "tts" | "stt" | "speaker-verification" | "alignment";
+  task: "tts" | "stt" | "speaker-verification" | "alignment" | "music";
   engine: string;
   tier: "smoke" | "recommended" | "advanced";
   recommended_for_12gb: boolean;
@@ -26,6 +25,7 @@ export interface CatalogModel {
   known_limitations?: string[];
   source_urls?: string[];
   default_sample_rate?: number | null;
+  license?: string;
   access?: string;
   install_status?: "ready" | "planned";
   revision?: string;
@@ -33,7 +33,7 @@ export interface CatalogModel {
 
 export interface InstalledModel {
   model_id: string;
-  task: "tts" | "stt" | "speaker-verification" | "alignment";
+  task: "tts" | "stt" | "speaker-verification" | "alignment" | "music";
   engine: string;
   tier: string;
   local_path: string;
@@ -218,6 +218,15 @@ export interface EngineControl {
   default: number;
 }
 
+export interface MusicFeatureCapability {
+  lyrics: boolean;
+  instrumental_when_lyrics_empty: boolean;
+  max_lyrics_characters?: number;
+  max_lyrics_characters_per_second?: number;
+  sample_rate: number;
+  channels: number;
+}
+
 export interface EngineCapability {
   id: string;
   display_name: string;
@@ -229,6 +238,7 @@ export interface EngineCapability {
   reference_formats: string[];
   output_formats: string[];
   controls: Record<string, EngineControl>;
+  music_features?: MusicFeatureCapability;
   transcription_evidence?: {
     word_timestamps: boolean;
     language_detection: boolean;
@@ -688,6 +698,11 @@ export interface ApplicationSettings {
   reduced_motion: boolean;
 }
 
+export interface UpdateCheckStatus {
+  phase: "idle" | "checking" | "current" | "available" | "error" | "unavailable";
+  message?: string;
+}
+
 export interface SynthesisRequest {
   model_id: string;
   text: string;
@@ -701,6 +716,8 @@ export interface SynthesisRequest {
   temperature?: number;
   top_p?: number;
   repetition_penalty?: number;
+  instruction?: string;
+  cfg_scale?: number;
   seed: number;
   output_format: "wav" | "flac";
   title?: string;
@@ -708,6 +725,27 @@ export interface SynthesisRequest {
   priority?: QueuePriority;
   benchmark_token?: string;
 }
+
+export interface MusicGenerationRequest {
+  model_id: string;
+  prompt: string;
+  lyrics?: string;
+  vocal_language?: string;
+  duration_seconds: number;
+  guidance_scale?: number;
+  temperature?: number;
+  top_k?: number;
+  top_p?: number;
+  inference_steps?: number;
+  shift?: number;
+  bpm?: number;
+  seed: number;
+  output_format: "wav" | "flac";
+  title?: string;
+  priority?: QueuePriority;
+}
+
+export type GenerationRequest = SynthesisRequest | MusicGenerationRequest;
 
 export interface SynthesisResult {
   id: string;
@@ -732,6 +770,7 @@ export interface HistoryItem extends SynthesisResult {
   title: string;
   voice: string;
   text: string;
+  generation_kind?: GenerationKind;
   missing?: boolean;
   artifact_state?: "verified" | "available" | "modified" | "missing";
   favorite?: boolean;

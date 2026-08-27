@@ -9,7 +9,7 @@ export function capabilityForModel(
 
 export function qualifiedModels(
   bootstrap: BootstrapState,
-  task: "tts" | "stt" | "speaker-verification" | "alignment",
+  task: "tts" | "stt" | "speaker-verification" | "alignment" | "music",
 ): InstalledModel[] {
   return bootstrap.installed.filter((model) => {
     if (model.task !== task) return false;

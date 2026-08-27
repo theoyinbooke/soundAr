@@ -1,13 +1,10 @@
-import { Activity, Check, CircleStop, Copy, Download, Eye, FolderOpen, Gauge, KeyRound, LoaderCircle, Mic, NotebookPen, Pause, Play, RefreshCw, Search, Server, SlidersHorizontal, Star, Trophy, Trash2, Volume2 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Activity, ArrowLeft, AudioWaveform, Check, CircleStop, Copy, Download, Eye, FolderOpen, Gauge, HardDrive, KeyRound, LoaderCircle, Mic, MonitorCog, NotebookPen, Palette, Pause, Play, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Star, Trophy, Trash2, Volume2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { ApplicationSettings, AudioInputDevice, AudioOutputDevice, AudioPlaybackState, AudioRecordingState, BootstrapState, ComparisonRecord, DeveloperApiState, HistoryFilters, HistoryItem } from "../types";
+import type { ApplicationSettings, AudioInputDevice, AudioOutputDevice, AudioPlaybackState, AudioRecordingState, BootstrapState, ComparisonRecord, DeveloperApiState, HistoryItem, UpdateCheckStatus } from "../types";
 import { CompactAudioPlayer, CompactField, EmptyState, MetricStrip, PageHeader, Panel, RowActionMenu, Segmented, SelectField, StatusText } from "../components/ui";
-import { BrandLockup, BrandMark } from "../components/Brand";
-import { cancelComparison, createComparison, deleteHistoryItem, duplicateHistoryItem, exportHistoryItem, getAudioPlaybackStatus, getAudioRecordingStatus, getComparison, getDeveloperApiStatus, getHistoryRequest, listAudioInputDevices, listAudioOutputDevices, listHistory, loadGeneratedAudio, loadTranscriptionAudio, startAudioPlayback, startAudioRecording, startDeveloperApi, stopAudioPlayback, stopAudioRecording, stopDeveloperApi, synthesizeSpeech, transcribeAudio, updateComparisonReview, updateHistoryMetadata } from "../lib/bridge";
+import { cancelComparison, createComparison, deleteHistoryItem, duplicateHistoryItem, exportHistoryItem, generateMusic, getAudioPlaybackStatus, getAudioRecordingStatus, getComparison, getDeveloperApiStatus, getHistoryRequest, listAudioInputDevices, listAudioOutputDevices, listHistory, loadGeneratedAudio, loadTranscriptionAudio, startAudioPlayback, startAudioRecording, startDeveloperApi, stopAudioPlayback, stopAudioRecording, stopDeveloperApi, synthesizeSpeech, transcribeAudio, updateComparisonReview, updateHistoryMetadata } from "../lib/bridge";
 import { canSynthesizeWithoutReference, qualifiedModels } from "../lib/capabilities";
-
-const idleWaveform = [22, 34, 18, 48, 28, 62, 42, 71, 38, 54, 31, 66, 45, 57];
 
 export function reconcileAudioDeviceSelection<T extends { id: string; is_default: boolean }>(current: string, devices: T[]) {
   if (devices.some((device) => device.id === current)) return current;
@@ -120,17 +117,15 @@ export function LiveView({ bootstrap }: { bootstrap: BootstrapState }) {
   }
 
   const peak = Math.max(0, Math.min(1, recording.peak ?? 0));
-  const levels = Array.from({ length: 32 }, (_, index) => Math.max(5, Math.round(peak * 72 * (0.45 + Math.abs(Math.sin(index * 1.71)) * 0.55))));
-
   return (
-    <div className="page">
+    <div className="page live-page">
       <PageHeader title="Live" subtitle="Capture local microphone audio, monitor input, review it, and transcribe without a cloud service." actions={<button className={`button ${recording.recording ? "button-secondary danger-button" : "button-primary"}`} type="button" disabled={!devices.length} onClick={() => void toggleRecording()}>{recording.recording ? <CircleStop size={14} /> : <Mic size={14} />}{recording.recording ? "Stop capture" : "Record"}</button>} />
       <MetricStrip metrics={[{ value: `${(recording.duration_seconds ?? 0).toFixed(1)} s`, label: "Capture" }, { value: `${(recording.speech_seconds ?? 0).toFixed(1)} s`, label: "Detected speech" }, { value: `${Math.round(peak * 100)}%`, label: "Input peak" }, { value: String(recording.dropped_frames ?? 0), label: "Dropped frames" }]} />
       <div className="live-layout">
         <Panel className="live-stage" ariaLabel="Live voice session">
           <div className={`live-orb ${recording.recording ? "is-active" : ""}`}><Activity size={22} /></div>
           <div><h2>{recording.recording ? recording.speech_active ? "Voice detected" : recording.speech_detected ? "Listening for more" : "Listening" : recording.audio_path ? "Capture ready" : "Microphone ready"}</h2><p>{recording.recording ? recording.device_name : recording.audio_path ? `${(recording.duration_seconds ?? 0).toFixed(1)} seconds captured as a managed WAV${recording.stop_reason === "silence" ? " after silence was detected" : ""}.` : "Select an input, then start a visible local recording."}</p></div>
-          <div className="level-bars" aria-hidden="true">{levels.map((height, index) => <i key={`${height}-${index}`} style={{ height }} />)}</div>
+          <div className="input-meter" aria-label={`Input level ${Math.round(peak * 100)} percent`}><i style={{ width: `${Math.round(peak * 100)}%` }} /></div>
           <CompactAudioPlayer src={audioUrl} label="captured audio" />
           <StatusText tone={error || recording.capture_error ? "danger" : recording.recording && recording.speech_active ? "success" : "muted"}>{error ?? recording.capture_error ?? (recording.recording ? `${vadEnabled ? "Adaptive voice detection active" : "Voice detection off"} / ${(recording.buffered_frames ?? 0)} frames buffered` : recording.stop_reason === "silence" ? "Auto-stopped after trailing silence" : "Microphone access is off")}</StatusText>
           {transcript ? <p className="live-transcript">{transcript}</p> : null}
@@ -279,7 +274,7 @@ export function CompareView({ bootstrap, onGenerated }: { bootstrap: BootstrapSt
           return <Panel className={`compare-side ${comparison.winner_take_id === take.id ? "is-winner" : ""}`} key={take.id} ariaLabel={`Take ${take.label}`}>
             <div className="compare-heading"><span>{take.label}</span><div><strong>{hidden ? "Identity hidden" : take.request.model_id || result?.model_id || "Legacy take"}</strong><StatusText tone={take.status === "completed" ? "success" : take.status === "failed" ? "danger" : "warning"}>{take.status}</StatusText></div></div>
             {result ? <>
-              <div className="mini-waveform">{result.waveform.slice(0, 64).map((height, index) => <i key={index} className="is-live" style={{ height: Math.max(3, Number(height) * 24), opacity: index / Math.max(1, result.waveform.length) <= progress ? 1 : .35 }} />)}</div>
+              <div className="mini-waveform"><i className="is-live" style={{ width: `${progress * 100}%` }} /></div>
               <div className="compare-player"><audio ref={(node) => { audioRefs.current[take.id] = node; }} src={urls[take.id]} preload="metadata" onTimeUpdate={(event) => { if (playingId === take.id && event.currentTarget.duration) setProgress(event.currentTarget.currentTime / event.currentTarget.duration); }} onPause={() => setPlayingId((id) => id === take.id ? undefined : id)} onEnded={() => setPlayingId(undefined)} /><button className="icon-button" title={`${playingId === take.id ? "Pause" : "Play"} take ${take.label}`} type="button" disabled={!urls[take.id]} onClick={() => void toggleTake(take.id)}>{playingId === take.id ? <Pause size={12} /> : <Play size={12} />}</button><button className="compare-scrubber" type="button" aria-label={`Seek take ${take.label}`} onClick={(event) => { const box = event.currentTarget.getBoundingClientRect(); seek((event.clientX - box.left) / box.width); }}><i style={{ width: `${progress * 100}%` }} /></button><span>{result.duration_seconds.toFixed(1)} s</span></div>
               <dl className="compact-definition-list"><div><dt>RTF</dt><dd>{result.rtf.toFixed(3)}x</dd></div><div><dt>Peak VRAM</dt><dd>{result.vram_peak_mb.toFixed(0)} MB</dd></div><div><dt>Seed</dt><dd>{take.request.seed}</dd></div></dl>
               <div className="take-rating" aria-label={`Rate take ${take.label}`}>{[1,2,3,4,5].map((rating) => <button className="icon-button" title={`${rating} star${rating === 1 ? "" : "s"}`} type="button" key={rating} onClick={() => void review({ take_id: take.id, rating })}><Star size={12} fill={(take.rating ?? 0) >= rating ? "currentColor" : "none"} /></button>)}<button className="icon-button" title={take.favorite ? "Remove favorite" : "Favorite take"} type="button" onClick={() => void review({ take_id: take.id, favorite: !take.favorite })}><Star size={13} fill={take.favorite ? "currentColor" : "none"} /></button></div>
@@ -294,36 +289,15 @@ export function CompareView({ bootstrap, onGenerated }: { bootstrap: BootstrapSt
   );
 }
 
-export function HistoryView({ history, onChange }: { history: HistoryItem[]; onChange: (history: HistoryItem[]) => void }) {
-  const [query, setQuery] = useState("");
-  const [modelFilter, setModelFilter] = useState("");
-  const [voiceFilter, setVoiceFilter] = useState("");
-  const [stateFilter, setStateFilter] = useState("");
-  const [favoritesOnly, setFavoritesOnly] = useState(false);
-  const [facets, setFacets] = useState(() => ({ models: [...new Set(history.map((item) => item.model_id))].sort(), voices: [...new Set(history.map((item) => item.voice))].sort() }));
+export function HistoryView({ history, onChange, selectedId }: { history: HistoryItem[]; onChange: (history: HistoryItem[]) => void; selectedId?: string }) {
   const [activeId, setActiveId] = useState<string>();
   const [loadingId, setLoadingId] = useState<string>();
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackError, setPlaybackError] = useState<{ id: string; message: string }>();
   const [rowNotice, setRowNotice] = useState<{ id: string; message: string }>();
-  const [searching, setSearching] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const objectUrlRef = useRef<string | undefined>(undefined);
   const requestRef = useRef(0);
-  const filters = useMemo<HistoryFilters>(() => ({ ...(modelFilter ? { model_id: modelFilter } : {}), ...(voiceFilter ? { voice: voiceFilter } : {}), ...(stateFilter ? { artifact_state: stateFilter as HistoryFilters["artifact_state"] } : {}), ...(favoritesOnly ? { favorite: true } : {}) }), [modelFilter, voiceFilter, stateFilter, favoritesOnly]);
-
-  useEffect(() => setFacets((current) => ({ models: [...new Set([...current.models, ...history.map((item) => item.model_id)])].sort(), voices: [...new Set([...current.voices, ...history.map((item) => item.voice)])].sort() })), [history]);
-
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      setSearching(true);
-      listHistory(query, filters)
-        .then(onChange)
-        .catch(() => undefined)
-        .finally(() => setSearching(false));
-    }, 180);
-    return () => window.clearTimeout(timer);
-  }, [query, filters]);
 
   useEffect(() => () => {
     requestRef.current += 1;
@@ -332,7 +306,7 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
   }, []);
 
   async function refreshHistory() {
-    onChange(await listHistory(query, filters));
+    onChange(await listHistory());
   }
 
   async function toggleHistoryPlayback(item: HistoryItem) {
@@ -388,9 +362,19 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
 
   async function copyText(item: HistoryItem) {
     try {
-      await navigator.clipboard.writeText(item.text);
+      if (item.generation_kind === "music") {
+        const request = await getHistoryRequest(item.id);
+        if (!("prompt" in request)) throw new Error("The stored music request is invalid.");
+        const lyrics = request.lyrics?.trim();
+        await navigator.clipboard.writeText([
+          `Music direction:\n${request.prompt}`,
+          lyrics ? `Lyrics or text to sing:\n${lyrics}` : "",
+        ].filter(Boolean).join("\n\n"));
+      } else {
+        await navigator.clipboard.writeText(item.text);
+      }
     } catch {
-      setPlaybackError({ id: item.id, message: "Could not copy text to the clipboard" });
+      setPlaybackError({ id: item.id, message: "Could not copy generation text to the clipboard" });
     }
   }
 
@@ -418,7 +402,13 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
     setLoadingId(item.id);
     try {
       const request = await getHistoryRequest(item.id);
-      await synthesizeSpeech({ ...request, title: `${item.title} rerun` });
+      if (item.generation_kind === "music") {
+        if (!("prompt" in request)) throw new Error("The stored music request is invalid.");
+        await generateMusic({ ...request, title: `${item.title} rerun` });
+      } else {
+        if (!("text" in request)) throw new Error("The stored speech request is invalid.");
+        await synthesizeSpeech({ ...request, title: `${item.title} rerun` });
+      }
       await refreshHistory();
     } catch (caught) {
       setPlaybackError({ id: item.id, message: caught instanceof Error ? caught.message : String(caught) });
@@ -450,62 +440,82 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
     }
   }
 
+  const selected = history.find((item) => item.id === selectedId) ?? history[0];
+  const selectedPlaying = Boolean(selected && activeId === selected.id && isPlaying);
+  const selectedLoading = Boolean(selected && loadingId === selected.id);
+  const selectedUnavailable = Boolean(selected && (!selected.audio_path || selected.missing || selected.artifact_state === "missing" || selected.artifact_state === "modified"));
+  const selectedArtifactMessage = selected?.artifact_state === "modified"
+    ? "Audio file changed on disk"
+    : selectedUnavailable ? "Audio file is missing" : undefined;
+
   return (
-    <div className="page">
+    <div className="page history-page">
       <PageHeader title="History" subtitle="Reopen, audition, and export generations made on this machine." />
-      <div className="history-toolbar"><label className="search-control"><Search size={14} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search scripts, voices, and models..." /></label><SelectField label="Model filter" value={modelFilter} onChange={setModelFilter} options={[{ value: "", label: "All models" }, ...facets.models.map((model) => ({ value: model, label: model.split("/").at(-1) ?? model }))]} /><SelectField label="Voice filter" value={voiceFilter} onChange={setVoiceFilter} options={[{ value: "", label: "All voices" }, ...facets.voices.map((voice) => ({ value: voice, label: voice }))]} /><SelectField label="Artifact filter" value={stateFilter} onChange={setStateFilter} options={[{ value: "", label: "All artifacts" }, { value: "available", label: "Available" }, { value: "unavailable", label: "Unavailable" }]} /><button className="button button-secondary history-favorite-filter" type="button" aria-pressed={favoritesOnly} onClick={() => setFavoritesOnly((value) => !value)}><Star size={12} fill={favoritesOnly ? "currentColor" : "none"} />Favorites</button><StatusText tone="muted">{searching ? "Searching local database..." : `${history.length} matching generations${history.length === 500 ? " shown" : ""}`}</StatusText></div>
-      <Panel className="table-panel">
-        {history.length ? (
-          <div className="table-scroll">
-            <table className="data-table history-table">
-              <thead><tr><th>Generation</th><th>Voice</th><th>Model</th><th>Duration</th><th>RTF</th><th aria-label="Actions" /></tr></thead>
-              <tbody>{history.map((item) => {
-                const playing = activeId === item.id && isPlaying;
-                const loading = loadingId === item.id;
-                const artifactUnavailable = !item.audio_path || item.missing || item.artifact_state === "missing" || item.artifact_state === "modified";
-                const artifactMessage = item.artifact_state === "modified"
-                  ? "Audio file changed on disk"
-                  : artifactUnavailable ? "Audio file is missing" : undefined;
-                return (
-                  <tr key={item.id}>
-                    <td>
-                      <strong>{item.favorite ? <Star aria-label="Favorite" fill="currentColor" size={11} /> : null}{item.title}</strong>
-                      <small className={playbackError?.id === item.id || artifactMessage ? "history-playback-error" : rowNotice?.id === item.id ? "history-row-notice" : undefined}>{playbackError?.id === item.id ? playbackError.message : rowNotice?.id === item.id ? rowNotice.message : (artifactMessage ?? item.notes) || new Date(item.created_at).toLocaleString()}</small>
-                    </td>
-                    <td>{item.voice}</td>
-                    <td className="muted-cell">{item.model_id.split("/").at(-1)}</td>
-                    <td className="mono-cell">{item.duration_seconds.toFixed(1)} s</td>
-                    <td className="mono-cell">{item.rtf.toFixed(2)}x</td>
-                    <td>
-                      <div className="history-actions"><button className="icon-button" title={artifactMessage ?? (playing ? "Pause generation" : "Play generation")} type="button" disabled={!item.audio_path || artifactUnavailable || loading} onClick={() => void toggleHistoryPlayback(item)}>
-                        {loading ? <LoaderCircle className="spin" size={12} /> : playing ? <Pause fill="currentColor" size={12} /> : <Play fill="currentColor" size={12} />}
-                      </button><RowActionMenu label={`More actions for ${item.title}`} actions={[
-                        { label: item.favorite ? "Remove favorite" : "Add favorite", icon: <Star fill={item.favorite ? "currentColor" : "none"} size={12} />, onSelect: () => toggleFavorite(item) },
-                        { label: "Edit notes", icon: <NotebookPen size={12} />, onSelect: () => editNotes(item) },
-                        { label: "Regenerate", icon: <RefreshCw size={12} />, disabled: loading, onSelect: () => regenerate(item) },
-                        { label: "Duplicate artifact", icon: <Copy size={12} />, disabled: loading || artifactUnavailable, onSelect: () => duplicate(item) },
-                        { label: "Export copy", icon: <Download size={12} />, disabled: artifactUnavailable, onSelect: () => exportCopy(item) },
-                        { label: "Reveal in folder", icon: <FolderOpen size={12} />, disabled: !item.audio_path || artifactUnavailable, onSelect: () => { if (item.audio_path) void revealItemInDir(item.audio_path); } },
-                        { label: "Copy script", icon: <Copy size={12} />, onSelect: () => copyText(item) },
-                        { label: "Delete", icon: <Trash2 size={12} />, danger: true, onSelect: () => remove(item) },
-                      ]} /></div>
-                    </td>
-                  </tr>
-                );
-              })}</tbody>
-            </table>
-          </div>
-        ) : <EmptyState title="No matching generations" detail="Generated audio will appear here automatically." />}
+      <Panel className={`history-workspace history-detail-only${selected ? "" : " is-empty"}`} ariaLabel="Generation history">
+        <section className="history-detail" aria-label="Generation details">
+          {selected ? <>
+            <header className="history-detail-header">
+              <div><span className="section-label">{selected.generation_kind === "music" ? "Music generation" : "Voice generation"}</span><h2>{selected.title}</h2><p>{new Date(selected.created_at).toLocaleString()}</p></div>
+              <div className="history-detail-actions">
+                <button className="icon-button" title={selected.favorite ? "Remove favorite" : "Add favorite"} type="button" onClick={() => void toggleFavorite(selected)}><Star fill={selected.favorite ? "currentColor" : "none"} size={13} /></button>
+                <RowActionMenu label={`More actions for ${selected.title}`} actions={[
+                  { label: selected.favorite ? "Remove favorite" : "Add favorite", icon: <Star fill={selected.favorite ? "currentColor" : "none"} size={12} />, onSelect: () => toggleFavorite(selected) },
+                  { label: "Edit notes", icon: <NotebookPen size={12} />, onSelect: () => editNotes(selected) },
+                  { label: "Regenerate", icon: <RefreshCw size={12} />, disabled: selectedLoading, onSelect: () => regenerate(selected) },
+                  { label: "Duplicate artifact", icon: <Copy size={12} />, disabled: selectedLoading || selectedUnavailable, onSelect: () => duplicate(selected) },
+                  { label: "Export copy", icon: <Download size={12} />, disabled: selectedUnavailable, onSelect: () => exportCopy(selected) },
+                  { label: "Reveal in folder", icon: <FolderOpen size={12} />, disabled: !selected.audio_path || selectedUnavailable, onSelect: () => { if (selected.audio_path) void revealItemInDir(selected.audio_path); } },
+                  { label: selected.generation_kind === "music" ? "Copy direction and lyrics" : "Copy script", icon: <Copy size={12} />, onSelect: () => copyText(selected) },
+                  { label: "Delete", icon: <Trash2 size={12} />, danger: true, onSelect: () => remove(selected) },
+                ]} />
+              </div>
+            </header>
+            <div className="history-player-row">
+              <button className="history-play-button" title={selectedArtifactMessage ?? (selectedPlaying ? "Pause generation" : "Play generation")} type="button" disabled={!selected.audio_path || selectedUnavailable || selectedLoading} onClick={() => void toggleHistoryPlayback(selected)}>{selectedLoading ? <LoaderCircle className="spin" size={15} /> : selectedPlaying ? <Pause fill="currentColor" size={15} /> : <Play fill="currentColor" size={15} />}</button>
+              <span><strong>{selectedArtifactMessage ?? (playbackError?.id === selected.id ? playbackError.message : rowNotice?.id === selected.id ? rowNotice.message : "Ready to play")}</strong><small>{selected.model_id.split("/").at(-1)} · {selected.voice}</small></span>
+              <strong className="mono-cell">{selected.duration_seconds.toFixed(1)} s</strong>
+            </div>
+            <dl className="history-detail-facts"><div><dt>Model</dt><dd>{selected.model_id.split("/").at(-1)}</dd></div><div><dt>Voice</dt><dd>{selected.generation_kind === "music" ? "Music" : selected.voice}</dd></div><div><dt>RTF</dt><dd>{selected.rtf.toFixed(2)}x</dd></div><div><dt>Peak VRAM</dt><dd>{selected.vram_peak_mb.toFixed(0)} MB</dd></div></dl>
+            <section className="history-script"><span className="section-label">{selected.generation_kind === "music" ? "Direction" : "Script"}</span><p>{selected.text}</p></section>
+            {selected.notes ? <section className="history-notes"><span className="section-label">Notes</span><p>{selected.notes}</p></section> : null}
+            <div className="history-primary-actions"><button className="button button-secondary" type="button" disabled={selectedLoading} onClick={() => void regenerate(selected)}><RefreshCw size={12} />Regenerate</button><button className="button button-primary" type="button" disabled={selectedUnavailable} onClick={() => void exportCopy(selected)}><Download size={12} />Export copy</button></div>
+          </> : <EmptyState title="No generations yet" detail="Generated speech and music will appear in the Recent list in the sidebar." />}
+        </section>
         <audio ref={audioRef} className="visually-hidden" preload="metadata" onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} onEnded={() => setIsPlaying(false)} onError={() => activeId && setPlaybackError({ id: activeId, message: "Generated audio could not be decoded" })} />
       </Panel>
     </div>
   );
 }
 
-export function SettingsView({ bootstrap, settings, onSetting }: { bootstrap: BootstrapState; settings: ApplicationSettings; onSetting: <K extends keyof ApplicationSettings>(key: K, value: ApplicationSettings[K]) => void }) {
+function UpdateCheckButton({ status, onCheck }: { status: UpdateCheckStatus; onCheck: () => void }) {
+  return (
+    <button className="button button-secondary" type="button" disabled={status.phase === "checking"} onClick={onCheck}>
+      {status.phase === "checking" ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <RefreshCw aria-hidden="true" size={13} />}
+      {status.phase === "checking" ? "Checking..." : "Check for updates"}
+    </button>
+  );
+}
+
+function UpdateCheckFeedback({ status }: { status: UpdateCheckStatus }) {
+  if (!status.message || status.phase === "idle") return null;
+  const tone = status.phase === "current"
+    ? "success"
+    : status.phase === "available" || status.phase === "checking"
+      ? "warning"
+      : status.phase === "error"
+        ? "danger"
+        : "muted";
+  return <div className="update-check-feedback" role="status" aria-live="polite"><StatusText tone={tone}>{status.message}</StatusText></div>;
+}
+
+type SettingsCategory = "general" | "appearance" | "audio" | "storage" | "runtime" | "developer";
+
+export function SettingsView({ bootstrap, settings, onSetting, updateCheck, onCheckForUpdates, onBack }: { bootstrap: BootstrapState; settings: ApplicationSettings; onSetting: <K extends keyof ApplicationSettings>(key: K, value: ApplicationSettings[K]) => void; updateCheck: UpdateCheckStatus; onCheckForUpdates: () => void; onBack: () => void }) {
   const [api, setApi] = useState<DeveloperApiState>({ running: false });
   const [apiBusy, setApiBusy] = useState(false);
   const [apiError, setApiError] = useState<string>();
+  const [category, setCategory] = useState<SettingsCategory>("general");
+  const [query, setQuery] = useState("");
 
   useEffect(() => { void getDeveloperApiStatus().then(setApi).catch(() => undefined); }, []);
 
@@ -518,72 +528,132 @@ export function SettingsView({ bootstrap, settings, onSetting }: { bootstrap: Bo
     finally { setApiBusy(false); }
   }
 
+  const categories: Array<{ group: string; key: SettingsCategory; label: string; icon: typeof Settings2 }> = [
+    { group: "Application", key: "general", label: "General", icon: Settings2 },
+    { group: "Application", key: "appearance", label: "Appearance", icon: Palette },
+    { group: "Application", key: "audio", label: "Audio", icon: AudioWaveform },
+    { group: "Local engine", key: "storage", label: "Models & storage", icon: HardDrive },
+    { group: "Local engine", key: "runtime", label: "Runtime & updates", icon: MonitorCog },
+    { group: "Advanced", key: "developer", label: "Developer API", icon: Server },
+  ];
+  const filteredCategories = categories.filter((item) => `${item.group} ${item.label}`.toLowerCase().includes(query.trim().toLowerCase()));
+
   return (
-    <div className="page settings-page">
-      <PageHeader title="Settings" subtitle="Tune the desktop runtime, storage, and visual appearance." />
-      <div className="settings-columns">
-        <Panel className="settings-section">
-          <div className="settings-title"><SlidersHorizontal size={15} /><div><h2>Appearance</h2><p>Compact in both themes, with no blue or purple.</p></div></div>
-          <span className="field-label standalone-label">Color mode</span>
-          <Segmented label="Color mode" value={settings.theme} onChange={(theme) => onSetting("theme", theme)} options={[{ value: "dark", label: "Dark" }, { value: "light", label: "Cream light" }]} />
-          <label className="toggle-row"><span><strong>Dense tables</strong><small>Keep rows compact across the workspace.</small></span><input type="checkbox" checked={settings.dense_tables} onChange={(event) => onSetting("dense_tables", event.target.checked)} /></label>
-          <label className="toggle-row"><span><strong>Reduced motion</strong><small>Limit interface animation.</small></span><input type="checkbox" checked={settings.reduced_motion} onChange={(event) => onSetting("reduced_motion", event.target.checked)} /></label>
-        </Panel>
-        <Panel className="settings-section">
-          <div className="settings-title"><Gauge size={15} /><div><h2>Local runtime</h2><p>Hardware and engine health reported by the desktop bridge.</p></div></div>
-          <dl className="compact-definition-list settings-facts"><div><dt>GPU</dt><dd>{bootstrap.system.gpu_name}</dd></div><div><dt>CUDA</dt><dd><StatusText tone={bootstrap.system.cuda_available ? "success" : "warning"}>{bootstrap.system.cuda_available ? "Ready" : "Unavailable"}</StatusText></dd></div><div><dt>Python engines</dt><dd><StatusText tone={bootstrap.system.python_ready ? "success" : "danger"}>{bootstrap.system.python_ready ? "Ready" : "Missing"}</StatusText></dd></div><div><dt>Driver</dt><dd>{bootstrap.system.driver_version || "Unknown"}</dd></div></dl>
-        </Panel>
-        <Panel className="settings-section settings-storage">
-          <div className="settings-title"><FolderOpen size={15} /><div><h2>Storage</h2><p>Models, voice references, and exports stay local.</p></div></div>
-          <CompactField label="Export directory"><div className="path-field"><span>{bootstrap.export_dir}</span></div></CompactField>
-          <div className="storage-summary"><div><strong>{bootstrap.installed.length}</strong><span>Installed models</span></div><div><strong>{(bootstrap.system.vram_total_mb / 1024).toFixed(1)} GB</strong><span>GPU memory</span></div><div><strong><Check size={15} /></strong><span>Local-only mode</span></div></div>
-        </Panel>
-        <Panel className="settings-section settings-api">
-          <div className="settings-title"><Server size={15} /><div><h2>Developer API</h2><p>Explicit, token-protected access on this machine only.</p></div></div>
-          <dl className="compact-definition-list settings-facts"><div><dt>Status</dt><dd><StatusText tone={api.running ? "success" : "muted"}>{api.running ? "Listening" : "Stopped"}</StatusText></dd></div><div><dt>Binding</dt><dd>{api.base_url ?? "127.0.0.1:17843"}</dd></div><div><dt>Compatibility</dt><dd>OpenAI audio/speech</dd></div></dl>
-          {api.running && api.token ? <div className="api-token"><KeyRound size={13} /><code>{api.token}</code><button className="icon-button" title="Copy API token" type="button" onClick={() => void navigator.clipboard.writeText(api.token ?? "")}><Copy size={12} /></button></div> : null}
-          {apiError ? <StatusText tone="danger">{apiError}</StatusText> : null}
-          <button className={`button ${api.running ? "button-secondary danger-button" : "button-primary"}`} type="button" disabled={apiBusy || bootstrap.runtime !== "tauri"} onClick={() => void toggleApi()}>{apiBusy ? <LoaderCircle className="spin" size={13} /> : <Server size={13} />}{apiBusy ? "Updating" : api.running ? "Stop local API" : "Start local API"}</button>
-        </Panel>
-      </div>
+    <div className="settings-shell">
+      <aside className="settings-navigation">
+        <button className="settings-back" type="button" onClick={onBack}><ArrowLeft aria-hidden="true" size={16} />Back to soundAr</button>
+        <label className="settings-search"><Search aria-hidden="true" size={15} /><span className="visually-hidden">Search settings</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search settings…" /></label>
+        <nav aria-label="Settings categories">
+          {["Application", "Local engine", "Advanced"].map((group) => {
+            const items = filteredCategories.filter((item) => item.group === group);
+            if (!items.length) return null;
+            return <div className="settings-nav-group" key={group}><span>{group}</span>{items.map((item) => {
+              const Icon = item.icon;
+              return <button key={item.key} type="button" className={category === item.key ? "is-active" : ""} aria-current={category === item.key ? "page" : undefined} onClick={() => setCategory(item.key)}><Icon aria-hidden="true" size={16} /><span>{item.label}</span></button>;
+            })}</div>;
+          })}
+          {!filteredCategories.length ? <p className="settings-no-results">No settings match “{query}”.</p> : null}
+        </nav>
+      </aside>
+
+      <section className="settings-content">
+        <div className="settings-content-inner">
+          {category === "general" ? <>
+            <header className="settings-page-heading"><h1>General</h1><p>Manage soundAr’s desktop behavior and local workspace defaults.</p></header>
+            <section className="settings-block" aria-labelledby="general-behavior"><h2 id="general-behavior">Application</h2><div className="settings-group">
+              <div className="settings-row"><span><strong>Local-first processing</strong><small>Speech, transcription, model files, and projects stay on this computer.</small></span><span className="settings-value success-value"><Check size={14} /> Active</span></div>
+              <div className="settings-row"><span><strong>Installed version</strong><small>Desktop application and bundled runtime.</small></span><span className="settings-value">{__APP_VERSION__}</span></div>
+              <div className="settings-row"><span><strong>Table density</strong><small>Choose how much information is visible in libraries and history.</small></span><Segmented label="Table density" value={settings.dense_tables ? "dense" : "comfortable"} onChange={(value) => onSetting("dense_tables", value === "dense")} options={[{ value: "comfortable", label: "Comfortable" }, { value: "dense", label: "Compact" }]} /></div>
+            </div></section>
+          </> : null}
+
+          {category === "appearance" ? <>
+            <header className="settings-page-heading"><h1>Appearance</h1><p>Choose how soundAr looks and moves across the desktop.</p></header>
+            <section className="settings-block"><h2>Theme</h2><div className="settings-group">
+              <div className="settings-row"><span><strong>Color mode</strong><small>Use a neutral light or dark desktop theme.</small></span><Segmented label="Color mode" value={settings.theme} onChange={(theme) => onSetting("theme", theme)} options={[{ value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} /></div>
+              <label className="settings-row"><span><strong>Reduced motion</strong><small>Minimize non-essential transitions and interface animation.</small></span><input type="checkbox" checked={settings.reduced_motion} onChange={(event) => onSetting("reduced_motion", event.target.checked)} /></label>
+            </div></section>
+          </> : null}
+
+          {category === "audio" ? <>
+            <header className="settings-page-heading"><h1>Audio</h1><p>Review the local audio environment used for recording and generation.</p></header>
+            <section className="settings-block"><h2>Processing</h2><div className="settings-group">
+              <div className="settings-row"><span><strong>Inference mode</strong><small>All enabled engines run through the local soundAr worker.</small></span><span className="settings-value">Local</span></div>
+              <div className="settings-row"><span><strong>GPU acceleration</strong><small>Hardware acceleration is used by compatible installed engines.</small></span><StatusText tone={bootstrap.system.cuda_available ? "success" : "warning"}>{bootstrap.system.cuda_available ? "Available" : "Unavailable"}</StatusText></div>
+              <div className="settings-row"><span><strong>Python audio engines</strong><small>Required by model runtimes and audio processing tools.</small></span><StatusText tone={bootstrap.system.python_ready ? "success" : "danger"}>{bootstrap.system.python_ready ? "Ready" : "Needs setup"}</StatusText></div>
+            </div></section>
+          </> : null}
+
+          {category === "storage" ? <>
+            <header className="settings-page-heading"><h1>Models & storage</h1><p>Understand where soundAr keeps model assets and generated work.</p></header>
+            <section className="settings-block"><h2>Storage</h2><div className="settings-group">
+              <div className="settings-row settings-path-row"><span><strong>Export directory</strong><small>Generated audio is written to this local folder.</small></span><code>{bootstrap.export_dir}</code></div>
+              <div className="settings-row"><span><strong>Installed models</strong><small>Models currently available to local engines.</small></span><span className="settings-value">{bootstrap.installed.length}</span></div>
+              <div className="settings-row"><span><strong>GPU memory</strong><small>Total memory visible to the local runtime.</small></span><span className="settings-value">{(bootstrap.system.vram_total_mb / 1024).toFixed(1)} GB</span></div>
+            </div></section>
+          </> : null}
+
+          {category === "runtime" ? <>
+            <header className="settings-page-heading"><h1>Runtime & updates</h1><p>Inspect the local engine and keep the installed application current.</p></header>
+            <UpdateCheckFeedback status={updateCheck} />
+            <section className="settings-block"><h2>Application updates</h2><div className="settings-group">
+              <div className="settings-row"><span><strong>soundAr updates</strong><small>Check the signed release feed for a newer desktop build.</small></span><UpdateCheckButton status={updateCheck} onCheck={onCheckForUpdates} /></div>
+            </div></section>
+            <section className="settings-block"><h2>Local runtime</h2><div className="settings-group">
+              <div className="settings-row"><span><strong>GPU</strong><small>{bootstrap.system.gpu_name}</small></span><StatusText tone={bootstrap.system.cuda_available ? "success" : "warning"}>{bootstrap.system.cuda_available ? "CUDA ready" : "CPU mode"}</StatusText></div>
+              <div className="settings-row"><span><strong>Driver</strong><small>Reported by the desktop bridge.</small></span><span className="settings-value">{bootstrap.system.driver_version || "Unknown"}</span></div>
+              <div className="settings-row"><span><strong>Install type</strong><small>Current Linux distribution package.</small></span><span className="settings-value">{bootstrap.install_kind.toUpperCase()}</span></div>
+            </div></section>
+          </> : null}
+
+          {category === "developer" ? <>
+            <header className="settings-page-heading"><h1>Developer API</h1><p>Expose an explicit token-protected audio endpoint on this machine.</p></header>
+            <section className="settings-block"><h2>Local endpoint</h2><div className="settings-group">
+              <div className="settings-row"><span><strong>Status</strong><small>{api.base_url ?? "127.0.0.1:17843"} · OpenAI audio/speech compatibility</small></span><StatusText tone={api.running ? "success" : "muted"}>{api.running ? "Listening" : "Stopped"}</StatusText></div>
+              {api.running && api.token ? <div className="settings-row"><span><strong>API token</strong><small>Keep this credential private.</small></span><div className="api-token"><KeyRound size={13} /><code>{api.token}</code><button className="icon-button" title="Copy API token" type="button" onClick={() => void navigator.clipboard.writeText(api.token ?? "")}><Copy size={12} /></button></div></div> : null}
+              <div className="settings-row"><span><strong>{api.running ? "Stop local API" : "Start local API"}</strong><small>{bootstrap.runtime === "tauri" ? "The endpoint only listens after you explicitly enable it." : "Available in the installed desktop application."}</small></span><button className={`button ${api.running ? "button-secondary danger-button" : "button-primary"}`} type="button" disabled={apiBusy || bootstrap.runtime !== "tauri"} onClick={() => void toggleApi()}>{apiBusy ? <LoaderCircle className="spin" size={13} /> : <Server size={13} />}{apiBusy ? "Updating" : api.running ? "Stop" : "Start"}</button></div>
+            </div></section>
+            {apiError ? <StatusText tone="danger">{apiError}</StatusText> : null}
+          </> : null}
+        </div>
+      </section>
     </div>
   );
 }
 
-export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
+export function AboutView({ bootstrap, updateCheck, onCheckForUpdates }: { bootstrap: BootstrapState; updateCheck: UpdateCheckStatus; onCheckForUpdates: () => void }) {
   return (
     <div className="page about-page">
-      <PageHeader title="About" subtitle="Application identity and local runtime details." />
-      <section className="about-identity" aria-labelledby="about-product-name">
-        <BrandMark className="about-mark" />
-        <div>
-          <BrandLockup className="about-lockup" />
-          <p id="about-product-name">Open-source local voice studio</p>
-        </div>
-        <span className="about-version">Version 0.3.0</span>
-      </section>
-      <div className="about-details">
-        <Panel className="about-section" ariaLabel="Application details">
-          <span className="section-label">Application</span>
-          <dl className="compact-definition-list settings-facts">
-            <div><dt>Desktop shell</dt><dd>Tauri 2</dd></div>
-            <div><dt>Interface</dt><dd>React 19</dd></div>
-            <div><dt>Inference</dt><dd>Local Python worker</dd></div>
-            <div><dt>Updates</dt><dd>Automatic release checks</dd></div>
-            <div><dt>Network fallback</dt><dd>None</dd></div>
-          </dl>
-        </Panel>
-        <Panel className="about-section" ariaLabel="Runtime details">
-          <span className="section-label">This machine</span>
-          <dl className="compact-definition-list settings-facts">
-            <div><dt>GPU</dt><dd>{bootstrap.system.gpu_name}</dd></div>
-            <div><dt>VRAM</dt><dd>{(bootstrap.system.vram_total_mb / 1024).toFixed(1)} GB</dd></div>
-            <div><dt>CUDA</dt><dd><StatusText tone={bootstrap.system.cuda_available ? "success" : "warning"}>{bootstrap.system.cuda_available ? "Ready" : "Unavailable"}</StatusText></dd></div>
-            <div><dt>Installed models</dt><dd>{bootstrap.installed.length}</dd></div>
-          </dl>
-        </Panel>
+      <PageHeader title="About soundAr" actions={<UpdateCheckButton status={updateCheck} onCheck={onCheckForUpdates} />} />
+      <div className="about-content">
+        <section className="about-product" aria-labelledby="about-product-name">
+          <img className="about-app-icon" src="/soundar-app-icon.png" alt="" aria-hidden="true" />
+          <div>
+            <h2 id="about-product-name">soundAr</h2>
+            <p>Local voice and music generation for Linux.</p>
+          </div>
+          <span className="about-version">Version {__APP_VERSION__}</span>
+        </section>
+        <UpdateCheckFeedback status={updateCheck} />
+        <section className="about-block" aria-labelledby="about-application-heading">
+          <h2 id="about-application-heading">Application</h2>
+          <div className="settings-group">
+            <div className="settings-row"><span><strong>Processing</strong><small>Speech and music render through local model workers.</small></span><span className="settings-value">Local only</span></div>
+            <div className="settings-row"><span><strong>Desktop application</strong><small>Native Linux shell with the soundAr React interface.</small></span><span className="settings-value">Tauri 2</span></div>
+            <div className="settings-row"><span><strong>Release updates</strong><small>New builds are verified against the signed release feed.</small></span><span className="settings-value">Signed</span></div>
+            <div className="settings-row"><span><strong>Cloud fallback</strong><small>Generation content is not sent to a hosted inference service.</small></span><span className="settings-value">Off</span></div>
+          </div>
+        </section>
+        <section className="about-block" aria-labelledby="about-runtime-heading">
+          <h2 id="about-runtime-heading">This machine</h2>
+          <div className="settings-group">
+            <div className="settings-row"><span><strong>Graphics processor</strong><small>{bootstrap.system.gpu_name}</small></span><span className="settings-value">{(bootstrap.system.vram_total_mb / 1024).toFixed(1)} GB</span></div>
+            <div className="settings-row"><span><strong>Acceleration</strong><small>CUDA availability reported by the local desktop bridge.</small></span><StatusText tone={bootstrap.system.cuda_available ? "success" : "warning"}>{bootstrap.system.cuda_available ? "CUDA ready" : "CPU mode"}</StatusText></div>
+            <div className="settings-row"><span><strong>Model library</strong><small>Models currently installed and available to soundAr.</small></span><span className="settings-value">{bootstrap.installed.length} installed</span></div>
+          </div>
+        </section>
+        <footer className="about-footer"><span>Open source</span><span>Private by default</span><span>Built for Linux</span></footer>
       </div>
-      <footer className="about-footer"><span>soundAr</span><span>Local only</span><span>Open-source application</span></footer>
     </div>
   );
 }

@@ -8,6 +8,7 @@ import { VoicesView } from "./VoicesView";
 const bridge = vi.hoisted(() => ({
   addVoiceReference: vi.fn(),
   deleteVoiceProfile: vi.fn(),
+  getAudioRecordingStatus: vi.fn(),
   importVoiceProfile: vi.fn(),
   listHistory: vi.fn(),
   loadGeneratedAudio: vi.fn(),
@@ -15,6 +16,8 @@ const bridge = vi.hoisted(() => ({
   pickAudioFile: vi.fn(),
   processVoiceReference: vi.fn(),
   saveVoiceEvaluation: vi.fn(),
+  startAudioRecording: vi.fn(),
+  stopAudioRecording: vi.fn(),
   synthesizeSpeech: vi.fn(),
   transcribeAudio: vi.fn(),
   updateVoiceReferenceTranscript: vi.fn(),
@@ -110,6 +113,37 @@ afterEach(() => {
 });
 
 describe("Voice Lab", () => {
+  it("offers recording and upload sources with consent selected by default", async () => {
+    const user = userEvent.setup();
+    bridge.listHistory.mockResolvedValue([]);
+    bridge.startAudioRecording.mockResolvedValue({ recording: true, device_name: "Studio mic" });
+    bridge.getAudioRecordingStatus.mockResolvedValue({ recording: true, device_name: "Studio mic", duration_seconds: 0.4 });
+    bridge.stopAudioRecording.mockResolvedValue({ recording: false, audio_path: "/captures/reference.wav", duration_seconds: 2.8 });
+    bridge.pickAudioFile.mockResolvedValue("/uploads/reference.flac");
+
+    render(
+      <VoicesView
+        bootstrap={{ ...fallbackBootstrap, voices: [voice], runtime: "tauri" }}
+        voices={[voice]}
+        onChange={vi.fn()}
+        onGenerated={vi.fn()}
+        onUseVoice={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Add voice profile" }));
+    expect(screen.getByRole("checkbox", { name: /I confirm I own this voice/ })).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Record sample" }));
+    expect(bridge.startAudioRecording).toHaveBeenCalledWith({ vad_enabled: true, auto_stop: false, silence_ms: 1200, input_gain: 1 });
+    await user.click(screen.getByRole("button", { name: "Stop recording" }));
+    expect(bridge.stopAudioRecording).toHaveBeenCalled();
+    expect(screen.getByText("reference.wav")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "Upload audio" }));
+    expect(bridge.pickAudioFile).toHaveBeenCalled();
+    expect(screen.getByText("reference.flac")).toBeVisible();
+  });
+
   it("keeps preview visible and places secondary table actions in the overflow menu", async () => {
     const user = userEvent.setup();
     const onUseVoice = vi.fn();

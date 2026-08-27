@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
-const routes = ["Generate", "Projects", "Transcribe", "Voices", "Models", "Live", "Compare", "Benchmarks", "History", "Settings", "About"];
-const mobileDirectRoutes = new Set(["Generate", "Projects", "Transcribe", "Voices"]);
+const routes = ["Generate", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History", "Settings", "About"];
+const mobileDirectRoutes = new Set(["Generate", "Projects", "Voices", "History"]);
 
 async function openRoute(page: import("@playwright/test").Page, route: string) {
   if (page.viewportSize()!.width <= 820) {
@@ -15,24 +15,62 @@ async function openRoute(page: import("@playwright/test").Page, route: string) {
   } else {
     await page.locator(".sidebar").getByRole("button", { name: route, exact: true }).click();
   }
-  await expect(page.getByRole("heading", { name: route })).toBeVisible();
+  const heading = route === "Generate" ? /New (music )?generation/ : route === "Settings" ? "General" : route;
+  await expect(page.getByRole("heading", { name: heading }).first()).toBeVisible();
 }
 
 test("workspace is explicit about preview and native capability boundaries", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByText("Browser preview")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Generate" })).toBeVisible();
-  await openRoute(page, "Live");
-  await expect(page.getByRole("heading", { name: "Live" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Record" })).toBeDisabled();
-  await expect(page.getByText("No input")).toBeVisible();
-  await expect(page.getByText("No output")).toBeVisible();
+  await expect(page.getByText("Preview", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "New generation" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Transcribe", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Live", exact: true })).toHaveCount(0);
   await expect(page.locator("body")).not.toHaveCSS("overflow-x", "scroll");
+});
+
+test("Settings and About expose manual update checks with explicit feedback", async ({ page }) => {
+  await page.goto("/");
+  await openRoute(page, "Settings");
+  await page.getByRole("button", { name: "Check for updates" }).click();
+  await expect(page.getByRole("status")).toContainText("available in the installed desktop app");
+
+  await openRoute(page, "About");
+  await expect(page.getByRole("button", { name: "Check for updates" })).toBeVisible();
+  await expect(page.getByText("Version 0.3.2", { exact: true })).toBeVisible();
+});
+
+test("text-to-music stays bounded and never fabricates browser audio", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Music", exact: true }).click();
+
+  await expect(page.getByRole("heading", { name: "Generate music" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Music direction" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Lyrics or text to sing" })).toBeVisible();
+  await expect(page.getByText("Text-to-music / local only")).toBeVisible();
+  await expect(page.getByText(/Direction and lyrics stay separate/i)).toBeVisible();
+  await expect(page.getByText(/source audio, and batch generation are intentionally outside this release/i)).toBeVisible();
+  await expect(page.getByText("Stereo / 48 kHz")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Preview music flow" })).toBeEnabled();
+
+  await page.getByRole("button", { name: "Preview music flow" }).click();
+  await expect(page.getByText("Browser preview has no rendered audio")).toBeVisible();
+  await expect(page.locator("audio")).toHaveCount(0);
+
+  const bounds = await page.locator(".generate-layout").evaluate((layout) => ({
+    clientWidth: layout.clientWidth,
+    scrollWidth: layout.scrollWidth,
+    left: layout.getBoundingClientRect().left,
+    right: layout.getBoundingClientRect().right,
+    viewportWidth: window.innerWidth,
+  }));
+  expect(bounds.scrollWidth).toBeLessThanOrEqual(bounds.clientWidth + 1);
+  expect(bounds.left).toBeGreaterThanOrEqual(-1);
+  expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth + 1);
 });
 
 test("implemented routes remain usable at the target viewport", async ({ page }) => {
   await page.goto("/");
-  for (const route of ["Projects", "Transcribe", "Voices", "Models", "Live", "Compare", "Benchmarks", "History"]) {
+  for (const route of ["Projects", "Voices", "Models", "Compare", "Benchmarks", "History"]) {
     await openRoute(page, route);
   }
 });
@@ -68,68 +106,6 @@ test("workspace controls do not collide at the target viewport", async ({ page }
     });
     expect(collisions, `${route} has overlapping controls`).toEqual([]);
   }
-});
-
-test("timed transcript corrections remain compact and saveable", async ({ page }) => {
-  await page.goto("/");
-  await openRoute(page, "Transcribe");
-
-  await expect(page.getByText("EN / 99.6%")).toBeVisible();
-  await expect(page.getByText("6 aligned")).toBeVisible();
-  const segment = page.getByRole("textbox", { name: "Transcript segment 1" });
-  await segment.fill("Corrected preview transcript.");
-  await page.getByRole("button", { name: "Save correction" }).click();
-  await expect(page.getByText("Revision 1 saved")).toBeVisible();
-  await expect(page.getByText("1 correction revision")).toBeVisible();
-
-  const bounds = await page.locator(".transcript-editor").evaluate((panel) => ({
-    clientWidth: panel.clientWidth,
-    scrollWidth: panel.scrollWidth,
-    right: panel.getBoundingClientRect().right,
-    viewport: window.innerWidth,
-  }));
-  expect(bounds.scrollWidth).toBeLessThanOrEqual(bounds.clientWidth + 1);
-  expect(bounds.right).toBeLessThanOrEqual(bounds.viewport + 1);
-});
-
-test("speaker separation evidence, labels, and turn playback stay compact", async ({ page }) => {
-  await page.goto("/");
-  await openRoute(page, "Transcribe");
-
-  await expect(page.getByText("Provisional clustering")).toBeVisible();
-  await expect(page.getByText("Overlap not detected")).toBeVisible();
-  await expect(page.getByText("No turn confidence")).toBeVisible();
-  await page.getByRole("textbox", { name: "Name Speaker 1" }).fill("Host");
-  await page.getByRole("button", { name: "Save speaker labels" }).click();
-  await expect(page.getByText("Speaker labels revision 1 saved")).toBeVisible();
-  await expect(page.getByRole("button", { name: "Play speaker turn 1" })).toBeVisible();
-
-  const overflow = await page.getByRole("region", { name: "Speaker separation", exact: true }).evaluate((section) => ({
-    clientWidth: section.clientWidth,
-    scrollWidth: section.scrollWidth,
-    left: section.getBoundingClientRect().left,
-    right: section.getBoundingClientRect().right,
-    viewportWidth: window.innerWidth,
-  }));
-  expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth + 1);
-  expect(overflow.left).toBeGreaterThanOrEqual(-1);
-  expect(overflow.right).toBeLessThanOrEqual(overflow.viewportWidth + 1);
-});
-
-test("forced alignment stays compact and is invalidated by a correction", async ({ page }) => {
-  await page.goto("/");
-  await openRoute(page, "Transcribe");
-  const alignment = page.getByRole("region", { name: "Forced word alignment" });
-  await expect(alignment.getByText("Scores uncalibrated")).toBeVisible();
-  await expect(alignment.getByText("Revision 0")).toBeVisible();
-  await expect(alignment.locator(".alignment-word-rail button")).toHaveCount(6);
-
-  await page.getByRole("textbox", { name: "Transcript segment 1" }).fill("Corrected preview transcript.");
-  await page.getByRole("button", { name: "Save correction" }).click();
-  await expect(alignment.getByText("Stale after correction")).toBeVisible();
-  await expect(alignment.getByRole("button", { name: "Align correction" })).toBeEnabled();
-  const bounds = await alignment.evaluate((element) => ({ client: element.clientWidth, scroll: element.scrollWidth }));
-  expect(bounds.scroll).toBeLessThanOrEqual(bounds.client + 1);
 });
 
 test("collapsed navigation keeps unambiguous route names", async ({ page }) => {
@@ -184,10 +160,6 @@ test("narrow phone keeps primary selectors and inspector text readable", async (
   const summary = page.locator(".model-inspector-main p");
   expect(await summary.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
 
-  await openRoute(page, "Transcribe");
-  const alignment = page.locator(".alignment-word-rail");
-  const alignmentBounds = await alignment.evaluate((element) => ({ client: element.clientWidth, scroll: element.scrollWidth }));
-  expect(alignmentBounds.scroll).toBeLessThanOrEqual(alignmentBounds.client + 1);
 });
 
 test("tablet model registry fits without horizontal scrolling", async ({ page }) => {
@@ -277,14 +249,16 @@ test("projects support create, edit, undo, redo, and local save", async ({ page 
   await openRoute(page, "Projects");
   await page.getByRole("button", { name: "New project" }).click();
   await page.getByLabel("Project name").fill("Responsive release narration");
+  await page.getByRole("button", { name: "Create project" }).click();
   await page.getByLabel("Script").fill("A durable chapter edited through the real workspace.");
-  await page.getByRole("button", { name: "Undo" }).click();
+  await page.getByRole("button", { name: "Undo chapter edit" }).click();
   await expect(page.getByLabel("Script")).toHaveValue("");
-  await page.getByRole("button", { name: "Redo" }).click();
+  await page.getByRole("button", { name: "Redo chapter edit" }).click();
   await expect(page.getByLabel("Script")).toHaveValue("A durable chapter edited through the real workspace.");
   await page.getByRole("button", { name: "Save", exact: true }).click();
   await expect(page.getByText("Saved locally", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "Render stale (1)" }).click();
+  await page.getByText("Production and export").click();
+  await page.getByRole("button", { name: "Render changed (1)" }).click();
   await expect(page.getByText(/0\/1 complete.*queued/i)).toBeVisible();
   await page.getByRole("button", { name: "Cancel project rendering" }).click();
   await expect(page.getByText("Project rendering cancelled", { exact: true })).toBeVisible();
@@ -334,7 +308,7 @@ test("every route keeps controls inside its layout in both themes", async ({ pag
       expect(overflow, `${theme} ${route} overflow`).toEqual([]);
 
       if (route === "About") {
-        await expect(page.getByText("Version 0.3.0", { exact: true })).toBeVisible();
+        await expect(page.getByText("Version 0.3.2", { exact: true })).toBeVisible();
         const runtimeDetails = page.getByLabel("Runtime details");
         await expect(runtimeDetails.getByText(/NVIDIA GeForce|No compatible GPU/)).toBeVisible();
       }
@@ -419,7 +393,7 @@ test("mobile routes reset scroll and overlays stay above navigation", async ({ p
 
   await page.keyboard.press("Escape");
   await page.getByLabel("Script").fill("Mobile history action proof.");
-  await page.getByRole("button", { name: "Queue audio" }).click();
+  await page.getByRole("button", { name: "Generate audio" }).click();
   await openRoute(page, "History");
   await page.getByRole("button", { name: /More actions for/i }).first().click();
   const menuBounds = await page.locator(".row-action-popover").evaluate((menu) => {
@@ -551,27 +525,23 @@ test("blind comparison matrix renders, reviews, reveals, and promotes without ov
   expect(overflow).toEqual([]);
 });
 
-test("History filters and compact artifact actions remain usable", async ({ page }) => {
+test("sidebar history selects a detail-only generation workspace", async ({ page }) => {
   await page.goto("/");
   await page.getByLabel("Script").fill("History workbench browser proof.");
-  await page.getByRole("button", { name: "Queue audio" }).click();
+  await page.getByRole("button", { name: "Generate audio" }).click();
   await expect(page.getByText("History workbench browser proof", { exact: false }).first()).toBeVisible({ timeout: 10_000 });
   await openRoute(page, "History");
 
-  await expect(page.getByRole("combobox", { name: "Model filter" })).toBeVisible();
-  await expect(page.getByRole("combobox", { name: "Voice filter" })).toBeVisible();
-  await page.getByRole("combobox", { name: "Artifact filter" }).click();
-  await page.getByRole("option", { name: "Unavailable" }).click();
-  await expect(page.getByText("History workbench browser proof", { exact: false }).first()).toBeVisible();
+  await expect(page.getByRole("region", { name: "History records" })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Generation details" })).toBeVisible();
 
   await page.getByRole("button", { name: /More actions for History workbench browser proof/i }).click();
   await page.getByRole("menuitem", { name: "Add favorite" }).click();
-  await page.getByRole("button", { name: "Favorites", exact: true }).click();
   await page.getByRole("button", { name: /More actions for History workbench browser proof/i }).click();
   await expect(page.getByRole("menuitem", { name: "Duplicate artifact" })).toBeDisabled();
   await expect(page.getByRole("menuitem", { name: "Export copy" })).toBeDisabled();
 
-  const bounds = await page.locator(".history-toolbar, .row-action-popover").evaluateAll((elements) => elements.map((element) => {
+  const bounds = await page.locator(".history-detail, .row-action-popover").evaluateAll((elements) => elements.map((element) => {
     const box = element.getBoundingClientRect();
     return { left: box.left, right: box.right, width: window.innerWidth, scrollWidth: element.scrollWidth, clientWidth: element.clientWidth };
   }));
@@ -582,12 +552,12 @@ test("phone History keeps artifact actions visible without horizontal scrolling"
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await page.getByLabel("Script").fill("Phone history controls stay visible.");
-  await page.getByRole("button", { name: "Queue audio" }).click();
+  await page.getByRole("button", { name: "Generate audio" }).click();
   await openRoute(page, "History");
 
-  const table = page.locator(".history-table");
-  expect(await table.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
-  const actions = page.locator(".history-actions").first();
+  const detail = page.locator(".history-detail");
+  expect(await detail.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+  const actions = page.locator(".history-detail-actions").first();
   const bounds = await actions.evaluate((element) => {
     const box = element.getBoundingClientRect();
     const workspace = document.querySelector<HTMLElement>(".app-content")!.getBoundingClientRect();

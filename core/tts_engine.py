@@ -46,6 +46,8 @@ class TTSEngine:
         from engines.tts.kokoro_tts import KokoroTTSEngine
         from engines.tts.chatterbox_tts import ChatterboxTTSEngine
         from engines.tts.chatterbox_turbo_tts import ChatterboxTurboTTSEngine
+        from engines.tts.breeze_tts import BreezeTTSEngine
+        from engines.tts.fish_speech import FishSpeechEngine
 
         with self._lock:
             if self._engine_impl is not None and self._model_id == model_id:
@@ -60,6 +62,8 @@ class TTSEngine:
                 "kokoro": KokoroTTSEngine,
                 "chatterbox": ChatterboxTTSEngine,
                 "chatterbox-turbo": ChatterboxTurboTTSEngine,
+                "breeze": BreezeTTSEngine,
+                "fish-speech": FishSpeechEngine,
             }
 
             cls = engine_map.get(engine)
@@ -83,7 +87,7 @@ class TTSEngine:
         language: str | None = None,
         reference_audio: np.ndarray | None = None,
         reference_sr: int | None = None,
-        controls: dict[str, float] | None = None,
+        controls: dict[str, Any] | None = None,
     ) -> SynthesisResult:
         """Synthesize text to speech."""
         if self._engine_impl is None:

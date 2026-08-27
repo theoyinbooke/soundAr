@@ -223,6 +223,70 @@ class ModelManagerRegistryTests(unittest.TestCase):
         (path / "t3_turbo_v1.safetensors").unlink()
         self.assertFalse(validate_local_model_files("ResembleAI/chatterbox-turbo", path, "chatterbox-turbo"))
 
+    def test_breeze_integrity_requires_bundled_audio_tokenizer_and_shards(self) -> None:
+        path = self.root / "models/BreezeBlue__Breeze-TTS-2"
+        (path / "audio_tokenizer").mkdir(parents=True)
+        for name in (
+            "config.json", "generation_config.json", "tokenizer.json",
+            "tokenizer_config.json", "audio_tokenizer/config.json",
+            "audio_tokenizer/preprocessor_config.json",
+        ):
+            (path / name).write_text("{}", encoding="utf-8")
+        (path / "audio_tokenizer/model.safetensors").write_bytes(b"codec")
+        (path / "model.safetensors.index.json").write_text(
+            '{"weight_map":{"model.layer":"model-00001-of-00001.safetensors"}}',
+            encoding="utf-8",
+        )
+        incomplete = model_integrity_report(
+            "BreezeBlue/Breeze-TTS-2", path, "breeze"
+        )
+        self.assertEqual(incomplete["state"], "repair-needed")
+        self.assertIn("model-00001-of-00001.safetensors", incomplete["missing_files"])
+        (path / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+        self.assertTrue(
+            validate_local_model_files("BreezeBlue/Breeze-TTS-2", path, "breeze")
+        )
+
+    def test_breeze_catalog_uses_qualified_release_pin(self) -> None:
+        entry = self.manager.hub_browser.get_model_entry("BreezeBlue/Breeze-TTS-2")
+        self.assertIsNotNone(entry)
+        self.assertEqual(
+            entry["revision"], "c1c8ca18b70b30822735633991d9ebf4898e47d4"
+        )
+        self.assertEqual(entry["engine"], "breeze")
+        self.assertEqual(entry["license"], "BreezeBlue Research and Non-Commercial License 1.0")
+
+    def test_fish_speech_integrity_and_release_pin(self) -> None:
+        path = self.root / "models/fishaudio__fish-speech-1.5"
+        path.mkdir(parents=True)
+        for name in (
+            "config.json",
+            "model.pth",
+            "firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
+            "special_tokens.json",
+            "tokenizer.tiktoken",
+        ):
+            (path / name).write_bytes(b"{}" if name.endswith(".json") else b"weights")
+        self.assertTrue(
+            validate_local_model_files(
+                "fishaudio/fish-speech-1.5", path, "fish-speech"
+            )
+        )
+        (path / "model.pth").unlink()
+        self.assertFalse(
+            validate_local_model_files(
+                "fishaudio/fish-speech-1.5", path, "fish-speech"
+            )
+        )
+
+        entry = self.manager.hub_browser.get_model_entry("fishaudio/fish-speech-1.5")
+        self.assertIsNotNone(entry)
+        self.assertEqual(
+            entry["revision"], "275a984d33c33659e39eed41ff5bcd6e67517f4c"
+        )
+        self.assertEqual(entry["engine"], "fish-speech")
+        self.assertEqual(entry["license"], "CC-BY-NC-SA-4.0")
+
     def test_speecht5_integrity_requires_model_vocoder_and_speaker_embedding(self) -> None:
         path = self.root / "models/microsoft__speecht5_tts"
         (path / "_aux/speecht5_hifigan").mkdir(parents=True)
@@ -250,6 +314,71 @@ class ModelManagerRegistryTests(unittest.TestCase):
         self.assertTrue(
             validate_local_model_files(
                 "microsoft/wavlm-base-plus-sv", path, "speaker-verification"
+            )
+        )
+
+    def test_musicgen_integrity_requires_processor_tokenizer_and_weights(self) -> None:
+        path = self.root / "models/facebook__musicgen-small"
+        path.mkdir(parents=True)
+        for name in ("config.json", "tokenizer_config.json", "tokenizer.json"):
+            (path / name).write_text("{}", encoding="utf-8")
+        (path / "pytorch_model.bin").write_bytes(b"weights")
+        incomplete = model_integrity_report(
+            "facebook/musicgen-small", path, "musicgen"
+        )
+        self.assertEqual(incomplete["state"], "repair-needed")
+        self.assertIn("preprocessor_config.json", incomplete["missing_files"])
+        (path / "preprocessor_config.json").write_text("{}", encoding="utf-8")
+        self.assertTrue(
+            validate_local_model_files("facebook/musicgen-small", path, "musicgen")
+        )
+
+    def test_acestep_integrity_requires_all_local_diffusers_components(self) -> None:
+        path = self.root / "models/ACE-Step__acestep-v15-xl-turbo-diffusers"
+        json_files = (
+            "model_index.json",
+            "transformer/config.json",
+            "condition_encoder/config.json",
+            "vae/config.json",
+            "text_encoder/config.json",
+            "tokenizer/tokenizer.json",
+            "scheduler/scheduler_config.json",
+        )
+        for name in json_files:
+            target = path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("{}", encoding="utf-8")
+        transformer_weights = path / "transformer/diffusion_pytorch_model.safetensors"
+        transformer_weights.write_bytes(b"transformer")
+
+        incomplete = model_integrity_report(
+            "ACE-Step/acestep-v15-xl-turbo-diffusers", path, "acestep"
+        )
+        self.assertEqual(incomplete["state"], "repair-needed")
+        self.assertTrue(any("condition_encoder" in item for item in incomplete["missing_files"]))
+
+        for name in (
+            "condition_encoder/diffusion_pytorch_model.safetensors",
+            "vae/diffusion_pytorch_model.safetensors",
+            "text_encoder/model.safetensors",
+        ):
+            target = path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"weights")
+        self.assertTrue(
+            validate_local_model_files(
+                "ACE-Step/acestep-v15-xl-turbo-diffusers", path, "acestep"
+            )
+        )
+        (path / "text_encoder/model.safetensors").unlink()
+        (path / "text_encoder/model.safetensors.index.json").write_text(
+            '{"weight_map":{"encoder.layer":"model-00001-of-00001.safetensors"}}',
+            encoding="utf-8",
+        )
+        (path / "text_encoder/model-00001-of-00001.safetensors").write_bytes(b"shard")
+        self.assertTrue(
+            validate_local_model_files(
+                "ACE-Step/acestep-v15-xl-turbo-diffusers", path, "acestep"
             )
         )
 

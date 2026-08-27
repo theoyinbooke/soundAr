@@ -41,12 +41,12 @@ describe("App native bootstrap boundary", () => {
 
     expect(await screen.findByRole("heading", { name: "Local runtime unavailable" })).toBeVisible();
     expect(screen.getByRole("alert")).toHaveTextContent("Database integrity check failed");
-    expect(screen.queryByRole("heading", { name: "Generate" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "New generation" })).not.toBeInTheDocument();
     expect(screen.queryByText("Mara")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(bridge.loadBootstrapState).toHaveBeenCalledTimes(2));
-    expect(await screen.findByRole("heading", { name: "Generate" })).toBeVisible();
+    expect(await screen.findByRole("heading", { name: "New generation" })).toBeVisible();
     expect(bridge.listHistory).toHaveBeenCalledOnce();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
@@ -59,6 +59,6 @@ describe("App native bootstrap boundary", () => {
 
     expect(await screen.findByRole("heading", { name: "Local runtime unavailable" })).toBeVisible();
     expect(screen.getByRole("alert")).toHaveTextContent("History store could not be read");
-    expect(screen.queryByRole("heading", { name: "Generate" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "New generation" })).not.toBeInTheDocument();
   });
 });

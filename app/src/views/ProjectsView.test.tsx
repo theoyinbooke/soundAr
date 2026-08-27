@@ -113,7 +113,8 @@ describe("Projects batch rendering", () => {
     bridge.listHistory.mockResolvedValue([]);
 
     render(<ProjectsView bootstrap={nativeBootstrap} projects={[project]} voices={nativeBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />);
-    await user.click(screen.getByRole("button", { name: "Render stale (2)" }));
+    await user.click(screen.getByText("Production and export"));
+    await user.click(screen.getByRole("button", { name: "Render changed (2)" }));
 
     await waitFor(() => expect(bridge.queueBatchRun).toHaveBeenCalledTimes(1));
     const [, rows, , parallelism] = bridge.queueBatchRun.mock.calls[0];
