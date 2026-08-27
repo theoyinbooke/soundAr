@@ -28,7 +28,7 @@ afterEach(cleanup);
 describe("AppShell capability navigation", () => {
   it("keeps page-specific headings and actions in the page while the desktop strip stays structural", () => {
     render(
-      <AppShell current="generate" onNavigate={vi.fn()} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features}>
+      <AppShell current="generate" onNavigate={vi.fn()} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
         <section className="page">
           <PageHeader title="Generate" subtitle="Create speech locally." actions={<button type="button">Queue audio</button>} />
         </section>
@@ -52,7 +52,7 @@ describe("AppShell capability navigation", () => {
   it("removes capture routes and keeps maturity details in native tooltips", () => {
     const navigate = vi.fn();
     render(
-      <AppShell current="generate" onNavigate={navigate} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features}>
+      <AppShell current="generate" onNavigate={navigate} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
         <div>Content</div>
       </AppShell>,
     );
@@ -66,7 +66,7 @@ describe("AppShell capability navigation", () => {
   it("provides desktop menus, navigation history, and a collapsible rail", () => {
     const navigate = vi.fn();
     render(
-      <AppShell current="generate" onNavigate={navigate} theme="light" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features}>
+      <AppShell current="generate" onNavigate={navigate} theme="light" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
         <div>Content</div>
       </AppShell>,
     );
@@ -90,7 +90,7 @@ describe("AppShell capability navigation", () => {
     });
 
     render(
-      <AppShell current="projects" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features}>
+      <AppShell current="projects" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
         <div>Content</div>
       </AppShell>,
     );
@@ -104,7 +104,7 @@ describe("AppShell capability navigation", () => {
   it("keeps secondary destinations available through compact navigation", () => {
     const navigate = vi.fn();
     render(
-      <AppShell current="generate" onNavigate={navigate} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features}>
+      <AppShell current="generate" onNavigate={navigate} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
         <div>Content</div>
       </AppShell>,
     );

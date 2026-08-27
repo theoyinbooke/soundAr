@@ -28,6 +28,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { FeatureState, HistoryItem, NavKey, SystemStatus, Theme } from "../types";
 import { BrandLockup } from "./Brand";
+import { AssistantLauncher, AssistantPane } from "./AssistantPane";
 
 interface NavItem {
   key: NavKey;
@@ -122,6 +123,9 @@ export function AppShell({
   history = [],
   selectedHistoryId,
   onSelectHistory,
+  assistantOpen,
+  onAssistantOpenChange,
+  onAssistantStudioChanged,
   children,
 }: {
   current: NavKey;
@@ -134,6 +138,9 @@ export function AppShell({
   history?: HistoryItem[];
   selectedHistoryId?: string;
   onSelectHistory?: (id: string) => void;
+  assistantOpen: boolean;
+  onAssistantOpenChange: (open: boolean) => void;
+  onAssistantStudioChanged?: () => void;
   children: ReactNode;
 }) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -242,7 +249,7 @@ export function AppShell({
   };
 
   return (
-    <div className={`app-shell ${settingsMode ? "is-settings-mode" : ""} ${sidebarCollapsed ? "is-sidebar-collapsed" : ""}`}>
+    <div className={`app-shell ${settingsMode ? "is-settings-mode" : ""} ${sidebarCollapsed ? "is-sidebar-collapsed" : ""} ${assistantOpen ? "is-assistant-open" : ""}`}>
         <header className="app-topbar" data-tauri-drag-region>
           <div className="topbar-brand-cell" ref={appMenuRef}>
             <button className="topbar-command" type="button" aria-label={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"} title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"} onClick={() => setSidebarCollapsed((value) => !value)}><PanelLeft aria-hidden="true" size={14} /></button>
@@ -323,6 +330,9 @@ export function AppShell({
         ) : null}
 
         <main className="app-content" ref={contentRef}>{children}</main>
+
+        <AssistantPane open={assistantOpen} onClose={() => onAssistantOpenChange(false)} onStudioChanged={onAssistantStudioChanged} />
+        {!assistantOpen ? <AssistantLauncher onClick={() => onAssistantOpenChange(true)} /> : null}
 
         {runtime === "tauri" ? <WindowResizeHandles /> : null}
 

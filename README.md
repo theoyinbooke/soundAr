@@ -29,6 +29,7 @@ soundAr is an open-source desktop application for high-quality, private audio ge
 - Manage installed models and isolated runtimes without bundling model weights into the app.
 - Review generation history, compare voices, and run reproducible local benchmarks.
 - Queue independent jobs through a durable, GPU-aware scheduler or the optional loopback API.
+- Describe an unfinished creative goal to the integrated assistant and let it research, plan, write, generate, review, and revise the complete soundAr workflow with you.
 
 The interface is designed for Linux as a compact, resizable, light-first desktop workspace. Tauri 2 provides the native shell; React 19 renders the application UI; isolated Python workers keep supported models warm between jobs.
 
@@ -47,7 +48,7 @@ The installer adds the Debian package and prepares soundAr's managed Python runt
 To install a package built locally:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.4.1_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.5.0_amd64.deb
 ```
 
 ### Storage and updates
@@ -64,6 +65,20 @@ Installing, opening, or updating soundAr never downloads model weights. A model 
 Generate speech with model-aware controls for voice, language, pacing, sampling, cloning support, and output format. The current curated catalog includes Kokoro-82M, Chatterbox and Chatterbox Turbo, SpeechT5, Breeze TTS 2, and Fish Speech 1.5. Availability and allowed use differ by model.
 
 Independent generations, project chapters, and batch rows use one durable scheduler. Jobs move through queued, in-progress, and completed states; supported actions include pause, resume, cancel, retry, dismiss, playback, and export. The default concurrency ceiling is four workers and can be changed from 1 to 8 with `SOUNDAR_MAX_PARALLEL_JOBS`; GPU admission is additionally bounded by declared VRAM requirements and current free memory.
+
+## Creative Producer
+
+The optional Assistant pane connects to an existing Codex CLI installation and uses the ChatGPT account already managed by Codex. soundAr never installs Codex, reads its credential files, or asks for an API key. It searches the ordinary Linux executable locations and common Node, Rust, Flatpak, Snap, mise, nvm, fnm, pnpm, and user-local locations; when no valid installation is found, the pane explains what is missing without changing the machine.
+
+The assistant is designed for goals, not just exact generation commands. It can:
+
+- turn a rough idea into a visible production plan and research the context needed to improve it;
+- write scripts, lyrics, directions, chapter structures, and batch content;
+- inspect the local model, voice, project, scheduler, and generation state before choosing a route;
+- queue speech, music, and batch work, create long-form projects, and follow durable jobs;
+- surface completed audio as a compact player in the conversation, then preserve the creative brief while revising from feedback.
+
+Read-only, Studio, and Full access modes control what the conversation can do. Read-only can inspect and plan. Studio can research and manage work inside soundAr's local studio. Full access exposes the broader machine capabilities of Codex and keeps approval prompts visible before sensitive actions.
 
 ## Music Studio
 

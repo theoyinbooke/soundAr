@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import packageMetadata from "../../package.json" with { type: "json" };
 
 const routes = ["Generate", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History"];
 const allRoutes = [...routes, "Settings", "About"];
@@ -48,7 +49,7 @@ test("Settings and About expose manual update checks with explicit feedback", as
 
   await openRoute(page, "About");
   await expect(page.getByRole("button", { name: "Check for updates" })).toBeVisible();
-  await expect(page.getByText("Version 0.4.1", { exact: true })).toBeVisible();
+  await expect(page.getByText(`Version ${packageMetadata.version}`, { exact: true })).toBeVisible();
 });
 
 test("Music Studio previews the complete workflow without fabricating browser audio", async ({ page }) => {
@@ -335,7 +336,7 @@ test("every route keeps controls inside its layout in both themes", async ({ pag
       expect(overflow, `${theme} ${route} overflow`).toEqual([]);
 
       if (route === "About") {
-        await expect(page.getByText("Version 0.4.1", { exact: true })).toBeVisible();
+        await expect(page.getByText(`Version ${packageMetadata.version}`, { exact: true })).toBeVisible();
         const runtimeDetails = page.getByRole("region", { name: "This machine" });
         await expect(runtimeDetails.getByText(/NVIDIA GeForce|No compatible GPU/)).toBeVisible();
       }

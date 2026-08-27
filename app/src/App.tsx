@@ -28,6 +28,7 @@ export default function App() {
   const [availableUpdate, setAvailableUpdate] = useState<Update>();
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckStatus>({ phase: "idle" });
   const [preferredVoiceId, setPreferredVoiceId] = useState<string>();
+  const [assistantOpen, setAssistantOpen] = useState(false);
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme;
@@ -145,7 +146,7 @@ export default function App() {
   }
 
   return (
-    <AppShell current={current} onNavigate={setCurrent} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId}>
+    <AppShell current={current} onNavigate={setCurrent} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId} assistantOpen={assistantOpen} onAssistantOpenChange={setAssistantOpen} onAssistantStudioChanged={() => { void listHistory().then(setHistory); }}>
       {runtimeNotice ? <div className="runtime-warning">Local operation failed: {runtimeNotice}</div> : null}
       {availableUpdate ? <UpdateNotice update={availableUpdate} installKind={bootstrap.install_kind} onDismiss={() => { void availableUpdate.close(); setAvailableUpdate(undefined); }} /> : null}
       {bootstrap.runtime === "tauri" && !bootstrap.system.python_ready ? <RuntimeSetupNotice onReady={refreshBootstrap} /> : null}

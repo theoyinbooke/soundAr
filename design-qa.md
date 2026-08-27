@@ -46,6 +46,8 @@ The final implementation was evaluated at 1860 × 1168 CSS pixels with device sc
 - Narrow Music Studio at 760 × 700 with the mobile dock and no horizontal overflow: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/music-studio-760x700-viewport.png`
 - Model setup dialog at 1024 × 768: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/music-setup-1024x768.png`
 - Persistent inline music variations at 760 × 700: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/music-results-760x700.png`
+- Creative Producer at 1860 × 1000 with the existing sidebar and Generate workspace visible: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/assistant-pane-1860x1000.png`
+- Same-input Codex side-pane reference / soundAr Creative Producer comparison: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/assistant-reference-comparison.png`
 
 Each comparison places the reference and implementation in the same image before judgment. Responsive checks also covered 1024 × 768 and 760 × 900.
 
@@ -83,6 +85,9 @@ Each comparison places the reference and implementation in the same image before
 - Rebuilt Music into a complete local studio with structured song sections, source/reference provenance, editable lyric timing, concurrent variations, section editing, stems, stage-aware progress, and persistent inline results.
 - Added model-selection disclosure for download size, hardware fit, expected speed, license, access, installed state, and capabilities before a user commits to setup.
 - Fixed a browser-preview polling race found during visual QA so inline variation results remain visible and playable after runtime refreshes.
+- Added a global Creative Producer launcher and right pane with a restrained header, persistent conversations, visible plans, tool-progress and approval cards, live model/reasoning/access controls, and a compact anchored composer.
+- Added split-pane reflow at wide desktop widths, a non-destructive overlay at ordinary desktop widths, and a full-width mobile pane above the navigation dock; the sidebar never collapses automatically.
+- Added compact playable artifact cards with seeking, export, and revision actions so generated speech or music can be auditioned and refined without leaving the conversation.
 
 ## Final rubric
 
@@ -91,7 +96,9 @@ Each comparison places the reference and implementation in the same image before
 - Colors and borders: pass — fully light default, neutral white/gray surfaces, low-contrast dividers, dark primary actions, accessible focus rings, and subtle shadows. Sidebar selections, record selections, and cards use no accent-colored edge or fill.
 - Icons and assets: pass — Lucide line icons are consistently sized; no custom logo, sparkle icon, emoji, or CSS illustration remains. The music result waveform is a functional, data-derived seek surface.
 - Responsive behavior: pass — no horizontal overflow at desktop, compact, or mobile breakpoints; the desktop sidebar remains user-controlled, while the dedicated phone breakpoint changes navigation into a mobile dock so primary tasks remain usable.
+- Assistant responsiveness: pass — verified at 1860 × 1000, 1280 × 800, 900 × 760, and 390 × 844. The document width matched each viewport, the composer remained reachable, and no sidebar state was changed by opening or closing the pane.
 - Interaction and accessibility: pass — route navigation, account menu, settings navigation, modal open/close and focus, labeled inputs/buttons, toggles, selected states, and disabled actions were exercised. The final route has one H1, no overflow, no sparkle text, and no unnamed buttons.
+- Assistant interaction: pass — launcher, close/new/history actions, open-ended prompt flow, plan state, model and reasoning menus, explicit access selection, missing-CLI/login/error states, stop/approval controls, and artifact revision affordance were exercised. Browser console and page-error logs were clean.
 - Product fidelity: pass — Codex structure and restraint are adopted while soundAr-specific audio, model, runtime, project, queue, and benchmark semantics remain intact.
 
 No P0, P1, or P2 visual mismatch remains in the audited states. Remaining differences are intentional product-semantic differences rather than design-system drift.

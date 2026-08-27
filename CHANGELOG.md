@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-08-27
+
+- Added a dockable Creative Producer powered by the user's existing Codex CLI and Codex-owned ChatGPT login, without bundling Codex or reading its credential files.
+- Added broad Linux Codex discovery, persistent app-server conversations, live model and reasoning selectors, read-only, Studio, and Full access modes, streaming messages, approvals, plans, and saved conversation history.
+- Connected Codex dynamic tools to soundAr's real local state and durable speech, music, batch, project, job-inspection, and cancellation workflows with server-side read-only enforcement.
+- Added end-to-end creative guidance that can research and shape incomplete goals, draft scripts, lyrics, directions, and project structures, execute local generation, and preserve intent through revisions.
+- Added inline playable generated-audio artifacts with seeking, export, and revision follow-ups directly in the assistant conversation.
+- Added responsive split-pane, overlay, and mobile layouts while preserving the user's explicit sidebar state and the neutral light-first design system.
+
 ## 0.4.1 - 2026-08-27
 
 - Preserved the runtime-owned model catalog path across development, Debian, and AppImage upgrades so stale checkout paths cannot hide newly installed models.

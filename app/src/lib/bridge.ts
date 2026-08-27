@@ -45,7 +45,7 @@ import type {
 
 const PRODUCTION_RUNTIME_ERROR = "The soundAr desktop runtime is unavailable. No preview data was loaded.";
 
-const hasTauriRuntime = () => {
+export const hasTauriRuntime = () => {
   const available = "__TAURI_INTERNALS__" in window;
   if (!available && !import.meta.env.DEV) throw new Error(PRODUCTION_RUNTIME_ERROR);
   return available;

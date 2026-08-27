@@ -1,3 +1,4 @@
+mod codex_agent;
 mod store;
 
 use cpal::{
@@ -60,6 +61,7 @@ struct RuntimeState {
     model_registry_path: PathBuf,
     store: Arc<Store>,
     worker_probe_after: Duration,
+    codex_agent: Arc<codex_agent::CodexAgentState>,
 }
 
 struct ActiveDownload {
@@ -361,6 +363,7 @@ impl RuntimeState {
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(Duration::from_secs(30)),
+            codex_agent: Arc::new(codex_agent::CodexAgentState::new()),
         }
     }
 
@@ -5728,6 +5731,96 @@ async fn remove_model(
         .map_err(|error| format!("Model removal worker failed: {error}"))?
 }
 
+#[tauri::command]
+fn codex_agent_status(state: tauri::State<'_, RuntimeState>) -> Value {
+    state.codex_agent.status()
+}
+
+#[tauri::command]
+fn codex_agent_connect(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, RuntimeState>,
+) -> Result<Value, String> {
+    state.codex_agent.connect(app, state.inner().clone())
+}
+
+#[tauri::command]
+fn codex_agent_disconnect(state: tauri::State<'_, RuntimeState>) -> Result<bool, String> {
+    state.codex_agent.disconnect()
+}
+
+#[tauri::command]
+fn codex_agent_request(
+    state: tauri::State<'_, RuntimeState>,
+    method: String,
+    params: Value,
+) -> Result<Value, String> {
+    let mut params = params;
+    let access = codex_agent::AgentAccess::from_value(
+        params
+            .get("soundarAccess")
+            .or_else(|| params.get("sandbox")),
+    );
+    let requested_thread_id = params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if let Some(object) = params.as_object_mut() {
+        object.remove("soundarAccess");
+    }
+    if method == "thread/start" {
+        if let Some(object) = params.as_object_mut() {
+            let studio_root = home_dir().join(".soundAr");
+            fs::create_dir_all(&studio_root).map_err(|error| {
+                format!("Could not prepare the soundAr assistant workspace: {error}")
+            })?;
+            object.insert("cwd".into(), json!(studio_root));
+            object.insert(
+                "runtimeWorkspaceRoots".into(),
+                json!([home_dir().join(".soundAr")]),
+            );
+            object.insert("dynamicTools".into(), codex_agent::dynamic_tools());
+            object.entry("developerInstructions").or_insert_with(|| json!(
+                "You are soundAr's creative producer, not merely a command parser. Help the user turn an incomplete goal into an executable brief; research outside the studio with Codex capabilities when the selected access permits it; draft the required scripts, lyrics, directions, and project structure; and use the provided soundAr tools to create speech, music, batches, projects, and revisions end to end. Inspect studio state before choosing model or voice identifiers. State a concise plan, execute it, monitor durable jobs, and report playable output artifacts. Treat follow-up feedback as a revision request and preserve the user's intent across turns. Never install Codex or modify soundAr application code. Ask only for genuinely blocking choices and always ask before destructive actions."
+            ));
+        }
+    } else if method == "thread/resume" {
+        if let Some(object) = params.as_object_mut() {
+            object.entry("developerInstructions").or_insert_with(|| json!(
+                "Continue as soundAr's creative producer. Research and plan when needed, use the soundAr tools already attached to this thread for every supported speech, music, batch, project, and revision workflow, and preserve prior creative intent. Never install Codex or modify soundAr application code. Ask before destructive actions."
+            ));
+        }
+    }
+    let response = state.codex_agent.request(&method, params)?;
+    let thread_id = if method == "thread/start" {
+        response
+            .get("thread")
+            .and_then(|thread| thread.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    } else if matches!(
+        method.as_str(),
+        "thread/resume" | "turn/start" | "turn/steer"
+    ) {
+        requested_thread_id
+    } else {
+        None
+    };
+    if let Some(thread_id) = thread_id {
+        state.codex_agent.set_thread_access(&thread_id, access)?;
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+fn codex_agent_respond(
+    state: tauri::State<'_, RuntimeState>,
+    id: u64,
+    result: Value,
+) -> Result<(), String> {
+    state.codex_agent.respond(id, result)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -5819,7 +5912,12 @@ pub fn run() {
             verify_model,
             install_model,
             cancel_model_install,
-            remove_model
+            remove_model,
+            codex_agent_status,
+            codex_agent_connect,
+            codex_agent_disconnect,
+            codex_agent_request,
+            codex_agent_respond
         ])
         .build(tauri::generate_context!())
         .expect("error while building soundAr");
@@ -5830,6 +5928,7 @@ pub fn run() {
             state.stop_active_playback().ok();
             state.stop_api_server().ok();
             state.stop_active_worker().ok();
+            state.codex_agent.disconnect().ok();
         }
     });
 }
