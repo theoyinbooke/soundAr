@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { AppShell } from "./components/AppShell";
 import { RuntimeSetupNotice } from "./components/RuntimeSetupNotice";
 import { UpdateNotice } from "./components/UpdateNotice";
 import { LoadingView, RuntimeFailureView } from "./components/ui";
-import { listHistory, loadBootstrapState, saveApplicationSetting } from "./lib/bridge";
+import { listHistory, listProjects, loadBootstrapState, saveApplicationSetting } from "./lib/bridge";
 import type { ApplicationSettings, BootstrapState, HistoryItem, NavKey, ProjectRecord, Theme, UpdateCheckStatus } from "./types";
 import { BenchmarksView } from "./views/BenchmarksView";
 import { GenerateView } from "./views/GenerateView";
@@ -29,6 +29,26 @@ export default function App() {
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckStatus>({ phase: "idle" });
   const [preferredVoiceId, setPreferredVoiceId] = useState<string>();
   const [assistantOpen, setAssistantOpen] = useState(false);
+
+  const refreshStudioData = useCallback(async () => {
+    try {
+      const [state, loadedHistory, loadedProjects] = await Promise.all([loadBootstrapState(), listHistory(), listProjects()]);
+      setBootstrap(state);
+      setSettings(state.settings);
+      setVoices(state.voices);
+      setHistory(loadedHistory);
+      setProjects(loadedProjects);
+      setSelectedHistoryId((selected) => selected && loadedHistory.some((item) => item.id === selected) ? selected : loadedHistory[0]?.id);
+      setRuntimeNotice(undefined);
+    } catch (caught) {
+      setRuntimeNotice(caught instanceof Error ? caught.message : String(caught));
+    }
+  }, []);
+
+  const navigate = useCallback((next: NavKey) => {
+    setCurrent(next);
+    if (next === "projects") void refreshStudioData();
+  }, [refreshStudioData]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme;
@@ -103,14 +123,7 @@ export default function App() {
   }
 
   async function refreshBootstrap() {
-    try {
-      const state = await loadBootstrapState();
-      setBootstrap(state);
-      setSettings(state.settings);
-      setRuntimeNotice(undefined);
-    } catch (caught) {
-      setRuntimeNotice(caught instanceof Error ? caught.message : String(caught));
-    }
+    await refreshStudioData();
   }
 
   async function updateSetting<K extends keyof ApplicationSettings>(key: K, value: ApplicationSettings[K]) {
@@ -146,7 +159,7 @@ export default function App() {
   }
 
   return (
-    <AppShell current={current} onNavigate={setCurrent} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId} assistantOpen={assistantOpen} onAssistantOpenChange={setAssistantOpen} onAssistantStudioChanged={() => { void listHistory().then(setHistory); }}>
+    <AppShell current={current} onNavigate={navigate} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId} assistantOpen={assistantOpen} onAssistantOpenChange={setAssistantOpen} onAssistantStudioChanged={refreshStudioData}>
       {runtimeNotice ? <div className="runtime-warning">Local operation failed: {runtimeNotice}</div> : null}
       {availableUpdate ? <UpdateNotice update={availableUpdate} installKind={bootstrap.install_kind} onDismiss={() => { void availableUpdate.close(); setAvailableUpdate(undefined); }} /> : null}
       {bootstrap.runtime === "tauri" && !bootstrap.system.python_ready ? <RuntimeSetupNotice onReady={refreshBootstrap} /> : null}

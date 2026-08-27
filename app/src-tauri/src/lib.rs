@@ -4212,60 +4212,80 @@ async fn export_project_master(
 ) -> Result<Value, String> {
     let runtime = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let plan = runtime.store.project_master_plan(&project_id)?;
-        let project_name = plan.get("name").and_then(Value::as_str).unwrap_or("project");
-        let format = settings.get("format").and_then(Value::as_str).unwrap_or("wav");
-        if !matches!(format, "wav" | "flac") {
-            return Err("Project masters must use WAV or FLAC".to_string());
+        build_project_master(&runtime, project_id, settings)
+    })
+    .await
+    .map_err(|error| format!("Project export worker failed: {error}"))?
+}
+
+fn build_project_master(
+    runtime: &RuntimeState,
+    project_id: String,
+    settings: Value,
+) -> Result<Value, String> {
+    let plan = runtime.store.project_master_plan(&project_id)?;
+    let project_name = plan
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("project");
+    let format = settings
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("wav");
+    if !matches!(format, "wav" | "flac") {
+        return Err("Project masters must use WAV or FLAC".to_string());
+    }
+    let output_id = Uuid::new_v4().simple().to_string();
+    let output_path = home_dir().join(".soundAr/exports").join(format!(
+        "{}-master-{}.{}",
+        safe_file_stem(project_name),
+        &output_id[..8],
+        format
+    ));
+    let request = json!({
+        "operation": "master_audio",
+        "project_id": project_id,
+        "audio_paths": plan.get("audio_paths").cloned().unwrap_or_else(|| json!([])),
+        "output_path": output_path,
+        "sample_rate": settings.get("sample_rate").and_then(Value::as_i64).unwrap_or(48_000),
+        "gap_ms": settings.get("gap_ms").and_then(Value::as_i64).unwrap_or(250),
+        "fade_ms": settings.get("fade_ms").and_then(Value::as_i64).unwrap_or(12),
+        "target_lufs": settings.get("target_lufs").and_then(Value::as_f64).unwrap_or(-16.0),
+        "output_format": format,
+        "title": format!("{project_name} master"),
+        "voice_name": "Project sequence",
+        "text": plan.get("document").and_then(|value| value.get("script")).and_then(Value::as_str).unwrap_or("Project master"),
+    });
+    let job_id = runtime.store.create_job("project-master", &request)?;
+    let started = std::time::Instant::now();
+    let mut result = match runtime.request_for_job(request.clone(), &job_id) {
+        Ok(result) => result,
+        Err(error) => {
+            runtime.store.fail_job(&job_id, &error)?;
+            return Err(error);
         }
-        let output_id = Uuid::new_v4().simple().to_string();
-        let output_path = home_dir().join(".soundAr/exports").join(format!(
-            "{}-master-{}.{}",
-            safe_file_stem(project_name),
-            &output_id[..8],
-            format
-        ));
-        let request = json!({
-            "operation": "master_audio",
-            "project_id": project_id,
-            "audio_paths": plan.get("audio_paths").cloned().unwrap_or_else(|| json!([])),
-            "output_path": output_path,
-            "sample_rate": settings.get("sample_rate").and_then(Value::as_i64).unwrap_or(48_000),
-            "gap_ms": settings.get("gap_ms").and_then(Value::as_i64).unwrap_or(250),
-            "fade_ms": settings.get("fade_ms").and_then(Value::as_i64).unwrap_or(12),
-            "target_lufs": settings.get("target_lufs").and_then(Value::as_f64).unwrap_or(-16.0),
-            "output_format": format,
-            "title": format!("{project_name} master"),
-            "voice_name": "Project sequence",
-            "text": plan.get("document").and_then(|value| value.get("script")).and_then(Value::as_str).unwrap_or("Project master"),
-        });
-        let job_id = runtime.store.create_job("project-master", &request)?;
-        let started = std::time::Instant::now();
-        let mut result = match runtime.request_for_job(request.clone(), &job_id) {
-            Ok(result) => result,
-            Err(error) => {
-                runtime.store.fail_job(&job_id, &error)?;
-                return Err(error);
-            }
-        };
-        let object = match result.as_object_mut() {
-            Some(object) => object,
-            None => {
-                let error = "Mastering returned an invalid result".to_string();
-                runtime.store.fail_job(&job_id, &error)?;
-                fs::remove_file(&output_path).ok();
-                return Err(error);
-            }
-        };
-        object.insert("id".to_string(), json!(output_id));
-        object.insert("model_id".to_string(), json!("soundar/project-master"));
-        object.insert("engine".to_string(), json!("finishing"));
-        object.insert("inference_seconds".to_string(), json!(started.elapsed().as_secs_f64()));
-        object.insert("rtf".to_string(), json!(0.0));
-        object.insert("vram_peak_mb".to_string(), json!(0));
-        let manifest_path = output_path.with_extension(format!("{format}.provenance.json"));
-        let publish = (|| -> Result<Value, String> {
-            let manifest = json!({
+    };
+    let object = match result.as_object_mut() {
+        Some(object) => object,
+        None => {
+            let error = "Mastering returned an invalid result".to_string();
+            runtime.store.fail_job(&job_id, &error)?;
+            fs::remove_file(&output_path).ok();
+            return Err(error);
+        }
+    };
+    object.insert("id".to_string(), json!(output_id));
+    object.insert("model_id".to_string(), json!("soundar/project-master"));
+    object.insert("engine".to_string(), json!("finishing"));
+    object.insert(
+        "inference_seconds".to_string(),
+        json!(started.elapsed().as_secs_f64()),
+    );
+    object.insert("rtf".to_string(), json!(0.0));
+    object.insert("vram_peak_mb".to_string(), json!(0));
+    let manifest_path = output_path.with_extension(format!("{format}.provenance.json"));
+    let publish = (|| -> Result<Value, String> {
+        let manifest = json!({
             "schema_version": 1,
             "application": { "name": "soundAr", "version": env!("CARGO_PKG_VERSION") },
             "project": plan,
@@ -4275,29 +4295,32 @@ async fn export_project_master(
                 "sha256": sha256_path(&output_path)?,
                 "generated_at": chrono::Utc::now().to_rfc3339(),
             }
-            });
-            write_json_atomically(&manifest_path, &manifest)?;
-            runtime.store.complete_synthesis(&job_id, &request, &result)
-        })();
-        let history = match publish {
-            Ok(history) => history,
-            Err(error) => {
+        });
+        write_json_atomically(&manifest_path, &manifest)?;
+        runtime.store.complete_synthesis(&job_id, &request, &result)
+    })();
+    let history = match publish {
+        Ok(history) => history,
+        Err(error) => {
             runtime.store.fail_job(&job_id, &error).ok();
             fs::remove_file(&output_path).ok();
             fs::remove_file(&manifest_path).ok();
-                return Err(error);
-            }
-        };
-        let export = runtime.store.record_project_export(
-            &project_id,
-            history.get("id").and_then(Value::as_str).ok_or("Master history has no identifier")?,
-            &settings,
-            &manifest_path,
-        )?;
-        Ok(json!({ "history": history, "export": export }))
-    })
-    .await
-    .map_err(|error| format!("Project export worker failed: {error}"))?
+            return Err(error);
+        }
+    };
+    let export = runtime.store.record_project_export(
+        &project_id,
+        history
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("Master history has no identifier")?,
+        &settings,
+        &manifest_path,
+    )?;
+    let project = runtime
+        .store
+        .attach_project_master(&project_id, &history, &export)?;
+    Ok(json!({ "history": history, "export": export, "project": project }))
 }
 
 fn parse_project_script(source: &str, extension: &str) -> Result<Vec<Value>, String> {
@@ -5781,13 +5804,13 @@ fn codex_agent_request(
             );
             object.insert("dynamicTools".into(), codex_agent::dynamic_tools());
             object.entry("developerInstructions").or_insert_with(|| json!(
-                "You are soundAr's creative producer, not merely a command parser. Help the user turn an incomplete goal into an executable brief; research outside the studio with Codex capabilities when the selected access permits it; draft the required scripts, lyrics, directions, and project structure; and use the provided soundAr tools to create speech, music, batches, projects, and revisions end to end. Inspect studio state before choosing model or voice identifiers. State a concise plan, execute it, monitor durable jobs, and report playable output artifacts. Treat follow-up feedback as a revision request and preserve the user's intent across turns. Never install Codex or modify soundAr application code. Ask only for genuinely blocking choices and always ask before destructive actions."
+                "You are soundAr's creative producer, not merely a command parser. Help the user turn an incomplete goal into an executable brief; research outside the studio with Codex capabilities when the selected access permits it; draft the required scripts, lyrics, directions, and project structure; and use the provided soundAr tools to create speech, music, batches, projects, and revisions end to end. Inspect studio state before choosing model or voice identifiers. State a concise plan, execute it, monitor durable jobs, and report playable output artifacts. For a multi-part project, save the project with every completed chapter history_id, then call export_project_master and report completion only after that tool returns a registered playable master; never assemble project audio with shell commands or expose an unregistered raw path. Treat follow-up feedback as a revision request and preserve the user's intent across turns. Never install Codex or modify soundAr application code. Ask only for genuinely blocking choices and always ask before destructive actions."
             ));
         }
     } else if method == "thread/resume" {
         if let Some(object) = params.as_object_mut() {
             object.entry("developerInstructions").or_insert_with(|| json!(
-                "Continue as soundAr's creative producer. Research and plan when needed, use the soundAr tools already attached to this thread for every supported speech, music, batch, project, and revision workflow, and preserve prior creative intent. Never install Codex or modify soundAr application code. Ask before destructive actions."
+                "Continue as soundAr's creative producer. Research and plan when needed, use the soundAr tools already attached to this thread for every supported speech, music, batch, project, and revision workflow, and preserve prior creative intent. Complete multi-part projects with export_project_master so the final audio is registered and playable in soundAr; never substitute a raw filesystem path. Never install Codex or modify soundAr application code. Ask before destructive actions."
             ));
         }
     }

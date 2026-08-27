@@ -1,12 +1,23 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AssistantLauncher, AssistantPane } from "./AssistantPane";
+import { AssistantLauncher, AssistantPane, selectAssistantArtifacts } from "./AssistantPane";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 afterEach(cleanup);
 
 describe("AssistantPane", () => {
+  it("shows only the final master for project workflows and one clip for single requests", () => {
+    const base = { voice: "Default", text: "", generation_kind: "speech" as const, audio_path: "/managed/audio.wav", sample_rate: 24000, duration_seconds: 1, inference_seconds: 0, rtf: 0, vram_peak_mb: 0, waveform: [], created_at: "2026-08-27T18:00:00Z", preview: false };
+    const history = [
+      { ...base, id: "master", title: "Project master", model_id: "soundar/project-master", engine: "finishing" },
+      { ...base, id: "chapter-2", title: "Chapter 2", model_id: "tts", engine: "breeze" },
+      { ...base, id: "chapter-1", title: "Chapter 1", model_id: "tts", engine: "breeze" },
+    ];
+    expect(selectAssistantArtifacts(history, new Set(), "project").map((item) => item.id)).toEqual(["master"]);
+    expect(selectAssistantArtifacts(history, new Set(), "single").map((item) => item.id)).toEqual(["chapter-2"]);
+  });
+
   it("opens from a restrained floating action", async () => {
     const onClick = vi.fn();
     render(<AssistantLauncher onClick={onClick} />);
@@ -21,9 +32,10 @@ describe("AssistantPane", () => {
     const composer = screen.getByRole("textbox", { name: "Message soundAr assistant" });
     await userEvent.type(composer, "Create a short ambient cue{enter}");
     expect(screen.getByText("Create a short ambient cue")).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText("Get studio state")).toBeInTheDocument(), { timeout: 2_000 });
+    await waitFor(() => expect(screen.getByText(/Activity complete · 2 actions/i)).toBeInTheDocument(), { timeout: 2_000 });
     expect(screen.getByText(/working brief/i)).toBeInTheDocument();
     expect(screen.getByRole("list", { name: "Current plan" })).toBeInTheDocument();
+    expect(screen.getByText("Get studio state")).toBeInTheDocument();
     expect(screen.getByText("Queue music generation")).toBeInTheDocument();
   });
 

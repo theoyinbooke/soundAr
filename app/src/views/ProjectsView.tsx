@@ -1,12 +1,17 @@
 import { ChevronDown, ChevronUp, Circle, CircleStop, Download, FileInput, FolderPlus, Layers3, LoaderCircle, Pause, Play, Plus, Redo2, RotateCcw, Save, Trash2, Undo2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { BatchInputRow, BatchRunRecord, BootstrapState, HistoryItem, ProjectChapter, ProjectMasterSettings, ProjectRecord, ProjectRenderBatch, SynthesisRequest, VoiceProfile } from "../types";
-import { cancelBatchRun, deleteProject, exportProjectMaster, getBatchRun, importProjectScript, listHistory, loadGeneratedAudio, pauseBatchRun, pickProjectScript, queueBatchRun, resumeBatchRun, saveProject, synthesizeSpeech } from "../lib/bridge";
+import { cancelBatchRun, deleteProject, exportHistoryItem, exportProjectMaster, getBatchRun, importProjectScript, listHistory, loadGeneratedAudio, pauseBatchRun, pickProjectScript, queueBatchRun, resumeBatchRun, saveProject, synthesizeSpeech } from "../lib/bridge";
 import { capabilityForModel, compatibleVoicesForModel, qualifiedModels } from "../lib/capabilities";
 import { EmptyState, PageHeader, Panel, SelectField, StatusText } from "../components/ui";
 
 function newChapter(position: number): ProjectChapter {
   return { id: crypto.randomUUID(), title: `Chapter ${position + 1}`, text: "", language: "en" };
+}
+
+function formatDuration(seconds = 0) {
+  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  return `${Math.floor(safe / 60)}:${Math.floor(safe % 60).toString().padStart(2, "0")}`;
 }
 
 function ProjectSetupDialog({
@@ -119,11 +124,17 @@ export function ProjectsView({
   const [parallelism, setParallelism] = useState(Math.min(2, bootstrap.scheduler.max_workers));
   const [audioUrl, setAudioUrl] = useState<string>();
   const [playing, setPlaying] = useState(false);
+  const [masterAudioUrl, setMasterAudioUrl] = useState<string>();
+  const [masterPlaying, setMasterPlaying] = useState(false);
+  const [masterTime, setMasterTime] = useState(0);
+  const [masterDuration, setMasterDuration] = useState(0);
+  const [masterHistory, setMasterHistory] = useState<HistoryItem>();
   const [undoStack, setUndoStack] = useState<ProjectChapter[][]>([]);
   const [redoStack, setRedoStack] = useState<ProjectChapter[][]>([]);
   const [projectDialogMode, setProjectDialogMode] = useState<"create" | "rename">();
   const [chapterDialogOpen, setChapterDialogOpen] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const masterAudioRef = useRef<HTMLAudioElement>(null);
   const deliveredHistoryIds = useRef(new Set<string>());
   const selectedIdRef = useRef(selectedId);
   const selected = projects.find((project) => project.id === selectedId);
@@ -148,6 +159,28 @@ export function ProjectsView({
   );
 
   useEffect(() => () => { if (audioUrl?.startsWith("blob:")) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
+
+  useEffect(() => {
+    const master = selected?.document.master;
+    let active = true;
+    let objectUrl: string | undefined;
+    setMasterHistory(undefined);
+    setMasterAudioUrl(undefined);
+    setMasterTime(0);
+    setMasterDuration(master?.duration_seconds ?? 0);
+    if (!master?.audio_path || !master.history_id) return () => undefined;
+    void Promise.all([listHistory(), loadGeneratedAudio(master.audio_path)]).then(([history, source]) => {
+      if (!active) return;
+      objectUrl = source;
+      setMasterHistory(history.find((item) => item.id === master.history_id));
+      setMasterAudioUrl(source);
+    }).catch((caught) => active && setState(caught instanceof Error ? caught.message : String(caught)));
+    return () => { active = false; if (objectUrl?.startsWith("blob:")) URL.revokeObjectURL(objectUrl); };
+  }, [selected?.id, selected?.document.master?.history_id, selected?.document.master?.audio_path]);
+
+  useEffect(() => {
+    if (!selectedId && !chapters.length && projects[0]) loadProject(projects[0]);
+  }, [projects, selectedId, chapters.length]);
 
   function loadProject(project: ProjectRecord) {
     selectedIdRef.current = project.id;
@@ -212,7 +245,7 @@ export function ProjectsView({
       ...selected,
       id: projectId,
       name: name.trim(),
-      document: { script: nextChapters.map((chapter) => chapter.text).join("\n\n"), chapters: nextChapters, speaker_assignments: {}, render_batch: nextRenderBatch },
+      document: { ...(selected?.document ?? {}), script: nextChapters.map((chapter) => chapter.text).join("\n\n"), chapters: nextChapters, speaker_assignments: selected?.document.speaker_assignments ?? {}, render_batch: nextRenderBatch },
     });
     onChange([next, ...projects.filter((project) => project.id !== next.id)]);
     if (selectedIdRef.current === expectedSelection) {
@@ -432,10 +465,13 @@ export function ProjectsView({
     try {
       const result = await exportProjectMaster(selectedId, masterSettings);
       onGenerated(result.history);
-      if (audioUrl?.startsWith("blob:")) URL.revokeObjectURL(audioUrl);
-      setAudioUrl(await loadGeneratedAudio(result.history.audio_path ?? ""));
+      onChange([result.project, ...projects.filter((project) => project.id !== result.project.id)]);
+      loadProject(result.project);
+      if (masterAudioUrl?.startsWith("blob:")) URL.revokeObjectURL(masterAudioUrl);
+      setMasterHistory(result.history);
+      setMasterAudioUrl(await loadGeneratedAudio(result.history.audio_path ?? ""));
       setState(`Master exported with provenance: ${result.export.manifest_path}`);
-      window.setTimeout(() => void audioRef.current?.play(), 0);
+      window.setTimeout(() => void masterAudioRef.current?.play(), 0);
     } catch (caught) { setState(caught instanceof Error ? caught.message : String(caught)); }
     finally { setMastering(false); }
   }
@@ -492,6 +528,12 @@ export function ProjectsView({
           <details className="project-production-drawer">
             <summary><span><strong>Production and export</strong><small>{batchState ? `${batchState.completed_items}/${batchState.total_items} rendered · ${batchState.status}` : `${staleChapters.length} chapter${staleChapters.length === 1 ? "" : "s"} ready to render`}</small></span><ChevronDown aria-hidden="true" size={15} /></summary>
             <div className="project-production-content">
+              {selected?.document.master ? <section className="project-master-artifact" aria-label="Project master audio">
+                <audio ref={masterAudioRef} src={masterAudioUrl} onPlay={() => setMasterPlaying(true)} onPause={() => setMasterPlaying(false)} onEnded={() => setMasterPlaying(false)} onLoadedMetadata={(event) => setMasterDuration(Number.isFinite(event.currentTarget.duration) && event.currentTarget.duration > 0 ? event.currentTarget.duration : selected.document.master?.duration_seconds ?? 0)} onTimeUpdate={(event) => setMasterTime(event.currentTarget.currentTime)} />
+                <button className="project-master-play" type="button" aria-label={masterPlaying ? "Pause project master" : "Play project master"} disabled={!masterAudioUrl} onClick={() => masterAudioRef.current && (masterAudioRef.current.paused ? void masterAudioRef.current.play() : masterAudioRef.current.pause())}>{masterPlaying ? <Pause aria-hidden="true" size={14} /> : <Play aria-hidden="true" size={14} />}</button>
+                <div className="project-master-main"><strong>{selected.document.master.title || `${selected.name} master`}</strong><small>Project master · {formatDuration(masterDuration || selected.document.master.duration_seconds)} · {(selected.document.master.format || "wav").toUpperCase()} {selected.document.master.sample_rate ? `${Math.round(selected.document.master.sample_rate / 1000)} kHz` : ""}</small><input aria-label="Project master position" type="range" min={0} max={Math.max(masterDuration || selected.document.master.duration_seconds || 0, 0.01)} step={0.05} value={Math.min(masterTime, masterDuration || selected.document.master.duration_seconds || 0)} onChange={(event) => { if (masterAudioRef.current) masterAudioRef.current.currentTime = Number(event.target.value); }} /></div>
+                <button className="button button-secondary" type="button" disabled={!masterHistory} onClick={() => masterHistory && void exportHistoryItem(masterHistory)}><Download aria-hidden="true" size={13} />Export copy</button>
+              </section> : null}
               <section className="project-render-section"><div className="project-render-summary"><Layers3 aria-hidden="true" size={14} /><span><strong>Chapter queue</strong><small>Render changed chapters together without blocking the editor.</small></span></div><SelectField label="Parallel jobs" value={String(parallelism)} onChange={(value) => setParallelism(Number(value))} disabled={Boolean(batchActive)} options={Array.from({ length: Math.min(4, bootstrap.scheduler.max_workers) }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} />{batchState && ["queued", "running"].includes(batchState.status) ? <button className="icon-button" aria-label="Pause project rendering" title="Pause project rendering" type="button" disabled={batchBusy} onClick={() => void pauseProjectBatch()}><Pause aria-hidden="true" size={13} /></button> : null}{batchState && ["paused", "failed"].includes(batchState.status) ? <button className="button button-secondary" type="button" disabled={batchBusy} onClick={() => void resumeProjectBatch()}><RotateCcw aria-hidden="true" size={13} />{batchState.status === "failed" ? "Retry failed" : "Resume"}</button> : null}{batchActive ? <button className="icon-button danger-button" aria-label="Cancel project rendering" title="Cancel project rendering" type="button" disabled={batchBusy} onClick={() => void cancelProjectBatch()}><CircleStop aria-hidden="true" size={13} /></button> : null}<button className="button button-primary" type="button" disabled={!staleChapters.length || Boolean(batchActive) || batchBusy} onClick={() => void renderStaleChapters()}>{batchBusy ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <Layers3 aria-hidden="true" size={13} />}{batchBusy ? "Updating" : `Render changed${staleChapters.length ? ` (${staleChapters.length})` : ""}`}</button></section>
               <section className="project-master-section"><div><strong>Master export</strong><small>Join rendered chapters into one delivery file.</small></div><SelectField label="Format" value={masterSettings.format} onChange={(format) => setMasterSettings((current) => ({ ...current, format: format as "wav" | "flac" }))} options={[{ value: "wav", label: "WAV" }, { value: "flac", label: "FLAC" }]} /><SelectField label="Rate" value={String(masterSettings.sample_rate)} onChange={(sample_rate) => setMasterSettings((current) => ({ ...current, sample_rate: Number(sample_rate) as ProjectMasterSettings["sample_rate"] }))} options={[{ value: "24000", label: "24 kHz" }, { value: "44100", label: "44.1 kHz" }, { value: "48000", label: "48 kHz" }]} /><label className="form-field"><span>Gap</span><input type="number" min="0" max="5000" step="50" value={masterSettings.gap_ms} onChange={(event) => setMasterSettings((current) => ({ ...current, gap_ms: Number(event.target.value) }))} /></label><label className="form-field"><span>LUFS</span><input type="number" min="-24" max="-9" step="1" value={masterSettings.target_lufs} onChange={(event) => setMasterSettings((current) => ({ ...current, target_lufs: Number(event.target.value) }))} /></label><button className="button button-primary" title={canMaster ? "Export mastered project" : "Render every written chapter before mastering"} type="button" disabled={!canMaster || mastering} onClick={() => void masterProject()}>{mastering ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <Download aria-hidden="true" size={13} />}{mastering ? "Mastering" : "Export master"}</button></section>
               <footer className="project-management"><StatusText tone="muted">{state?.startsWith("Master exported") ? state : `${chapters.length} chapters · ${chapters.filter((chapter) => chapter.history_id).length} rendered · ${chapters.filter((chapter) => chapter.text.trim() && !chapter.history_id).length} changed`}</StatusText><button className="text-button danger-button" type="button" disabled={!selected} onClick={() => void removeProject()}><Trash2 aria-hidden="true" size={13} />Delete project</button></footer>

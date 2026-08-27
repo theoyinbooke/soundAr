@@ -8,6 +8,7 @@ import { ProjectsView, reconcileProjectBatchChapters } from "./ProjectsView";
 const bridge = vi.hoisted(() => ({
   cancelBatchRun: vi.fn(),
   deleteProject: vi.fn(),
+  exportHistoryItem: vi.fn(),
   exportProjectMaster: vi.fn(),
   getBatchRun: vi.fn(),
   importProjectScript: vi.fn(),
@@ -152,5 +153,52 @@ describe("Projects batch rendering", () => {
 
     await waitFor(() => expect(bridge.resumeBatchRun).toHaveBeenCalledWith("batch-1", 2, true));
     await waitFor(() => expect(bridge.getBatchRun.mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("surfaces a registered project master and preserves it when the project is saved", async () => {
+    const user = userEvent.setup();
+    const nativeBootstrap = { ...fallbackBootstrap, runtime: "tauri" as const };
+    const masterHistory = {
+      id: "master-history",
+      title: "Release narration master",
+      voice: "Project sequence",
+      text: project.document.script,
+      model_id: "soundar/project-master",
+      engine: "finishing",
+      generation_kind: "speech" as const,
+      audio_path: "/managed/release-master.wav",
+      sample_rate: 48000,
+      duration_seconds: 92,
+      inference_seconds: 0,
+      rtf: 0,
+      vram_peak_mb: 0,
+      waveform: [],
+      created_at: "2026-08-27T18:00:00Z",
+    };
+    const masteredProject: ProjectRecord = {
+      ...project,
+      document: {
+        ...project.document,
+        master: {
+          history_id: masterHistory.id,
+          audio_path: masterHistory.audio_path,
+          title: masterHistory.title,
+          duration_seconds: masterHistory.duration_seconds,
+          sample_rate: masterHistory.sample_rate,
+          format: "wav",
+        },
+      },
+    };
+    bridge.listHistory.mockResolvedValue([masterHistory]);
+    bridge.loadGeneratedAudio.mockResolvedValue("blob:project-master");
+    bridge.saveProject.mockImplementation(async (value: ProjectRecord) => ({ ...masteredProject, ...value }));
+
+    render(<ProjectsView bootstrap={nativeBootstrap} projects={[masteredProject]} voices={nativeBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />);
+    await user.click(screen.getByText("Production and export"));
+    expect(await screen.findByText("Release narration master")).toBeInTheDocument();
+    expect(screen.getByText(/Project master · 1:32 · WAV 48 kHz/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(bridge.saveProject).toHaveBeenCalled());
+    expect(bridge.saveProject.mock.calls.at(-1)?.[0].document.master).toEqual(masteredProject.document.master);
   });
 });

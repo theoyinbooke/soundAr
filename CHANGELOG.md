@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.5.3 - 2026-08-27
+
+- Recovered legacy assistant-created project masters into soundAr's managed artifact history so existing projects and assembled audio resurface automatically.
+- Added an app-owned assistant tool for exporting, registering, attaching, playing, and copying a final project master instead of returning an inaccessible filesystem path.
+- Refreshed Projects immediately after assistant changes, preserved assistant-owned project metadata during edits, and exposed the final master in the Production panel.
+- Kept project conversations focused on the final assembled master while collapsing completed tool calls into a compact activity summary; single-audio requests still show their playable result.
+
 ## 0.5.2 - 2026-08-27
 
 - Reorganized the assistant composer so model and Studio access stay together while reasoning sits beside the Send action.

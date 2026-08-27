@@ -466,11 +466,24 @@ export interface ProjectRecord {
   document: {
     script: string;
     chapters: ProjectChapter[];
-    speaker_assignments: Record<string, string>;
+    speaker_assignments: Record<string, unknown>;
     render_batch?: ProjectRenderBatch;
+    master?: ProjectMasterArtifact;
+    [key: string]: unknown;
   };
   created_at: string;
   updated_at: string;
+}
+
+export interface ProjectMasterArtifact {
+  history_id?: string;
+  audio_path: string;
+  title?: string;
+  duration_seconds?: number;
+  sample_rate?: number;
+  format?: "wav" | "flac";
+  manifest_path?: string;
+  created_at?: string;
 }
 
 export interface ProjectRenderBatch {
@@ -498,6 +511,7 @@ export interface ProjectChapter {
 
 export interface ProjectMasterResult {
   history: HistoryItem;
+  project: ProjectRecord;
   export: {
     id: string;
     project_id: string;

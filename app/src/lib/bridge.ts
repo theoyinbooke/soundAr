@@ -518,6 +518,11 @@ export async function saveProject(project: Partial<ProjectRecord> & { name: stri
   return invoke<ProjectRecord>("save_project", { project });
 }
 
+export async function listProjects(): Promise<ProjectRecord[]> {
+  if (import.meta.env.DEV && !hasTauriRuntime()) return (await previewBootstrap()).projects;
+  return invoke<ProjectRecord[]>("list_projects");
+}
+
 export async function deleteProject(id: string): Promise<boolean> {
   if (import.meta.env.DEV && !hasTauriRuntime()) return false;
   return invoke<boolean>("delete_project", { id });

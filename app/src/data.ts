@@ -335,7 +335,29 @@ export const fallbackBootstrap: BootstrapState = {
   voices: seedVoices,
   jobs: [],
   presets: [],
-  projects: [],
+  projects: [{
+    id: "preview-project",
+    name: "Local AI, Close to Home",
+    document: {
+      script: "A finished two-voice conversation about practical local AI.",
+      speaker_assignments: {},
+      chapters: [
+        { id: "preview-chapter-1", title: "Opening", text: "Local AI keeps useful tools close to home.", language: "en", history_id: "preview-take-1" },
+        { id: "preview-chapter-2", title: "Closing", text: "The result stays available even when the network does not.", language: "en", history_id: "preview-take-2" },
+      ],
+      master: {
+        history_id: "preview-project-master",
+        audio_path: previewReferenceAudio,
+        title: "Local AI, Close to Home · Full Dialogue",
+        duration_seconds: 113.88,
+        sample_rate: 24000,
+        format: "wav",
+        created_at: "2026-08-27T18:03:00Z",
+      },
+    },
+    created_at: "2026-08-27T17:41:00Z",
+    updated_at: "2026-08-27T18:03:00Z",
+  }],
   transcriptions: [{
     id: "preview-transcript", job_id: "preview-transcription-job", source_path: previewReferenceAudio,
     original_source_path: previewReferenceAudio, model_id: "openai/whisper-tiny", engine: "transformers",

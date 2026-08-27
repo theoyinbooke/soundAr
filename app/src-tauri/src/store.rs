@@ -3128,6 +3128,7 @@ impl Store {
     }
 
     pub fn list_projects(&self) -> Result<Vec<Value>, String> {
+        self.reconcile_project_masters()?;
         let connection = self.lock()?;
         let mut statement = connection
             .prepare("SELECT id, name, document_json, created_at, updated_at FROM projects ORDER BY updated_at DESC")
@@ -3146,6 +3147,174 @@ impl Store {
             .map_err(|error| format!("Could not list projects: {error}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("Could not read projects: {error}"))
+    }
+
+    pub fn attach_project_master(
+        &self,
+        project_id: &str,
+        history: &Value,
+        export: &Value,
+    ) -> Result<Value, String> {
+        let connection = self.lock()?;
+        let (name, raw_document): (String, String) = connection
+            .query_row(
+                "SELECT name, document_json FROM projects WHERE id = ?1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Could not inspect the project master: {error}"))?
+            .ok_or("Project was not found")?;
+        drop(connection);
+        let mut document =
+            serde_json::from_str::<Value>(&raw_document).unwrap_or_else(|_| json!({}));
+        let master = document
+            .as_object_mut()
+            .ok_or("Project document is invalid")?
+            .entry("master")
+            .or_insert_with(|| json!({}));
+        let master = master
+            .as_object_mut()
+            .ok_or("Project master metadata is invalid")?;
+        master.insert(
+            "history_id".into(),
+            history
+                .get("id")
+                .cloned()
+                .ok_or("Master history has no identifier")?,
+        );
+        master.insert(
+            "audio_path".into(),
+            history
+                .get("audio_path")
+                .cloned()
+                .ok_or("Master history has no audio path")?,
+        );
+        for key in ["title", "duration_seconds", "sample_rate", "created_at"] {
+            if let Some(value) = history.get(key) {
+                master.insert(key.into(), value.clone());
+            }
+        }
+        if let Some(path) = history.get("audio_path").and_then(Value::as_str) {
+            master.insert(
+                "format".into(),
+                json!(Path::new(path)
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("wav")),
+            );
+        }
+        if let Some(value) = export.get("manifest_path") {
+            master.insert("manifest_path".into(), value.clone());
+        }
+        self.save_project(&json!({ "id": project_id, "name": name, "document": document }))
+    }
+
+    fn reconcile_project_masters(&self) -> Result<(), String> {
+        let candidates = {
+            let connection = self.lock()?;
+            let mut statement = connection
+                .prepare("SELECT id, name, document_json FROM projects ORDER BY updated_at DESC")
+                .map_err(|error| format!("Could not prepare project master recovery: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("Could not inspect project masters: {error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Could not read project masters: {error}"))?
+        };
+
+        for (project_id, project_name, raw_document) in candidates {
+            let document =
+                serde_json::from_str::<Value>(&raw_document).unwrap_or_else(|_| json!({}));
+            let Some(master) = document.get("master") else {
+                continue;
+            };
+            if master.get("history_id").and_then(Value::as_str).is_some() {
+                continue;
+            }
+            let Some(raw_path) = master.get("audio_path").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = match self.validate_artifact_path(raw_path) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
+            let path_string = path.to_string_lossy().to_string();
+            let existing = self.list_history(None)?.into_iter().find(|item| {
+                item.get("audio_path").and_then(Value::as_str) == Some(path_string.as_str())
+            });
+            let history = if let Some(history) = existing {
+                history
+            } else {
+                let request = json!({
+                    "operation": "adopt_project_master",
+                    "project_id": project_id,
+                    "generation_kind": "speech",
+                    "title": master.get("title").and_then(Value::as_str).unwrap_or(&project_name),
+                    "voice_name": "Project sequence",
+                    "text": document.get("script").and_then(Value::as_str).unwrap_or("Project master"),
+                });
+                let job_id = self.create_job("project-master", &request)?;
+                self.complete_synthesis(
+                    &job_id,
+                    &request,
+                    &json!({
+                        "id": Uuid::new_v4().simple().to_string(),
+                        "audio_path": path_string,
+                        "model_id": "soundar/project-master",
+                        "engine": "finishing",
+                        "generation_kind": "speech",
+                        "sample_rate": master.get("sample_rate").and_then(Value::as_i64).unwrap_or(48_000),
+                        "duration_seconds": master.get("duration_seconds").and_then(Value::as_f64).unwrap_or(0.0),
+                        "inference_seconds": 0.0,
+                        "rtf": 0.0,
+                        "vram_peak_mb": 0,
+                    }),
+                )?
+            };
+            let format = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("wav");
+            let settings = json!({
+                "format": format,
+                "sample_rate": history.get("sample_rate").and_then(Value::as_i64).unwrap_or(48_000),
+                "gap_ms": master.get("gap_ms").and_then(Value::as_i64).unwrap_or(250),
+                "fade_ms": master.get("fade_ms").and_then(Value::as_i64).unwrap_or(12),
+                "target_lufs": master.get("target_lufs").and_then(Value::as_f64).unwrap_or(-16.0),
+                "recovered": true,
+            });
+            let manifest_path = path.with_extension(format!("{format}.provenance.json"));
+            if !manifest_path.exists() {
+                write_store_json_atomically(
+                    &manifest_path,
+                    &json!({
+                        "schema_version": 1,
+                        "application": "soundAr",
+                        "project": { "id": project_id, "name": project_name },
+                        "output": { "path": path, "sha256": sha256_file(&path)?, "recovered_at": now() },
+                        "recovered": true,
+                    }),
+                )?;
+            }
+            let export = self.record_project_export(
+                &project_id,
+                history
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("Master history has no identifier")?,
+                &settings,
+                &manifest_path,
+            )?;
+            self.attach_project_master(&project_id, &history, &export)?;
+        }
+        Ok(())
     }
 
     pub fn project_master_plan(&self, id: &str) -> Result<Value, String> {
@@ -5415,6 +5584,25 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn write_store_json_atomically(path: &Path, value: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not prepare project provenance storage: {error}"))?;
+    }
+    let temporary = path.with_extension(format!(
+        "{}.partial",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("json")
+    ));
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("Could not encode project provenance: {error}"))?;
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("Could not write project provenance: {error}"))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("Could not publish project provenance: {error}"))
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -6908,6 +7096,47 @@ mod tests {
             ("rendered".to_string(), Some("render-two".to_string()))
         );
         drop(connection);
+        drop(store);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn project_listing_recovers_an_unregistered_master_as_a_playable_artifact() {
+        let (store, root) = test_store();
+        let master_path = root.join("artifacts/local-ai-master.wav");
+        fs::write(&master_path, b"RIFF\x04\x00\x00\x00WAVEtest").expect("write master audio");
+        store
+            .save_project(&json!({
+                "id": "local-ai",
+                "name": "Local AI, Close to Home",
+                "document": {
+                    "script": "A complete two-voice dialogue.",
+                    "chapters": [],
+                    "speaker_assignments": {},
+                    "master": {
+                        "audio_path": master_path,
+                        "title": "Local AI, Close to Home · Full Dialogue",
+                        "duration_seconds": 113.88,
+                        "sample_rate": 24000
+                    }
+                }
+            }))
+            .expect("save project with raw master");
+
+        let projects = store.list_projects().expect("recover project master");
+        let master = &projects[0]["document"]["master"];
+        assert!(master["history_id"].as_str().is_some());
+        assert!(master["manifest_path"].as_str().is_some());
+        let history = store.list_history(None).expect("list registered master");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["model_id"], "soundar/project-master");
+        assert_eq!(history[0]["audio_path"], master["audio_path"]);
+        assert_eq!(
+            store
+                .generated_audio_bytes(history[0]["audio_path"].as_str().expect("master path"))
+                .expect("playable master"),
+            b"RIFF\x04\x00\x00\x00WAVEtest"
+        );
         drop(store);
         fs::remove_dir_all(root).ok();
     }

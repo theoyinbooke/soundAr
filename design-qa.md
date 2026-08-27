@@ -136,3 +136,30 @@ The implementation keeps the assistant as a dedicated right pane and no longer c
 Model, reasoning, and Studio access menus were opened; ordering, checked states, popover geometry, and scrollbar suppression were verified. The browser-rendered interaction produced no relevant console error. No actionable P0, P1, or P2 difference remains. Reasoning is intentionally farther right than in the supplied reference because that is the user's explicit correction.
 
 final result: passed
+
+## Project-master recovery addendum — 2026-08-27
+
+- Source visual truth: `/tmp/codex-clipboard-6835cc01-75a1-4f83-918e-afab33c43d78.png`, `/tmp/codex-clipboard-3c62cdaa-9224-4818-b95d-1714be254b61.png`, and `/tmp/codex-clipboard-23666a8d-bf91-4ae1-8b6e-7f30286b9241.png`.
+- Implementation screenshots: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/project-master-implementation.png` and `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/assistant-compact-implementation.png`.
+- Same-input comparison board: `/home/theoyinbooke/.codex/worktrees/43ea/soundAr/design-qa/project-master-comparison.png`.
+- Viewport: implementation 1280 × 720 CSS pixels at 1× density; the 1920 × 1200 source was normalized into a side-by-side 1920 × 600 comparison board.
+- State: light theme, Projects route with a selected assistant-created project, Production panel open, registered project master visible, assistant open with a completed project workflow.
+
+### Comparison history
+
+1. P0: the assistant reported a raw filesystem path that the app could not play, export, or rediscover. Fixed by adding an app-owned project-master export tool and a one-time recovery path that registers legacy masters in managed History, provenance, and project export storage.
+2. P1: assistant-created project data did not refresh into Projects. Fixed by refreshing projects together with History after assistant tools complete and whenever Projects is opened.
+3. P1: project conversations retained a long stack of completed tool cards and individual chapter clips. Fixed by preserving the high-level plan, collapsing completed tool activity into one disclosure, and showing only the final assembled project master. Single-audio requests still show their one playable result.
+4. P2: subsequent project edits could discard assistant-owned master metadata. Fixed by preserving unknown document fields and the attached master when saving ordinary project edits.
+
+### Required fidelity surfaces
+
+- Typography and spacing: pass — the master player uses the established compact row anatomy, Inter hierarchy, neutral labels, and balanced action spacing.
+- Colors and borders: pass — no accent edge or fill was introduced; the player, activity disclosure, and project selection use the established neutral tokens.
+- Copy and information architecture: pass — “Project master,” duration, format, sample rate, Play, and Export copy are visible inside Projects instead of exposing an internal path.
+- Interaction: pass — project selection, Production disclosure, master playback surface, export action state, assistant prompt submission, plan visibility, and collapsed activity were exercised in the running preview.
+- Persistence: pass — a Rust recovery test starts with the exact legacy state (project document contains only a raw master path) and proves that listing projects attaches a registered playable artifact without losing the project or its chapters.
+
+No actionable P0, P1, or P2 mismatch remains in the audited project-master and assistant-workflow states.
+
+final result: passed

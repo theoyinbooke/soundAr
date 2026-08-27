@@ -317,6 +317,7 @@ pub fn dynamic_tools() -> Value {
         { "name": "queue_speech_generation", "description": "Queue local text-to-speech generation in soundAr and return a durable job id. Requires Studio or Full access.", "inputSchema": { "type": "object", "required": ["text", "model_id", "voice_id"], "properties": { "text":{"type":"string"}, "model_id":{"type":"string"}, "voice_id":{"type":"string"}, "title":{"type":"string"}, "language":{"type":"string"}, "priority":{"type":"string","enum":["low","normal","high"]} } } },
         { "name": "queue_speech_batch", "description": "Queue an ordered batch of local speech generations for a campaign, course, audiobook, podcast, or other multi-part plan. Requires Studio or Full access.", "inputSchema": { "type":"object", "required":["rows"], "properties": { "rows":{"type":"array","minItems":1,"maxItems":500,"items":{"type":"object","required":["text"],"properties":{"name":{"type":"string"},"text":{"type":"string"},"model_id":{"type":"string"},"voice_id":{"type":"string"},"priority":{"type":"string","enum":["low","normal","high"]},"settings":{"type":"object"}}}}, "parallelism":{"type":"integer","minimum":1,"maximum":8} } } },
         { "name": "save_project", "description": "Create or update a soundAr long-form audio project with chapters. Requires Studio or Full access.", "inputSchema": { "type":"object", "required":["name","document"], "properties": { "id":{"type":"string"}, "name":{"type":"string"}, "document":{"type":"object"} } } },
+        { "name": "export_project_master", "description": "Assemble rendered project chapters into one registered, playable soundAr master. Use this for every completed multi-part project instead of shell commands or raw filesystem paths. Requires Studio or Full access.", "inputSchema": { "type":"object", "required":["project_id"], "properties": { "project_id":{"type":"string"}, "settings":{"type":"object","properties":{"format":{"type":"string","enum":["wav","flac"]},"sample_rate":{"type":"integer","enum":[24000,44100,48000]},"gap_ms":{"type":"integer","minimum":0,"maximum":5000},"fade_ms":{"type":"integer","minimum":0,"maximum":1000},"target_lufs":{"type":"number","minimum":-24,"maximum":-9}}} } } },
         { "name": "list_jobs", "description": "List current queued, running, completed, cancelled, and failed soundAr jobs.", "inputSchema": { "type":"object", "properties":{} } },
         { "name": "cancel_job", "description": "Cancel a queued or running soundAr job by id. Requires Studio or Full access and user confirmation.", "inputSchema": { "type":"object", "required":["job_id"], "properties":{"job_id":{"type":"string"}} } }
     ])
@@ -348,6 +349,7 @@ fn execute_dynamic_tool(
             | "queue_speech_generation"
             | "queue_speech_batch"
             | "save_project"
+            | "export_project_master"
             | "cancel_job"
     ) && !access.permits_studio_writes()
     {
@@ -368,6 +370,18 @@ fn execute_dynamic_tool(
         }),
         "list_jobs" => json!(runtime.store.list_jobs()?),
         "save_project" => runtime.store.save_project(&arguments)?,
+        "export_project_master" => super::build_project_master(
+            runtime,
+            arguments
+                .get("project_id")
+                .and_then(Value::as_str)
+                .ok_or("project_id is required")?
+                .to_string(),
+            arguments
+                .get("settings")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        )?,
         "cancel_job" => {
             json!({ "cancelled": runtime.cancel_job(arguments.get("job_id").and_then(Value::as_str).ok_or("job_id is required")?)? })
         }
@@ -556,10 +570,11 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"get_studio_state"));
         assert!(names.contains(&"queue_speech_generation"));
         assert!(names.contains(&"queue_music_generation"));
+        assert!(names.contains(&"export_project_master"));
     }
 
     #[test]

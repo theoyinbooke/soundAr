@@ -34,6 +34,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [artifacts, setArtifacts] = useState<HistoryItem[]>([]);
+  const [artifactMode, setArtifactMode] = useState<"single" | "project">("single");
   const scrollRef = useRef<HTMLDivElement>(null);
   const initialHistoryIds = useRef<Set<string> | undefined>(undefined);
   const artifactKey = useRef("");
@@ -80,7 +81,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
         const history = await listHistory();
         if (!active) return;
         if (!initialHistoryIds.current) initialHistoryIds.current = new Set(history.map((item) => item.id));
-        const created = history.filter((item) => item.audio_path && !initialHistoryIds.current?.has(item.id)).slice(0, 4);
+        const created = selectAssistantArtifacts(history, initialHistoryIds.current, artifactMode);
         if (created.length) {
           const key = created.map((item) => item.id).join(":");
           if (key !== artifactKey.current) {
@@ -95,7 +96,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
     }
     void refreshArtifacts();
     return () => { active = false; window.clearTimeout(timer); };
-  }, [open, sending, onStudioChanged]);
+  }, [open, sending, onStudioChanged, artifactMode]);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -134,7 +135,9 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       if (item?.type === "dynamicToolCall") {
         const id = String(item.id);
         const title = humanize(String(item.tool ?? "soundAr tool"));
+        if (item.tool === "save_project" || item.tool === "export_project_master") setArtifactMode("project");
         setToolRuns((runs) => [...runs.filter((run) => run.id !== id), { id, title, detail: event.method === "item/completed" ? "Finished in soundAr" : "Working in soundAr", state: event.method === "item/completed" ? "complete" : "running" }]);
+        if (event.method === "item/completed") onStudioChanged?.();
       } else if (event.method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer") {
         setSending(false);
         setMessages((items) => items.map((message) => ({ ...message, pending: false })));
@@ -169,6 +172,12 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
     setError(undefined);
     setSending(true);
     setPlanSteps([]);
+    setToolRuns([]);
+    setArtifacts([]);
+    setArtifactMode("single");
+    const currentHistory = await listHistory().catch(() => []);
+    initialHistoryIds.current = new Set(currentHistory.map((item) => item.id));
+    artifactKey.current = "";
     setMessages((items) => [...items, { id: `user-${Date.now()}`, role: "user", text }]);
     try {
       let activeThread = threadId;
@@ -253,7 +262,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       {account ? <>
         {messages.map((message) => <article className={`assistant-message is-${message.role}`} key={message.id}><span>{message.role === "assistant" ? "Assistant" : message.role === "user" ? "You" : "soundAr"}</span><p>{message.text}{message.pending ? <i className="assistant-caret" /> : null}</p></article>)}
         {planSteps.length ? <ol className="assistant-plan" aria-label="Current plan">{planSteps.map((step, index) => <li className={`is-${step.status}`} key={`${index}-${step.step}`}><span>{step.status === "completed" ? <Check size={12} /> : step.status === "inProgress" ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><strong>{step.step}</strong></li>)}</ol> : null}
-        {toolRuns.length ? <div className="assistant-tool-stack">{toolRuns.slice(-6).map((run) => <div className={`assistant-tool is-${run.state}`} key={run.id}>{run.state === "running" ? <LoaderCircle className="spin" size={15} /> : run.state === "complete" ? <Check size={15} /> : <CircleAlert size={15} />}<div><strong>{run.title}</strong><span>{run.detail}</span></div></div>)}</div> : null}
+        {toolRuns.length ? <ActivitySummary runs={toolRuns} /> : null}
         {artifacts.map((item) => <AudioArtifact key={item.id} item={item} onRevise={() => {
           setDraft(`Revise “${item.title || (item.generation_kind === "music" ? "Generated music" : "Generated speech")}” (${item.id}): `);
           window.setTimeout(() => composerRef.current?.focus(), 0);
@@ -321,6 +330,23 @@ function AudioArtifact({ item, onRevise }: { item: HistoryItem; onRevise: () => 
 }
 
 function humanize(value: string) { return value.replaceAll("_", " ").replaceAll("-", " ").replace(/\b\w/g, (letter) => letter.toUpperCase()); }
+export function selectAssistantArtifacts(history: HistoryItem[], baseline: Set<string> | undefined, mode: "single" | "project") {
+  return history
+    .filter((item) => item.audio_path && !baseline?.has(item.id))
+    .filter((item) => mode === "project" ? item.model_id === "soundar/project-master" || item.engine === "finishing" : item.model_id !== "soundar/project-master")
+    .slice(0, 1);
+}
+
+function ActivitySummary({ runs }: { runs: ToolRun[] }) {
+  const recent = runs.slice(-8);
+  const running = recent.filter((run) => run.state === "running").length;
+  const failed = recent.filter((run) => run.state === "failed").length;
+  const label = failed ? "Action needs attention" : running ? `Working in soundAr · ${running} active` : `Activity complete · ${recent.length} actions`;
+  return <details className={`assistant-activity-summary${failed ? " is-failed" : ""}`} open={Boolean(running || failed)}>
+    <summary>{running ? <LoaderCircle className="spin" size={13} /> : failed ? <CircleAlert size={13} /> : <Check size={13} />}<span>{label}</span><ChevronDown size={13} /></summary>
+    <div>{recent.map((run) => <div className={`assistant-activity-row is-${run.state}`} key={run.id}><span>{run.state === "running" ? <LoaderCircle className="spin" size={12} /> : run.state === "failed" ? <CircleAlert size={12} /> : <Check size={12} />}</span><strong>{run.title}</strong><small>{run.detail}</small></div>)}</div>
+  </details>;
+}
 function previewCreativeResponse(prompt: string): { message: string; plan: PlanStep[]; tools: ToolRun[] } {
   const normalized = prompt.toLowerCase();
   const isSpeech = /speech|voice|podcast|narrat|audiobook|opening|spoken/.test(normalized);
@@ -331,11 +357,11 @@ function previewCreativeResponse(prompt: string): { message: string; plan: PlanS
     plan: [
       { step: "Shape the goal into a production brief", status: "completed" },
       { step: isSpeech ? "Draft the script and select a local voice" : "Draft the direction and select a local music model", status: "completed" },
-      { step: `Generate and review the ${output}`, status: "inProgress" },
+      { step: `Generate and review the ${output}`, status: "completed" },
     ],
     tools: [
       { id: "preview-state", title: "Get studio state", detail: "Finished in soundAr", state: "complete" },
-      { id: "preview-create", title: isSpeech ? "Queue speech generation" : "Queue music generation", detail: "Working in soundAr", state: "running" },
+      { id: "preview-create", title: isSpeech ? "Queue speech generation" : "Queue music generation", detail: "Finished in soundAr", state: "complete" },
     ],
   };
 }
