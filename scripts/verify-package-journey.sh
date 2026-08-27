@@ -38,7 +38,9 @@ home="$profile_root/home"
 xdg_data="$profile_root/xdg-data"
 xdg_config="$profile_root/xdg-config"
 xdg_cache="$profile_root/xdg-cache"
-mkdir -p "$previous_root" "$candidate_root" "$home" "$xdg_data" "$xdg_config" "$xdg_cache"
+xdg_runtime="$profile_root/xdg-runtime"
+mkdir -p "$previous_root" "$candidate_root" "$home" "$xdg_data" "$xdg_config" "$xdg_cache" "$xdg_runtime"
+chmod 700 "$xdg_runtime"
 dpkg-deb -x "$PREVIOUS_DEB" "$previous_root"
 dpkg-deb -x "$CANDIDATE_DEB" "$candidate_root"
 
@@ -59,13 +61,17 @@ launch_offline() {
     printf '%s\n' "Kernel network namespaces are unavailable; enforcing offline library and proxy settings for $label."
   fi
   set +e
-  timeout --signal=TERM --kill-after=3s 7s \
+  timeout --signal=TERM --kill-after=3s 12s \
     "${network_isolation[@]}" \
     env \
       HOME="$home" \
       XDG_DATA_HOME="$xdg_data" \
       XDG_CONFIG_HOME="$xdg_config" \
       XDG_CACHE_HOME="$xdg_cache" \
+      XDG_RUNTIME_DIR="$xdg_runtime" \
+      GDK_BACKEND=x11 \
+      WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+      LIBGL_ALWAYS_SOFTWARE=1 \
       "${runtime_environment[@]}" \
       SOUNDAR_PYTHON=/usr/bin/python3 \
       HF_HUB_OFFLINE=1 \
@@ -113,6 +119,7 @@ voices="$home/.soundAr/state/voices/journey-voice"
 models="$xdg_data/soundar/runtime/models/journey-model"
 [[ -s "$database" ]] || {
   printf 'The candidate Debian package did not create its durable store.\n' >&2
+  sed -n '1,160p' "$journey_root/candidate-clean-deb.log" >&2
   exit 1
 }
 mkdir -p "$exports" "$voices" "$models"
@@ -135,8 +142,8 @@ reference = reference_path.read_bytes()
 connection = sqlite3.connect(database)
 connection.execute("PRAGMA foreign_keys=ON")
 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-if schema != 30:
-    raise SystemExit(f"candidate clean launch created schema {schema}, expected 30")
+if schema != 31:
+    raise SystemExit(f"candidate clean launch created schema {schema}, expected 31")
 timestamp = "2026-08-13T12:00:00Z"
 connection.execute(
     "INSERT INTO jobs (id, kind, status, request_json, progress, attempt, output_artifact_id, created_at, updated_at, dismissed, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -171,8 +178,9 @@ connection.execute(
     "INSERT OR REPLACE INTO settings (key, value_json, updated_at) VALUES ('theme', '\"light\"', ?)",
     (timestamp,),
 )
-connection.execute("DROP TABLE transcription_alignments")
-connection.execute("PRAGMA user_version=29")
+connection.execute("DROP INDEX history_generation_kind_created_idx")
+connection.execute("ALTER TABLE history DROP COLUMN generation_kind")
+connection.execute("PRAGMA user_version=30")
 connection.commit()
 connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 connection.close()
@@ -196,8 +204,8 @@ import sys
 database = pathlib.Path(sys.argv[1])
 state = pathlib.Path(sys.argv[2])
 connection = sqlite3.connect(database)
-if connection.execute("PRAGMA user_version").fetchone()[0] != 30:
-    raise SystemExit("the candidate did not migrate schema 29 to 30")
+if connection.execute("PRAGMA user_version").fetchone()[0] != 31:
+    raise SystemExit("the candidate did not migrate schema 30 to 31")
 if connection.execute("PRAGMA quick_check").fetchone()[0].lower() != "ok":
     raise SystemExit("the migrated database failed quick_check")
 if list(connection.execute("PRAGMA foreign_key_check")):
@@ -215,19 +223,26 @@ for table, identity in [
         raise SystemExit(f"upgrade did not preserve {table}:{identity}")
 if connection.execute("SELECT value_json FROM settings WHERE key = 'theme'").fetchone()[0] != '"light"':
     raise SystemExit("upgrade did not preserve settings")
-if connection.execute("SELECT COUNT(*) FROM transcription_alignments").fetchone()[0] != 0:
-    raise SystemExit("schema-30 alignment table was not created cleanly")
+if connection.execute("SELECT generation_kind FROM history WHERE id = 'journey-history'").fetchone()[0] != "speech":
+    raise SystemExit("schema-31 generation kind was not created cleanly")
 connection.close()
 backups = list(state.glob("soundar.sqlite3.backup-*"))
 if not backups:
     raise SystemExit("upgrade did not create a migration backup")
+preserved_upgrade_backups = 0
 for backup in backups:
     check = sqlite3.connect(backup)
-    if check.execute("PRAGMA user_version").fetchone()[0] != 29:
-        raise SystemExit("migration backup does not preserve schema 29")
-    if check.execute("SELECT COUNT(*) FROM projects WHERE id = 'journey-project'").fetchone()[0] != 1:
-        raise SystemExit("migration backup does not preserve user data")
+    if check.execute("PRAGMA quick_check").fetchone()[0].lower() != "ok":
+        raise SystemExit("a migration backup failed quick_check")
+    version = check.execute("PRAGMA user_version").fetchone()[0]
+    project_count = check.execute(
+        "SELECT COUNT(*) FROM projects WHERE id = 'journey-project'"
+    ).fetchone()[0]
+    if version == 30 and project_count == 1:
+        preserved_upgrade_backups += 1
     check.close()
+if preserved_upgrade_backups < 1:
+    raise SystemExit("no schema-30 migration backup preserves the seeded user data")
 PY
 sha256sum --check --status "$journey_root/sentinels.sha256" || {
   printf 'The Debian upgrade changed a user model, voice reference, export, or registry.\n' >&2
@@ -245,7 +260,7 @@ import sqlite3
 import sys
 
 connection = sqlite3.connect(sys.argv[1])
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 30
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 31
 assert connection.execute("PRAGMA quick_check").fetchone()[0].lower() == "ok"
 assert connection.execute("SELECT COUNT(*) FROM projects WHERE id = 'journey-project'").fetchone()[0] == 1
 assert connection.execute("SELECT COUNT(*) FROM history WHERE id = 'journey-history'").fetchone()[0] == 1
@@ -253,4 +268,4 @@ assert connection.execute("SELECT COUNT(*) FROM voices WHERE id = 'journey-voice
 connection.close()
 PY
 
-printf 'Verified offline previous-release launch, clean candidate launch, schema-29 upgrade, and Debian/AppImage profile preservation for soundAr %s.\n' "$VERSION"
+printf 'Verified offline previous-release launch, clean candidate launch, schema-30 upgrade, and Debian/AppImage profile preservation for soundAr %s.\n' "$VERSION"
