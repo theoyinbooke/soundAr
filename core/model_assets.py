@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,28 @@ SPEECHT5_XVECTOR_REPO = "Matthijs/cmu-arctic-xvectors"
 SPEECHT5_XVECTOR_REVISION = "5c1297a9eb6c91714ea77c0d4ac5aca9b6a952e5"
 SPEECHT5_XVECTOR_ARCHIVE = "spkrec-xvect.zip"
 SPEECHT5_DEFAULT_XVECTOR = "spkrec-xvect/cmu_us_slt_arctic-wav-arctic_a0001.npy"
+
+# The pinned ACE-Step 1.5 runtime replaces these two repository-side Python
+# files with the matching implementation from its verified source archive on
+# first load. Accept only those exact post-sync hashes so the managed model
+# remains usable without weakening manifest checks for any weight or config.
+ACESTEP_SYNCED_CODE_SHA256 = {
+    "acestep-v15-turbo/configuration_acestep_v15.py": "5f15aa79fe793bba3c00b6992dd193a269954950603d5031ecd7703b0fa69da1",
+    "acestep-v15-turbo/modeling_acestep_v15_turbo.py": "71b22e01b490bd9e149e4c0c5da2e1f512126f3ab3316e0ae97779af84d19512",
+}
+
+
+def _is_trusted_acestep_code_sync(model_id: str, relative: str, candidate: Path) -> bool:
+    if model_id != "ACE-Step/Ace-Step1.5":
+        return False
+    expected = ACESTEP_SYNCED_CODE_SHA256.get(relative)
+    if expected is None:
+        return False
+    try:
+        digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    return digest == expected
 
 
 def default_local_model_dir(cache_dir: str | Path, model_id: str) -> Path:
@@ -219,7 +242,10 @@ def model_integrity_report(
         except OSError:
             invalid.append(relative)
             return False
-        if (expected_size is None and size <= 0) or (expected_size is not None and size != expected_size):
+        invalid_size = (expected_size is None and size <= 0) or (
+            expected_size is not None and size != expected_size
+        )
+        if invalid_size and not _is_trusted_acestep_code_sync(model_id, relative, candidate):
             invalid.append(relative)
             return False
         return True

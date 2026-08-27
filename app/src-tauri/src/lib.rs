@@ -8489,8 +8489,8 @@ for line in sys.stdin:
     }
 
     #[test]
-    #[ignore = "requires the packaged ACE-Step runtime, an NVIDIA GPU, and an installed ACE-Step/acestep-v15-xl-turbo-diffusers checkpoint"]
-    fn packaged_runtime_generates_playable_lyric_music_through_native_bridge() {
+    #[ignore = "requires the packaged ACE-Step runtime, an NVIDIA GPU, and an installed ACE-Step/Ace-Step1.5 checkpoint"]
+    fn packaged_runtime_generates_playable_acestep_studio_music_through_native_bridge() {
         let runtime_root = PathBuf::from(
             std::env::var("SOUNDAR_E2E_RUNTIME_ROOT")
                 .expect("SOUNDAR_E2E_RUNTIME_ROOT must point to packaged runtime resources"),
@@ -8512,7 +8512,7 @@ for line in sys.stdin:
         let request = json!({
             "operation": "generate_music",
             "generation_kind": "music",
-            "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+            "model_id": "ACE-Step/Ace-Step1.5",
             "prompt": "Warm, intimate indie-pop with brushed drums, soft electric piano, a restrained build, and a close-mic vocal performance.",
             "lyrics": "[Verse]\nThe city hums beneath the rain\nI trace your name across the windowpane\n\n[Chorus]\nHold the light until the morning comes",
             "vocal_language": "en",
@@ -8569,7 +8569,7 @@ for line in sys.stdin:
         verify_playable_wav(&runtime, &warm).expect("decode warm packaged ACE-Step WAV");
 
         runtime
-            .unload_model_runtime("ACE-Step/acestep-v15-xl-turbo-diffusers")
+            .unload_model_runtime("ACE-Step/Ace-Step1.5")
             .expect("unload ACE-Step worker");
         require_quiescent_scheduler(&runtime).expect("release ACE-Step scheduler reservation");
         runtime.stop_active_worker().expect("stop ACE-Step worker");

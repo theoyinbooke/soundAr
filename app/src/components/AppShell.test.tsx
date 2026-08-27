@@ -44,6 +44,7 @@ describe("AppShell capability navigation", () => {
     expect(screen.getByRole("button", { name: "Minimize window" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Maximize window" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close window" })).toBeInTheDocument();
+    expect(document.querySelectorAll(".window-resize-handle")).toHaveLength(8);
     expect(document.querySelector(".app-topbar")).toHaveAttribute("data-tauri-drag-region");
     expect(document.querySelector(".app-content .page-header")).not.toBeNull();
   });
@@ -96,6 +97,7 @@ describe("AppShell capability navigation", () => {
 
     expect(document.querySelector(".app-shell")).not.toHaveClass("is-sidebar-collapsed");
     expect(screen.getByRole("button", { name: "Hide sidebar" })).toBeInTheDocument();
+    expect(document.querySelector(".window-resize-handles")).toBeNull();
     window.matchMedia = originalMatchMedia;
   });
 

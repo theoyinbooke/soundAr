@@ -2119,3 +2119,54 @@ input[type="checkbox"]:checked::before { transform: translateX(12px); }
   .model-table-panel > .model-inspector { grid-template-columns: minmax(0, 1fr); }
   .model-table-panel .model-inspector .inspector-actions { grid-column: 1; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; }
 }
+
+/* Native frameless windows need explicit edge targets on Linux. */
+.window-resize-handles { position: fixed; z-index: 1000; inset: 0; pointer-events: none; }
+.window-resize-handle { position: absolute; pointer-events: auto; }
+.resize-north, .resize-south { right: 8px; left: 8px; height: 5px; cursor: ns-resize; }
+.resize-north { top: 0; }
+.resize-south { bottom: 0; }
+.resize-east, .resize-west { top: 8px; bottom: 8px; width: 5px; cursor: ew-resize; }
+.resize-east { right: 0; }
+.resize-west { left: 0; }
+.resize-northeast, .resize-northwest, .resize-southeast, .resize-southwest { width: 10px; height: 10px; }
+.resize-northeast { top: 0; right: 0; cursor: nesw-resize; }
+.resize-northwest { top: 0; left: 0; cursor: nwse-resize; }
+.resize-southeast { right: 0; bottom: 0; cursor: nwse-resize; }
+.resize-southwest { bottom: 0; left: 0; cursor: nesw-resize; }
+
+/* The generation workspace is fluid on desktop instead of living in a fixed 1210px island. */
+:root { --generation-workspace-max: 1600px; }
+.page.generate-page > .page-header,
+.page.generate-page > .generate-layout,
+.music-studio-layout {
+  width: min(calc(100% - 56px), var(--generation-workspace-max));
+  margin-right: auto;
+  margin-left: auto;
+}
+.generate-layout { grid-template-columns: minmax(0, 1fr) clamp(292px, 21vw, 360px); gap: 20px; }
+.generate-page .script-box textarea { height: clamp(158px, 18vh, 220px); }
+.generate-page .runtime-rail,
+.generate-page .runtime-rail.generation-activity-drawer { min-height: min(650px, calc(100dvh - 132px)); }
+.music-studio-layout { grid-template-columns: minmax(0, 1fr) clamp(292px, 21vw, 360px); gap: 20px; }
+
+@media (min-width: 821px) and (max-width: 1120px) {
+  .app-topbar { grid-template-columns: 224px minmax(0, 1fr) auto auto; }
+  .page.generate-page > .page-header,
+  .page.generate-page > .generate-layout,
+  .music-studio-layout { width: calc(100% - 40px); }
+  .generate-layout,
+  .music-studio-layout { grid-template-columns: minmax(0, 1fr); }
+  .generate-page .runtime-rail,
+  .generate-page .runtime-rail.generation-activity-drawer { position: static; min-height: 360px; }
+  .music-runtime-rail { position: static; min-height: 0; }
+  .music-runtime-summary { margin-top: 12px; }
+}
+
+@media (max-width: 820px) {
+  .page.generate-page > .page-header,
+  .page.generate-page > .generate-layout,
+  .music-studio-layout { width: calc(100% - 28px); margin-inline: 14px; }
+  .generate-page .runtime-rail,
+  .generate-page .runtime-rail.generation-activity-drawer { min-height: 320px; }
+}

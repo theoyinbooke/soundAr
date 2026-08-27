@@ -41,6 +41,6 @@ printf 'Running packaged ACE-Step acceptance against soundAr %s.\n' "$VERSION"
   cd "$ROOT/app/src-tauri"
   SOUNDAR_E2E_RUNTIME_ROOT="$RUNTIME_ROOT" \
   SOUNDAR_E2E_PYTHON="$PYTHON" \
-    cargo test --locked packaged_runtime_generates_playable_lyric_music_through_native_bridge \
+    cargo test --locked packaged_runtime_generates_playable_acestep_studio_music_through_native_bridge \
       -- --ignored --nocapture --test-threads=1
 )

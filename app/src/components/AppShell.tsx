@@ -25,6 +25,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { FeatureState, HistoryItem, NavKey, SystemStatus, Theme } from "../types";
 import { BrandLockup } from "./Brand";
 
@@ -64,17 +65,14 @@ const mobilePrimaryKeys = new Set<NavKey>(["generate", "projects", "voices", "hi
 
 function WindowControls() {
   async function minimize() {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
     await getCurrentWindow().minimize();
   }
 
   async function toggleMaximize() {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
     await getCurrentWindow().toggleMaximize();
   }
 
   async function close() {
-    const { getCurrentWindow } = await import("@tauri-apps/api/window");
     await getCurrentWindow().close();
   }
 
@@ -89,6 +87,26 @@ function WindowControls() {
       <button className="window-close" type="button" aria-label="Close window" title="Close" onClick={() => void close()}>
         <X aria-hidden="true" size={13} strokeWidth={1.8} />
       </button>
+    </div>
+  );
+}
+
+const resizeDirections = ["North", "NorthEast", "East", "SouthEast", "South", "SouthWest", "West", "NorthWest"] as const;
+
+function WindowResizeHandles() {
+  function beginResize(direction: (typeof resizeDirections)[number]) {
+    void getCurrentWindow().startResizeDragging(direction);
+  }
+
+  return (
+    <div className="window-resize-handles" aria-hidden="true">
+      {resizeDirections.map((direction) => (
+        <div
+          className={`window-resize-handle resize-${direction.toLowerCase()}`}
+          key={direction}
+          onPointerDown={() => void beginResize(direction)}
+        />
+      ))}
     </div>
   );
 }
@@ -305,6 +323,8 @@ export function AppShell({
         ) : null}
 
         <main className="app-content" ref={contentRef}>{children}</main>
+
+        {runtime === "tauri" ? <WindowResizeHandles /> : null}
 
         {mobileMenuOpen ? (
           <div className="mobile-more-menu" id="mobile-more-menu">

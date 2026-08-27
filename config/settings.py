@@ -49,6 +49,11 @@ class AppSettings:
         except (OSError, json.JSONDecodeError):
             return
 
+        # The catalog is an application resource whose absolute path changes
+        # between development, AppImage, and Debian installations. Persisting
+        # an old path makes upgraded runtimes reconcile against stale model
+        # metadata and can hide newly installed models.
+        data.pop("catalog_path", None)
         for key, value in data.items():
             if hasattr(self, key):
                 setattr(self, key, value)
@@ -63,4 +68,5 @@ class AppSettings:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("settings_path", None)
+        payload.pop("catalog_path", None)
         return payload
