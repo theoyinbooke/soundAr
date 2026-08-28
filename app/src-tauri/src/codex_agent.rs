@@ -432,6 +432,19 @@ pub fn dynamic_tools() -> Value {
     tools
 }
 
+/// Returns only the Video Studio tools supported by the headless control plane.
+pub(crate) fn video_dynamic_tools() -> Value {
+    let mut tools = video_tools::tool_catalog();
+    for tool in &mut tools {
+        if let Some(specification) = tool.as_object_mut() {
+            specification
+                .entry("type".to_string())
+                .or_insert_with(|| Value::String("function".to_string()));
+        }
+    }
+    Value::Array(tools)
+}
+
 fn execute_dynamic_tool(
     runtime: &RuntimeState,
     session: &CodexSession,
@@ -797,7 +810,7 @@ mod tests {
             .expect("tool catalog")
             .iter()
             .all(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("function")));
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 24);
         assert!(names.contains(&"get_studio_state"));
         assert!(names.contains(&"queue_speech_generation"));
         assert!(names.contains(&"queue_music_generation"));
@@ -805,6 +818,8 @@ mod tests {
         assert!(names.contains(&"preview_link"));
         assert!(names.contains(&"import_link"));
         assert!(names.contains(&"analyze_video"));
+        assert!(names.contains(&"edit_video_timeline"));
+        assert!(names.contains(&"add_visual_asset"));
         assert!(names.contains(&"render_video_preview"));
         assert!(names.contains(&"revise_video"));
         assert!(names.contains(&"export_video"));

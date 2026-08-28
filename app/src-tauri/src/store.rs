@@ -4086,6 +4086,7 @@ impl Store {
             lock_token,
             status,
             None,
+            false,
         )
     }
 
@@ -4118,6 +4119,42 @@ impl Store {
             lock_token,
             status,
             Some(required_active_job_id),
+            false,
+        )
+    }
+
+    /// Atomically commits one editorial revision and completes its durable edit job.
+    ///
+    /// This closes the otherwise unavoidable crash/cancellation window between publishing a
+    /// timeline mutation and recording the synchronous editor operation as completed. The same
+    /// active-job, project-lock, and revision predicates are checked inside the write transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_video_manifest_and_complete_job(
+        &self,
+        project_id: &str,
+        expected_revision: i64,
+        manifest: &Value,
+        actor: &str,
+        reason: &str,
+        lock_token: &str,
+        status: Option<&str>,
+        required_active_job_id: &str,
+    ) -> Result<Value, String> {
+        if required_active_job_id.trim().is_empty() || required_active_job_id.len() > 256 {
+            return Err(
+                "video.parent_job_inactive: The durable editor job is missing or invalid".into(),
+            );
+        }
+        self.commit_video_manifest_guarded(
+            project_id,
+            expected_revision,
+            manifest,
+            actor,
+            reason,
+            lock_token,
+            status,
+            Some(required_active_job_id),
+            true,
         )
     }
 
@@ -4132,6 +4169,7 @@ impl Store {
         lock_token: &str,
         status: Option<&str>,
         required_active_job_id: Option<&str>,
+        complete_required_job: bool,
     ) -> Result<Value, String> {
         if !manifest.is_object() {
             return Err(
@@ -4277,10 +4315,41 @@ impl Store {
                 params![Uuid::new_v4().simple().to_string(), project_id, version_id, json!({"actor": actor, "reason": reason, "base_revision": current_revision, "revision": next_revision}).to_string(), timestamp],
             )
             .map_err(|error| format!("video.store_failed: Could not record the timeline revision: {error}"))?;
+        if complete_required_job {
+            let required_job_id = required_active_job_id.ok_or_else(|| {
+                "video.parent_job_inactive: The durable editor job is missing".to_string()
+            })?;
+            let changed = transaction
+                .execute(
+                    "UPDATE jobs
+                     SET status = 'completed', progress = 1, error = NULL, updated_at = ?2
+                     WHERE id = ?1 AND status IN ('queued', 'preparing', 'running')",
+                    params![required_job_id, timestamp],
+                )
+                .map_err(|error| {
+                    format!("video.store_failed: Could not complete the editor job: {error}")
+                })?;
+            if changed != 1 {
+                return Err(
+                    "video.parent_job_inactive: The durable editor job is no longer active".into(),
+                );
+            }
+            insert_job_event(
+                &transaction,
+                required_job_id,
+                "completed",
+                1.0,
+                None,
+                &timestamp,
+            )?;
+        }
         transaction.commit().map_err(|error| {
             format!("video.store_failed: Could not commit the timeline revision: {error}")
         })?;
         drop(connection);
+        if let Some(required_job_id) = required_active_job_id.filter(|_| complete_required_job) {
+            self.clear_job_preview(required_job_id)?;
+        }
         self.get_video_project(project_id)?
             .ok_or_else(|| "video.store_failed: The revised project could not be reloaded".into())
     }

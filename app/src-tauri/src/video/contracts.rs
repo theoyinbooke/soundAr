@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use super::visuals::{VisualAsset, VisualLayer, MAX_VISUAL_ASSETS, MAX_VISUAL_LAYERS};
+
 pub const VIDEO_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const SHA256_HEX_LENGTH: usize = 64;
 pub const NORMALIZED_BASIS_POINTS: i32 = 10_000;
@@ -1446,6 +1448,10 @@ pub struct VideoProjectManifest {
     pub frame_rate: RationalFrameRate,
     pub timeline_duration_us: Microseconds,
     pub source_assets: Vec<SourceAsset>,
+    #[serde(default)]
+    pub visual_assets: Vec<VisualAsset>,
+    #[serde(default)]
+    pub visual_layers: Vec<VisualLayer>,
     pub rights_confirmations: Vec<RightsConfirmation>,
     pub transcript: Option<TranscriptVersion>,
     pub candidates: Vec<ClipCandidate>,
@@ -1483,6 +1489,8 @@ impl VideoProjectManifest {
             frame_rate,
             timeline_duration_us,
             source_assets: Vec::new(),
+            visual_assets: Vec::new(),
+            visual_layers: Vec::new(),
             rights_confirmations: Vec::new(),
             transcript: None,
             candidates: Vec::new(),
@@ -1537,6 +1545,28 @@ impl Validate for VideoProjectManifest {
             "source_assets",
         )?;
         validate_unique_ids(
+            self.visual_assets.iter().map(|asset| asset.id.as_str()),
+            "visual_assets",
+        )?;
+        validate_unique_ids(
+            self.visual_layers.iter().map(|layer| layer.id.as_str()),
+            "visual_layers",
+        )?;
+        if self.visual_assets.len() > MAX_VISUAL_ASSETS {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidAsset,
+                format!("a project supports at most {MAX_VISUAL_ASSETS} distinct visual assets"),
+            )
+            .at("visual_assets"));
+        }
+        if self.visual_layers.len() > MAX_VISUAL_LAYERS {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidLayout,
+                format!("a project supports at most {MAX_VISUAL_LAYERS} visual layers"),
+            )
+            .at("visual_layers"));
+        }
+        validate_unique_ids(
             self.rights_confirmations
                 .iter()
                 .map(|rights| rights.id.as_str()),
@@ -1579,6 +1609,11 @@ impl Validate for VideoProjectManifest {
 
         let source_by_id: BTreeMap<&str, &SourceAsset> = self
             .source_assets
+            .iter()
+            .map(|asset| (asset.id.as_str(), asset))
+            .collect();
+        let visual_by_id: BTreeMap<&str, &VisualAsset> = self
+            .visual_assets
             .iter()
             .map(|asset| (asset.id.as_str(), asset))
             .collect();
@@ -1629,6 +1664,50 @@ impl Validate for VideoProjectManifest {
                         "rights record is not bound to the imported source URI",
                     )
                     .at("source_assets.rights_confirmation_id"));
+                }
+            }
+        }
+        for asset in &self.visual_assets {
+            asset.validate()?;
+        }
+        for layer in &self.visual_layers {
+            layer.validate()?;
+            if !visual_by_id.contains_key(layer.asset_id.as_str()) {
+                return Err(VideoError::new(
+                    VideoErrorCode::MissingReference,
+                    format!("visual layer {} references a missing asset", layer.id),
+                )
+                .at("visual_layers.asset_id"));
+            }
+            validate_range_within(
+                layer.range,
+                self.timeline_duration_us,
+                VideoErrorCode::InvalidLayout,
+                "visual_layers.range",
+            )?;
+            if let Some(scene_id) = layer.scene_id.as_deref() {
+                let scene = scene_by_id.get(scene_id).ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::MissingReference,
+                        format!("visual layer {} references a missing scene", layer.id),
+                    )
+                    .at("visual_layers.scene_id")
+                })?;
+                let scene_range = TimeRange::new(
+                    scene.timeline_start_us.0,
+                    scene
+                        .timeline_start_us
+                        .checked_add(scene.timeline_duration_us)?
+                        .0,
+                )?;
+                if layer.range.start_us < scene_range.start_us
+                    || layer.range.end_us > scene_range.end_us
+                {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidLayout,
+                        "a scene visual layer must remain within its scene timeline range",
+                    )
+                    .at("visual_layers.range"));
                 }
             }
         }
@@ -2086,7 +2165,11 @@ pub(crate) fn validate_sha256(value: &str, field: &str, code: VideoErrorCode) ->
     Ok(())
 }
 
-fn validate_nonempty(value: &str, field: &str, maximum_length: usize) -> VideoResult<()> {
+pub(crate) fn validate_nonempty(
+    value: &str,
+    field: &str,
+    maximum_length: usize,
+) -> VideoResult<()> {
     if value.trim().is_empty() || value.len() > maximum_length {
         return Err(VideoError::new(
             VideoErrorCode::InvalidIdentifier,
@@ -2115,7 +2198,7 @@ fn validate_language_tag(value: &str, field: &str) -> VideoResult<()> {
     Ok(())
 }
 
-fn validate_timestamp_text(value: &str, field: &str) -> VideoResult<()> {
+pub(crate) fn validate_timestamp_text(value: &str, field: &str) -> VideoResult<()> {
     if !value.ends_with('Z') || DateTime::parse_from_rfc3339(value).is_err() {
         return Err(VideoError::new(
             VideoErrorCode::InvalidTimestamp,
@@ -2135,7 +2218,7 @@ const fn gcd_u32(mut left: u32, mut right: u32) -> u32 {
     left
 }
 
-fn validate_managed_path(value: &str, field: &str) -> VideoResult<()> {
+pub(crate) fn validate_managed_path(value: &str, field: &str) -> VideoResult<()> {
     let path = std::path::Path::new(value);
     if value.is_empty()
         || value.len() > 4_096
@@ -2376,6 +2459,8 @@ mod tests {
             frame_rate: RationalFrameRate::FPS_30000_1001,
             timeline_duration_us: Microseconds(3_000_000),
             source_assets: vec![source()],
+            visual_assets: vec![],
+            visual_layers: vec![],
             rights_confirmations: vec![],
             transcript: None,
             candidates: vec![],

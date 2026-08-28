@@ -245,6 +245,43 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             })
         })
         .collect::<Vec<_>>();
+    let visual_assets = manifest
+        .visual_assets
+        .iter()
+        .map(|asset| {
+            json!({
+                "id": asset.id,
+                "mime_type": asset.mime_type.as_mime(),
+                "local_path": managed_path(video_root, &asset.managed_path),
+                "width": asset.width,
+                "height": asset.height,
+                "has_alpha": asset.has_alpha,
+                "size_bytes": asset.size_bytes,
+                "checksum": asset.sha256,
+                "provenance": asset.provenance,
+                "created_at": asset.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let visual_layers = manifest
+        .visual_layers
+        .iter()
+        .map(|layer| {
+            json!({
+                "id": layer.id,
+                "asset_id": layer.asset_id,
+                "scene_id": layer.scene_id,
+                "start_ms": micros_to_millis(layer.range.start_us),
+                "end_ms": micros_to_millis(layer.range.end_us),
+                "fit": layer.fit,
+                "crop": layer.crop,
+                "z_index": layer.z_index,
+                "motion": layer.motion,
+                "transition_in_ms": micros_to_millis(layer.transition_in_us),
+                "transition_out_ms": micros_to_millis(layer.transition_out_us),
+            })
+        })
+        .collect::<Vec<_>>();
     let timeline = present_timeline(&manifest, &caption_pages);
     let revisions = present_revisions(&manifest, &version_id);
     let status = present_status(record.get("status").and_then(Value::as_str));
@@ -290,6 +327,8 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "scenes": scenes,
             "caption_pages": presented_caption_pages,
             "narration_bindings": narration_bindings,
+            "visual_assets": visual_assets,
+            "visual_layers": visual_layers,
             "timeline": timeline,
             "artifacts": artifacts,
             "revisions": revisions,
@@ -621,6 +660,30 @@ fn present_timeline(
             })).collect::<Vec<_>>(),
         }));
     }
+    if !manifest.visual_layers.is_empty() {
+        let title_by_asset = manifest
+            .visual_assets
+            .iter()
+            .map(|asset| (asset.id.as_str(), asset.provenance.producer.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        tracks.push(json!({
+            "kind": "visuals",
+            "items": manifest.visual_layers.iter().map(|layer| json!({
+                "id": layer.id,
+                "track": "visuals",
+                "kind": "clip",
+                "start_ms": micros_to_millis(layer.range.start_us),
+                "end_ms": micros_to_millis(layer.range.end_us),
+                "label": title_by_asset.get(layer.asset_id.as_str()).copied().unwrap_or("Visual"),
+                "scene_id": layer.scene_id,
+                "asset_id": layer.asset_id,
+                "start_bounds": layer.motion.start_bounds,
+                "end_bounds": layer.motion.end_bounds,
+                "fit": layer.fit,
+                "z_index": layer.z_index,
+            })).collect::<Vec<_>>(),
+        }));
+    }
     let source_duration = manifest
         .source_assets
         .iter()
@@ -897,12 +960,15 @@ fn presentation_error(message: impl Into<String>) -> VideoError {
 #[cfg(test)]
 mod tests {
     use super::super::contracts::{
-        AudioMix, CanvasSpec, CaptionCue, LayoutElement, LayoutPlan, NormalizedRect,
-        RationalFrameRate, ReviewState, ReviewedScene, RevisionRecord, TimeRange, TimelineTrack,
-        TrackKind,
+        AudioMix, CanvasSpec, CaptionCue, LayoutElement, LayoutPlan, NormalizedRect, Provenance,
+        ProvenanceKind, RationalFrameRate, ReviewState, ReviewedScene, RevisionRecord, TimeRange,
+        TimelineTrack, TrackKind,
+    };
+    use super::super::visuals::{
+        VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
     };
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn manifest() -> VideoProjectManifest {
         let mut manifest = VideoProjectManifest::new(
@@ -971,6 +1037,108 @@ mod tests {
         assert_eq!(presented["manifest"]["source"]["kind"], "prompt");
         let summary = present_video_project_summary(&record, Path::new("/tmp/video-root")).unwrap();
         assert!(summary.get("manifest").is_none());
+    }
+
+    #[test]
+    fn generated_visuals_project_into_the_authoritative_manifest_and_timeline_lane() {
+        let mut manifest = manifest();
+        manifest.visual_assets.push(VisualAsset {
+            id: "visual-illustration".into(),
+            managed_path: "projects/video-project/visuals/visual-illustration.png".into(),
+            sha256: "a".repeat(64),
+            mime_type: VisualMimeType::Png,
+            width: 1080,
+            height: 1920,
+            has_alpha: true,
+            size_bytes: 4096,
+            provenance: Provenance {
+                kind: ProvenanceKind::GeneratedLocally,
+                original_uri: None,
+                imported_at: "2026-08-27T20:00:00.000Z".into(),
+                producer: "codex-imagegen".into(),
+                producer_version: Some("1".into()),
+                metadata: BTreeMap::from([
+                    ("generation_id".into(), json!("image-generation-one")),
+                    (
+                        "prompt".into(),
+                        json!("A restrained editorial illustration"),
+                    ),
+                ]),
+            },
+            created_at: "2026-08-27T20:00:00.000Z".into(),
+        });
+        manifest.visual_layers.push(VisualLayer {
+            id: "visual-layer-illustration".into(),
+            asset_id: "visual-illustration".into(),
+            scene_id: None,
+            range: TimeRange::new(500_000, 4_500_000).unwrap(),
+            fit: VisualFit::Cover,
+            crop: None,
+            z_index: 3,
+            motion: VisualMotion {
+                start_bounds: NormalizedRect {
+                    x_bp: 0,
+                    y_bp: 0,
+                    width_bp: 10_000,
+                    height_bp: 10_000,
+                },
+                end_bounds: NormalizedRect {
+                    x_bp: 250,
+                    y_bp: 250,
+                    width_bp: 9_500,
+                    height_bp: 9_500,
+                },
+                start_opacity_milli: 1_000,
+                end_opacity_milli: 1_000,
+                start_rotation_milli_degrees: 0,
+                end_rotation_milli_degrees: 0,
+                easing: VisualEasing::EaseInOut,
+            },
+            transition_in_us: Microseconds(250_000),
+            transition_out_us: Microseconds(250_000),
+        });
+        manifest.validate_strict().unwrap();
+        let record = json!({
+            "id": "video-project",
+            "name": "Thoughtful reel",
+            "revision": 1,
+            "status": "ready",
+            "created_at": "2026-08-27T20:00:00Z",
+            "updated_at": "2026-08-27T20:01:00Z",
+            "version": {"id": "version-1"},
+            "manifest": manifest,
+            "assets": [],
+            "outputs": [],
+        });
+
+        let presented = present_video_project(&record, Path::new("/tmp/video-root")).unwrap();
+        let visual = &presented["manifest"]["visual_assets"][0];
+        assert_eq!(visual["id"], "visual-illustration");
+        assert_eq!(visual["mime_type"], "image/png");
+        assert_eq!(visual["checksum"], "a".repeat(64));
+        assert_eq!(visual["provenance"]["kind"], "generated_locally");
+        assert_eq!(
+            visual["local_path"],
+            "/tmp/video-root/projects/video-project/visuals/visual-illustration.png"
+        );
+        let layer = &presented["manifest"]["visual_layers"][0];
+        assert_eq!(layer["id"], "visual-layer-illustration");
+        assert_eq!(layer["start_ms"], 500);
+        assert_eq!(layer["end_ms"], 4_500);
+        assert_eq!(layer["motion"]["easing"], "ease_in_out");
+
+        let tracks = presented["manifest"]["timeline"]["tracks"]
+            .as_array()
+            .unwrap();
+        let visuals = tracks
+            .iter()
+            .find(|track| track["kind"] == "visuals")
+            .expect("authoritative visuals lane");
+        assert_eq!(visuals["items"].as_array().unwrap().len(), 1);
+        assert_eq!(visuals["items"][0]["asset_id"], "visual-illustration");
+        assert_eq!(visuals["items"][0]["label"], "codex-imagegen");
+        assert_eq!(visuals["items"][0]["start_ms"], 500);
+        assert_eq!(visuals["items"][0]["end_ms"], 4_500);
     }
 
     #[test]

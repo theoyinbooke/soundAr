@@ -54,6 +54,8 @@ pub(crate) enum VideoAgentOperationKind {
     CreateVideoProject,
     ListVideoProjects,
     GetVideoProject,
+    EditVideoTimeline,
+    AddVisualAsset,
     RenderVideoPreview,
     ReviseVideo,
     ExportVideo,
@@ -74,6 +76,8 @@ impl VideoAgentOperationKind {
             Self::CreateVideoProject => "create_video_project",
             Self::ListVideoProjects => "list_video_projects",
             Self::GetVideoProject => "get_video_project",
+            Self::EditVideoTimeline => "edit_video_timeline",
+            Self::AddVisualAsset => "add_visual_asset",
             Self::RenderVideoPreview => "render_video_preview",
             Self::ReviseVideo => "revise_video",
             Self::ExportVideo => "export_video",
@@ -90,7 +94,10 @@ impl VideoAgentOperationKind {
             | Self::ImportLink
             | Self::CreateVideoProject => VideoProductionPhase::Source,
             Self::AnalyzeVideo => VideoProductionPhase::Analyze,
-            Self::PlanVideo | Self::ReviseVideo => VideoProductionPhase::Review,
+            Self::PlanVideo
+            | Self::ReviseVideo
+            | Self::EditVideoTimeline
+            | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
             Self::ExportVideo | Self::ExportPublishPackage => VideoProductionPhase::Export,
             Self::ListVideoProjects
@@ -112,6 +119,8 @@ pub(crate) enum VideoAgentOperation {
     CreateVideoProject(CreateVideoProjectRequest),
     ListVideoProjects(EmptyRequest),
     GetVideoProject(GetVideoProjectRequest),
+    EditVideoTimeline(video::VideoTimelineEditRequest),
+    AddVisualAsset(video::AddVisualAssetRequest),
     RenderVideoPreview(RenderVideoPreviewRequest),
     ReviseVideo(ReviseVideoRequest),
     ExportVideo(ExportVideoRequest),
@@ -131,6 +140,8 @@ impl VideoAgentOperation {
             Self::CreateVideoProject(_) => VideoAgentOperationKind::CreateVideoProject,
             Self::ListVideoProjects(_) => VideoAgentOperationKind::ListVideoProjects,
             Self::GetVideoProject(_) => VideoAgentOperationKind::GetVideoProject,
+            Self::EditVideoTimeline(_) => VideoAgentOperationKind::EditVideoTimeline,
+            Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
             Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
             Self::ReviseVideo(_) => VideoAgentOperationKind::ReviseVideo,
             Self::ExportVideo(_) => VideoAgentOperationKind::ExportVideo,
@@ -151,6 +162,8 @@ impl VideoAgentOperation {
             "create_video_project" => Self::CreateVideoProject(decode(arguments)?),
             "list_video_projects" => Self::ListVideoProjects(decode(arguments)?),
             "get_video_project" => Self::GetVideoProject(decode(arguments)?),
+            "edit_video_timeline" => Self::EditVideoTimeline(decode(arguments)?),
+            "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
             "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
             "revise_video" => Self::ReviseVideo(decode(arguments)?),
             "export_video" => Self::ExportVideo(decode(arguments)?),
@@ -293,6 +306,44 @@ impl VideoAgentOperation {
                 Ok(())
             }
             Self::GetVideoProject(request) => require_text(&request.project_id, "project_id"),
+            Self::EditVideoTimeline(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.base_version_id, "base_version_id")?;
+                require_text(&request.operation_id, "operation_id")?;
+                if request.operations.is_empty() || request.operations.len() > 100 {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "operations",
+                        "Submit between one and one hundred ordered timeline edits",
+                    ));
+                }
+                Ok(())
+            }
+            Self::AddVisualAsset(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.expected_version_id, "expected_version_id")?;
+                require_text(&request.operation_id, "operation_id")?;
+                require_text(&request.actor, "actor")?;
+                if request.expected_revision < 1 {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "expected_revision",
+                        "Visual edits require a positive current project revision",
+                    ));
+                }
+                match &request.origin {
+                    video::VisualAssetOrigin::UserSelected { user_confirmed } => {
+                        require_confirmation(*user_confirmed, "local image import")?;
+                    }
+                    video::VisualAssetOrigin::GeneratedLocally {
+                        producer,
+                        generation_id,
+                        ..
+                    } => {
+                        require_text(producer, "origin.producer")?;
+                        require_text(generation_id, "origin.generation_id")?;
+                    }
+                }
+                Ok(())
+            }
             Self::RenderVideoPreview(request) => {
                 require_text(&request.project_id, "project_id")?;
                 if let Some(version) = request.version_id.as_deref() {
@@ -963,6 +1014,8 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "create_video_project" => VideoAgentOperationKind::CreateVideoProject,
         "list_video_projects" => VideoAgentOperationKind::ListVideoProjects,
         "get_video_project" => VideoAgentOperationKind::GetVideoProject,
+        "edit_video_timeline" => VideoAgentOperationKind::EditVideoTimeline,
+        "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
         "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
         "revise_video" => VideoAgentOperationKind::ReviseVideo,
         "export_video" => VideoAgentOperationKind::ExportVideo,
@@ -981,6 +1034,8 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::AnalyzeVideo
                 | VideoAgentOperationKind::PlanVideo
                 | VideoAgentOperationKind::CreateVideoProject
+                | VideoAgentOperationKind::EditVideoTimeline
+                | VideoAgentOperationKind::AddVisualAsset
                 | VideoAgentOperationKind::RenderVideoPreview
                 | VideoAgentOperationKind::ReviseVideo
                 | VideoAgentOperationKind::ExportVideo
@@ -1116,6 +1171,16 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
             object_schema(&["project_id"], properties([("project_id", string("Video Studio project id"))])),
         ),
         tool(
+            "edit_video_timeline",
+            "Apply source-clock-safe split, trim, reorder, or exact merge operations to one immutable project version. Use one stable operation_id for retries. Requires Studio or Full access.",
+            timeline_edit_schema(),
+        ),
+        tool(
+            "add_visual_asset",
+            "Import one user-selected or locally generated PNG, JPEG, or WebP and place it as a durable animated layer on the exact project clock. Generated images must include their producing tool and generation id. Requires Studio or Full access.",
+            visual_asset_schema(),
+        ),
+        tool(
             "render_video_preview",
             "Render or reuse a fast low-resolution preview for the requested project version. Returns a durable job/result and playable artifact when complete. Requires Studio or Full access.",
             object_schema(
@@ -1215,6 +1280,242 @@ fn nullable_bounded_string(description: &str, maximum: usize) -> Value {
 
 fn true_schema(description: &str) -> Value {
     json!({ "type": "boolean", "const": true, "description": description })
+}
+
+fn normalized_visual_bounds_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["x_bp","y_bp","width_bp","height_bp"],
+        "properties":{
+            "x_bp":{"type":"integer","minimum":0,"maximum":9999},
+            "y_bp":{"type":"integer","minimum":0,"maximum":9999},
+            "width_bp":{"type":"integer","minimum":1,"maximum":10000},
+            "height_bp":{"type":"integer","minimum":1,"maximum":10000}
+        }
+    })
+}
+
+fn visual_range_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["start_us","end_us"],
+        "properties":{
+            "start_us":{"type":"integer","minimum":0},
+            "end_us":{"type":"integer","minimum":1}
+        }
+    })
+}
+
+fn visual_motion_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["start_bounds","end_bounds","start_opacity_milli","end_opacity_milli","start_rotation_milli_degrees","end_rotation_milli_degrees","easing"],
+        "properties":{
+            "start_bounds":normalized_visual_bounds_schema(),
+            "end_bounds":normalized_visual_bounds_schema(),
+            "start_opacity_milli":{"type":"integer","minimum":0,"maximum":1000},
+            "end_opacity_milli":{"type":"integer","minimum":0,"maximum":1000},
+            "start_rotation_milli_degrees":{"type":"integer","const":0},
+            "end_rotation_milli_degrees":{"type":"integer","const":0},
+            "easing":{"type":"string","enum":["linear","ease_in_out"]}
+        }
+    })
+}
+
+fn timeline_edit_schema() -> Value {
+    object_schema(
+        &[
+            "project_id",
+            "expected_revision",
+            "base_version_id",
+            "operation_id",
+            "operations",
+        ],
+        properties([
+            ("project_id", string("Video Studio project id")),
+            (
+                "expected_revision",
+                json!({"type":"integer","minimum":1,"description":"Exact current project revision"}),
+            ),
+            (
+                "base_version_id",
+                string("Exact current immutable version id"),
+            ),
+            (
+                "operation_id",
+                string("Stable idempotency identifier for this ordered edit batch"),
+            ),
+            (
+                "operations",
+                json!({
+                    "type":"array",
+                    "minItems":1,
+                    "maxItems":100,
+                    "items": {
+                        "oneOf": [
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","scene_id","at_timeline_us"],
+                                "properties":{
+                                    "type":{"const":"split_scene"},
+                                    "scene_id":{"type":"string","minLength":1},
+                                    "at_timeline_us":{"type":"integer","minimum":0}
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","scene_id","source_start_us","source_end_us"],
+                                "properties":{
+                                    "type":{"const":"trim_scene"},
+                                    "scene_id":{"type":"string","minLength":1},
+                                    "source_start_us":{"type":"integer","minimum":0},
+                                    "source_end_us":{"type":"integer","minimum":1}
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","scene_id","to_index"],
+                                "properties":{
+                                    "type":{"const":"reorder_scene"},
+                                    "scene_id":{"type":"string","minLength":1},
+                                    "to_index":{"type":"integer","minimum":0}
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","first_scene_id","second_scene_id"],
+                                "properties":{
+                                    "type":{"const":"merge_scenes"},
+                                    "first_scene_id":{"type":"string","minLength":1},
+                                    "second_scene_id":{"type":"string","minLength":1}
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","layer_id","scene_id","range","fit","crop","z_index","motion","transition_in_us","transition_out_us"],
+                                "properties":{
+                                    "type":{"const":"update_visual_layer"},
+                                    "layer_id":{"type":"string","minLength":1},
+                                    "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}]},
+                                    "range":visual_range_schema(),
+                                    "fit":{"type":"string","enum":["cover","contain","stretch"]},
+                                    "crop":{"oneOf":[normalized_visual_bounds_schema(),{"type":"null"}]},
+                                    "z_index":{"type":"integer","minimum":-32768,"maximum":32767},
+                                    "motion":visual_motion_schema(),
+                                    "transition_in_us":{"type":"integer","minimum":0},
+                                    "transition_out_us":{"type":"integer","minimum":0}
+                                }
+                            }
+                        ]
+                    }
+                }),
+            ),
+        ]),
+    )
+}
+
+fn visual_asset_schema() -> Value {
+    object_schema(
+        &[
+            "project_id",
+            "expected_revision",
+            "expected_version_id",
+            "operation_id",
+            "source_path",
+            "actor",
+            "origin",
+            "range",
+            "fit",
+            "z_index",
+            "motion",
+            "transition_in_us",
+            "transition_out_us",
+        ],
+        properties([
+            ("project_id", string("Video Studio project id")),
+            (
+                "expected_revision",
+                json!({"type":"integer","minimum":1,"description":"Exact current project revision"}),
+            ),
+            (
+                "expected_version_id",
+                string("Exact current immutable version id"),
+            ),
+            (
+                "operation_id",
+                string("Stable idempotency identifier for this visual import and placement"),
+            ),
+            (
+                "source_path",
+                string("Local PNG, JPEG, or WebP selected by the user or produced by the current agent workflow"),
+            ),
+            ("actor", string("Auditable local actor name")),
+            (
+                "origin",
+                json!({
+                    "oneOf":[
+                        {
+                            "type":"object",
+                            "additionalProperties":false,
+                            "required":["kind","user_confirmed"],
+                            "properties":{
+                                "kind":{"const":"user_selected"},
+                                "user_confirmed":{"type":"boolean","const":true,"description":"True only after the user selected or explicitly authorized this exact local image"}
+                            }
+                        },
+                        {
+                            "type":"object",
+                            "additionalProperties":false,
+                            "required":["kind","producer","generation_id"],
+                            "properties":{
+                                "kind":{"const":"generated_locally"},
+                                "producer":{"type":"string","minLength":1,"maxLength":256},
+                                "producer_version":{"type":["string","null"],"minLength":1,"maxLength":128},
+                                "generation_id":{"type":"string","minLength":1,"maxLength":256}
+                            }
+                        }
+                    ]
+                }),
+            ),
+            (
+                "scene_id",
+                nullable_string("Optional scene that owns this visual layer"),
+            ),
+            (
+                "range",
+                visual_range_schema(),
+            ),
+            (
+                "fit",
+                json!({"type":"string","enum":["cover","contain","stretch"]}),
+            ),
+            (
+                "crop",
+                json!({"oneOf":[normalized_visual_bounds_schema(),{"type":"null"}]}),
+            ),
+            (
+                "z_index",
+                json!({"type":"integer","minimum":-32768,"maximum":32767}),
+            ),
+            ("motion", visual_motion_schema()),
+            (
+                "transition_in_us",
+                json!({"type":"integer","minimum":0}),
+            ),
+            (
+                "transition_out_us",
+                json!({"type":"integer","minimum":0}),
+            ),
+        ]),
+    )
 }
 
 fn revise_schema() -> Value {
@@ -1438,8 +1739,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 14);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 14);
+        assert_eq!(names.len(), 16);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 16);
         for required in [
             "preview_link",
             "import_link",
@@ -1448,6 +1749,8 @@ mod tests {
             "create_video_project",
             "list_video_projects",
             "get_video_project",
+            "edit_video_timeline",
+            "add_visual_asset",
             "render_video_preview",
             "revise_video",
             "export_video",
@@ -1462,6 +1765,154 @@ mod tests {
         assert!(catalog
             .iter()
             .all(|tool| tool["inputSchema"]["additionalProperties"] == false));
+    }
+
+    #[test]
+    fn timeline_edit_tool_exposes_and_parses_the_exact_source_clock_union() {
+        let operation = VideoAgentOperation::parse(
+            "edit_video_timeline",
+            json!({
+                "project_id":"project-7",
+                "expected_revision":4,
+                "base_version_id":"version-4",
+                "operation_id":"operation-7",
+                "operations":[
+                    {"type":"split_scene","scene_id":"scene-1","at_timeline_us":500000},
+                    {"type":"reorder_scene","scene_id":"scene-2","to_index":0},
+                    {
+                        "type":"update_visual_layer",
+                        "layer_id":"visual-layer-1",
+                        "scene_id":"scene-1",
+                        "range":{"start_us":0,"end_us":1000000},
+                        "fit":"cover",
+                        "crop":null,
+                        "z_index":4,
+                        "motion":{
+                            "start_bounds":{"x_bp":0,"y_bp":0,"width_bp":10000,"height_bp":10000},
+                            "end_bounds":{"x_bp":500,"y_bp":500,"width_bp":9000,"height_bp":9000},
+                            "start_opacity_milli":1000,
+                            "end_opacity_milli":1000,
+                            "start_rotation_milli_degrees":0,
+                            "end_rotation_milli_degrees":0,
+                            "easing":"ease_in_out"
+                        },
+                        "transition_in_us":150000,
+                        "transition_out_us":150000
+                    }
+                ]
+            }),
+        )
+        .expect("timeline edit request");
+        assert_eq!(operation.kind(), VideoAgentOperationKind::EditVideoTimeline);
+
+        let schema = tool_catalog()
+            .into_iter()
+            .find(|tool| tool["name"] == "edit_video_timeline")
+            .expect("timeline edit schema");
+        assert_eq!(schema["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            schema["inputSchema"]["properties"]["operations"]["maxItems"],
+            100
+        );
+        assert_eq!(
+            schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+
+        let error = VideoAgentOperation::parse(
+            "edit_video_timeline",
+            json!({
+                "project_id":"project-7",
+                "expected_revision":4,
+                "base_version_id":"version-4",
+                "operation_id":"operation-7",
+                "operations":[],
+                "unexpected":true
+            }),
+        )
+        .expect_err("unknown fields fail closed");
+        assert_eq!(error.code, "video.agent_invalid_arguments");
+    }
+
+    #[test]
+    fn visual_asset_tool_exposes_generated_provenance_motion_and_exact_clock() {
+        let operation = VideoAgentOperation::parse(
+            "add_visual_asset",
+            json!({
+                "project_id":"project-visual",
+                "expected_revision":3,
+                "expected_version_id":"version-3",
+                "operation_id":"visual-operation-1",
+                "source_path":"/tmp/generated-illustration.png",
+                "actor":"codex-video-agent",
+                "origin":{
+                    "kind":"generated_locally",
+                    "producer":"codex-image-tool",
+                    "producer_version":"1",
+                    "generation_id":"generation-1"
+                },
+                "scene_id":"scene-1",
+                "range":{"start_us":0,"end_us":2000000},
+                "fit":"contain",
+                "crop":null,
+                "z_index":4,
+                "motion":{
+                    "start_bounds":{"x_bp":1000,"y_bp":2000,"width_bp":8000,"height_bp":4500},
+                    "end_bounds":{"x_bp":200,"y_bp":1500,"width_bp":9600,"height_bp":5400},
+                    "start_opacity_milli":1000,
+                    "end_opacity_milli":1000,
+                    "start_rotation_milli_degrees":0,
+                    "end_rotation_milli_degrees":0,
+                    "easing":"ease_in_out"
+                },
+                "transition_in_us":150000,
+                "transition_out_us":150000
+            }),
+        )
+        .expect("generated visual request");
+        assert_eq!(operation.kind(), VideoAgentOperationKind::AddVisualAsset);
+        let schema = tool_catalog()
+            .into_iter()
+            .find(|tool| tool["name"] == "add_visual_asset")
+            .expect("visual asset schema");
+        assert_eq!(schema["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            schema["inputSchema"]["properties"]["origin"]["oneOf"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        let error = VideoAgentOperation::parse(
+            "add_visual_asset",
+            json!({
+                "project_id":"project-visual",
+                "expected_revision":3,
+                "expected_version_id":"version-3",
+                "operation_id":"visual-operation-2",
+                "source_path":"/tmp/user-photo.png",
+                "actor":"codex-video-agent",
+                "origin":{"kind":"user_selected","user_confirmed":false},
+                "range":{"start_us":0,"end_us":1000000},
+                "fit":"cover",
+                "z_index":1,
+                "motion":{
+                    "start_bounds":{"x_bp":0,"y_bp":0,"width_bp":10000,"height_bp":10000},
+                    "end_bounds":{"x_bp":0,"y_bp":0,"width_bp":10000,"height_bp":10000},
+                    "start_opacity_milli":1000,
+                    "end_opacity_milli":1000,
+                    "start_rotation_milli_degrees":0,
+                    "end_rotation_milli_degrees":0,
+                    "easing":"linear"
+                },
+                "transition_in_us":0,
+                "transition_out_us":0
+            }),
+        )
+        .expect_err("agent cannot assert local image approval");
+        assert_eq!(error.code, "video.approval_required");
+        assert!(error.approval_required);
     }
 
     #[test]

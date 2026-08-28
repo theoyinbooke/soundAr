@@ -326,6 +326,42 @@ pub(crate) fn dispatch_video_operation(
                 None,
             )
         }
+        VideoAgentOperation::EditVideoTimeline(request) => {
+            let result = runtime
+                .video
+                .edit_timeline(request)
+                .map_err(VideoAgentToolError::from)?;
+            let project = video::present_video_project(
+                &result.project,
+                &runtime.store.video_artifacts_root(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                "Timeline edit committed on the source clock; affected render stages were invalidated",
+                project,
+                Some(result.job_id),
+            )
+        }
+        VideoAgentOperation::AddVisualAsset(request) => {
+            let result = runtime
+                .video
+                .add_visual_asset(request)
+                .map_err(VideoAgentToolError::from)?;
+            let project = video::present_video_project(
+                &result.project,
+                &runtime.store.video_artifacts_root(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                "Visual asset imported, placed on the canonical clock, and registered for preview rendering",
+                project,
+                Some(result.job_id),
+            )
+        }
         VideoAgentOperation::RenderVideoPreview(request) => {
             let result = render_project(
                 runtime,
@@ -666,6 +702,51 @@ pub(crate) async fn revise_video(
     })
     .await
     .map_err(|error| format!("video.worker_failed: Revision worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn edit_video_timeline(
+    state: tauri::State<'_, RuntimeState>,
+    request: video::VideoTimelineEditRequest,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = service.edit_timeline(request).map_err(service_error)?;
+        let project = video::present_video_project(&result.project, &video_root)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "project": project,
+            "receipt": result.receipt,
+            "job_id": result.job_id,
+            "replayed": result.replayed,
+        }))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Timeline edit worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn add_video_visual_asset(
+    state: tauri::State<'_, RuntimeState>,
+    request: video::AddVisualAssetRequest,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = service.add_visual_asset(request).map_err(service_error)?;
+        let project = video::present_video_project(&result.project, &video_root)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "project": project,
+            "asset_id": result.asset_id,
+            "layer_id": result.layer_id,
+            "job_id": result.job_id,
+            "replayed": result.replayed,
+        }))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Visual import worker failed: {error}"))?
 }
 
 fn revise_project(

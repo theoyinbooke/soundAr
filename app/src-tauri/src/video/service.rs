@@ -5,18 +5,21 @@
 //! [`Store`] and deterministic media planning to the sibling video modules.
 
 use super::{
-    build_ass_document, build_portrait_command_with_layout, build_proxy_command,
-    build_thumbnail_command, build_timeline_render_plan, build_waveform_command,
-    discover_media_runtime, local_media_input_args, preflight_import_url_destination, probe_media,
-    publish_atomic, sibling_staging_path, terminate_process_group, validate_import_url,
-    write_ass_document_atomic, AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage,
-    CaptionTheme, FfmpegProgressParser, LayoutRole, MediaError, MediaRuntimeStatus, Microseconds,
-    NarrationBinding, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
-    PublicationState, RationalFrameRate, RationalRate, RenderArtifact, RenderArtifactRole,
-    RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass,
-    ResourceRequest, ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis,
-    RightsConfirmation, RuntimeMediaProbe, SourceAsset, SourceAssetKind, TimeRange, TimelineClip,
-    TimelineTrack, TrackKind, Validate, VideoEncoder, VideoError, VideoProjectManifest,
+    apply_timeline_edit, build_ass_document, build_portrait_command_with_layout,
+    build_proxy_command, build_thumbnail_command, build_timeline_render_plan,
+    build_waveform_command, discover_media_runtime, local_media_input_args,
+    preflight_import_url_destination, probe_media, publish_atomic, sibling_staging_path,
+    terminate_process_group, validate_import_url, write_ass_document_atomic, AdmissionOutcome,
+    AssemblyOptions, CacheKeyBuilder, CacheStage, CaptionTheme, FfmpegProgressParser, LayoutRole,
+    MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance,
+    ProvenanceKind, PublicHttpsProxy, PublicationState, RationalFrameRate, RationalRate,
+    RenderArtifact, RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile,
+    RenderWorkloadClass, ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord,
+    RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, SourceAsset,
+    SourceAssetKind, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder,
+    VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
+    VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_VISUAL_ASSET_BYTES,
+    MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
 };
 use crate::store::Store;
 use chrono::{SecondsFormat, Utc};
@@ -556,6 +559,63 @@ pub struct VideoJobResult {
     pub project_id: String,
     pub job: Value,
     pub project: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TimelineEditServiceResult {
+    pub project: Value,
+    pub receipt: VideoTimelineChangeReceipt,
+    pub job_id: String,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VisualAssetOrigin {
+    UserSelected {
+        /// Native callers set this only after the file chooser returns; agent callers set it only
+        /// after the user explicitly asked to import that exact local image.
+        user_confirmed: bool,
+    },
+    GeneratedLocally {
+        producer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_version: Option<String>,
+        generation_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AddVisualAssetRequest {
+    pub project_id: String,
+    pub expected_revision: i64,
+    pub expected_version_id: String,
+    pub operation_id: String,
+    pub source_path: PathBuf,
+    pub actor: String,
+    pub origin: VisualAssetOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
+    pub range: TimeRange,
+    pub fit: VisualFit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<super::NormalizedRect>,
+    pub z_index: i16,
+    pub motion: VisualMotion,
+    pub transition_in_us: Microseconds,
+    pub transition_out_us: Microseconds,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AddVisualAssetResult {
+    pub project: Value,
+    pub asset_id: String,
+    pub layer_id: String,
+    pub job_id: String,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -2584,20 +2644,34 @@ fn ensure_path_in_root(root: &Path, path: &Path) -> ServiceResult<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageInspection {
+    mime_type: VisualMimeType,
+    width: u32,
+    height: u32,
+    has_alpha: bool,
+    size_bytes: u64,
+}
+
 fn validate_image_file(path: &Path) -> Result<(), MediaError> {
+    inspect_image_file(path).map(|_| ())
+}
+
+fn inspect_image_file(path: &Path) -> Result<ImageInspection, MediaError> {
     let metadata = fs::metadata(path).map_err(|error| {
         MediaError::new("image_not_found", "The generated image could not be opened")
             .detail(error.to_string())
     })?;
-    if !metadata.is_file() || metadata.len() < 16 {
+    if !metadata.is_file() || metadata.len() < 16 || metadata.len() > MAX_VISUAL_ASSET_BYTES {
         return Err(MediaError::new(
             "invalid_image",
-            "The generated image is empty or invalid",
+            "The image is empty or exceeds the supported 256 MiB limit",
         ));
     }
-    let mut header = [0_u8; 12];
-    File::open(path)
-        .and_then(|mut file| file.read_exact(&mut header))
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
         .map_err(|error| {
             MediaError::new(
                 "invalid_image",
@@ -2605,15 +2679,177 @@ fn validate_image_file(path: &Path) -> Result<(), MediaError> {
             )
             .detail(error.to_string())
         })?;
-    let png = header.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
-    let jpeg = header.starts_with(&[0xff, 0xd8, 0xff]);
-    if !png && !jpeg {
+    inspect_image_reader(&mut file, metadata.len())
+}
+
+fn inspect_image_reader(file: &mut File, size_bytes: u64) -> Result<ImageInspection, MediaError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        MediaError::new("invalid_image", "The image header could not be read")
+            .detail(error.to_string())
+    })?;
+    let mut header = [0_u8; 30];
+    file.read_exact(&mut header).map_err(|error| {
+        MediaError::new("invalid_image", "The image header is incomplete").detail(error.to_string())
+    })?;
+    let (mime_type, width, height, has_alpha) =
+        if header.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+            if &header[12..16] != b"IHDR" {
+                return Err(MediaError::new(
+                    "invalid_image",
+                    "The PNG image has no canonical IHDR header",
+                ));
+            }
+            let width = u32::from_be_bytes(header[16..20].try_into().expect("PNG width"));
+            let height = u32::from_be_bytes(header[20..24].try_into().expect("PNG height"));
+            (
+                VisualMimeType::Png,
+                width,
+                height,
+                matches!(header[25], 4 | 6),
+            )
+        } else if header.starts_with(&[0xff, 0xd8, 0xff]) {
+            file.seek(SeekFrom::Start(2)).map_err(|error| {
+                MediaError::new("invalid_image", "The JPEG image could not be inspected")
+                    .detail(error.to_string())
+            })?;
+            let (width, height) = inspect_jpeg_dimensions(file)?;
+            (VisualMimeType::Jpeg, width, height, false)
+        } else if header.starts_with(b"RIFF") && &header[8..12] == b"WEBP" {
+            let (width, height, has_alpha) = inspect_webp_dimensions(&header)?;
+            (VisualMimeType::Webp, width, height, has_alpha)
+        } else {
+            return Err(MediaError::new(
+                "invalid_image",
+                "The image is not PNG, JPEG, or WebP data",
+            ));
+        };
+    if width == 0
+        || height == 0
+        || width > MAX_VISUAL_DIMENSION
+        || height > MAX_VISUAL_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_VISUAL_PIXELS
+    {
         return Err(MediaError::new(
-            "invalid_image",
-            "The generated image is not PNG or JPEG data",
+            "invalid_image_dimensions",
+            "The image dimensions exceed the supported visual envelope",
         ));
     }
-    Ok(())
+    Ok(ImageInspection {
+        mime_type,
+        width,
+        height,
+        has_alpha,
+        size_bytes,
+    })
+}
+
+fn inspect_jpeg_dimensions(file: &mut File) -> Result<(u32, u32), MediaError> {
+    let mut inspected = 2_u64;
+    while inspected < 16 * 1024 * 1024 {
+        let mut prefix = [0_u8; 2];
+        file.read_exact(&mut prefix).map_err(|error| {
+            MediaError::new("invalid_image", "The JPEG marker stream is incomplete")
+                .detail(error.to_string())
+        })?;
+        inspected += 2;
+        if prefix[0] != 0xff {
+            return Err(MediaError::new(
+                "invalid_image",
+                "The JPEG marker stream is invalid",
+            ));
+        }
+        let marker = prefix[1];
+        if matches!(marker, 0xd8 | 0xd9) || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        let mut length_bytes = [0_u8; 2];
+        file.read_exact(&mut length_bytes).map_err(|error| {
+            MediaError::new("invalid_image", "The JPEG segment length is incomplete")
+                .detail(error.to_string())
+        })?;
+        inspected += 2;
+        let length = u16::from_be_bytes(length_bytes);
+        if length < 2 {
+            return Err(MediaError::new(
+                "invalid_image",
+                "The JPEG contains an invalid segment length",
+            ));
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            if length < 7 {
+                return Err(MediaError::new(
+                    "invalid_image",
+                    "The JPEG frame header is incomplete",
+                ));
+            }
+            let mut dimensions = [0_u8; 5];
+            file.read_exact(&mut dimensions).map_err(|error| {
+                MediaError::new("invalid_image", "The JPEG dimensions could not be read")
+                    .detail(error.to_string())
+            })?;
+            return Ok((
+                u32::from(u16::from_be_bytes([dimensions[3], dimensions[4]])),
+                u32::from(u16::from_be_bytes([dimensions[1], dimensions[2]])),
+            ));
+        }
+        let skip = i64::from(length) - 2;
+        file.seek(SeekFrom::Current(skip)).map_err(|error| {
+            MediaError::new("invalid_image", "The JPEG segment could not be inspected")
+                .detail(error.to_string())
+        })?;
+        inspected = inspected.saturating_add(u64::from(length) - 2);
+    }
+    Err(MediaError::new(
+        "invalid_image",
+        "The JPEG frame header is missing or exceeds the inspection limit",
+    ))
+}
+
+fn inspect_webp_dimensions(header: &[u8; 30]) -> Result<(u32, u32, bool), MediaError> {
+    match &header[12..16] {
+        b"VP8X" => {
+            let width = 1
+                + u32::from(header[24])
+                + (u32::from(header[25]) << 8)
+                + (u32::from(header[26]) << 16);
+            let height = 1
+                + u32::from(header[27])
+                + (u32::from(header[28]) << 8)
+                + (u32::from(header[29]) << 16);
+            Ok((width, height, header[20] & 0x10 != 0))
+        }
+        b"VP8L" if header[20] == 0x2f => {
+            let width = 1 + u32::from(header[21]) + ((u32::from(header[22]) & 0x3f) << 8);
+            let height = 1
+                + (u32::from(header[22]) >> 6)
+                + (u32::from(header[23]) << 2)
+                + ((u32::from(header[24]) & 0x0f) << 10);
+            Ok((width, height, true))
+        }
+        b"VP8 " if header[23..26] == [0x9d, 0x01, 0x2a] => {
+            let width = u32::from(u16::from_le_bytes([header[26], header[27]]) & 0x3fff);
+            let height = u32::from(u16::from_le_bytes([header[28], header[29]]) & 0x3fff);
+            Ok((width, height, false))
+        }
+        _ => Err(MediaError::new(
+            "invalid_image",
+            "The WebP image header is unsupported or incomplete",
+        )),
+    }
 }
 
 fn force_image_codec(plan: &mut RenderCommandPlan, codec: &str) {
@@ -4911,6 +5147,13 @@ pub(crate) fn invalidated_stages_for_manifest_changes(
                 RevisionStage::FinalRender,
                 RevisionStage::PublishPackage,
             ])
+        } else if path.starts_with("/visual_assets") || path.starts_with("/visual_layers") {
+            BTreeSet::from([
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ])
         } else if path.starts_with("/layout") {
             BTreeSet::from([
                 RevisionStage::Tracking,
@@ -5384,6 +5627,232 @@ mod tests {
                 .get("manifest")
                 .and_then(|value| value.get("revision"))
                 .and_then(Value::as_u64),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn timeline_edit_is_version_bound_atomic_and_idempotent() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        let mut manifest = empty_manifest(&project_id, "Timeline edit contract");
+        manifest.reviewed_scenes = vec![
+            ReviewedScene {
+                id: "scene-one".to_string(),
+                candidate_id: None,
+                source_asset_id: None,
+                source_range: None,
+                timeline_start_us: Microseconds(0),
+                timeline_duration_us: Microseconds(500_000),
+                title: "Opening".to_string(),
+                script: "Opening".to_string(),
+                review_state: ReviewState::Approved,
+                revision: 1,
+            },
+            ReviewedScene {
+                id: "scene-two".to_string(),
+                candidate_id: None,
+                source_asset_id: None,
+                source_range: None,
+                timeline_start_us: Microseconds(500_000),
+                timeline_duration_us: Microseconds(500_000),
+                title: "Close".to_string(),
+                script: "Close".to_string(),
+                review_state: ReviewState::Approved,
+                revision: 1,
+            },
+        ];
+        manifest.validate_strict().expect("editable manifest");
+        let created = workspace
+            .service
+            .create_project(CreateVideoProjectRequest {
+                name: manifest.name.clone(),
+                manifest,
+                actor: "service-test".to_string(),
+                initial_intent: Some("Exercise durable timeline editing".to_string()),
+            })
+            .expect("create editable project");
+        let version_id = created
+            .pointer("/version/id")
+            .and_then(Value::as_str)
+            .expect("initial version")
+            .to_string();
+        let request = VideoTimelineEditRequest {
+            project_id: project_id.clone(),
+            expected_revision: 1,
+            base_version_id: version_id,
+            operation_id: "timeline-operation-reorder".to_string(),
+            operations: vec![super::super::VideoTimelineOperation::ReorderScene {
+                scene_id: "scene-two".to_string(),
+                to_index: 0,
+            }],
+        };
+
+        let edited = workspace
+            .service
+            .edit_timeline(request.clone())
+            .expect("commit timeline edit");
+        assert!(!edited.replayed);
+        assert_eq!(
+            edited.project.get("revision").and_then(Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(
+            edited
+                .project
+                .pointer("/manifest/reviewed_scenes/0/id")
+                .and_then(Value::as_str),
+            Some("scene-two")
+        );
+        assert_eq!(
+            workspace
+                .service
+                .store
+                .get_job(&edited.job_id)
+                .expect("edit job")
+                .and_then(|job| job.get("status").cloned())
+                .and_then(|status| status.as_str().map(str::to_string))
+                .as_deref(),
+            Some("completed")
+        );
+
+        let replay = workspace
+            .service
+            .edit_timeline(request.clone())
+            .expect("adopt exact edit replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.job_id, edited.job_id);
+        assert_eq!(
+            replay.project.get("revision").and_then(Value::as_i64),
+            Some(2),
+            "an idempotent replay must not create another version"
+        );
+
+        let mut conflicting = request;
+        conflicting.operations = vec![super::super::VideoTimelineOperation::ReorderScene {
+            scene_id: "scene-one".to_string(),
+            to_index: 0,
+        }];
+        let error = workspace
+            .service
+            .edit_timeline(conflicting)
+            .expect_err("operation identifiers cannot be reused with different edits");
+        assert_eq!(error.code, "video.idempotency_conflict");
+    }
+
+    #[test]
+    fn generated_visual_is_managed_versioned_idempotent_and_renderable() {
+        let ffmpeg = Path::new("/usr/bin/ffmpeg");
+        if !ffmpeg.is_file() {
+            return;
+        }
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        let created = workspace.create_project(&project_id, "Generated visual contract");
+        let source = workspace.root.join("generated-illustration.png");
+        let status = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x5C7CFA:s=320x180:d=0.04",
+                "-frames:v",
+                "1",
+                "-threads",
+                "1",
+            ])
+            .arg(&source)
+            .status()
+            .expect("generate illustration");
+        assert!(status.success());
+        let version_id = created
+            .pointer("/version/id")
+            .and_then(Value::as_str)
+            .expect("initial version")
+            .to_string();
+        let request = AddVisualAssetRequest {
+            project_id: project_id.clone(),
+            expected_revision: 1,
+            expected_version_id: version_id,
+            operation_id: "generated-illustration-one".to_string(),
+            source_path: source,
+            actor: "codex-video-agent".to_string(),
+            origin: VisualAssetOrigin::GeneratedLocally {
+                producer: "codex-image-tool".to_string(),
+                producer_version: Some("1".to_string()),
+                generation_id: "image-generation-one".to_string(),
+            },
+            scene_id: None,
+            range: TimeRange::new(0, 1_000_000).expect("visual range"),
+            fit: VisualFit::Contain,
+            crop: None,
+            z_index: 1,
+            motion: VisualMotion {
+                start_bounds: NormalizedRect {
+                    x_bp: 1_000,
+                    y_bp: 2_000,
+                    width_bp: 8_000,
+                    height_bp: 4_500,
+                },
+                end_bounds: NormalizedRect {
+                    x_bp: 200,
+                    y_bp: 1_500,
+                    width_bp: 9_600,
+                    height_bp: 5_400,
+                },
+                start_opacity_milli: 1_000,
+                end_opacity_milli: 1_000,
+                start_rotation_milli_degrees: 0,
+                end_rotation_milli_degrees: 0,
+                easing: super::super::VisualEasing::EaseInOut,
+            },
+            transition_in_us: Microseconds(100_000),
+            transition_out_us: Microseconds(100_000),
+        };
+        let added = workspace
+            .service
+            .add_visual_asset(request.clone())
+            .expect("add generated visual");
+        assert!(!added.replayed);
+        assert_eq!(
+            added.project.get("revision").and_then(Value::as_i64),
+            Some(2)
+        );
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            added
+                .project
+                .get("manifest")
+                .cloned()
+                .expect("visual manifest"),
+        )
+        .expect("typed visual manifest");
+        assert_eq!(manifest.visual_assets.len(), 1);
+        assert_eq!(manifest.visual_layers.len(), 1);
+        let managed = workspace
+            .service
+            .resolve_managed_path(&manifest.visual_assets[0].managed_path)
+            .expect("managed visual");
+        assert!(managed.is_file());
+        assert_eq!(fs::metadata(&managed).expect("visual metadata").nlink(), 1);
+        assert_eq!(
+            manifest.visual_assets[0]
+                .provenance
+                .metadata
+                .get("generation_id"),
+            Some(&Value::String("image-generation-one".to_string()))
+        );
+        let replay = workspace
+            .service
+            .add_visual_asset(request)
+            .expect("adopt generated visual replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.asset_id, added.asset_id);
+        assert_eq!(replay.layer_id, added.layer_id);
+        assert_eq!(
+            replay.project.get("revision").and_then(Value::as_i64),
             Some(2)
         );
     }
@@ -10666,6 +11135,644 @@ impl VideoStudioService {
         result
     }
 
+    /// Applies one idempotent batch of source-clock timeline edits and returns the authoritative
+    /// project. The durable edit job, revision CAS, project lock, manifest version, and terminal
+    /// completion are committed as one observable operation; a crash replay adopts the exact
+    /// revision instead of applying the edit twice.
+    pub fn edit_timeline(
+        &self,
+        request: VideoTimelineEditRequest,
+    ) -> ServiceResult<TimelineEditServiceResult> {
+        let request_value = serde_json::to_value(&request).map_err(json_error)?;
+        let idempotency_key = format!(
+            "timeline-edit:{}",
+            sha256_bytes(format!("{}:{}", request.project_id, request.operation_id).as_bytes())
+        );
+        let Some((job_id, created)) = self
+            .store
+            .create_idempotent_job("video_edit_timeline", &idempotency_key, &request_value)
+            .map_err(VideoServiceError::store)?
+        else {
+            return Err(VideoServiceError::new(
+                "video.idempotency_conflict",
+                "This timeline operation identifier was already used with a different request",
+            ));
+        };
+
+        let result = self.edit_timeline_with_job(&request, &job_id, created);
+        if let Err(error) = &result {
+            let _ = self.store.fail_job(&job_id, &error.stable_message());
+        }
+        result
+    }
+
+    fn edit_timeline_with_job(
+        &self,
+        request: &VideoTimelineEditRequest,
+        job_id: &str,
+        created: bool,
+    ) -> ServiceResult<TimelineEditServiceResult> {
+        let reason = format!("Timeline edit {}", request.operation_id);
+        let actor = "video-studio-editor";
+        let existing_job = self
+            .store
+            .get_job(job_id)
+            .map_err(VideoServiceError::store)?
+            .ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.job_not_found",
+                    "The durable timeline edit job was not found",
+                )
+            })?;
+        let existing_status = existing_job
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_store_shape("job.status"))?;
+
+        if !created && matches!(existing_status, "preparing" | "running" | "queued") {
+            return Err(VideoServiceError::new(
+                "video.operation_in_progress",
+                "This timeline edit is already running",
+            )
+            .retryable(true)
+            .details(json!({ "job_id": job_id })));
+        }
+
+        if !created && matches!(existing_status, "failed" | "cancelled") {
+            self.store
+                .resume_video_job(job_id, &["video_edit_timeline"])
+                .map_err(VideoServiceError::store)?;
+        }
+
+        let lock = ProjectLock::acquire(self, &request.project_id, actor)?;
+        let current = self.get_project(&request.project_id)?;
+        let current_manifest: VideoProjectManifest = serde_json::from_value(
+            current
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        current_manifest.validate_strict()?;
+
+        if let Some(record) = current_manifest.revision_history.iter().find(|record| {
+            record.reason == reason
+                && record.actor == actor
+                && record.revision == request.expected_revision.saturating_add(1)
+        }) {
+            if existing_status != "completed" {
+                let completed = self
+                    .store
+                    .complete_job(job_id)
+                    .map_err(VideoServiceError::store)?;
+                if !completed {
+                    return Err(VideoServiceError::new(
+                        "video.cancelled",
+                        "The timeline edit completed before cancellation and is ready to reload",
+                    )
+                    .details(json!({ "job_id": job_id, "project_id": request.project_id })));
+                }
+            }
+            drop(lock);
+            return Ok(TimelineEditServiceResult {
+                project: current,
+                receipt: VideoTimelineChangeReceipt {
+                    project_id: request.project_id.clone(),
+                    expected_revision: request.expected_revision,
+                    base_version_id: request.base_version_id.clone(),
+                    operation_id: request.operation_id.clone(),
+                    changed_paths: record.changed_paths.clone(),
+                    invalidated_stages: record.invalidated_stages.clone(),
+                },
+                job_id: job_id.to_string(),
+                replayed: true,
+            });
+        }
+
+        if existing_status == "completed" {
+            return Err(VideoServiceError::new(
+                "video.integrity_failed",
+                "The completed timeline edit has no matching project revision",
+            ));
+        }
+        self.store
+            .start_job(job_id)
+            .map_err(VideoServiceError::store)?;
+
+        let expectation = ProjectExpectation {
+            revision: i64::try_from(request.expected_revision).map_err(|_| {
+                VideoServiceError::new(
+                    "video.invalid_revision",
+                    "The timeline edit revision is outside the supported range",
+                )
+            })?,
+            version_id: request.base_version_id.clone(),
+        };
+        ensure_project_matches(&current, &expectation)?;
+        let applied = apply_timeline_edit(&current_manifest, request)?;
+        let mut manifest = applied.manifest;
+        let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
+            VideoServiceError::new(
+                "video.revision_overflow",
+                "The timeline edit revision could not be advanced",
+            )
+        })?;
+        manifest.revision = next_revision;
+        manifest.updated_at = utc_now();
+        manifest.revision_history.push(RevisionRecord {
+            id: new_id(),
+            revision: next_revision,
+            parent_id: manifest
+                .revision_history
+                .last()
+                .map(|record| record.id.clone()),
+            actor: actor.to_string(),
+            reason: reason.clone(),
+            changed_paths: applied.receipt.changed_paths.clone(),
+            invalidated_stages: applied.receipt.invalidated_stages.clone(),
+            created_at: manifest.updated_at.clone(),
+        });
+        manifest.validate_strict()?;
+        let manifest_value = serde_json::to_value(&manifest).map_err(json_error)?;
+        let status = current.get("status").and_then(Value::as_str);
+        let project = self
+            .store
+            .commit_video_manifest_and_complete_job(
+                &request.project_id,
+                expectation.revision,
+                &manifest_value,
+                actor,
+                &reason,
+                &lock.token,
+                status,
+                job_id,
+            )
+            .map_err(VideoServiceError::store)?;
+        drop(lock);
+        Ok(TimelineEditServiceResult {
+            project,
+            receipt: applied.receipt,
+            job_id: job_id.to_string(),
+            replayed: false,
+        })
+    }
+
+    /// Imports one user-selected or locally generated still and places it on the canonical
+    /// project clock. The durable operation owns deterministic asset/layer identities, a private
+    /// no-clobber managed copy, project-version CAS, and terminal completion.
+    pub fn add_visual_asset(
+        &self,
+        request: AddVisualAssetRequest,
+    ) -> ServiceResult<AddVisualAssetResult> {
+        let actor = require_text(
+            &request.actor,
+            "video.invalid_actor",
+            "An actor is required",
+        )?;
+        let operation_id = require_text(
+            &request.operation_id,
+            "video.invalid_operation_id",
+            "A visual operation identifier is required",
+        )?;
+        if operation_id.chars().count() > 256 {
+            return Err(VideoServiceError::new(
+                "video.invalid_operation_id",
+                "The visual operation identifier is too long",
+            ));
+        }
+        request.range.validate()?;
+        request.motion.validate()?;
+        if matches!(
+            request.origin,
+            VisualAssetOrigin::UserSelected {
+                user_confirmed: false
+            }
+        ) {
+            return Err(VideoServiceError::new(
+                "video.approval_required",
+                "Importing a user-selected image requires explicit confirmation",
+            ));
+        }
+        let request_value = serde_json::to_value(&request).map_err(json_error)?;
+        let idempotency_key = format!(
+            "visual-add:{}",
+            sha256_bytes(format!("{}:{operation_id}", request.project_id).as_bytes())
+        );
+        let Some((job_id, created)) = self
+            .store
+            .create_idempotent_job("video_add_visual_asset", &idempotency_key, &request_value)
+            .map_err(VideoServiceError::store)?
+        else {
+            return Err(VideoServiceError::new(
+                "video.idempotency_conflict",
+                "This visual operation identifier was already used with a different request",
+            ));
+        };
+        let result = self.add_visual_asset_with_job(&request, &job_id, created, actor);
+        if let Err(error) = &result {
+            let _ = self.store.fail_job(&job_id, &error.stable_message());
+        }
+        result
+    }
+
+    fn add_visual_asset_with_job(
+        &self,
+        request: &AddVisualAssetRequest,
+        job_id: &str,
+        created: bool,
+        actor: &str,
+    ) -> ServiceResult<AddVisualAssetResult> {
+        let asset_id =
+            stable_import_asset_id(&request.project_id, job_id, "visual", &request.operation_id);
+        let layer_id = format!(
+            "visual-layer-{}",
+            sha256_bytes(
+                json!([request.project_id, job_id, request.operation_id, "layer"])
+                    .to_string()
+                    .as_bytes()
+            )
+        );
+        let reason = format!("Added visual {}", request.operation_id);
+        let existing_job = self
+            .store
+            .get_job(job_id)
+            .map_err(VideoServiceError::store)?
+            .ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.job_not_found",
+                    "The durable visual import job was not found",
+                )
+            })?;
+        let existing_status = value_string(&existing_job, "status")?;
+        let current = self.get_project(&request.project_id)?;
+        let current_manifest: VideoProjectManifest = serde_json::from_value(
+            current
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        current_manifest.validate_strict()?;
+        let expected_next_revision = u64::try_from(request.expected_revision)
+            .ok()
+            .and_then(|revision| revision.checked_add(1));
+        let committed = expected_next_revision.is_some_and(|revision| {
+            current_manifest
+                .revision_history
+                .last()
+                .is_some_and(|record| {
+                    record.revision == revision
+                        && record.actor == actor
+                        && record.reason == reason
+                        && record.changed_paths
+                            == ["/visual_assets".to_string(), "/visual_layers".to_string()]
+                })
+                && current_manifest
+                    .visual_assets
+                    .iter()
+                    .any(|asset| asset.id == asset_id)
+                && current_manifest
+                    .visual_layers
+                    .iter()
+                    .any(|layer| layer.id == layer_id && layer.asset_id == asset_id)
+        });
+        if committed {
+            if existing_status != "completed" {
+                let completed = self
+                    .store
+                    .complete_job(job_id)
+                    .map_err(VideoServiceError::store)?;
+                if !completed {
+                    return Err(VideoServiceError::cancelled());
+                }
+            }
+            return Ok(AddVisualAssetResult {
+                project: current,
+                asset_id,
+                layer_id,
+                job_id: job_id.to_string(),
+                replayed: true,
+            });
+        }
+        if !created && matches!(existing_status.as_str(), "preparing" | "running" | "queued") {
+            return Err(VideoServiceError::new(
+                "video.operation_in_progress",
+                "This visual import is already running",
+            )
+            .retryable(true)
+            .details(json!({ "job_id": job_id })));
+        }
+        if !created && matches!(existing_status.as_str(), "failed" | "cancelled") {
+            self.store
+                .resume_video_job(job_id, &["video_add_visual_asset"])
+                .map_err(VideoServiceError::store)?;
+        }
+        if existing_status == "completed" {
+            return Err(VideoServiceError::new(
+                "video.integrity_failed",
+                "The completed visual import has no matching project revision",
+            ));
+        }
+        let status = self
+            .store
+            .start_job(job_id)
+            .map_err(VideoServiceError::store)?;
+        if status == "cancelled" {
+            return Err(VideoServiceError::cancelled());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job_id.to_string(), Arc::clone(&cancel));
+        let _cancellation_registration = CancellationRegistration {
+            cancellations: &self.cancellations,
+            job_id: job_id.to_string(),
+        };
+        let expectation = ProjectExpectation {
+            revision: request.expected_revision,
+            version_id: request.expected_version_id.clone(),
+        };
+        ensure_project_matches(&current, &expectation)?;
+
+        let mut source = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&request.source_path)
+            .map_err(|error| {
+                VideoServiceError::io(
+                    "video.visual_not_found",
+                    "The selected visual could not be opened safely",
+                    error,
+                )
+            })?;
+        let metadata = source.metadata().map_err(|error| {
+            VideoServiceError::io(
+                "video.visual_not_found",
+                "The selected visual could not be inspected",
+                error,
+            )
+        })?;
+        if !metadata.is_file() || metadata.len() < 16 || metadata.len() > MAX_VISUAL_ASSET_BYTES {
+            return Err(VideoServiceError::new(
+                "video.invalid_visual",
+                "The selected visual is not a supported bounded regular file",
+            ));
+        }
+        let source_identity = LocalSourceIdentity::from_metadata(&metadata);
+        let inspection = inspect_image_reader(&mut source, metadata.len())?;
+        source.seek(SeekFrom::Start(0)).map_err(|error| {
+            VideoServiceError::io(
+                "video.visual_read_failed",
+                "The selected visual could not be prepared",
+                error,
+            )
+        })?;
+        let extension = match inspection.mime_type {
+            VisualMimeType::Png => "png",
+            VisualMimeType::Jpeg => "jpg",
+            VisualMimeType::Webp => "webp",
+        };
+        let visual_dir = self.project_dir(&request.project_id)?.join("visuals");
+        self.secure_managed_directory(&visual_dir)?;
+        let final_path = visual_dir.join(format!("{asset_id}.{extension}"));
+        let staging_path =
+            visual_dir.join(format!(".{asset_id}.{}.partial", Uuid::new_v4().simple()));
+        let _storage_lease = self.reserve_storage(
+            format!("{job_id}:visual"),
+            &self.video_root,
+            with_disk_headroom(MAX_VISUAL_ASSET_BYTES, 1),
+            "visual_import",
+        )?;
+        let staged_sha = copy_file_cancelable(
+            source,
+            source_identity,
+            &staging_path,
+            cancel.as_ref(),
+            |_| {},
+        )?;
+        let staged_inspection = inspect_image_file(&staging_path)?;
+        if staged_inspection != inspection {
+            let _ = fs::remove_file(&staging_path);
+            return Err(VideoServiceError::new(
+                "video.visual_changed",
+                "The selected visual changed while it was copied",
+            ));
+        }
+        let newly_published = match fs::hard_link(&staging_path, &final_path) {
+            Ok(()) => {
+                fs::remove_file(&staging_path).map_err(|error| {
+                    VideoServiceError::io(
+                        "video.import_cleanup_failed",
+                        "The visual staging link could not be finalized",
+                        error,
+                    )
+                })?;
+                secure_managed_file(&final_path)?;
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing_sha = sha256_file_with_cancel(&final_path, Some(cancel.as_ref()))?;
+                let _ = fs::remove_file(&staging_path);
+                if existing_sha != staged_sha || inspect_image_file(&final_path)? != inspection {
+                    return Err(VideoServiceError::new(
+                        "video.import_identity_conflict",
+                        "This visual operation already owns different managed bytes",
+                    ));
+                }
+                false
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&staging_path);
+                return Err(VideoServiceError::io(
+                    "video.publication_commit_failed",
+                    "The visual could not be atomically published",
+                    error,
+                ));
+            }
+        };
+        self.ensure_not_cancelled(cancel.as_ref())?;
+
+        let lock = ProjectLock::acquire(self, &request.project_id, actor)?;
+        let current = self.get_project(&request.project_id)?;
+        if let Err(error) = ensure_project_matches(&current, &expectation) {
+            if newly_published {
+                let _ = fs::remove_file(&final_path);
+            }
+            return Err(error);
+        }
+        let provenance_kind = match request.origin {
+            VisualAssetOrigin::UserSelected { .. } => ProvenanceKind::UserUpload,
+            VisualAssetOrigin::GeneratedLocally { .. } => ProvenanceKind::GeneratedLocally,
+        };
+        let (producer, producer_version, generation_id) = match &request.origin {
+            VisualAssetOrigin::UserSelected { .. } => {
+                ("soundAr Video Studio".to_string(), None, None)
+            }
+            VisualAssetOrigin::GeneratedLocally {
+                producer,
+                producer_version,
+                generation_id,
+            } => (
+                require_text(
+                    producer,
+                    "video.invalid_visual_provenance",
+                    "Generated visuals require a producer",
+                )?
+                .to_string(),
+                producer_version.clone(),
+                Some(
+                    require_text(
+                        generation_id,
+                        "video.invalid_visual_provenance",
+                        "Generated visuals require a generation identifier",
+                    )?
+                    .to_string(),
+                ),
+            ),
+        };
+        let created_at = utc_now();
+        let relative_path = self.relative_managed_path(&final_path)?;
+        let mut provenance_metadata = BTreeMap::new();
+        provenance_metadata.insert(
+            "operation_id".to_string(),
+            Value::String(request.operation_id.clone()),
+        );
+        if let Some(generation_id) = generation_id {
+            provenance_metadata.insert("generation_id".to_string(), Value::String(generation_id));
+        }
+        let provenance = Provenance {
+            kind: provenance_kind,
+            original_uri: None,
+            imported_at: created_at.clone(),
+            producer,
+            producer_version,
+            metadata: provenance_metadata,
+        };
+        let visual_asset = VisualAsset {
+            id: asset_id.clone(),
+            managed_path: relative_path,
+            sha256: staged_sha.clone(),
+            mime_type: inspection.mime_type,
+            width: inspection.width,
+            height: inspection.height,
+            has_alpha: inspection.has_alpha,
+            size_bytes: inspection.size_bytes,
+            provenance: provenance.clone(),
+            created_at: created_at.clone(),
+        };
+        let visual_layer = VisualLayer {
+            id: layer_id.clone(),
+            asset_id: asset_id.clone(),
+            scene_id: request.scene_id.clone(),
+            range: request.range,
+            fit: request.fit,
+            crop: request.crop,
+            z_index: request.z_index,
+            motion: request.motion.clone(),
+            transition_in_us: request.transition_in_us,
+            transition_out_us: request.transition_out_us,
+        };
+        visual_asset.validate()?;
+        visual_layer.validate()?;
+        if let Some(existing) = current
+            .get("assets")
+            .and_then(Value::as_array)
+            .and_then(|assets| {
+                assets.iter().find(|asset| {
+                    asset.get("id").and_then(Value::as_str) == Some(asset_id.as_str())
+                })
+            })
+        {
+            if existing.get("content_sha256").and_then(Value::as_str) != Some(staged_sha.as_str())
+                || existing.get("local_path").and_then(Value::as_str)
+                    != Some(final_path.to_string_lossy().as_ref())
+            {
+                return Err(VideoServiceError::new(
+                    "video.import_identity_conflict",
+                    "The durable visual row owns different content",
+                ));
+            }
+        } else {
+            self.store
+                .upsert_video_asset(&json!({
+                    "id": asset_id,
+                    "project_id": request.project_id,
+                    "kind": "image",
+                    "source_kind": if matches!(request.origin, VisualAssetOrigin::GeneratedLocally { .. }) { "generated" } else { "local" },
+                    "local_path": final_path,
+                    "mime_type": inspection.mime_type.as_mime(),
+                    "content_sha256": staged_sha,
+                    "size_bytes": inspection.size_bytes,
+                    "status": "ready",
+                    "probe": {
+                        "width": inspection.width,
+                        "height": inspection.height,
+                        "has_alpha": inspection.has_alpha,
+                    },
+                    "provenance": provenance,
+                }))
+                .map_err(VideoServiceError::store)?;
+        }
+        self.ensure_not_cancelled(cancel.as_ref())?;
+        let mut manifest: VideoProjectManifest = serde_json::from_value(
+            current
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.visual_assets.push(visual_asset);
+        manifest.visual_layers.push(visual_layer);
+        let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
+            VideoServiceError::new(
+                "video.revision_overflow",
+                "The visual revision could not be advanced",
+            )
+        })?;
+        manifest.revision = next_revision;
+        manifest.updated_at = created_at.clone();
+        let changed_paths = vec!["/visual_assets".to_string(), "/visual_layers".to_string()];
+        let invalidated_stages =
+            invalidated_stages_for_manifest_changes(&changed_paths.iter().cloned().collect());
+        manifest.revision_history.push(RevisionRecord {
+            id: new_id(),
+            revision: next_revision,
+            parent_id: manifest
+                .revision_history
+                .last()
+                .map(|record| record.id.clone()),
+            actor: actor.to_string(),
+            reason: reason.clone(),
+            changed_paths,
+            invalidated_stages,
+            created_at,
+        });
+        manifest.validate_strict()?;
+        let manifest_value = serde_json::to_value(&manifest).map_err(json_error)?;
+        let project = self
+            .store
+            .commit_video_manifest_and_complete_job(
+                &request.project_id,
+                expectation.revision,
+                &manifest_value,
+                actor,
+                &reason,
+                &lock.token,
+                current.get("status").and_then(Value::as_str),
+                job_id,
+            )
+            .map_err(VideoServiceError::store)?;
+        drop(lock);
+        Ok(AddVisualAssetResult {
+            project,
+            asset_id,
+            layer_id,
+            job_id: job_id.to_string(),
+            replayed: false,
+        })
+    }
+
     pub fn preview_link(&self, raw_url: &str) -> ServiceResult<LinkPreview> {
         let validated = validate_import_url(raw_url)?;
         if validated.is_playlist {
@@ -13898,6 +15005,31 @@ impl VideoStudioService {
                 }
             }
         }
+        let rendered_visual_ids = manifest
+            .visual_layers
+            .iter()
+            .map(|layer| layer.asset_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for visual in manifest
+            .visual_assets
+            .iter()
+            .filter(|visual| rendered_visual_ids.contains(visual.id.as_str()))
+        {
+            self.ensure_not_cancelled(cancel)?;
+            let resolved_key = format!("visual:{}", visual.id);
+            let path = self.resolve_managed_path(&visual.managed_path)?;
+            validate_image_file(&path)?;
+            let actual_sha256 = sha256_file(&path)?;
+            if actual_sha256 != visual.sha256 {
+                return Err(VideoServiceError::new(
+                    "video.integrity_failed",
+                    "A managed visual asset no longer matches its manifest checksum",
+                )
+                .details(json!({ "visual_asset_id": visual.id })));
+            }
+            render_key_builder = render_key_builder.artifact(resolved_key.clone(), actual_sha256);
+            resolved_sources.insert(resolved_key, path);
+        }
 
         let caption_key = timeline_caption_cache_key(&manifest, request)?;
         let ass_document = build_ass_document(&manifest, &options)?;
@@ -13954,11 +15086,28 @@ impl VideoStudioService {
             Some(json!({ "cache_hit": caption_cache_hit })),
         );
 
+        let rendered_visual_assets = manifest
+            .visual_assets
+            .iter()
+            .filter(|visual| rendered_visual_ids.contains(visual.id.as_str()))
+            .map(|visual| {
+                json!({
+                    "id": visual.id,
+                    "sha256": visual.sha256,
+                    "mime_type": visual.mime_type,
+                    "width": visual.width,
+                    "height": visual.height,
+                    "has_alpha": visual.has_alpha,
+                })
+            })
+            .collect::<Vec<_>>();
         let render_slice = json!({
             "reviewed_scenes": manifest.reviewed_scenes,
             "tracks": manifest.tracks,
             "gaps": manifest.gaps,
             "captions": manifest.captions,
+            "visual_assets": rendered_visual_assets,
+            "visual_layers": manifest.visual_layers,
             "layout": manifest.layout,
             "audio_mix": manifest.audio_mix,
             "timeline_duration_us": manifest.timeline_duration_us,

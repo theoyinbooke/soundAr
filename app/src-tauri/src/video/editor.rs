@@ -1,0 +1,2828 @@
+//! Pure, deterministic edits for the canonical Video Studio timeline.
+//!
+//! This module deliberately does not acquire locks, read the Store version, advance the
+//! manifest revision, append revision history, or write files. The integration layer must bind
+//! `base_version_id` to the current Store record, provide the project lock/idempotency boundary,
+//! and commit the returned manifest with the receipt's canonical diff.
+
+use super::contracts::{
+    validate_identifier, CaptionCue, Microseconds, ReviewedScene, RevisionStage, TimeRange,
+    TimelineClip, TimelineGap, Validate, VideoError, VideoErrorCode, VideoProjectManifest,
+    VideoResult,
+};
+use super::timeline::{
+    map_source_endpoint_to_timeline, map_timeline_endpoint_to_source, QuantizeMode,
+};
+use super::visuals::{VisualFit, VisualMotion};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+
+pub const MIN_TIMELINE_SCENE_DURATION_US: i64 = 100_000;
+const MAX_TIMELINE_EDIT_OPERATIONS: usize = 100;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoTimelineEditRequest {
+    pub project_id: String,
+    pub expected_revision: u64,
+    /// Opaque Store version. The pure layer echoes it; the integration layer owns its CAS check.
+    pub base_version_id: String,
+    /// Idempotency key for the complete ordered operation batch.
+    pub operation_id: String,
+    pub operations: Vec<VideoTimelineOperation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VideoTimelineOperation {
+    SplitScene {
+        scene_id: String,
+        at_timeline_us: Microseconds,
+    },
+    TrimScene {
+        scene_id: String,
+        source_start_us: Microseconds,
+        source_end_us: Microseconds,
+    },
+    ReorderScene {
+        scene_id: String,
+        to_index: usize,
+    },
+    /// Exact inverse of a deterministic split. Arbitrary adjacent scenes are not mergeable.
+    MergeScenes {
+        first_scene_id: String,
+        second_scene_id: String,
+    },
+    /// Repositions or animates an existing managed visual without replacing its immutable bytes.
+    UpdateVisualLayer {
+        layer_id: String,
+        scene_id: Option<String>,
+        range: TimeRange,
+        fit: VisualFit,
+        crop: Option<super::contracts::NormalizedRect>,
+        z_index: i16,
+        motion: VisualMotion,
+        transition_in_us: Microseconds,
+        transition_out_us: Microseconds,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoTimelineChangeReceipt {
+    pub project_id: String,
+    pub expected_revision: u64,
+    pub base_version_id: String,
+    pub operation_id: String,
+    pub changed_paths: Vec<String>,
+    pub invalidated_stages: BTreeSet<RevisionStage>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppliedVideoTimelineEdit {
+    pub manifest: VideoProjectManifest,
+    pub receipt: VideoTimelineChangeReceipt,
+}
+
+/// Applies an ordered batch against one already-loaded manifest.
+///
+/// The returned manifest retains the input `revision`, `revision_history`, and `updated_at`.
+/// Callers must perform the opaque Store-version check and durable idempotency/CAS commit.
+pub fn apply_timeline_edit(
+    manifest: &VideoProjectManifest,
+    request: &VideoTimelineEditRequest,
+) -> VideoResult<AppliedVideoTimelineEdit> {
+    manifest.validate_strict()?;
+    validate_request(manifest, request)?;
+    validate_editable_scene_references(manifest)?;
+
+    let original_revision = manifest.revision;
+    let original_history = manifest.revision_history.clone();
+    let original_updated_at = manifest.updated_at.clone();
+    let mut edited = manifest.clone();
+    for operation in &request.operations {
+        match operation {
+            VideoTimelineOperation::SplitScene {
+                scene_id,
+                at_timeline_us,
+            } => split_scene(&mut edited, scene_id, *at_timeline_us)?,
+            VideoTimelineOperation::TrimScene {
+                scene_id,
+                source_start_us,
+                source_end_us,
+            } => trim_scene(&mut edited, scene_id, *source_start_us, *source_end_us)?,
+            VideoTimelineOperation::ReorderScene { scene_id, to_index } => {
+                reorder_scene(&mut edited, scene_id, *to_index)?
+            }
+            VideoTimelineOperation::MergeScenes {
+                first_scene_id,
+                second_scene_id,
+            } => merge_scenes(&mut edited, first_scene_id, second_scene_id)?,
+            VideoTimelineOperation::UpdateVisualLayer {
+                layer_id,
+                scene_id,
+                range,
+                fit,
+                crop,
+                z_index,
+                motion,
+                transition_in_us,
+                transition_out_us,
+            } => update_visual_layer(
+                &mut edited,
+                layer_id,
+                scene_id.clone(),
+                *range,
+                *fit,
+                *crop,
+                *z_index,
+                motion.clone(),
+                *transition_in_us,
+                *transition_out_us,
+            )?,
+        }
+        validate_editable_scene_references(&edited)?;
+        edited.validate_strict()?;
+    }
+
+    if edited.revision != original_revision
+        || edited.revision_history != original_history
+        || edited.updated_at != original_updated_at
+    {
+        return Err(edit_error(
+            VideoErrorCode::InvalidRevision,
+            "pure timeline edits may not advance commit metadata",
+            "revision",
+        ));
+    }
+
+    let changed_paths = super::manifest_changed_paths(manifest, &edited).map_err(|error| {
+        edit_error(
+            VideoErrorCode::InvalidRevision,
+            format!("canonical manifest diff failed: {error}"),
+            "manifest",
+        )
+    })?;
+    if changed_paths.is_empty() {
+        return Err(edit_error(
+            VideoErrorCode::InvalidRevision,
+            "the requested timeline edit produced no content change",
+            "operations",
+        ));
+    }
+    let invalidated_stages = super::invalidated_stages_for_manifest_changes(&changed_paths);
+    Ok(AppliedVideoTimelineEdit {
+        manifest: edited,
+        receipt: VideoTimelineChangeReceipt {
+            project_id: request.project_id.clone(),
+            expected_revision: request.expected_revision,
+            base_version_id: request.base_version_id.clone(),
+            operation_id: request.operation_id.clone(),
+            changed_paths: changed_paths.into_iter().collect(),
+            invalidated_stages,
+        },
+    })
+}
+
+fn validate_request(
+    manifest: &VideoProjectManifest,
+    request: &VideoTimelineEditRequest,
+) -> VideoResult<()> {
+    validate_identifier(&request.project_id, "project_id")?;
+    validate_identifier(&request.base_version_id, "base_version_id")?;
+    validate_identifier(&request.operation_id, "operation_id")?;
+    if request.project_id != manifest.project_id {
+        return Err(edit_error(
+            VideoErrorCode::MissingReference,
+            "timeline edit targets a different project",
+            "project_id",
+        ));
+    }
+    if request.expected_revision != manifest.revision {
+        return Err(edit_error(
+            VideoErrorCode::InvalidRevision,
+            format!(
+                "timeline edit expects revision {}, but the manifest is at {}",
+                request.expected_revision, manifest.revision
+            ),
+            "expected_revision",
+        ));
+    }
+    if request.operations.is_empty() || request.operations.len() > MAX_TIMELINE_EDIT_OPERATIONS {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            format!("timeline edit requires 1..={MAX_TIMELINE_EDIT_OPERATIONS} operations"),
+            "operations",
+        ));
+    }
+    for operation in &request.operations {
+        match operation {
+            VideoTimelineOperation::SplitScene { scene_id, .. }
+            | VideoTimelineOperation::TrimScene { scene_id, .. }
+            | VideoTimelineOperation::ReorderScene { scene_id, .. } => {
+                validate_identifier(scene_id, "operations.scene_id")?
+            }
+            VideoTimelineOperation::MergeScenes {
+                first_scene_id,
+                second_scene_id,
+            } => {
+                validate_identifier(first_scene_id, "operations.first_scene_id")?;
+                validate_identifier(second_scene_id, "operations.second_scene_id")?;
+            }
+            VideoTimelineOperation::UpdateVisualLayer {
+                layer_id, scene_id, ..
+            } => {
+                validate_identifier(layer_id, "operations.layer_id")?;
+                if let Some(scene_id) = scene_id {
+                    validate_identifier(scene_id, "operations.scene_id")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_visual_layer(
+    manifest: &mut VideoProjectManifest,
+    layer_id: &str,
+    scene_id: Option<String>,
+    range: TimeRange,
+    fit: VisualFit,
+    crop: Option<super::contracts::NormalizedRect>,
+    z_index: i16,
+    motion: VisualMotion,
+    transition_in_us: Microseconds,
+    transition_out_us: Microseconds,
+) -> VideoResult<()> {
+    let layer = manifest
+        .visual_layers
+        .iter_mut()
+        .find(|layer| layer.id == layer_id)
+        .ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::MissingReference,
+                format!("visual layer {layer_id} does not exist"),
+                "operations.layer_id",
+            )
+        })?;
+    layer.scene_id = scene_id;
+    layer.range = range;
+    layer.fit = fit;
+    layer.crop = crop;
+    layer.z_index = z_index;
+    layer.motion = motion;
+    layer.transition_in_us = transition_in_us;
+    layer.transition_out_us = transition_out_us;
+    layer.validate()
+}
+
+fn validate_editable_scene_references(manifest: &VideoProjectManifest) -> VideoResult<()> {
+    let mut previous_end = Microseconds::ZERO;
+    let scene_ranges = manifest
+        .reviewed_scenes
+        .iter()
+        .map(|scene| Ok((scene.id.as_str(), scene_timeline_range(scene)?)))
+        .collect::<VideoResult<BTreeMap<_, _>>>()?;
+    for scene in &manifest.reviewed_scenes {
+        let range = scene_ranges[scene.id.as_str()];
+        if range.start_us < previous_end {
+            return Err(edit_error(
+                VideoErrorCode::TimelineOverlap,
+                "reviewed scenes must be stored in non-overlapping timeline order",
+                "reviewed_scenes",
+            ));
+        }
+        previous_end = range.end_us;
+    }
+    for clip in manifest.tracks.iter().flat_map(|track| &track.clips) {
+        let Some(scene_id) = clip.scene_id.as_deref() else {
+            continue;
+        };
+        let scene_range = scene_ranges.get(scene_id).ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::MissingReference,
+                "timeline clip references a missing reviewed scene",
+                "tracks.clips.scene_id",
+            )
+        })?;
+        if !range_contains(*scene_range, clip.timeline_range()?) {
+            return Err(edit_error(
+                VideoErrorCode::InvalidTrack,
+                "scene-owned clips must remain inside their reviewed scene",
+                "tracks.clips.timeline",
+            ));
+        }
+    }
+    for caption in &manifest.captions {
+        let Some(scene_id) = caption.scene_id.as_deref() else {
+            continue;
+        };
+        let scene_range = scene_ranges.get(scene_id).ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::MissingReference,
+                "caption references a missing reviewed scene",
+                "captions.scene_id",
+            )
+        })?;
+        if !range_contains(*scene_range, caption.range) {
+            return Err(edit_error(
+                VideoErrorCode::InvalidCaption,
+                "scene-owned captions must remain inside their reviewed scene",
+                "captions.range",
+            ));
+        }
+    }
+    for layer in &manifest.visual_layers {
+        let Some(scene_id) = layer.scene_id.as_deref() else {
+            continue;
+        };
+        let scene_range = scene_ranges.get(scene_id).ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::MissingReference,
+                "visual layer references a missing reviewed scene",
+                "visual_layers.scene_id",
+            )
+        })?;
+        if !range_contains(*scene_range, layer.range) {
+            return Err(edit_error(
+                VideoErrorCode::InvalidLayout,
+                "scene-owned visual layers must remain inside their reviewed scene",
+                "visual_layers.range",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn scene_timeline_range(scene: &ReviewedScene) -> VideoResult<TimeRange> {
+    let end = scene
+        .timeline_start_us
+        .checked_add(scene.timeline_duration_us)?;
+    TimeRange::new(scene.timeline_start_us.0, end.0)
+}
+
+fn range_contains(outer: TimeRange, inner: TimeRange) -> bool {
+    inner.start_us >= outer.start_us && inner.end_us <= outer.end_us
+}
+
+fn find_scene_index(manifest: &VideoProjectManifest, scene_id: &str) -> VideoResult<usize> {
+    manifest
+        .reviewed_scenes
+        .iter()
+        .position(|scene| scene.id == scene_id)
+        .ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::MissingReference,
+                format!("reviewed scene {scene_id} does not exist"),
+                "operations.scene_id",
+            )
+        })
+}
+
+fn find_source_anchor(
+    manifest: &VideoProjectManifest,
+    scene: &ReviewedScene,
+) -> VideoResult<TimelineClip> {
+    let source_asset_id = scene.source_asset_id.as_deref().ok_or_else(|| {
+        edit_error(
+            VideoErrorCode::InvalidScene,
+            "split and trim require a source-backed scene",
+            "reviewed_scenes.source_asset_id",
+        )
+    })?;
+    let source_range = scene.source_range.ok_or_else(|| {
+        edit_error(
+            VideoErrorCode::InvalidScene,
+            "split and trim require a source-clock scene range",
+            "reviewed_scenes.source_range",
+        )
+    })?;
+    let timeline_range = scene_timeline_range(scene)?;
+    manifest
+        .tracks
+        .iter()
+        .flat_map(|track| &track.clips)
+        .filter(|clip| {
+            clip.scene_id.as_deref() == Some(scene.id.as_str())
+                && clip.media.source_asset_id.as_deref() == Some(source_asset_id)
+                && clip.source_range == source_range
+                && clip.timeline_range().ok() == Some(timeline_range)
+        })
+        .min_by(|left, right| left.id.cmp(&right.id))
+        .cloned()
+        .ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::InvalidTrack,
+                "source-backed scene requires a full-span canonical source clip",
+                "tracks.clips",
+            )
+        })
+}
+
+fn map_timeline_endpoint_to_source_exact(
+    clip: &TimelineClip,
+    timeline_us: Microseconds,
+) -> VideoResult<Microseconds> {
+    let source = map_timeline_endpoint_to_source(clip, timeline_us, QuantizeMode::Floor)?;
+    let round_trip = map_source_endpoint_to_timeline(clip, source, QuantizeMode::Floor)?;
+    if round_trip != timeline_us {
+        return Err(edit_error(
+            VideoErrorCode::DurationMismatch,
+            "timeline boundary does not map to an exact source microsecond",
+            "operations.at_timeline_us",
+        ));
+    }
+    Ok(source)
+}
+
+fn map_source_endpoint_to_timeline_exact(
+    clip: &TimelineClip,
+    source_us: Microseconds,
+) -> VideoResult<Microseconds> {
+    let timeline = map_source_endpoint_to_timeline(clip, source_us, QuantizeMode::Floor)?;
+    let round_trip = map_timeline_endpoint_to_source(clip, timeline, QuantizeMode::Floor)?;
+    if round_trip != source_us {
+        return Err(edit_error(
+            VideoErrorCode::DurationMismatch,
+            "source boundary does not map to an exact timeline microsecond",
+            "operations.source_start_us",
+        ));
+    }
+    Ok(timeline)
+}
+
+fn arithmetic_overflow() -> VideoError {
+    VideoError::new(
+        VideoErrorCode::ArithmeticOverflow,
+        "timeline edit arithmetic overflowed",
+    )
+}
+
+fn edit_error(
+    code: VideoErrorCode,
+    message: impl Into<String>,
+    field: impl Into<String>,
+) -> VideoError {
+    VideoError::new(code, message).at(field)
+}
+
+fn split_scene(
+    manifest: &mut VideoProjectManifest,
+    scene_id: &str,
+    split_timeline_us: Microseconds,
+) -> VideoResult<()> {
+    let scene_index = find_scene_index(manifest, scene_id)?;
+    let original = manifest.reviewed_scenes[scene_index].clone();
+    let timeline_range = scene_timeline_range(&original)?;
+    let left_duration = split_timeline_us
+        .0
+        .checked_sub(timeline_range.start_us.0)
+        .ok_or_else(arithmetic_overflow)?;
+    let right_duration = timeline_range
+        .end_us
+        .0
+        .checked_sub(split_timeline_us.0)
+        .ok_or_else(arithmetic_overflow)?;
+    if left_duration < MIN_TIMELINE_SCENE_DURATION_US
+        || right_duration < MIN_TIMELINE_SCENE_DURATION_US
+    {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            format!(
+                "both split scenes must be at least {MIN_TIMELINE_SCENE_DURATION_US} microseconds"
+            ),
+            "operations.at_timeline_us",
+        ));
+    }
+
+    let anchor = find_source_anchor(manifest, &original)?;
+    if manifest
+        .narration_bindings
+        .iter()
+        .any(|binding| binding.scene_id.as_deref() == Some(scene_id))
+        || manifest
+            .render_artifacts
+            .iter()
+            .any(|artifact| artifact.scene_id.as_deref() == Some(scene_id))
+    {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            "rendered or narrated scenes must be regenerated before they can be split safely",
+            "reviewed_scenes",
+        ));
+    }
+    for layer in &manifest.visual_layers {
+        ensure_span_does_not_cross_scene_boundary(
+            layer.range,
+            timeline_range,
+            VideoErrorCode::InvalidLayout,
+            "visual_layers.range",
+        )?;
+        if range_contains(timeline_range, layer.range)
+            && layer.range.start_us < split_timeline_us
+            && layer.range.end_us > split_timeline_us
+        {
+            return Err(edit_error(
+                VideoErrorCode::InvalidLayout,
+                "split the visual layer at the playhead or move it wholly to one side before splitting this scene",
+                "visual_layers.range",
+            ));
+        }
+    }
+    let split_source_us = map_timeline_endpoint_to_source_exact(&anchor, split_timeline_us)?;
+    let original_source = original.source_range.ok_or_else(|| {
+        edit_error(
+            VideoErrorCode::InvalidScene,
+            "a source-mapped scene is required for this split",
+            "reviewed_scenes.source_range",
+        )
+    })?;
+    let left_source_duration = split_source_us
+        .0
+        .checked_sub(original_source.start_us.0)
+        .ok_or_else(arithmetic_overflow)?;
+    let right_source_duration = original_source
+        .end_us
+        .0
+        .checked_sub(split_source_us.0)
+        .ok_or_else(arithmetic_overflow)?;
+    if left_source_duration < MIN_TIMELINE_SCENE_DURATION_US
+        || right_source_duration < MIN_TIMELINE_SCENE_DURATION_US
+    {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            format!(
+                "both split source ranges must be at least {MIN_TIMELINE_SCENE_DURATION_US} microseconds"
+            ),
+            "operations.at_timeline_us",
+        ));
+    }
+
+    let split_revision = original.revision.checked_add(1).ok_or_else(|| {
+        edit_error(
+            VideoErrorCode::ArithmeticOverflow,
+            "scene revision overflowed during split",
+            "reviewed_scenes.revision",
+        )
+    })?;
+    let right_scene_id = deterministic_split_id("scene", &original.id, split_timeline_us);
+    if manifest
+        .reviewed_scenes
+        .iter()
+        .any(|scene| scene.id == right_scene_id)
+    {
+        return Err(edit_error(
+            VideoErrorCode::DuplicateId,
+            "deterministic split scene identifier already exists",
+            "reviewed_scenes.id",
+        ));
+    }
+
+    let mut left = original.clone();
+    left.source_range = Some(TimeRange::new(
+        original_source.start_us.0,
+        split_source_us.0,
+    )?);
+    left.timeline_duration_us = Microseconds(left_duration);
+    left.revision = split_revision;
+    let mut right = original.clone();
+    right.id = right_scene_id.clone();
+    right.source_range = Some(TimeRange::new(split_source_us.0, original_source.end_us.0)?);
+    right.timeline_start_us = split_timeline_us;
+    right.timeline_duration_us = Microseconds(right_duration);
+    right.revision = split_revision;
+    manifest
+        .reviewed_scenes
+        .splice(scene_index..=scene_index, [left, right]);
+
+    let mut layout_ids = manifest
+        .layout
+        .elements
+        .iter()
+        .map(|element| element.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut layout_elements = Vec::with_capacity(manifest.layout.elements.len().saturating_add(1));
+    for element in &manifest.layout.elements {
+        layout_elements.push(element.clone());
+        if element.scene_id.as_deref() == Some(scene_id) {
+            let mut right_element = element.clone();
+            right_element.id = deterministic_split_id("layout", &element.id, split_timeline_us);
+            if !layout_ids.insert(right_element.id.clone()) {
+                return Err(edit_error(
+                    VideoErrorCode::DuplicateId,
+                    "deterministic split layout identifier already exists",
+                    "layout.elements.id",
+                ));
+            }
+            right_element.scene_id = Some(right_scene_id.clone());
+            layout_elements.push(right_element);
+        }
+    }
+    manifest.layout.elements = layout_elements;
+
+    let mut clip_ids = manifest
+        .tracks
+        .iter()
+        .flat_map(|track| track.clips.iter().map(|clip| clip.id.clone()))
+        .collect::<BTreeSet<_>>();
+    for track in &mut manifest.tracks {
+        let mut edited = Vec::with_capacity(track.clips.len().saturating_add(1));
+        for mut clip in track.clips.drain(..) {
+            let clip_range = clip.timeline_range()?;
+            ensure_span_does_not_cross_scene_boundary(
+                clip_range,
+                timeline_range,
+                VideoErrorCode::InvalidTrack,
+                "tracks.clips.timeline",
+            )?;
+            if !range_contains(timeline_range, clip_range) {
+                edited.push(clip);
+                continue;
+            }
+            if clip_range.end_us <= split_timeline_us {
+                edited.push(clip);
+                continue;
+            }
+            if clip_range.start_us >= split_timeline_us {
+                if clip.scene_id.as_deref() == Some(scene_id) {
+                    clip.scene_id = Some(right_scene_id.clone());
+                }
+                edited.push(clip);
+                continue;
+            }
+
+            let source_split = map_timeline_endpoint_to_source_exact(&clip, split_timeline_us)?;
+            let original_clip = clip.clone();
+            clip.source_range =
+                TimeRange::new(original_clip.source_range.start_us.0, source_split.0)?;
+            clip.timeline_duration_us = Microseconds(
+                split_timeline_us
+                    .0
+                    .checked_sub(original_clip.timeline_start_us.0)
+                    .ok_or_else(arithmetic_overflow)?,
+            );
+            let mut right_clip = original_clip.clone();
+            right_clip.id = deterministic_split_id("clip", &original_clip.id, split_timeline_us);
+            if !clip_ids.insert(right_clip.id.clone()) {
+                return Err(edit_error(
+                    VideoErrorCode::DuplicateId,
+                    "deterministic split clip identifier already exists",
+                    "tracks.clips.id",
+                ));
+            }
+            right_clip.source_range =
+                TimeRange::new(source_split.0, original_clip.source_range.end_us.0)?;
+            right_clip.timeline_start_us = split_timeline_us;
+            right_clip.timeline_duration_us = Microseconds(
+                original_clip
+                    .timeline_start_us
+                    .checked_add(original_clip.timeline_duration_us)?
+                    .0
+                    .checked_sub(split_timeline_us.0)
+                    .ok_or_else(arithmetic_overflow)?,
+            );
+            if original_clip.scene_id.as_deref() == Some(scene_id) {
+                clip.scene_id = Some(scene_id.to_string());
+                right_clip.scene_id = Some(right_scene_id.clone());
+            }
+            edited.push(clip);
+            edited.push(right_clip);
+        }
+        track.clips = edited;
+    }
+
+    let mut gap_ids = manifest
+        .gaps
+        .iter()
+        .map(|gap| gap.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut gaps = Vec::with_capacity(manifest.gaps.len().saturating_add(1));
+    for mut gap in manifest.gaps.drain(..) {
+        ensure_span_does_not_cross_scene_boundary(
+            gap.range,
+            timeline_range,
+            VideoErrorCode::InvalidGap,
+            "gaps.range",
+        )?;
+        if !range_contains(timeline_range, gap.range)
+            || gap.range.end_us <= split_timeline_us
+            || gap.range.start_us >= split_timeline_us
+        {
+            gaps.push(gap);
+            continue;
+        }
+        let original_gap = gap.clone();
+        gap.range = TimeRange::new(original_gap.range.start_us.0, split_timeline_us.0)?;
+        let mut right_gap = original_gap.clone();
+        right_gap.id = deterministic_split_id("gap", &original_gap.id, split_timeline_us);
+        if !gap_ids.insert(right_gap.id.clone()) {
+            return Err(edit_error(
+                VideoErrorCode::DuplicateId,
+                "deterministic split gap identifier already exists",
+                "gaps.id",
+            ));
+        }
+        right_gap.range = TimeRange::new(split_timeline_us.0, original_gap.range.end_us.0)?;
+        if let Some(source_range) = original_gap.source_range {
+            let source_split = source_range.start_us.checked_add(Microseconds(
+                split_timeline_us
+                    .0
+                    .checked_sub(original_gap.range.start_us.0)
+                    .ok_or_else(arithmetic_overflow)?,
+            ))?;
+            gap.source_range = Some(TimeRange::new(source_range.start_us.0, source_split.0)?);
+            right_gap.source_range = Some(TimeRange::new(source_split.0, source_range.end_us.0)?);
+        }
+        gaps.push(gap);
+        gaps.push(right_gap);
+    }
+    manifest.gaps = gaps;
+
+    let mut caption_ids = manifest
+        .captions
+        .iter()
+        .map(|caption| caption.id.clone())
+        .collect::<BTreeSet<_>>();
+    let transcript = manifest.transcript.clone();
+    let mut captions = Vec::with_capacity(manifest.captions.len().saturating_add(1));
+    for mut caption in manifest.captions.drain(..) {
+        ensure_span_does_not_cross_scene_boundary(
+            caption.range,
+            timeline_range,
+            VideoErrorCode::InvalidCaption,
+            "captions.range",
+        )?;
+        if !range_contains(timeline_range, caption.range) {
+            captions.push(caption);
+            continue;
+        }
+        if caption.range.end_us <= split_timeline_us {
+            captions.push(caption);
+            continue;
+        }
+        if caption.range.start_us >= split_timeline_us {
+            if caption.scene_id.as_deref() == Some(scene_id) {
+                caption.scene_id = Some(right_scene_id.clone());
+            }
+            captions.push(caption);
+            continue;
+        }
+
+        let original_caption = caption.clone();
+        let split_index = caption_split_byte_index_for_transcript(
+            transcript.as_ref(),
+            &original_caption,
+            split_timeline_us,
+            split_source_us,
+            true,
+        )?;
+        caption.range = TimeRange::new(original_caption.range.start_us.0, split_timeline_us.0)?;
+        caption.text = original_caption.text[..split_index].to_string();
+        let mut right_caption = original_caption.clone();
+        right_caption.id =
+            deterministic_split_id("caption", &original_caption.id, split_timeline_us);
+        if !caption_ids.insert(right_caption.id.clone()) {
+            return Err(edit_error(
+                VideoErrorCode::DuplicateId,
+                "deterministic split caption identifier already exists",
+                "captions.id",
+            ));
+        }
+        right_caption.range = TimeRange::new(split_timeline_us.0, original_caption.range.end_us.0)?;
+        right_caption.text = original_caption.text[split_index..].to_string();
+        if original_caption.scene_id.as_deref() == Some(scene_id) {
+            caption.scene_id = Some(scene_id.to_string());
+            right_caption.scene_id = Some(right_scene_id.clone());
+        }
+        caption.validate()?;
+        right_caption.validate()?;
+        captions.push(caption);
+        captions.push(right_caption);
+    }
+    manifest.captions = captions;
+    for layer in &mut manifest.visual_layers {
+        if layer.scene_id.as_deref() == Some(scene_id) && layer.range.start_us >= split_timeline_us
+        {
+            layer.scene_id = Some(right_scene_id.clone());
+        }
+    }
+    Ok(())
+}
+
+fn ensure_span_does_not_cross_scene_boundary(
+    span: TimeRange,
+    scene: TimeRange,
+    code: VideoErrorCode,
+    field: &str,
+) -> VideoResult<()> {
+    let disjoint = span.end_us <= scene.start_us || span.start_us >= scene.end_us;
+    if disjoint || range_contains(scene, span) {
+        return Ok(());
+    }
+    Err(edit_error(
+        code,
+        "timeline item crosses an edited scene boundary and cannot be transformed safely",
+        field,
+    ))
+}
+
+fn deterministic_split_id(kind: &str, original_id: &str, split_us: Microseconds) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"soundar-video-timeline-split-v1\0");
+    digest.update(kind.as_bytes());
+    digest.update(b"\0");
+    digest.update(original_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(split_us.0.to_be_bytes());
+    let hash = format!("{:x}", digest.finalize());
+    format!("{kind}-split-{}", &hash[..24])
+}
+
+fn token_start_byte_indices(text: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut in_token = false;
+    for (index, character) in text.char_indices() {
+        if character.is_whitespace() {
+            in_token = false;
+        } else if !in_token {
+            starts.push(index);
+            in_token = true;
+        }
+    }
+    starts
+}
+
+fn transcript_word_byte_index_from(
+    transcript: &super::contracts::TranscriptVersion,
+    caption: &CaptionCue,
+    split_source_us: Microseconds,
+    token_starts: &[usize],
+) -> Option<usize> {
+    let segment_id = caption.transcript_segment_id.as_deref()?;
+    let segment = transcript
+        .segments
+        .iter()
+        .find(|segment| segment.id == segment_id)?;
+    if segment.word_ids.len() != token_starts.len() {
+        return None;
+    }
+    let words = transcript
+        .words
+        .iter()
+        .map(|word| (word.id.as_str(), word))
+        .collect::<BTreeMap<_, _>>();
+    let mut left_count = 0;
+    for word_id in &segment.word_ids {
+        let word = words.get(word_id.as_str())?;
+        let midpoint = (i128::from(word.range.start_us.0) + i128::from(word.range.end_us.0)) / 2;
+        if midpoint <= i128::from(split_source_us.0) {
+            left_count += 1;
+        }
+    }
+    if left_count == 0 {
+        Some(0)
+    } else if left_count == token_starts.len() {
+        Some(caption.text.len())
+    } else {
+        Some(token_starts[left_count])
+    }
+}
+
+fn proportional_index(offset: i64, duration: i64, item_count: usize) -> VideoResult<usize> {
+    if offset <= 0 || duration <= 0 || offset >= duration || item_count < 2 {
+        return Err(arithmetic_overflow());
+    }
+    let scaled = i128::from(offset)
+        .checked_mul(i128::try_from(item_count).map_err(|_| arithmetic_overflow())?)
+        .ok_or_else(arithmetic_overflow)?;
+    let rounded = scaled
+        .checked_add(i128::from(duration / 2))
+        .ok_or_else(arithmetic_overflow)?
+        / i128::from(duration);
+    let index = usize::try_from(rounded).map_err(|_| arithmetic_overflow())?;
+    Ok(index.clamp(1, item_count - 1))
+}
+
+fn nonempty_text_halves(text: &str, index: usize) -> bool {
+    !text[..index].trim().is_empty() && !text[index..].trim().is_empty()
+}
+
+fn trim_scene(
+    manifest: &mut VideoProjectManifest,
+    scene_id: &str,
+    source_start_us: Microseconds,
+    source_end_us: Microseconds,
+) -> VideoResult<()> {
+    let scene_index = find_scene_index(manifest, scene_id)?;
+    let original = manifest.reviewed_scenes[scene_index].clone();
+    let original_source = original.source_range.ok_or_else(|| {
+        edit_error(
+            VideoErrorCode::InvalidScene,
+            "trim requires a source-clock scene range",
+            "reviewed_scenes.source_range",
+        )
+    })?;
+    if source_start_us < original_source.start_us
+        || source_end_us > original_source.end_us
+        || source_end_us <= source_start_us
+    {
+        return Err(edit_error(
+            VideoErrorCode::InvalidTimestamp,
+            "trim source range must be a non-empty subset of the current scene source range",
+            "operations.source_start_us",
+        ));
+    }
+    if source_end_us.0 - source_start_us.0 < MIN_TIMELINE_SCENE_DURATION_US {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            format!(
+                "trimmed source range must be at least {MIN_TIMELINE_SCENE_DURATION_US} microseconds"
+            ),
+            "operations.source_end_us",
+        ));
+    }
+    if source_start_us == original_source.start_us && source_end_us == original_source.end_us {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            "trim operation must change at least one scene boundary",
+            "operations",
+        ));
+    }
+
+    let anchor = find_source_anchor(manifest, &original)?;
+    let retained_timeline_start = map_source_endpoint_to_timeline_exact(&anchor, source_start_us)?;
+    let retained_timeline_end = map_source_endpoint_to_timeline_exact(&anchor, source_end_us)?;
+    let retained_timeline_duration = retained_timeline_end
+        .0
+        .checked_sub(retained_timeline_start.0)
+        .ok_or_else(arithmetic_overflow)?;
+    if retained_timeline_duration < MIN_TIMELINE_SCENE_DURATION_US {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            format!(
+                "trimmed timeline scene must be at least {MIN_TIMELINE_SCENE_DURATION_US} microseconds"
+            ),
+            "operations.source_end_us",
+        ));
+    }
+    let original_timeline = scene_timeline_range(&original)?;
+    let retained_timeline = TimeRange::new(retained_timeline_start.0, retained_timeline_end.0)?;
+    let removed_duration = original
+        .timeline_duration_us
+        .0
+        .checked_sub(retained_timeline_duration)
+        .ok_or_else(arithmetic_overflow)?;
+    let new_timeline_duration = manifest
+        .timeline_duration_us
+        .0
+        .checked_sub(removed_duration)
+        .ok_or_else(arithmetic_overflow)?;
+    if new_timeline_duration <= 0 {
+        return Err(edit_error(
+            VideoErrorCode::InvalidTimestamp,
+            "trim would remove the complete project timeline",
+            "timeline_duration_us",
+        ));
+    }
+    let target_revision = original.revision.checked_add(1).ok_or_else(|| {
+        edit_error(
+            VideoErrorCode::ArithmeticOverflow,
+            "scene revision overflowed during trim",
+            "reviewed_scenes.revision",
+        )
+    })?;
+    for layer in &manifest.visual_layers {
+        ensure_span_does_not_cross_scene_boundary(
+            layer.range,
+            original_timeline,
+            VideoErrorCode::InvalidLayout,
+            "visual_layers.range",
+        )?;
+        if range_contains(original_timeline, layer.range)
+            && !range_contains(retained_timeline, layer.range)
+        {
+            return Err(edit_error(
+                VideoErrorCode::InvalidLayout,
+                "move or resize visual layers into the retained scene range before trimming",
+                "visual_layers.range",
+            ));
+        }
+    }
+
+    for (index, scene) in manifest.reviewed_scenes.iter_mut().enumerate() {
+        if index == scene_index {
+            scene.source_range = Some(TimeRange::new(source_start_us.0, source_end_us.0)?);
+            scene.timeline_duration_us = Microseconds(retained_timeline_duration);
+            scene.revision = target_revision;
+        } else if scene.timeline_start_us >= original_timeline.end_us {
+            scene.timeline_start_us = checked_shift(scene.timeline_start_us, -removed_duration)?;
+        }
+    }
+
+    for track in &mut manifest.tracks {
+        let mut clips = Vec::with_capacity(track.clips.len());
+        for clip in track.clips.drain(..) {
+            let clip_range = clip.timeline_range()?;
+            ensure_span_does_not_cross_scene_boundary(
+                clip_range,
+                original_timeline,
+                VideoErrorCode::InvalidTrack,
+                "tracks.clips.timeline",
+            )?;
+            if range_contains(original_timeline, clip_range) {
+                if let Some(trimmed) =
+                    trim_clip_to_timeline(clip, retained_timeline, original_timeline.start_us)?
+                {
+                    clips.push(trimmed);
+                }
+            } else {
+                let mut clip = clip;
+                if clip.timeline_start_us >= original_timeline.end_us {
+                    clip.timeline_start_us =
+                        checked_shift(clip.timeline_start_us, -removed_duration)?;
+                }
+                clips.push(clip);
+            }
+        }
+        track.clips = clips;
+    }
+
+    let mut gaps = Vec::with_capacity(manifest.gaps.len());
+    for gap in manifest.gaps.drain(..) {
+        ensure_span_does_not_cross_scene_boundary(
+            gap.range,
+            original_timeline,
+            VideoErrorCode::InvalidGap,
+            "gaps.range",
+        )?;
+        if range_contains(original_timeline, gap.range) {
+            if let Some(trimmed) =
+                trim_gap_to_timeline(gap, retained_timeline, original_timeline.start_us)?
+            {
+                gaps.push(trimmed);
+            }
+        } else {
+            let mut gap = gap;
+            if gap.range.start_us >= original_timeline.end_us {
+                gap.range = checked_shift_range(gap.range, -removed_duration)?;
+            }
+            gaps.push(gap);
+        }
+    }
+    manifest.gaps = gaps;
+
+    let transcript = manifest.transcript.clone();
+    let mut captions = Vec::with_capacity(manifest.captions.len());
+    for caption in manifest.captions.drain(..) {
+        ensure_span_does_not_cross_scene_boundary(
+            caption.range,
+            original_timeline,
+            VideoErrorCode::InvalidCaption,
+            "captions.range",
+        )?;
+        if range_contains(original_timeline, caption.range) {
+            if let Some(trimmed) = trim_caption_to_timeline(
+                transcript.as_ref(),
+                &anchor,
+                caption,
+                retained_timeline,
+                original_timeline.start_us,
+            )? {
+                captions.push(trimmed);
+            }
+        } else {
+            let mut caption = caption;
+            if caption.range.start_us >= original_timeline.end_us {
+                caption.range = checked_shift_range(caption.range, -removed_duration)?;
+            }
+            captions.push(caption);
+        }
+    }
+    manifest.captions = captions;
+    for layer in &mut manifest.visual_layers {
+        if range_contains(original_timeline, layer.range) {
+            layer.range = shifted_intersection(
+                layer.range,
+                retained_timeline.start_us,
+                original_timeline.start_us,
+            )?;
+        } else if layer.range.start_us >= original_timeline.end_us {
+            layer.range = checked_shift_range(layer.range, -removed_duration)?;
+        }
+    }
+    manifest.visual_layers.sort_by(|left, right| {
+        (left.range.start_us, left.z_index, &left.id).cmp(&(
+            right.range.start_us,
+            right.z_index,
+            &right.id,
+        ))
+    });
+    manifest.timeline_duration_us = Microseconds(new_timeline_duration);
+    Ok(())
+}
+
+fn trim_clip_to_timeline(
+    mut clip: TimelineClip,
+    retained: TimeRange,
+    new_scene_start: Microseconds,
+) -> VideoResult<Option<TimelineClip>> {
+    let original_range = clip.timeline_range()?;
+    let Some(intersection) = range_intersection(original_range, retained)? else {
+        return Ok(None);
+    };
+    let source_start = map_timeline_endpoint_to_source_exact(&clip, intersection.start_us)?;
+    let source_end = map_timeline_endpoint_to_source_exact(&clip, intersection.end_us)?;
+    clip.source_range = TimeRange::new(source_start.0, source_end.0)?;
+    clip.timeline_start_us = new_scene_start.checked_add(Microseconds(
+        intersection
+            .start_us
+            .0
+            .checked_sub(retained.start_us.0)
+            .ok_or_else(arithmetic_overflow)?,
+    ))?;
+    clip.timeline_duration_us = intersection.duration()?;
+    Ok(Some(clip))
+}
+
+fn trim_gap_to_timeline(
+    mut gap: TimelineGap,
+    retained: TimeRange,
+    new_scene_start: Microseconds,
+) -> VideoResult<Option<TimelineGap>> {
+    let original_range = gap.range;
+    let Some(intersection) = range_intersection(original_range, retained)? else {
+        return Ok(None);
+    };
+    gap.range = shifted_intersection(intersection, retained.start_us, new_scene_start)?;
+    if let Some(source_range) = gap.source_range {
+        let source_start = source_range.start_us.checked_add(Microseconds(
+            intersection
+                .start_us
+                .0
+                .checked_sub(original_range.start_us.0)
+                .ok_or_else(arithmetic_overflow)?,
+        ))?;
+        let source_end = source_start.checked_add(intersection.duration()?)?;
+        gap.source_range = Some(TimeRange::new(source_start.0, source_end.0)?);
+    }
+    Ok(Some(gap))
+}
+
+fn trim_caption_to_timeline(
+    transcript: Option<&super::contracts::TranscriptVersion>,
+    anchor: &TimelineClip,
+    mut caption: CaptionCue,
+    retained: TimeRange,
+    new_scene_start: Microseconds,
+) -> VideoResult<Option<CaptionCue>> {
+    let original_range = caption.range;
+    let Some(intersection) = range_intersection(original_range, retained)? else {
+        return Ok(None);
+    };
+    let start_index = if intersection.start_us > original_range.start_us {
+        let source = map_timeline_endpoint_to_source_exact(anchor, intersection.start_us)?;
+        caption_split_byte_index_for_transcript(
+            transcript,
+            &caption,
+            intersection.start_us,
+            source,
+            false,
+        )?
+    } else {
+        0
+    };
+    let end_index = if intersection.end_us < original_range.end_us {
+        let source = map_timeline_endpoint_to_source_exact(anchor, intersection.end_us)?;
+        caption_split_byte_index_for_transcript(
+            transcript,
+            &caption,
+            intersection.end_us,
+            source,
+            false,
+        )?
+    } else {
+        caption.text.len()
+    };
+    if start_index >= end_index || caption.text[start_index..end_index].trim().is_empty() {
+        return Ok(None);
+    }
+    caption.text = caption.text[start_index..end_index].to_string();
+    caption.range = shifted_intersection(intersection, retained.start_us, new_scene_start)?;
+    caption.validate()?;
+    Ok(Some(caption))
+}
+
+fn shifted_intersection(
+    intersection: TimeRange,
+    old_origin: Microseconds,
+    new_origin: Microseconds,
+) -> VideoResult<TimeRange> {
+    let start_offset = intersection
+        .start_us
+        .0
+        .checked_sub(old_origin.0)
+        .ok_or_else(arithmetic_overflow)?;
+    let start = new_origin.checked_add(Microseconds(start_offset))?;
+    let end = start.checked_add(intersection.duration()?)?;
+    TimeRange::new(start.0, end.0)
+}
+
+fn range_intersection(left: TimeRange, right: TimeRange) -> VideoResult<Option<TimeRange>> {
+    let start = left.start_us.max(right.start_us);
+    let end = left.end_us.min(right.end_us);
+    if start >= end {
+        Ok(None)
+    } else {
+        TimeRange::new(start.0, end.0).map(Some)
+    }
+}
+
+fn checked_shift(value: Microseconds, delta: i64) -> VideoResult<Microseconds> {
+    value
+        .0
+        .checked_add(delta)
+        .map(Microseconds)
+        .ok_or_else(arithmetic_overflow)
+}
+
+fn checked_shift_range(range: TimeRange, delta: i64) -> VideoResult<TimeRange> {
+    TimeRange::new(
+        checked_shift(range.start_us, delta)?.0,
+        checked_shift(range.end_us, delta)?.0,
+    )
+}
+
+fn caption_split_byte_index_for_transcript(
+    transcript: Option<&super::contracts::TranscriptVersion>,
+    caption: &CaptionCue,
+    split_timeline_us: Microseconds,
+    split_source_us: Microseconds,
+    require_nonempty_halves: bool,
+) -> VideoResult<usize> {
+    if split_timeline_us <= caption.range.start_us || split_timeline_us >= caption.range.end_us {
+        return Err(edit_error(
+            VideoErrorCode::InvalidCaption,
+            "caption text may only be partitioned at an interior cue boundary",
+            "captions.range",
+        ));
+    }
+    let token_starts = token_start_byte_indices(&caption.text);
+    if token_starts.len() >= 2 {
+        if let Some(byte_index) = transcript.and_then(|transcript| {
+            transcript_word_byte_index_from(transcript, caption, split_source_us, &token_starts)
+        }) {
+            if !require_nonempty_halves || nonempty_text_halves(&caption.text, byte_index) {
+                return Ok(byte_index);
+            }
+        }
+        let token_index = proportional_index(
+            split_timeline_us.0 - caption.range.start_us.0,
+            caption.range.duration()?.0,
+            token_starts.len(),
+        )?;
+        let byte_index = token_starts[token_index];
+        if nonempty_text_halves(&caption.text, byte_index) {
+            return Ok(byte_index);
+        }
+    }
+    let character_starts = caption
+        .text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if character_starts.len() >= 2 {
+        let character_index = proportional_index(
+            split_timeline_us.0 - caption.range.start_us.0,
+            caption.range.duration()?.0,
+            character_starts.len(),
+        )?;
+        let byte_index = character_starts[character_index];
+        if nonempty_text_halves(&caption.text, byte_index) {
+            return Ok(byte_index);
+        }
+    }
+    Err(edit_error(
+        VideoErrorCode::InvalidCaption,
+        "caption text cannot be divided into two non-empty deterministic substrings",
+        "captions.text",
+    ))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RegionTranslation {
+    old: TimeRange,
+    delta: i64,
+}
+
+fn reorder_scene(
+    manifest: &mut VideoProjectManifest,
+    scene_id: &str,
+    to_index: usize,
+) -> VideoResult<()> {
+    let from_index = find_scene_index(manifest, scene_id)?;
+    let scene_count = manifest.reviewed_scenes.len();
+    if to_index >= scene_count {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            format!("reorder index {to_index} is outside 0..{scene_count}"),
+            "operations.to_index",
+        ));
+    }
+    if from_index == to_index {
+        return Err(edit_error(
+            VideoErrorCode::InvalidScene,
+            "reorder operation must change the scene position",
+            "operations.to_index",
+        ));
+    }
+
+    let original_scenes = manifest.reviewed_scenes.clone();
+    let original_ranges = original_scenes
+        .iter()
+        .map(scene_timeline_range)
+        .collect::<VideoResult<Vec<_>>>()?;
+    let prefix_duration = original_ranges
+        .first()
+        .map(|range| range.start_us.0)
+        .unwrap_or(0);
+    let suffix_start = original_ranges
+        .last()
+        .map(|range| range.end_us.0)
+        .unwrap_or(manifest.timeline_duration_us.0);
+    let inter_scene_durations = original_ranges
+        .windows(2)
+        .map(|pair| {
+            pair[1]
+                .start_us
+                .0
+                .checked_sub(pair[0].end_us.0)
+                .ok_or_else(arithmetic_overflow)
+        })
+        .collect::<VideoResult<Vec<_>>>()?;
+
+    let mut order = (0..scene_count).collect::<Vec<_>>();
+    let moved = order.remove(from_index);
+    order.insert(to_index, moved);
+
+    let mut cursor = Microseconds(prefix_duration);
+    let mut new_starts = BTreeMap::new();
+    let mut new_gap_starts = Vec::with_capacity(inter_scene_durations.len());
+    for (slot, original_index) in order.iter().copied().enumerate() {
+        new_starts.insert(original_scenes[original_index].id.clone(), cursor);
+        cursor = cursor.checked_add(original_scenes[original_index].timeline_duration_us)?;
+        if let Some(gap_duration) = inter_scene_durations.get(slot).copied() {
+            let gap_start = cursor;
+            cursor = cursor.checked_add(Microseconds(gap_duration))?;
+            new_gap_starts.push(gap_start);
+        }
+    }
+    let expected_suffix_start = Microseconds(suffix_start);
+    if cursor != expected_suffix_start {
+        return Err(edit_error(
+            VideoErrorCode::ArithmeticOverflow,
+            "scene reorder changed the aggregate timeline duration",
+            "reviewed_scenes",
+        ));
+    }
+
+    let mut regions = Vec::new();
+    if prefix_duration > 0 {
+        regions.push(RegionTranslation {
+            old: TimeRange::new(0, prefix_duration)?,
+            delta: 0,
+        });
+    }
+    for (index, scene) in original_scenes.iter().enumerate() {
+        let new_start = new_starts[scene.id.as_str()];
+        regions.push(RegionTranslation {
+            old: original_ranges[index],
+            delta: new_start
+                .0
+                .checked_sub(original_ranges[index].start_us.0)
+                .ok_or_else(arithmetic_overflow)?,
+        });
+        if let Some(duration) = inter_scene_durations.get(index).copied() {
+            if duration > 0 {
+                let old_gap = TimeRange::new(
+                    original_ranges[index].end_us.0,
+                    original_ranges[index + 1].start_us.0,
+                )?;
+                regions.push(RegionTranslation {
+                    old: old_gap,
+                    delta: new_gap_starts[index]
+                        .0
+                        .checked_sub(old_gap.start_us.0)
+                        .ok_or_else(arithmetic_overflow)?,
+                });
+            }
+        }
+    }
+    if suffix_start < manifest.timeline_duration_us.0 {
+        regions.push(RegionTranslation {
+            old: TimeRange::new(suffix_start, manifest.timeline_duration_us.0)?,
+            delta: 0,
+        });
+    }
+
+    manifest.reviewed_scenes = order
+        .into_iter()
+        .map(|index| {
+            let mut scene = original_scenes[index].clone();
+            scene.timeline_start_us = new_starts[scene.id.as_str()];
+            scene
+        })
+        .collect();
+    for track in &mut manifest.tracks {
+        for clip in &mut track.clips {
+            clip.timeline_start_us = translated_range(clip.timeline_range()?, &regions)?.start_us;
+        }
+        track.clips.sort_by(|left, right| {
+            (left.timeline_start_us, &left.id).cmp(&(right.timeline_start_us, &right.id))
+        });
+    }
+    for gap in &mut manifest.gaps {
+        gap.range = translated_range(gap.range, &regions)?;
+    }
+    manifest.gaps.sort_by(|left, right| {
+        (&left.track_id, left.range.start_us, &left.id).cmp(&(
+            &right.track_id,
+            right.range.start_us,
+            &right.id,
+        ))
+    });
+    for caption in &mut manifest.captions {
+        caption.range = translated_range(caption.range, &regions)?;
+    }
+    manifest.captions.sort_by(|left, right| {
+        (left.range.start_us, &left.id).cmp(&(right.range.start_us, &right.id))
+    });
+    for layer in &mut manifest.visual_layers {
+        layer.range = translated_range(layer.range, &regions)?;
+    }
+    manifest.visual_layers.sort_by(|left, right| {
+        (left.range.start_us, left.z_index, &left.id).cmp(&(
+            right.range.start_us,
+            right.z_index,
+            &right.id,
+        ))
+    });
+    Ok(())
+}
+
+fn translated_range(range: TimeRange, regions: &[RegionTranslation]) -> VideoResult<TimeRange> {
+    let matches = regions
+        .iter()
+        .filter(|region| range_contains(region.old, range))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(edit_error(
+            VideoErrorCode::InvalidTrack,
+            "timeline item crosses a scene or inter-scene boundary and cannot be reordered safely",
+            "timeline",
+        ));
+    }
+    checked_shift_range(range, matches[0].delta)
+}
+
+fn merge_scenes(
+    manifest: &mut VideoProjectManifest,
+    first_scene_id: &str,
+    second_scene_id: &str,
+) -> VideoResult<()> {
+    let first_index = find_scene_index(manifest, first_scene_id)?;
+    let second_index = find_scene_index(manifest, second_scene_id)?;
+    if second_index != first_index + 1 {
+        return Err(merge_error(
+            "merge requires adjacent scenes in canonical timeline order",
+            "operations.second_scene_id",
+        ));
+    }
+    let first = manifest.reviewed_scenes[first_index].clone();
+    let second = manifest.reviewed_scenes[second_index].clone();
+    let first_timeline = scene_timeline_range(&first)?;
+    let second_timeline = scene_timeline_range(&second)?;
+    if first_timeline.end_us != second_timeline.start_us {
+        return Err(merge_error(
+            "merge requires contiguous sibling timeline ranges",
+            "reviewed_scenes.timeline_start_us",
+        ));
+    }
+    let boundary = first_timeline.end_us;
+    if second.id != deterministic_split_id("scene", &first.id, boundary) {
+        return Err(merge_error(
+            "second scene identifier is not derived from the first split sibling",
+            "operations.second_scene_id",
+        ));
+    }
+    let (Some(first_source), Some(second_source)) = (first.source_range, second.source_range)
+    else {
+        return Err(merge_error(
+            "merge requires source-backed split siblings",
+            "reviewed_scenes.source_range",
+        ));
+    };
+    if first.source_asset_id != second.source_asset_id
+        || first.candidate_id != second.candidate_id
+        || first_source.end_us != second_source.start_us
+        || first.title != second.title
+        || first.script != second.script
+        || first.review_state != second.review_state
+        || first.revision != second.revision
+        || first.revision == 0
+    {
+        return Err(merge_error(
+            "merge accepts only unchanged compatible split siblings",
+            "reviewed_scenes",
+        ));
+    }
+    if manifest.narration_bindings.iter().any(|binding| {
+        matches!(
+            binding.scene_id.as_deref(),
+            Some(id) if id == first_scene_id || id == second_scene_id
+        )
+    }) || manifest.render_artifacts.iter().any(|artifact| {
+        matches!(
+            artifact.scene_id.as_deref(),
+            Some(id) if id == first_scene_id || id == second_scene_id
+        )
+    }) {
+        return Err(merge_error(
+            "split-derived right scene acquired dependent artifacts and is no longer mergeable",
+            "reviewed_scenes",
+        ));
+    }
+    manifest.layout.elements = merge_split_layout_elements(
+        &manifest.layout.elements,
+        first_scene_id,
+        second_scene_id,
+        boundary,
+    )?;
+
+    let mut found_anchor_pair = false;
+    for track in &mut manifest.tracks {
+        let original_clips = track.clips.clone();
+        let mut consumed = BTreeSet::new();
+        let mut clips = Vec::with_capacity(original_clips.len());
+        for (index, clip) in original_clips.iter().enumerate() {
+            if consumed.contains(&index) {
+                continue;
+            }
+            if clip.timeline_range()?.end_us == boundary {
+                let expected_id = deterministic_split_id("clip", &clip.id, boundary);
+                if let Some((right_index, right)) =
+                    original_clips
+                        .iter()
+                        .enumerate()
+                        .find(|(right_index, right)| {
+                            !consumed.contains(right_index)
+                                && right.id == expected_id
+                                && right.timeline_start_us == boundary
+                        })
+                {
+                    validate_merge_clip_pair(clip, right, first_scene_id, second_scene_id)?;
+                    let mut merged = clip.clone();
+                    merged.source_range =
+                        TimeRange::new(clip.source_range.start_us.0, right.source_range.end_us.0)?;
+                    merged.timeline_duration_us = Microseconds(
+                        clip.timeline_duration_us
+                            .0
+                            .checked_add(right.timeline_duration_us.0)
+                            .ok_or_else(arithmetic_overflow)?,
+                    );
+                    if clip.scene_id.as_deref() == Some(first_scene_id)
+                        && right.scene_id.as_deref() == Some(second_scene_id)
+                        && clip.timeline_range()? == first_timeline
+                        && right.timeline_range()? == second_timeline
+                        && clip.source_range == first_source
+                        && right.source_range == second_source
+                        && clip.media.source_asset_id == first.source_asset_id
+                    {
+                        found_anchor_pair = true;
+                    }
+                    consumed.insert(right_index);
+                    clips.push(merged);
+                    continue;
+                }
+            }
+            let mut unchanged = clip.clone();
+            if unchanged.scene_id.as_deref() == Some(second_scene_id) {
+                unchanged.scene_id = Some(first_scene_id.to_string());
+            }
+            clips.push(unchanged);
+        }
+        track.clips = clips;
+    }
+    if !found_anchor_pair {
+        return Err(merge_error(
+            "merge requires a contiguous split-derived clip pair on the original source route",
+            "tracks.clips",
+        ));
+    }
+
+    manifest.gaps = merge_split_gaps(&manifest.gaps, boundary)?;
+    manifest.captions = merge_split_captions(
+        &manifest.captions,
+        first_scene_id,
+        second_scene_id,
+        boundary,
+    )?;
+    for layer in &mut manifest.visual_layers {
+        if layer.scene_id.as_deref() == Some(second_scene_id) {
+            layer.scene_id = Some(first_scene_id.to_string());
+        }
+    }
+
+    let mut merged_scene = first.clone();
+    merged_scene.source_range = Some(TimeRange::new(
+        first_source.start_us.0,
+        second_source.end_us.0,
+    )?);
+    merged_scene.timeline_duration_us = Microseconds(
+        first
+            .timeline_duration_us
+            .0
+            .checked_add(second.timeline_duration_us.0)
+            .ok_or_else(arithmetic_overflow)?,
+    );
+    merged_scene.revision = first.revision - 1;
+    manifest
+        .reviewed_scenes
+        .splice(first_index..=second_index, [merged_scene]);
+    Ok(())
+}
+
+fn validate_merge_clip_pair(
+    left: &TimelineClip,
+    right: &TimelineClip,
+    first_scene_id: &str,
+    second_scene_id: &str,
+) -> VideoResult<()> {
+    let scene_pair = (left.scene_id.as_deref(), right.scene_id.as_deref());
+    if !matches!(
+        scene_pair,
+        (Some(left_id), Some(right_id))
+            if left_id == first_scene_id && right_id == second_scene_id
+    ) && scene_pair != (None, None)
+    {
+        return Err(merge_error(
+            "split clip pair has incompatible scene ownership",
+            "tracks.clips.scene_id",
+        ));
+    }
+    if left.timeline_range()?.end_us != right.timeline_start_us
+        || left.source_range.end_us != right.source_range.start_us
+        || left.media != right.media
+        || left.playback_rate != right.playback_rate
+        || left.gain_db_milli != right.gain_db_milli
+        || left.muted != right.muted
+        || left.crop != right.crop
+    {
+        return Err(merge_error(
+            "split clip pair no longer has one contiguous media/playback route",
+            "tracks.clips",
+        ));
+    }
+    Ok(())
+}
+
+fn merge_split_layout_elements(
+    elements: &[super::contracts::LayoutElement],
+    first_scene_id: &str,
+    second_scene_id: &str,
+    boundary: Microseconds,
+) -> VideoResult<Vec<super::contracts::LayoutElement>> {
+    let first_elements = elements
+        .iter()
+        .filter(|element| element.scene_id.as_deref() == Some(first_scene_id))
+        .collect::<Vec<_>>();
+    let mut split_element_ids = BTreeSet::new();
+    for source in first_elements {
+        let expected_id = deterministic_split_id("layout", &source.id, boundary);
+        let Some(split) = elements.iter().find(|element| element.id == expected_id) else {
+            return Err(merge_error(
+                "split-derived right scene is missing its paired layout element",
+                "layout.elements",
+            ));
+        };
+        if split.scene_id.as_deref() != Some(second_scene_id)
+            || source.role != split.role
+            || source.bounds != split.bounds
+            || source.z_index != split.z_index
+            || source.style_id != split.style_id
+        {
+            return Err(merge_error(
+                "split-derived layout siblings are no longer compatible",
+                "layout.elements",
+            ));
+        }
+        split_element_ids.insert(split.id.as_str());
+    }
+    if elements.iter().any(|element| {
+        element.scene_id.as_deref() == Some(second_scene_id)
+            && !split_element_ids.contains(element.id.as_str())
+    }) {
+        return Err(merge_error(
+            "right sibling has a layout element that was not created by the split",
+            "layout.elements",
+        ));
+    }
+    Ok(elements
+        .iter()
+        .filter(|element| !split_element_ids.contains(element.id.as_str()))
+        .cloned()
+        .collect())
+}
+
+fn merge_split_gaps(gaps: &[TimelineGap], boundary: Microseconds) -> VideoResult<Vec<TimelineGap>> {
+    let mut consumed = BTreeSet::new();
+    let mut merged = Vec::with_capacity(gaps.len());
+    for (index, gap) in gaps.iter().enumerate() {
+        if consumed.contains(&index) {
+            continue;
+        }
+        if gap.range.end_us == boundary {
+            let expected_id = deterministic_split_id("gap", &gap.id, boundary);
+            if let Some((right_index, right)) =
+                gaps.iter().enumerate().find(|(right_index, right)| {
+                    !consumed.contains(right_index)
+                        && right.id == expected_id
+                        && right.range.start_us == boundary
+                })
+            {
+                if gap.track_id != right.track_id
+                    || gap.reason != right.reason
+                    || gap.source_asset_id != right.source_asset_id
+                {
+                    return Err(merge_error(
+                        "split gap pair is no longer compatible",
+                        "gaps",
+                    ));
+                }
+                let source_range = match (gap.source_range, right.source_range) {
+                    (Some(left), Some(right)) if left.end_us == right.start_us => {
+                        Some(TimeRange::new(left.start_us.0, right.end_us.0)?)
+                    }
+                    (None, None) => None,
+                    _ => {
+                        return Err(merge_error(
+                            "split source-clock gap pair is no longer contiguous",
+                            "gaps.source_range",
+                        ))
+                    }
+                };
+                let mut combined = gap.clone();
+                combined.range = TimeRange::new(gap.range.start_us.0, right.range.end_us.0)?;
+                combined.source_range = source_range;
+                consumed.insert(right_index);
+                merged.push(combined);
+                continue;
+            }
+        }
+        merged.push(gap.clone());
+    }
+    Ok(merged)
+}
+
+fn merge_split_captions(
+    captions: &[CaptionCue],
+    first_scene_id: &str,
+    second_scene_id: &str,
+    boundary: Microseconds,
+) -> VideoResult<Vec<CaptionCue>> {
+    let mut consumed = BTreeSet::new();
+    let mut merged = Vec::with_capacity(captions.len());
+    for (index, caption) in captions.iter().enumerate() {
+        if consumed.contains(&index) {
+            continue;
+        }
+        if caption.range.end_us == boundary {
+            let expected_id = deterministic_split_id("caption", &caption.id, boundary);
+            if let Some((right_index, right)) =
+                captions.iter().enumerate().find(|(right_index, right)| {
+                    !consumed.contains(right_index)
+                        && right.id == expected_id
+                        && right.range.start_us == boundary
+                })
+            {
+                let scene_pair = (caption.scene_id.as_deref(), right.scene_id.as_deref());
+                if !matches!(
+                    scene_pair,
+                    (Some(left_id), Some(right_id))
+                        if left_id == first_scene_id && right_id == second_scene_id
+                ) && scene_pair != (None, None)
+                {
+                    return Err(merge_error(
+                        "split caption pair has incompatible scene ownership",
+                        "captions.scene_id",
+                    ));
+                }
+                if caption.style_id != right.style_id
+                    || caption.speaker_id != right.speaker_id
+                    || caption.transcript_segment_id != right.transcript_segment_id
+                {
+                    return Err(merge_error(
+                        "split caption pair is no longer compatible",
+                        "captions",
+                    ));
+                }
+                let mut combined = caption.clone();
+                combined.range = TimeRange::new(caption.range.start_us.0, right.range.end_us.0)?;
+                combined.text.push_str(&right.text);
+                combined.validate()?;
+                consumed.insert(right_index);
+                merged.push(combined);
+                continue;
+            }
+        }
+        let mut unchanged = caption.clone();
+        if unchanged.scene_id.as_deref() == Some(second_scene_id) {
+            unchanged.scene_id = Some(first_scene_id.to_string());
+        }
+        merged.push(unchanged);
+    }
+    Ok(merged)
+}
+
+fn merge_error(message: impl Into<String>, field: impl Into<String>) -> VideoError {
+    edit_error(VideoErrorCode::InvalidScene, message, field)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::contracts::{
+        AudioMix, AudioMixTrack, CandidateStatus, CanvasMode, CanvasSpec, ClipCandidate, GapReason,
+        LayoutElement, LayoutPlan, LayoutRole, MediaProbe, MediaReference, NarrationBinding,
+        NormalizedRect, Provenance, ProvenanceKind, PublicationState, RationalFrameRate,
+        RationalRate, RenderArtifact, RenderArtifactRole, ReviewState, SourceAsset,
+        SourceAssetKind, TimelineTrack, TrackKind, TranscriptSegment, TranscriptTimingSource,
+        TranscriptVersion, TranscriptWord,
+    };
+    use super::super::visuals::{
+        VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    };
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    const NOW: &str = "2026-08-28T12:00:00Z";
+    const SOURCE_ID: &str = "source-main";
+    const FIRST_SCENE_ID: &str = "scene-first";
+    const SECOND_SCENE_ID: &str = "scene-second";
+
+    fn range(start: i64, end: i64) -> TimeRange {
+        TimeRange::new(start, end).unwrap()
+    }
+
+    fn clip(
+        id: &str,
+        scene_id: &str,
+        source_start_us: i64,
+        source_end_us: i64,
+        timeline_start_us: i64,
+        timeline_end_us: i64,
+    ) -> TimelineClip {
+        TimelineClip {
+            id: id.into(),
+            scene_id: Some(scene_id.into()),
+            media: MediaReference {
+                source_asset_id: Some(SOURCE_ID.into()),
+                render_artifact_id: None,
+            },
+            source_range: range(source_start_us, source_end_us),
+            timeline_start_us: Microseconds(timeline_start_us),
+            timeline_duration_us: Microseconds(timeline_end_us - timeline_start_us),
+            playback_rate: RationalRate::ONE,
+            gain_db_milli: 0,
+            muted: false,
+            crop: None,
+        }
+    }
+
+    fn manifest() -> VideoProjectManifest {
+        let mut manifest = VideoProjectManifest::new(
+            "project-editor",
+            "Editor fixture",
+            RationalFrameRate::FPS_30,
+            Microseconds(7_000_000),
+            LayoutPlan {
+                mode: CanvasMode::Portrait,
+                canvas: CanvasSpec {
+                    width: 1080,
+                    height: 1920,
+                    pixel_aspect_numerator: 1,
+                    pixel_aspect_denominator: 1,
+                },
+                safe_area: NormalizedRect {
+                    x_bp: 0,
+                    y_bp: 0,
+                    width_bp: 10_000,
+                    height_bp: 10_000,
+                },
+                background_rgba: [0, 0, 0, 255],
+                elements: Vec::new(),
+            },
+            AudioMix {
+                target_lufs_milli: -16_000,
+                true_peak_db_milli: -1_000,
+                tracks: Vec::new(),
+            },
+            NOW,
+        )
+        .unwrap();
+        manifest.source_assets.push(SourceAsset {
+            id: SOURCE_ID.into(),
+            kind: SourceAssetKind::LocalVideo,
+            managed_path: "sources/main.mp4".into(),
+            sha256: "a".repeat(64),
+            probe: MediaProbe {
+                duration_us: Microseconds(20_000_000),
+                width: Some(1920),
+                height: Some(1080),
+                frame_rate: Some(RationalFrameRate::FPS_30),
+                has_video: true,
+                has_audio: true,
+                format_name: "mov,mp4".into(),
+            },
+            provenance: Provenance {
+                kind: ProvenanceKind::UserUpload,
+                original_uri: None,
+                imported_at: NOW.into(),
+                producer: "editor-test".into(),
+                producer_version: None,
+                metadata: BTreeMap::new(),
+            },
+            rights_confirmation_id: None,
+        });
+        let words = vec![
+            ("word-one", 1_100_000, 1_500_000, "one"),
+            ("word-two", 1_600_000, 2_200_000, "two"),
+            ("word-three", 2_400_000, 3_100_000, "three"),
+            ("word-four", 3_200_000, 3_800_000, "four"),
+            ("word-five", 8_200_000, 9_100_000, "five"),
+            ("word-six", 9_300_000, 10_400_000, "six"),
+        ]
+        .into_iter()
+        .map(|(id, start, end, text)| TranscriptWord {
+            id: id.into(),
+            range: range(start, end),
+            text: text.into(),
+            speaker_id: None,
+            confidence_milli: Some(950),
+        })
+        .collect::<Vec<_>>();
+        manifest.transcript = Some(TranscriptVersion {
+            id: "transcript-main".into(),
+            source_asset_id: SOURCE_ID.into(),
+            source_clock_duration_us: Microseconds(20_000_000),
+            language: Some("en".into()),
+            timing_source: TranscriptTimingSource::SoundArWhisper,
+            preserved_source_gaps: true,
+            segments: vec![
+                TranscriptSegment {
+                    id: "segment-first".into(),
+                    range: range(1_000_000, 4_000_000),
+                    text: "one two three four".into(),
+                    speaker_id: None,
+                    word_ids: vec![
+                        "word-one".into(),
+                        "word-two".into(),
+                        "word-three".into(),
+                        "word-four".into(),
+                    ],
+                },
+                TranscriptSegment {
+                    id: "segment-second".into(),
+                    range: range(8_000_000, 11_000_000),
+                    text: "five six".into(),
+                    speaker_id: None,
+                    word_ids: vec!["word-five".into(), "word-six".into()],
+                },
+            ],
+            words,
+            content_sha256: "b".repeat(64),
+            created_at: NOW.into(),
+        });
+        manifest.candidates = vec![
+            ClipCandidate {
+                id: "candidate-first".into(),
+                source_asset_id: SOURCE_ID.into(),
+                source_range: range(1_000_000, 4_000_000),
+                title: "First".into(),
+                rationale: "First source selection".into(),
+                transcript_segment_ids: vec!["segment-first".into()],
+                score_milli: 900,
+                status: CandidateStatus::Accepted,
+            },
+            ClipCandidate {
+                id: "candidate-second".into(),
+                source_asset_id: SOURCE_ID.into(),
+                source_range: range(8_000_000, 11_000_000),
+                title: "Second".into(),
+                rationale: "Second source selection".into(),
+                transcript_segment_ids: vec!["segment-second".into()],
+                score_milli: 850,
+                status: CandidateStatus::Accepted,
+            },
+        ];
+        manifest.reviewed_scenes = vec![
+            ReviewedScene {
+                id: FIRST_SCENE_ID.into(),
+                candidate_id: Some("candidate-first".into()),
+                source_asset_id: Some(SOURCE_ID.into()),
+                source_range: Some(range(1_000_000, 4_000_000)),
+                timeline_start_us: Microseconds::ZERO,
+                timeline_duration_us: Microseconds(3_000_000),
+                title: "First".into(),
+                script: "one two three four".into(),
+                review_state: ReviewState::Approved,
+                revision: 1,
+            },
+            ReviewedScene {
+                id: SECOND_SCENE_ID.into(),
+                candidate_id: Some("candidate-second".into()),
+                source_asset_id: Some(SOURCE_ID.into()),
+                source_range: Some(range(8_000_000, 11_000_000)),
+                timeline_start_us: Microseconds(4_000_000),
+                timeline_duration_us: Microseconds(3_000_000),
+                title: "Second".into(),
+                script: "five six".into(),
+                review_state: ReviewState::Approved,
+                revision: 1,
+            },
+        ];
+        manifest.tracks = vec![
+            TimelineTrack {
+                id: "video-main".into(),
+                kind: TrackKind::Video,
+                clips: vec![
+                    clip(
+                        "clip-video-first",
+                        FIRST_SCENE_ID,
+                        1_000_000,
+                        4_000_000,
+                        0,
+                        3_000_000,
+                    ),
+                    clip(
+                        "clip-video-second",
+                        SECOND_SCENE_ID,
+                        8_000_000,
+                        11_000_000,
+                        4_000_000,
+                        7_000_000,
+                    ),
+                ],
+                preserve_gaps: true,
+            },
+            TimelineTrack {
+                id: "audio-main".into(),
+                kind: TrackKind::Audio,
+                clips: vec![
+                    clip(
+                        "clip-audio-first",
+                        FIRST_SCENE_ID,
+                        1_000_000,
+                        4_000_000,
+                        0,
+                        3_000_000,
+                    ),
+                    clip(
+                        "clip-audio-second",
+                        SECOND_SCENE_ID,
+                        8_000_000,
+                        11_000_000,
+                        4_000_000,
+                        7_000_000,
+                    ),
+                ],
+                preserve_gaps: true,
+            },
+            TimelineTrack {
+                id: "overlay-empty".into(),
+                kind: TrackKind::Overlay,
+                clips: Vec::new(),
+                preserve_gaps: true,
+            },
+        ];
+        manifest.gaps = vec![
+            TimelineGap {
+                id: "gap-video-transition".into(),
+                track_id: "video-main".into(),
+                range: range(3_000_000, 4_000_000),
+                reason: GapReason::Transition,
+                source_asset_id: None,
+                source_range: None,
+            },
+            TimelineGap {
+                id: "gap-audio-transition".into(),
+                track_id: "audio-main".into(),
+                range: range(3_000_000, 4_000_000),
+                reason: GapReason::Editorial,
+                source_asset_id: None,
+                source_range: None,
+            },
+            TimelineGap {
+                id: "gap-overlay-first".into(),
+                track_id: "overlay-empty".into(),
+                range: range(0, 3_000_000),
+                reason: GapReason::Padding,
+                source_asset_id: None,
+                source_range: None,
+            },
+            TimelineGap {
+                id: "gap-overlay-transition".into(),
+                track_id: "overlay-empty".into(),
+                range: range(3_000_000, 4_000_000),
+                reason: GapReason::Transition,
+                source_asset_id: None,
+                source_range: None,
+            },
+            TimelineGap {
+                id: "gap-overlay-second".into(),
+                track_id: "overlay-empty".into(),
+                range: range(4_000_000, 7_000_000),
+                reason: GapReason::Padding,
+                source_asset_id: None,
+                source_range: None,
+            },
+        ];
+        manifest.captions = vec![
+            CaptionCue {
+                id: "caption-first".into(),
+                range: range(100_000, 2_900_000),
+                text: "one two three four".into(),
+                style_id: "caption-clean-white".into(),
+                speaker_id: None,
+                transcript_segment_id: Some("segment-first".into()),
+                scene_id: Some(FIRST_SCENE_ID.into()),
+            },
+            CaptionCue {
+                id: "caption-second".into(),
+                range: range(4_100_000, 6_900_000),
+                text: "five six".into(),
+                style_id: "caption-clean-white".into(),
+                speaker_id: None,
+                transcript_segment_id: Some("segment-second".into()),
+                scene_id: Some(SECOND_SCENE_ID.into()),
+            },
+        ];
+        manifest.layout.elements.push(LayoutElement {
+            id: "layout-first".into(),
+            role: LayoutRole::PrimaryVideo,
+            scene_id: Some(FIRST_SCENE_ID.into()),
+            bounds: NormalizedRect {
+                x_bp: 0,
+                y_bp: 0,
+                width_bp: 10_000,
+                height_bp: 10_000,
+            },
+            z_index: 0,
+            style_id: None,
+        });
+        manifest.audio_mix.tracks.push(AudioMixTrack {
+            track_id: "audio-main".into(),
+            gain_db_milli: 0,
+            pan_milli: 0,
+            ducking: None,
+        });
+        manifest.validate_strict().unwrap();
+        manifest
+    }
+
+    fn add_visual_layer(manifest: &mut VideoProjectManifest, range: TimeRange, scene_id: &str) {
+        manifest.visual_assets.push(VisualAsset {
+            id: "visual-editor".into(),
+            managed_path: "visuals/editor.png".into(),
+            sha256: "e".repeat(64),
+            mime_type: VisualMimeType::Png,
+            width: 1600,
+            height: 900,
+            has_alpha: false,
+            size_bytes: 1_024,
+            provenance: Provenance {
+                kind: ProvenanceKind::GeneratedLocally,
+                original_uri: None,
+                imported_at: NOW.into(),
+                producer: "editor-image-test".into(),
+                producer_version: Some("1".into()),
+                metadata: BTreeMap::new(),
+            },
+            created_at: NOW.into(),
+        });
+        manifest.visual_layers.push(VisualLayer {
+            id: "visual-layer-editor".into(),
+            asset_id: "visual-editor".into(),
+            scene_id: Some(scene_id.into()),
+            range,
+            fit: VisualFit::Contain,
+            crop: None,
+            z_index: 2,
+            motion: VisualMotion {
+                start_bounds: NormalizedRect {
+                    x_bp: 1_000,
+                    y_bp: 2_000,
+                    width_bp: 8_000,
+                    height_bp: 4_500,
+                },
+                end_bounds: NormalizedRect {
+                    x_bp: 200,
+                    y_bp: 1_500,
+                    width_bp: 9_600,
+                    height_bp: 5_400,
+                },
+                start_opacity_milli: 1_000,
+                end_opacity_milli: 1_000,
+                start_rotation_milli_degrees: 0,
+                end_rotation_milli_degrees: 0,
+                easing: VisualEasing::EaseInOut,
+            },
+            transition_in_us: Microseconds(100_000),
+            transition_out_us: Microseconds(100_000),
+        });
+    }
+
+    fn request(operations: Vec<VideoTimelineOperation>) -> VideoTimelineEditRequest {
+        VideoTimelineEditRequest {
+            project_id: "project-editor".into(),
+            expected_revision: 0,
+            base_version_id: "store-version-1".into(),
+            operation_id: "timeline-operation-1".into(),
+            operations,
+        }
+    }
+
+    fn add_narration_dependency(manifest: &mut VideoProjectManifest, scene_id: &str, suffix: &str) {
+        let artifact_id = format!("artifact-narration-{suffix}");
+        manifest.render_artifacts.push(RenderArtifact {
+            id: artifact_id.clone(),
+            role: RenderArtifactRole::SceneSegment,
+            scene_id: None,
+            managed_path: format!("renders/narration-{suffix}.wav"),
+            sha256: "e".repeat(64),
+            cache_key: "f".repeat(64),
+            mime_type: "audio/wav".into(),
+            duration_us: Some(Microseconds(3_000_000)),
+            width: None,
+            height: None,
+            publication_state: PublicationState::Published,
+            created_at: NOW.into(),
+        });
+        let script = manifest
+            .reviewed_scenes
+            .iter()
+            .find(|scene| scene.id == scene_id)
+            .unwrap()
+            .script
+            .clone();
+        manifest.narration_bindings.push(NarrationBinding {
+            id: format!("narration-{suffix}"),
+            scene_id: Some(scene_id.into()),
+            render_artifact_id: artifact_id,
+            history_id: format!("history-{suffix}"),
+            generation_job_id: format!("job-{suffix}"),
+            voice_id: format!("voice-{suffix}"),
+            model_id: "model-test".into(),
+            speaker: "speaker".into(),
+            language: "en".into(),
+            script_sha256: format!("{:x}", Sha256::digest(script.as_bytes())),
+            created_at: NOW.into(),
+        });
+        manifest.validate_strict().unwrap();
+    }
+
+    fn split_operation(at_timeline_us: i64) -> VideoTimelineOperation {
+        VideoTimelineOperation::SplitScene {
+            scene_id: FIRST_SCENE_ID.into(),
+            at_timeline_us: Microseconds(at_timeline_us),
+        }
+    }
+
+    #[test]
+    fn structured_requests_reject_unknown_fields() {
+        let top_level = json!({
+            "project_id": "project-editor",
+            "expected_revision": 0,
+            "base_version_id": "store-version-1",
+            "operation_id": "timeline-operation-1",
+            "operations": [{"type": "reorder_scene", "scene_id": FIRST_SCENE_ID, "to_index": 1}],
+            "surprise": true,
+        });
+        assert!(serde_json::from_value::<VideoTimelineEditRequest>(top_level).is_err());
+        let operation = json!({
+            "type": "split_scene",
+            "scene_id": FIRST_SCENE_ID,
+            "at_timeline_us": 1_500_000,
+            "milliseconds": 1_500,
+        });
+        assert!(serde_json::from_value::<VideoTimelineOperation>(operation).is_err());
+    }
+
+    #[test]
+    fn split_uses_exact_source_clock_and_partitions_tracks_gaps_captions_and_layout() {
+        let original = manifest();
+        let applied =
+            apply_timeline_edit(&original, &request(vec![split_operation(1_500_000)])).unwrap();
+        let right_id = deterministic_split_id("scene", FIRST_SCENE_ID, Microseconds(1_500_000));
+        assert_eq!(applied.manifest.reviewed_scenes.len(), 3);
+        assert_eq!(
+            applied.manifest.reviewed_scenes[0].source_range,
+            Some(range(1_000_000, 2_500_000))
+        );
+        assert_eq!(applied.manifest.reviewed_scenes[1].id, right_id);
+        assert_eq!(
+            applied.manifest.reviewed_scenes[1].source_range,
+            Some(range(2_500_000, 4_000_000))
+        );
+        let first_video = &applied.manifest.tracks[0].clips[0];
+        let right_video = &applied.manifest.tracks[0].clips[1];
+        assert_eq!(first_video.source_range, range(1_000_000, 2_500_000));
+        assert_eq!(right_video.source_range, range(2_500_000, 4_000_000));
+        assert_eq!(right_video.scene_id.as_deref(), Some(right_id.as_str()));
+        let split_overlay = applied
+            .manifest
+            .gaps
+            .iter()
+            .filter(|gap| gap.track_id == "overlay-empty" && gap.range.end_us.0 <= 3_000_000)
+            .collect::<Vec<_>>();
+        assert_eq!(split_overlay.len(), 2);
+        assert_eq!(split_overlay[0].range, range(0, 1_500_000));
+        assert_eq!(split_overlay[1].range, range(1_500_000, 3_000_000));
+        let first_caption = &applied.manifest.captions[0];
+        let right_caption = &applied.manifest.captions[1];
+        assert_eq!(first_caption.range, range(100_000, 1_500_000));
+        assert_eq!(right_caption.range, range(1_500_000, 2_900_000));
+        assert_eq!(first_caption.text, "one two ");
+        assert_eq!(right_caption.text, "three four");
+        assert_eq!(
+            format!("{}{}", first_caption.text, right_caption.text),
+            "one two three four"
+        );
+        assert_eq!(right_caption.scene_id.as_deref(), Some(right_id.as_str()));
+        assert!(applied
+            .manifest
+            .layout
+            .elements
+            .iter()
+            .any(|element| element.scene_id.as_deref() == Some(right_id.as_str())));
+        assert_eq!(applied.manifest.revision, original.revision);
+        assert_eq!(applied.manifest.revision_history, original.revision_history);
+        assert_eq!(applied.manifest.updated_at, original.updated_at);
+        assert_eq!(
+            applied.receipt.changed_paths,
+            vec![
+                "/captions",
+                "/gaps",
+                "/layout/elements",
+                "/reviewed_scenes",
+                "/tracks",
+            ]
+        );
+        assert!(applied
+            .receipt
+            .invalidated_stages
+            .contains(&RevisionStage::Plan));
+        assert!(applied
+            .receipt
+            .invalidated_stages
+            .contains(&RevisionStage::PublishPackage));
+        applied.manifest.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn split_enforces_minimums_and_rejects_inexact_rational_boundaries() {
+        let original = manifest();
+        let error =
+            apply_timeline_edit(&original, &request(vec![split_operation(99_999)])).unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidScene);
+        apply_timeline_edit(&original, &request(vec![split_operation(100_000)])).unwrap();
+
+        let mut rational = manifest();
+        rational.reviewed_scenes[0].source_range = Some(range(1_000_000, 5_500_000));
+        rational.candidates[0].source_range = range(1_000_000, 5_500_000);
+        for clip in rational
+            .tracks
+            .iter_mut()
+            .flat_map(|track| &mut track.clips)
+            .filter(|clip| clip.scene_id.as_deref() == Some(FIRST_SCENE_ID))
+        {
+            clip.source_range = range(1_000_000, 5_500_000);
+            clip.playback_rate = RationalRate {
+                numerator: 3,
+                denominator: 2,
+            };
+        }
+        rational.validate_strict().unwrap();
+        let error =
+            apply_timeline_edit(&rational, &request(vec![split_operation(1_500_001)])).unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::DurationMismatch);
+    }
+
+    #[test]
+    fn trim_clamps_source_derived_caption_text_and_preserves_inter_scene_gaps() {
+        let original = manifest();
+        let applied = apply_timeline_edit(
+            &original,
+            &request(vec![VideoTimelineOperation::TrimScene {
+                scene_id: FIRST_SCENE_ID.into(),
+                source_start_us: Microseconds(1_500_000),
+                source_end_us: Microseconds(3_500_000),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(
+            applied.manifest.timeline_duration_us,
+            Microseconds(6_000_000)
+        );
+        assert_eq!(
+            applied.manifest.reviewed_scenes[0].source_range,
+            Some(range(1_500_000, 3_500_000))
+        );
+        assert_eq!(
+            applied.manifest.reviewed_scenes[1].timeline_start_us,
+            Microseconds(3_000_000)
+        );
+        assert_eq!(
+            applied.manifest.tracks[0].clips[0].source_range,
+            range(1_500_000, 3_500_000)
+        );
+        assert!(
+            applied
+                .manifest
+                .gaps
+                .iter()
+                .filter(|gap| gap.range == range(2_000_000, 3_000_000))
+                .count()
+                >= 3
+        );
+        assert_eq!(applied.manifest.captions[0].range, range(0, 2_000_000));
+        assert_eq!(applied.manifest.captions[0].text, "two three four");
+        assert!(applied
+            .receipt
+            .changed_paths
+            .contains(&"/timeline_duration_us".to_string()));
+        applied.manifest.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn trim_drops_empty_caption_intersections_and_rejects_subminimum_ranges() {
+        let original = manifest();
+        let applied = apply_timeline_edit(
+            &original,
+            &request(vec![VideoTimelineOperation::TrimScene {
+                scene_id: FIRST_SCENE_ID.into(),
+                source_start_us: Microseconds(2_800_000),
+                source_end_us: Microseconds(3_000_000),
+            }]),
+        )
+        .unwrap();
+        assert!(applied
+            .manifest
+            .captions
+            .iter()
+            .all(|caption| caption.scene_id.as_deref() != Some(FIRST_SCENE_ID)));
+        let error = apply_timeline_edit(
+            &original,
+            &request(vec![VideoTimelineOperation::TrimScene {
+                scene_id: FIRST_SCENE_ID.into(),
+                source_start_us: Microseconds(2_800_000),
+                source_end_us: Microseconds(2_899_999),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidScene);
+    }
+
+    #[test]
+    fn reorder_moves_scene_local_media_while_preserving_gap_slots_and_source_ranges() {
+        let original = manifest();
+        let applied = apply_timeline_edit(
+            &original,
+            &request(vec![VideoTimelineOperation::ReorderScene {
+                scene_id: FIRST_SCENE_ID.into(),
+                to_index: 1,
+            }]),
+        )
+        .unwrap();
+        assert_eq!(applied.manifest.reviewed_scenes[0].id, SECOND_SCENE_ID);
+        assert_eq!(
+            applied.manifest.reviewed_scenes[0].source_range,
+            original.reviewed_scenes[1].source_range
+        );
+        assert_eq!(
+            applied.manifest.reviewed_scenes[1].timeline_start_us,
+            Microseconds(4_000_000)
+        );
+        assert!(
+            applied
+                .manifest
+                .gaps
+                .iter()
+                .filter(|gap| gap.range == range(3_000_000, 4_000_000))
+                .count()
+                >= 3
+        );
+        let second_clip = applied.manifest.tracks[0]
+            .clips
+            .iter()
+            .find(|clip| clip.scene_id.as_deref() == Some(SECOND_SCENE_ID))
+            .unwrap();
+        assert_eq!(second_clip.timeline_start_us, Microseconds::ZERO);
+        assert_eq!(second_clip.source_range, range(8_000_000, 11_000_000));
+        assert_eq!(
+            applied.manifest.layout.elements[0].scene_id.as_deref(),
+            Some(FIRST_SCENE_ID)
+        );
+        applied.manifest.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn visual_layers_follow_reorder_and_fail_closed_when_a_split_would_change_motion() {
+        let mut original = manifest();
+        add_visual_layer(&mut original, range(500_000, 1_000_000), FIRST_SCENE_ID);
+        original.validate_strict().unwrap();
+        let reordered = apply_timeline_edit(
+            &original,
+            &request(vec![VideoTimelineOperation::ReorderScene {
+                scene_id: FIRST_SCENE_ID.into(),
+                to_index: 1,
+            }]),
+        )
+        .unwrap();
+        assert_eq!(
+            reordered.manifest.visual_layers[0].range,
+            range(4_500_000, 5_000_000)
+        );
+        assert_eq!(
+            reordered.manifest.visual_layers[0].scene_id.as_deref(),
+            Some(FIRST_SCENE_ID)
+        );
+        assert!(reordered
+            .receipt
+            .changed_paths
+            .iter()
+            .any(|path| path == "/visual_layers"));
+
+        let mut crossing = manifest();
+        add_visual_layer(&mut crossing, range(500_000, 2_000_000), FIRST_SCENE_ID);
+        crossing.validate_strict().unwrap();
+        let error = apply_timeline_edit(&crossing, &request(vec![split_operation(1_500_000)]))
+            .expect_err("a split cannot silently retime an active visual motion curve");
+        assert_eq!(error.code, VideoErrorCode::InvalidLayout);
+        assert_eq!(error.field.as_deref(), Some("visual_layers.range"));
+    }
+
+    #[test]
+    fn visual_layer_motion_is_revisioned_without_replacing_the_managed_asset() {
+        let mut original = manifest();
+        add_visual_layer(&mut original, range(500_000, 2_500_000), FIRST_SCENE_ID);
+        original.validate_strict().unwrap();
+        let original_asset = original.visual_assets[0].clone();
+        let motion = VisualMotion {
+            start_bounds: NormalizedRect {
+                x_bp: 2_000,
+                y_bp: 3_000,
+                width_bp: 6_400,
+                height_bp: 3_600,
+            },
+            end_bounds: NormalizedRect {
+                x_bp: 1_000,
+                y_bp: 2_000,
+                width_bp: 8_000,
+                height_bp: 4_500,
+            },
+            start_opacity_milli: 900,
+            end_opacity_milli: 900,
+            start_rotation_milli_degrees: 0,
+            end_rotation_milli_degrees: 0,
+            easing: VisualEasing::Linear,
+        };
+        let update = VideoTimelineOperation::UpdateVisualLayer {
+            layer_id: "visual-layer-editor".into(),
+            scene_id: Some(FIRST_SCENE_ID.into()),
+            range: range(750_000, 2_250_000),
+            fit: VisualFit::Cover,
+            crop: None,
+            z_index: 7,
+            motion: motion.clone(),
+            transition_in_us: Microseconds(200_000),
+            transition_out_us: Microseconds(150_000),
+        };
+        let applied = apply_timeline_edit(&original, &request(vec![update.clone()])).unwrap();
+        assert_eq!(applied.manifest.visual_assets[0], original_asset);
+        let layer = &applied.manifest.visual_layers[0];
+        assert_eq!(layer.asset_id, "visual-editor");
+        assert_eq!(layer.range, range(750_000, 2_250_000));
+        assert_eq!(layer.fit, VisualFit::Cover);
+        assert_eq!(layer.z_index, 7);
+        assert_eq!(layer.motion, motion);
+        assert_eq!(
+            applied.receipt.changed_paths,
+            vec!["/visual_layers".to_string()]
+        );
+        assert_eq!(applied.manifest.revision, original.revision);
+
+        let mut outside_scene = update;
+        if let VideoTimelineOperation::UpdateVisualLayer { range, .. } = &mut outside_scene {
+            *range = TimeRange::new(2_500_000, 3_500_000).unwrap();
+        }
+        let error = apply_timeline_edit(&original, &request(vec![outside_scene])).unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidLayout);
+        assert_eq!(error.field.as_deref(), Some("visual_layers.range"));
+    }
+
+    #[test]
+    fn deterministic_split_merge_is_an_exact_manifest_round_trip() {
+        let original = manifest();
+        let split =
+            apply_timeline_edit(&original, &request(vec![split_operation(1_500_000)])).unwrap();
+        let right_id = split.manifest.reviewed_scenes[1].id.clone();
+        let merged = apply_timeline_edit(
+            &split.manifest,
+            &request(vec![VideoTimelineOperation::MergeScenes {
+                first_scene_id: FIRST_SCENE_ID.into(),
+                second_scene_id: right_id,
+            }]),
+        )
+        .unwrap();
+        assert_eq!(merged.manifest, original);
+        assert_eq!(merged.manifest.revision, split.manifest.revision);
+    }
+
+    #[test]
+    fn merge_rejects_modified_or_arbitrary_siblings() {
+        let original = manifest();
+        let split =
+            apply_timeline_edit(&original, &request(vec![split_operation(1_500_000)])).unwrap();
+        let right_id = split.manifest.reviewed_scenes[1].id.clone();
+        let mut incompatible = split.manifest;
+        incompatible.tracks[0].clips[1].muted = true;
+        incompatible.validate_strict().unwrap();
+        let error = apply_timeline_edit(
+            &incompatible,
+            &request(vec![VideoTimelineOperation::MergeScenes {
+                first_scene_id: FIRST_SCENE_ID.into(),
+                second_scene_id: right_id,
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidScene);
+
+        let error = apply_timeline_edit(
+            &original,
+            &request(vec![VideoTimelineOperation::MergeScenes {
+                first_scene_id: FIRST_SCENE_ID.into(),
+                second_scene_id: SECOND_SCENE_ID.into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidScene);
+    }
+
+    #[test]
+    fn split_fails_closed_for_rendered_scene_dependencies() {
+        let mut rendered = manifest();
+        rendered.render_artifacts.push(RenderArtifact {
+            id: "artifact-scene-first".into(),
+            role: RenderArtifactRole::SceneSegment,
+            scene_id: Some(FIRST_SCENE_ID.into()),
+            managed_path: "renders/scene-first.mp4".into(),
+            sha256: "c".repeat(64),
+            cache_key: "d".repeat(64),
+            mime_type: "video/mp4".into(),
+            duration_us: Some(Microseconds(3_000_000)),
+            width: Some(1080),
+            height: Some(1920),
+            publication_state: PublicationState::Published,
+            created_at: NOW.into(),
+        });
+        rendered.validate_strict().unwrap();
+        let error =
+            apply_timeline_edit(&rendered, &request(vec![split_operation(1_500_000)])).unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidScene);
+    }
+
+    #[test]
+    fn narration_dependencies_fail_closed_for_split_and_merge_but_survive_reorder() {
+        let mut narrated = manifest();
+        add_narration_dependency(&mut narrated, FIRST_SCENE_ID, "first");
+        let error =
+            apply_timeline_edit(&narrated, &request(vec![split_operation(1_500_000)])).unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidScene);
+
+        let reordered = apply_timeline_edit(
+            &narrated,
+            &request(vec![VideoTimelineOperation::ReorderScene {
+                scene_id: FIRST_SCENE_ID.into(),
+                to_index: 1,
+            }]),
+        )
+        .unwrap();
+        assert_eq!(
+            reordered.manifest.narration_bindings[0].scene_id.as_deref(),
+            Some(FIRST_SCENE_ID)
+        );
+        reordered.manifest.validate_strict().unwrap();
+
+        let original = manifest();
+        let split =
+            apply_timeline_edit(&original, &request(vec![split_operation(1_500_000)])).unwrap();
+        let right_id = split.manifest.reviewed_scenes[1].id.clone();
+        let mut right_narrated = split.manifest;
+        add_narration_dependency(&mut right_narrated, &right_id, "right");
+        let error = apply_timeline_edit(
+            &right_narrated,
+            &request(vec![VideoTimelineOperation::MergeScenes {
+                first_scene_id: FIRST_SCENE_ID.into(),
+                second_scene_id: right_id,
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidScene);
+    }
+
+    #[test]
+    fn deterministic_id_collisions_and_scene_revision_overflow_fail_closed() {
+        let mut collision = manifest();
+        let derived = deterministic_split_id("scene", FIRST_SCENE_ID, Microseconds(1_500_000));
+        collision.reviewed_scenes[1].id = derived.clone();
+        for clip in collision
+            .tracks
+            .iter_mut()
+            .flat_map(|track| &mut track.clips)
+            .filter(|clip| clip.scene_id.as_deref() == Some(SECOND_SCENE_ID))
+        {
+            clip.scene_id = Some(derived.clone());
+        }
+        for caption in &mut collision.captions {
+            if caption.scene_id.as_deref() == Some(SECOND_SCENE_ID) {
+                caption.scene_id = Some(derived.clone());
+            }
+        }
+        collision.validate_strict().unwrap();
+        let error = apply_timeline_edit(&collision, &request(vec![split_operation(1_500_000)]))
+            .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::DuplicateId);
+
+        let mut overflow = manifest();
+        overflow.reviewed_scenes[0].revision = u32::MAX;
+        overflow.validate_strict().unwrap();
+        let error =
+            apply_timeline_edit(&overflow, &request(vec![split_operation(1_500_000)])).unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::ArithmeticOverflow);
+    }
+
+    #[test]
+    fn stale_project_or_revision_is_rejected_but_opaque_store_version_is_echoed() {
+        let original = manifest();
+        let mut stale_project = request(vec![split_operation(1_500_000)]);
+        stale_project.project_id = "project-other".into();
+        assert_eq!(
+            apply_timeline_edit(&original, &stale_project)
+                .unwrap_err()
+                .code,
+            VideoErrorCode::MissingReference
+        );
+        let mut stale_revision = request(vec![split_operation(1_500_000)]);
+        stale_revision.expected_revision = 1;
+        assert_eq!(
+            apply_timeline_edit(&original, &stale_revision)
+                .unwrap_err()
+                .code,
+            VideoErrorCode::InvalidRevision
+        );
+        let mut current = request(vec![split_operation(1_500_000)]);
+        current.base_version_id = "opaque-store-version".into();
+        let applied = apply_timeline_edit(&original, &current).unwrap();
+        assert_eq!(applied.receipt.base_version_id, "opaque-store-version");
+    }
+
+    #[test]
+    fn deterministic_replay_and_ordered_batch_do_not_advance_revision() {
+        let original = manifest();
+        let replay_request = request(vec![split_operation(1_500_000)]);
+        assert_eq!(
+            apply_timeline_edit(&original, &replay_request).unwrap(),
+            apply_timeline_edit(&original, &replay_request).unwrap()
+        );
+
+        let batch = request(vec![
+            VideoTimelineOperation::TrimScene {
+                scene_id: FIRST_SCENE_ID.into(),
+                source_start_us: Microseconds(1_500_000),
+                source_end_us: Microseconds(3_500_000),
+            },
+            VideoTimelineOperation::ReorderScene {
+                scene_id: SECOND_SCENE_ID.into(),
+                to_index: 0,
+            },
+        ]);
+        let applied = apply_timeline_edit(&original, &batch).unwrap();
+        assert_eq!(applied.manifest.revision, original.revision);
+        assert_eq!(applied.receipt.operation_id, batch.operation_id);
+        assert_eq!(applied.receipt.expected_revision, original.revision);
+        applied.manifest.validate_strict().unwrap();
+    }
+}

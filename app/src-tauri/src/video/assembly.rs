@@ -31,6 +31,8 @@ use std::{
 };
 use uuid::Uuid;
 
+use super::visuals::{VisualEasing, VisualFit, VisualLayer};
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptionTheme {
@@ -274,6 +276,55 @@ pub fn build_timeline_render_plan(
             })?);
         }
     }
+    let mut visual_input_by_asset = BTreeMap::new();
+    for layer in &manifest.visual_layers {
+        if visual_input_by_asset.contains_key(layer.asset_id.as_str()) {
+            continue;
+        }
+        let asset = manifest
+            .visual_assets
+            .iter()
+            .find(|asset| asset.id == layer.asset_id)
+            .ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorCode::MissingReference,
+                    format!("visual layer {} has no managed asset", layer.id),
+                )
+            })?;
+        let namespaced_id = format!("visual:{}", asset.id);
+        let path = resolved_sources
+            .get(&namespaced_id)
+            .or_else(|| resolved_sources.get(asset.id.as_str()))
+            .ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorCode::MissingReference,
+                    format!("visual asset {} has no resolved managed file", asset.id),
+                )
+            })?;
+        let path = fs::canonicalize(path).map_err(|error| {
+            VideoError::new(
+                VideoErrorCode::InvalidAsset,
+                format!("visual asset {} could not be opened: {error}", asset.id),
+            )
+        })?;
+        let input_index = input_by_clip.len() + visual_input_by_asset.len();
+        visual_input_by_asset.insert(asset.id.as_str(), input_index);
+        args.extend([
+            OsString::from("-loop"),
+            OsString::from("1"),
+            OsString::from("-framerate"),
+            OsString::from(&frame_rate),
+        ]);
+        args.extend(local_media_input_args(&path).map_err(|error| {
+            VideoError::new(
+                VideoErrorCode::InvalidAsset,
+                format!(
+                    "visual asset {} failed local-input policy: {}",
+                    asset.id, error.message
+                ),
+            )
+        })?);
+    }
     args.extend([
         OsString::from("-map_metadata"),
         OsString::from("-1"),
@@ -303,6 +354,16 @@ pub fn build_timeline_render_plan(
         ));
         "assembled_video".to_string()
     };
+    if !manifest.visual_layers.is_empty() {
+        assembled_video = append_visual_layer_filters(
+            &mut filters,
+            &assembled_video,
+            &manifest.visual_layers,
+            &visual_input_by_asset,
+            width,
+            height,
+        )?;
+    }
 
     let mut audio_labels = Vec::new();
     for (index, track) in audio_tracks.iter().enumerate() {
@@ -401,12 +462,12 @@ pub fn build_timeline_render_plan(
                 "[{assembled_video}]subtitles=filename='{}'[video_output]",
                 escape_filter_path(path)
             ));
-            "[video_output]"
+            "[video_output]".to_string()
         } else {
-            "[assembled_video]"
+            format!("[{assembled_video}]")
         }
     } else {
-        "[assembled_video]"
+        format!("[{assembled_video}]")
     };
     let target_lufs = f64::from(manifest.audio_mix.target_lufs_milli) / 1_000.0;
     let true_peak = f64::from(manifest.audio_mix.true_peak_db_milli) / 1_000.0;
@@ -417,7 +478,7 @@ pub fn build_timeline_render_plan(
         OsString::from("-filter_complex"),
         OsString::from(filters.join(";")),
         OsString::from("-map"),
-        OsString::from(video_output),
+        OsString::from(&video_output),
         OsString::from("-map"),
         OsString::from("[audio_output]"),
     ]);
@@ -444,6 +505,132 @@ pub fn build_timeline_render_plan(
         primary: build_command(primary_encoder),
         software_fallback: h264_nvenc_runtime.then(|| build_command(VideoEncoder::Libx264)),
     })
+}
+
+fn append_visual_layer_filters(
+    filters: &mut Vec<String>,
+    base_label: &str,
+    layers: &[VisualLayer],
+    input_by_asset: &BTreeMap<&str, usize>,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> VideoResult<String> {
+    let mut ordered = layers.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        (left.z_index, left.range.start_us, &left.id).cmp(&(
+            right.z_index,
+            right.range.start_us,
+            &right.id,
+        ))
+    });
+    let mut composed = base_label.to_string();
+    for (index, layer) in ordered.into_iter().enumerate() {
+        let input = input_by_asset.get(layer.asset_id.as_str()).ok_or_else(|| {
+            VideoError::new(
+                VideoErrorCode::MissingReference,
+                format!("visual layer {} has no FFmpeg input", layer.id),
+            )
+        })?;
+        let duration_us = layer.range.duration()?.0;
+        let start_seconds = ffmpeg_time(layer.range.start_us);
+        let end_seconds = ffmpeg_time(layer.range.end_us);
+        let duration_seconds = ffmpeg_time(Microseconds(duration_us));
+        let start_width = basis_pixels(layer.motion.start_bounds.width_bp, canvas_width);
+        let start_height = basis_pixels(layer.motion.start_bounds.height_bp, canvas_height);
+        let end_width = basis_pixels(layer.motion.end_bounds.width_bp, canvas_width);
+        let end_height = basis_pixels(layer.motion.end_bounds.height_bp, canvas_height);
+        let start_x = basis_pixels_signed(layer.motion.start_bounds.x_bp, canvas_width);
+        let start_y = basis_pixels_signed(layer.motion.start_bounds.y_bp, canvas_height);
+        let end_x = basis_pixels_signed(layer.motion.end_bounds.x_bp, canvas_width);
+        let end_y = basis_pixels_signed(layer.motion.end_bounds.y_bp, canvas_height);
+        let progress =
+            visual_progress_expression(layer.motion.easing, &start_seconds, &duration_seconds);
+        let width_expression = visual_interpolation(start_width, end_width, &progress, true);
+        let height_expression = visual_interpolation(start_height, end_height, &progress, true);
+        let x_expression = visual_interpolation(start_x, end_x, &progress, false);
+        let y_expression = visual_interpolation(start_y, end_y, &progress, false);
+        let source_label = format!("visual_source_{index}");
+        let animated_label = format!("visual_animated_{index}");
+        let output_label = format!("visual_composite_{index}");
+        let mut source = format!("[{input}:v:0]format=rgba");
+        if let Some(crop) = layer.crop {
+            source.push(',');
+            source.push_str(&normalized_crop_filter(crop));
+        }
+        match layer.fit {
+            VisualFit::Stretch => source.push_str(&format!(
+                ",scale={start_width}:{start_height}:flags=lanczos"
+            )),
+            VisualFit::Cover => source.push_str(&format!(
+                ",scale=w={start_width}:h={start_height}:force_original_aspect_ratio=increase:flags=lanczos,crop={start_width}:{start_height}"
+            )),
+            VisualFit::Contain => source.push_str(&format!(
+                ",scale=w={start_width}:h={start_height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={start_width}:{start_height}:(ow-iw)/2:(oh-ih)/2:color=black@0"
+            )),
+        }
+        source.push_str(&format!(
+            ",setsar=1,trim=duration={duration_seconds},setpts=PTS-STARTPTS+{start_seconds}/TB[{source_label}]"
+        ));
+        filters.push(source);
+
+        let opacity = f64::from(layer.motion.start_opacity_milli) / 1_000.0;
+        let mut animation = format!(
+            "[{source_label}]scale=w='{width_expression}':h='{height_expression}':eval=frame:flags=lanczos,format=rgba,colorchannelmixer=aa={opacity:.3}"
+        );
+        if layer.transition_in_us.0 > 0 {
+            animation.push_str(&format!(
+                ",fade=t=in:st={start_seconds}:d={}:alpha=1",
+                ffmpeg_time(layer.transition_in_us)
+            ));
+        }
+        if layer.transition_out_us.0 > 0 {
+            let fade_start = layer
+                .range
+                .end_us
+                .checked_add(Microseconds(-layer.transition_out_us.0))?;
+            animation.push_str(&format!(
+                ",fade=t=out:st={}:d={}:alpha=1",
+                ffmpeg_time(fade_start),
+                ffmpeg_time(layer.transition_out_us)
+            ));
+        }
+        animation.push_str(&format!("[{animated_label}]"));
+        filters.push(animation);
+        filters.push(format!(
+            "[{composed}][{animated_label}]overlay=x='{x_expression}':y='{y_expression}':enable='between(t,{start_seconds},{end_seconds})':eof_action=pass:shortest=0[{output_label}]"
+        ));
+        composed = output_label;
+    }
+    Ok(composed)
+}
+
+fn visual_progress_expression(
+    easing: VisualEasing,
+    start_seconds: &str,
+    duration_seconds: &str,
+) -> String {
+    let linear = format!("min(max((t-{start_seconds})/{duration_seconds}\\,0)\\,1)");
+    match easing {
+        VisualEasing::Linear => linear,
+        VisualEasing::EaseInOut => format!("({linear})*({linear})*(3-2*({linear}))"),
+    }
+}
+
+fn visual_interpolation(start: i64, end: i64, progress: &str, even: bool) -> String {
+    let value = format!("({start}+({end}-{start})*({progress}))");
+    if even {
+        format!("max(2,trunc(({value})/2)*2)")
+    } else {
+        value
+    }
+}
+
+fn basis_pixels(value_bp: i32, dimension: u32) -> i64 {
+    ((i64::from(value_bp) * i64::from(dimension) + 5_000) / 10_000).max(2)
+}
+
+fn basis_pixels_signed(value_bp: i32, dimension: u32) -> i64 {
+    (i64::from(value_bp) * i64::from(dimension) + 5_000) / 10_000
 }
 
 /// Generate the caption/title/speaker overlay document from timeline-clock cues. The document is
@@ -2113,6 +2300,9 @@ mod tests {
         TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, TranscriptSegment,
         TranscriptTimingSource, TranscriptVersion, TranscriptWord,
     };
+    use super::super::visuals::{
+        VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    };
     use super::*;
     use std::process::{Command, Stdio};
 
@@ -2859,6 +3049,188 @@ mod tests {
             .unwrap();
         assert!(filter.contains("showwaves="));
         assert!(filter.contains("asplit=2[waveform_audio][audio_for_master]"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn real_ffmpeg_animates_a_still_visual_layer_on_the_canonical_clock() {
+        let ffmpeg = Path::new("/usr/bin/ffmpeg");
+        let ffprobe = Path::new("/usr/bin/ffprobe");
+        if !ffmpeg.is_file() || !ffprobe.is_file() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("soundar-visual-layer-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        let illustration = root.join("illustration.png");
+        let output = root.join("output.mp4");
+        let source_status = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x142033:s=320x180:r=30:d=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=330:sample_rate=48000:duration=1",
+                "-shortest",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(source_status.success());
+        let image_status = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0xE85D45@1:s=128x128:d=0.04",
+                "-frames:v",
+                "1",
+                "-threads",
+                "1",
+            ])
+            .arg(&illustration)
+            .status()
+            .unwrap();
+        assert!(image_status.success());
+
+        let mut manifest = fixture_manifest(&source);
+        let illustration_size = fs::metadata(&illustration).unwrap().len();
+        manifest.visual_assets.push(VisualAsset {
+            id: "visual-illustration".into(),
+            managed_path: "illustration.png".into(),
+            sha256: "b".repeat(64),
+            mime_type: VisualMimeType::Png,
+            width: 128,
+            height: 128,
+            has_alpha: false,
+            size_bytes: illustration_size,
+            provenance: Provenance {
+                kind: ProvenanceKind::GeneratedLocally,
+                original_uri: None,
+                imported_at: timestamp(),
+                producer: "assembly-test-image-generator".into(),
+                producer_version: Some("1".into()),
+                metadata: BTreeMap::new(),
+            },
+            created_at: timestamp(),
+        });
+        manifest.visual_layers.push(VisualLayer {
+            id: "layer-illustration".into(),
+            asset_id: "visual-illustration".into(),
+            scene_id: Some("scene-1".into()),
+            range: TimeRange::new(0, 1_000_000).unwrap(),
+            fit: VisualFit::Cover,
+            crop: None,
+            z_index: 10,
+            motion: VisualMotion {
+                start_bounds: NormalizedRect {
+                    x_bp: 500,
+                    y_bp: 500,
+                    width_bp: 2_000,
+                    height_bp: 2_000,
+                },
+                end_bounds: NormalizedRect {
+                    x_bp: 6_000,
+                    y_bp: 7_000,
+                    width_bp: 3_000,
+                    height_bp: 3_000,
+                },
+                start_opacity_milli: 1_000,
+                end_opacity_milli: 1_000,
+                start_rotation_milli_degrees: 0,
+                end_rotation_milli_degrees: 0,
+                easing: VisualEasing::EaseInOut,
+            },
+            transition_in_us: Microseconds(100_000),
+            transition_out_us: Microseconds(100_000),
+        });
+        manifest.validate_strict().unwrap();
+        let sources = BTreeMap::from([
+            ("source:source-1".into(), source),
+            ("visual:visual-illustration".into(), illustration),
+        ]);
+        let plan = build_timeline_render_plan(
+            ffmpeg,
+            &manifest,
+            &sources,
+            None,
+            &output,
+            &AssemblyOptions {
+                profile: RenderProfile::Preview,
+                burn_captions: false,
+                ..AssemblyOptions::default()
+            },
+            false,
+        )
+        .unwrap();
+        let filter = plan
+            .primary
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-filter_complex")
+            .map(|pair| pair[1].to_string_lossy().into_owned())
+            .unwrap();
+        assert!(filter.contains("visual_source_0"));
+        assert!(filter.contains("scale=w='max(2,trunc"));
+        assert!(filter.contains("overlay=x='"));
+        assert!(filter.contains("fade=t=in"));
+        assert!(filter.contains("fade=t=out"));
+        let result = plan
+            .primary
+            .command()
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let probe = Command::new(ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration:stream=codec_type,width,height",
+                "-of",
+                "json",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        assert!(value["streams"].as_array().unwrap().iter().any(|stream| {
+            stream["codec_type"] == "video" && stream["width"] == 720 && stream["height"] == 1280
+        }));
+        let frame_digest = |at: &str| {
+            let result = Command::new(ffmpeg)
+                .args(["-hide_banner", "-loglevel", "error", "-ss", at, "-i"])
+                .arg(&output)
+                .args(["-frames:v", "1", "-f", "framemd5", "-"])
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            result.stdout
+        };
+        assert_ne!(frame_digest("0.15"), frame_digest("0.85"));
         fs::remove_dir_all(root).ok();
     }
 

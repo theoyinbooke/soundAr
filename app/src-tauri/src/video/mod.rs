@@ -7,6 +7,7 @@
 pub mod assembly;
 pub mod cache;
 pub mod contracts;
+pub mod editor;
 pub mod intelligence;
 pub mod media;
 pub mod presentation;
@@ -14,6 +15,7 @@ pub mod renderer;
 pub mod scheduler;
 pub mod service;
 pub mod timeline;
+pub mod visuals;
 
 pub use assembly::{
     build_ass_document, build_timeline_render_plan, plan_caption_preview_pages,
@@ -25,6 +27,10 @@ pub use cache::{
     ManifestChange,
 };
 pub use contracts::*;
+pub use editor::{
+    apply_timeline_edit, AppliedVideoTimelineEdit, VideoTimelineChangeReceipt,
+    VideoTimelineEditRequest, VideoTimelineOperation,
+};
 pub use intelligence::{
     apply_scene_plan, identify_clip_candidates, plan_reviewed_timeline, source_range_fingerprint,
     transcript_from_runtime_json, CandidateAnalysis, CandidatePolicy, ScenePlan, ScenePlanRequest,
@@ -55,18 +61,24 @@ pub use scheduler::{
 };
 pub(crate) use service::{invalidated_stages_for_manifest_changes, manifest_changed_paths};
 pub use service::{
+    AddVisualAssetRequest, AddVisualAssetResult,
     CreateVideoProjectRequest as ServiceCreateVideoProjectRequest, LinkImportRequest, LinkPreview,
     LinkRightsRequest, LocalImportRequest, NarrationReplacement, PortraitRenderRequest,
     PortraitSourceLayout, ProgressCallback, PublishPackageRequest, QueuedVideoJob,
     ReplaceNarrationRequest, ReviseVideoManifestRequest, ServiceResult, SharedGpuAdmissionGate,
     SharedGpuAdmissionLease, SharedGpuAdmissionOutcome, SharedGpuAdmissionRequest,
-    SharedGpuAdmissionWait, TimelineRenderBatchRequest, TimelineRenderProfile,
-    TimelineRenderRequest, VideoJobResult, VideoServiceError, VideoServiceProgress,
-    VideoStudioService,
+    SharedGpuAdmissionWait, TimelineEditServiceResult, TimelineRenderBatchRequest,
+    TimelineRenderProfile, TimelineRenderRequest, VideoJobResult, VideoServiceError,
+    VideoServiceProgress, VideoStudioService, VisualAssetOrigin,
 };
 pub use timeline::{
     frame_index_at, frame_time_us, map_source_endpoint_to_timeline, map_source_to_timeline,
     map_timeline_endpoint_to_source, map_timeline_to_source, partition_track,
     quantize_range_outward, quantize_to_frame, source_clock_partition, FramePoint, FrameRange,
     QuantizeMode, SourceClockSpan, SourceClockSpanKind, TimelineSpan, TimelineSpanKind,
+};
+pub use visuals::{
+    VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    MAX_VISUAL_ASSETS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_LAYERS,
+    MAX_VISUAL_PIXELS,
 };
