@@ -49,7 +49,11 @@ const previewModels: CodexModel[] = [
   { id: "gpt-5.5", model: "gpt-5.5", displayName: "GPT-5.5", description: "Frontier model for complex work", isDefault: false, hidden: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
 ];
 
-const CODEX_DISCOVERY_RETRY_DELAY_MS = 200;
+// Desktop launchers and shell-managed Node installations can become visible a little after the
+// WebView mounts (notably NVM on a cold login). Keep the Assistant in its connecting state while
+// discovery settles instead of painting a false "not detected" banner that asks the user to scan
+// manually. The bounded backoff still reports a genuinely missing installation within seconds.
+const CODEX_DISCOVERY_RETRY_DELAYS_MS = [200, 400, 800, 1_200, 1_600, 2_000] as const;
 let codexConnectionRefresh: Promise<CodexStatus> | undefined;
 
 export async function getCodexStatus(): Promise<CodexStatus> {
@@ -75,8 +79,9 @@ export function refreshCodexConnection(): Promise<CodexStatus> {
 
   const attempt = (async () => {
     let current = await getCodexStatus();
-    if (!current.available) {
-      await new Promise((resolve) => window.setTimeout(resolve, CODEX_DISCOVERY_RETRY_DELAY_MS));
+    for (const delay of CODEX_DISCOVERY_RETRY_DELAYS_MS) {
+      if (current.available) break;
+      await new Promise((resolve) => window.setTimeout(resolve, delay));
       current = await getCodexStatus();
     }
     if (current.connected || !current.available) return current;

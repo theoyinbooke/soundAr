@@ -25,8 +25,10 @@ describe("native Codex bridge discovery", () => {
     delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   });
 
-  it("retries one unavailable first scan and deduplicates concurrent refreshes", async () => {
+  it("keeps retrying a cold unavailable scan and deduplicates concurrent refreshes", async () => {
     tauri.invoke
+      .mockResolvedValueOnce({ available: false, connected: false, message: "Codex CLI was not found." })
+      .mockResolvedValueOnce({ available: false, connected: false, message: "Codex CLI was not found." })
       .mockResolvedValueOnce({ available: false, connected: false, message: "Codex CLI was not found." })
       .mockResolvedValueOnce({ available: true, connected: false, path: "/opt/codex/bin/codex", version: "codex-cli 0.151.0" })
       .mockResolvedValueOnce({ available: true, connected: true, path: "/opt/codex/bin/codex", version: "codex-cli 0.151.0" });
@@ -38,6 +40,8 @@ describe("native Codex bridge discovery", () => {
     await vi.runAllTimersAsync();
     await expect(first).resolves.toMatchObject({ available: true, connected: true });
     expect(tauri.invoke.mock.calls.map(([command]) => command)).toEqual([
+      "codex_agent_status",
+      "codex_agent_status",
       "codex_agent_status",
       "codex_agent_status",
       "codex_agent_connect",
