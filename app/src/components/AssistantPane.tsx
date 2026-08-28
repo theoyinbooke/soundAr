@@ -6,7 +6,7 @@ import { exportHistoryItem, listHistory, listJobs, loadGeneratedAudio, loadJobPr
 import type { HistoryItem, JobRecord } from "../types";
 import type { VideoArtifact, VideoJobPhase, VideoProject } from "../types/video";
 import { useVideoIntegration, useVideoProjectSummaries } from "./video/VideoIntegrationContext";
-import { videoSourceWithFirstFrame } from "../lib/videoPlayback";
+import { videoSourceForIdlePoster } from "../lib/videoPlayback";
 
 type Message = { id: string; role: "user" | "assistant" | "system"; text: string; pending?: boolean };
 type ToolRun = { id: string; title: string; detail: string; state: "running" | "complete" | "failed" };
@@ -432,7 +432,7 @@ function AssistantVideoResult({ artifact, project, onOpen }: { artifact: VideoAr
   const resultLabel = isMaster ? "Final video master" : artifact.role === "preview" ? "Video preview" : artifact.role.replaceAll("-", " ");
   const secondary = project.manifest.artifacts.filter((candidate) => candidate.id !== artifact.id && candidate.role !== "source");
   return <article className="assistant-video-master" aria-label={`${resultLabel}: ${artifact.title}`}>
-    <div className="assistant-video-master-media">{isPlayableVideo ? <video aria-label={`Play ${artifact.title}`} controls playsInline preload="auto" poster={artifact.poster_url ?? project.poster_url} src={videoSourceWithFirstFrame(artifact.url)} /> : <div><FileVideo2 aria-hidden="true" size={22} /><span>{isMaster ? "Master" : resultLabel} stored locally</span></div>}</div>
+    <div className="assistant-video-master-media">{isPlayableVideo ? <video aria-label={`Play ${artifact.title}`} controls playsInline preload={artifact.poster_url ?? project.poster_url ? "metadata" : "auto"} poster={artifact.poster_url ?? project.poster_url} src={videoSourceForIdlePoster(artifact.url, artifact.poster_url ?? project.poster_url)} /> : <div><FileVideo2 aria-hidden="true" size={22} /><span>{isMaster ? "Master" : resultLabel} stored locally</span></div>}</div>
     <div className="assistant-video-master-copy"><span className="section-label">{isMaster ? "Final video master" : `Playable ${resultLabel.toLowerCase()}`}</span><strong>{artifact.title}</strong><small>{formatVideoDuration(artifact.duration_ms ?? project.duration_ms)} · {artifact.width && artifact.height ? `${artifact.width}×${artifact.height}` : artifact.format.toUpperCase()} · {artifact.codec ?? "Local render"}</small><div><button type="button" onClick={onOpen}><Clapperboard aria-hidden="true" size={12} />Open project</button>{artifact.url ? <a aria-label={`Download ${artifact.title}`} download={artifact.download_name ?? `${project.id}-${artifact.role}.${artifact.format}`} href={artifact.url}><Download aria-hidden="true" size={12} />Download</a> : null}</div></div>
     {secondary.length ? <details className="assistant-video-secondary"><summary><span>Project assets</span><small>{secondary.length} secondary</small><ChevronDown aria-hidden="true" size={12} /></summary><div>{secondary.slice(-6).map((candidate) => <AssistantVideoArtifactRow artifact={candidate} key={candidate.id} />)}</div></details> : null}
   </article>;
