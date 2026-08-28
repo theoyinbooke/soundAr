@@ -31,6 +31,17 @@ export interface CodexEvent {
   params?: Record<string, unknown>;
 }
 
+export interface AssistantVideoThreadLink {
+  id: string;
+  thread_id: string;
+  turn_id?: string;
+  item_id?: string;
+  project_id: string;
+  output_id?: string;
+  relationship: "project" | "preview" | "master" | "variation" | "publish-package";
+  created_at: string;
+}
+
 const previewModels: CodexModel[] = [
   { id: "gpt-5.6-sol", model: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", description: "Latest frontier agentic model", isDefault: true, hidden: false, defaultReasoningEffort: "low", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
   { id: "gpt-5.6-terra", model: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", description: "Balanced model for everyday studio work", isDefault: false, hidden: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
@@ -73,11 +84,54 @@ export async function loadCodexModels(): Promise<CodexModel[]> {
   return response.data.filter((model) => !model.hidden);
 }
 
+export async function loadAssistantVideoThreadLink(
+  threadId: string,
+): Promise<AssistantVideoThreadLink | undefined> {
+  if (import.meta.env.DEV && !hasTauriRuntime()) {
+    if (threadId === "preview-video-thread") return {
+        id: "preview-video-link",
+        thread_id: threadId,
+        turn_id: "preview-video-turn",
+        item_id: "preview-video-tool",
+        project_id: "creator-update-master",
+        output_id: "creator-update-master-master",
+        relationship: "master",
+        created_at: "2026-08-27T20:24:18.000Z",
+      };
+    if (threadId === "preview-only-video-thread") return {
+      id: "preview-only-video-link",
+      thread_id: threadId,
+      turn_id: "preview-only-video-turn",
+      item_id: "preview-only-video-tool",
+      project_id: "creator-update",
+      output_id: "creator-update-preview",
+      relationship: "preview",
+      created_at: "2026-08-27T20:25:18.000Z",
+    };
+    if (threadId === "stale-video-thread") return {
+      id: "stale-video-project-link",
+      thread_id: threadId,
+      turn_id: "stale-video-turn",
+      item_id: "stale-video-tool",
+      project_id: "creator-update-master",
+      relationship: "project",
+      created_at: "2026-08-27T20:26:18.000Z",
+    };
+    return undefined;
+  }
+  return (await invoke<AssistantVideoThreadLink | null>("assistant_video_thread_link", { threadId })) ?? undefined;
+}
+
 function previewRequest(method: string, params: Record<string, unknown>): unknown {
   if (method === "account/read") return { requiresOpenaiAuth: true, account: { type: "chatgpt", email: "studio@example.com", planType: "pro" } };
   if (method === "model/list") return { data: previewModels, nextCursor: null };
-  if (method === "thread/list") return { data: [], nextCursor: null };
+  if (method === "thread/list") return { data: [
+    { id: "preview-video-thread", name: "Saved video production", preview: "Portrait reel", updatedAt: 1_777_000_000 },
+    { id: "preview-only-video-thread", name: "Saved video preview", preview: "Reviewed preview", updatedAt: 1_776_999_900 },
+    { id: "stale-video-thread", name: "Saved unavailable output", preview: "Project fallback", updatedAt: 1_776_999_800 },
+  ], nextCursor: null };
   if (method === "thread/start") return { thread: { id: "preview-thread", turns: [], cwd: "/home/studio/.soundAr" }, model: previewModels[0].id };
+  if (method === "thread/resume") return { thread: { id: params.threadId, turns: [], cwd: "/home/studio/.soundAr" }, model: previewModels[0].id };
   if (method === "turn/start") return { turn: { id: `preview-turn-${Date.now()}`, status: "completed", input: params.input } };
   if (method === "account/login/start") return { type: "chatgpt", loginId: "preview-login", authUrl: "https://chatgpt.com" };
   return {};

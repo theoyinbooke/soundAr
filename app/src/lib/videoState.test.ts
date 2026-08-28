@@ -51,9 +51,29 @@ describe("videoStudioReducer", () => {
       base_version_id: created.manifest.version_id,
       instruction: "Make this scene calmer.",
       scene_id: scene.id,
-      scene_patch: { layout: "portrait", crop_mode: "fit", captions_enabled: true, caption_style: "calm", voice_gain_db: -2, music_gain_db: -16 },
+      scene_patch: {
+        layout: "portrait",
+        crop_mode: "fit",
+        captions_enabled: true,
+        caption_style: "calm",
+        voice_gain_db: -2,
+        music_gain_db: -16,
+        voice_id: "af_heart",
+        model_id: "hexgrad/Kokoro-82M",
+        speaker: "af_heart",
+        language: "en-US",
+      },
     });
-    expect(revised.manifest.scenes[0]).toMatchObject({ crop_mode: "fit", caption_style: "calm", voice_gain_db: -2, music_gain_db: -16 });
+    expect(revised.manifest.scenes[0]).toMatchObject({
+      crop_mode: "fit",
+      caption_style: "calm",
+      voice_gain_db: -2,
+      music_gain_db: -16,
+      voice_id: "af_heart",
+      model_id: "hexgrad/Kokoro-82M",
+      speaker: "af_heart",
+      language: "en-US",
+    });
     expect(revised.manifest.version_id).not.toBe(created.manifest.version_id);
     expect(revised.manifest.revisions.at(-1)?.affected_stages).toEqual(["preview", "export"]);
   });

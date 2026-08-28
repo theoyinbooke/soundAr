@@ -21,7 +21,7 @@ export type VideoProjectStatus =
   | "failed";
 
 export type VideoJobPhase = "source" | "analyze" | "review" | "preview" | "export";
-export type VideoJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type VideoJobStatus = "queued" | "preparing" | "running" | "completed" | "failed" | "cancelled";
 export type VideoTimelineTrackKind = "video" | "captions" | "voice" | "music";
 export type VideoArtifactRole = "source" | "proxy" | "preview" | "master" | "variation" | "publish-package";
 
@@ -95,10 +95,36 @@ export interface VideoScene {
   transcript: string;
   layout: "portrait" | "landscape" | "square";
   crop_mode: "auto-center" | "fit" | "manual";
+  crop_rect?: {
+    x_bp: number;
+    y_bp: number;
+    width_bp: number;
+    height_bp: number;
+  };
   captions_enabled: boolean;
   caption_style: "clean-white" | "calm" | "kinetic";
   voice_gain_db: number;
   music_gain_db: number;
+  narration_binding_id?: string;
+  narration_history_id?: string;
+  voice_id?: string;
+  model_id?: string;
+  speaker?: string;
+  language?: string;
+}
+
+export interface VideoNarrationBinding {
+  id: string;
+  scene_id?: string;
+  render_artifact_id: string;
+  history_id: string;
+  generation_job_id: string;
+  voice_id: string;
+  model_id: string;
+  speaker: string;
+  language: string;
+  script_sha256: string;
+  created_at: string;
 }
 
 export interface VideoTimelineItem {
@@ -162,6 +188,7 @@ export interface VideoProjectManifest {
   transcript: VideoTranscriptSegment[];
   candidates: CandidateVideoClip[];
   scenes: VideoScene[];
+  narration_bindings: VideoNarrationBinding[];
   timeline: VideoTimelineManifest;
   artifacts: VideoArtifact[];
   revisions: VideoRevision[];
@@ -177,16 +204,20 @@ export interface VideoProjectSummary {
   id: string;
   name: string;
   status: VideoProjectStatus;
+  revision: number;
   duration_ms: number;
   scene_count: number;
   updated_at: string;
   poster_url?: string;
   master?: VideoArtifact;
+  deliverables?: VideoArtifact[];
 }
 
 export interface VideoProject extends VideoProjectSummary {
   created_at: string;
   manifest: VideoProjectManifest;
+  workflow_job?: VideoJob;
+  recoverable_job?: VideoJob;
 }
 
 export interface VideoJob {
@@ -244,12 +275,26 @@ export interface CreateVideoProjectRequest {
   source_project_id?: string;
 }
 
+export type VideoScenePatch = Partial<Pick<VideoScene,
+  | "layout"
+  | "crop_mode"
+  | "crop_rect"
+  | "captions_enabled"
+  | "caption_style"
+  | "voice_gain_db"
+  | "music_gain_db"
+  | "voice_id"
+  | "model_id"
+  | "speaker"
+  | "language"
+>>;
+
 export interface ReviseVideoRequest {
   project_id: string;
   instruction: string;
   base_version_id: string;
   scene_id?: string;
-  scene_patch?: Pick<VideoScene, "layout" | "crop_mode" | "captions_enabled" | "caption_style" | "voice_gain_db" | "music_gain_db">;
+  scene_patch?: VideoScenePatch;
 }
 
 export interface VideoExportRequest {

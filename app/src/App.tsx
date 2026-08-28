@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { AppShell } from "./components/AppShell";
 import { RuntimeSetupNotice } from "./components/RuntimeSetupNotice";
@@ -12,10 +12,11 @@ import { ModelsView } from "./views/ModelsView";
 import { AboutView, CompareView, HistoryView, SettingsView } from "./views/SecondaryViews";
 import { VoicesView } from "./views/VoicesView";
 import { ProjectsView } from "./views/ProjectsView";
-import { VideoStudioView } from "./views/VideoStudioView";
 import { createVideoStudioService } from "./lib/videoBridge";
 import { VideoIntegrationProvider } from "./components/video/VideoIntegrationContext";
 import type { VideoStudioService } from "./types/video";
+
+const VideoStudioView = lazy(() => import("./views/VideoStudioView"));
 
 export default function App() {
   const [settings, setSettings] = useState<ApplicationSettings>({ theme: "light", dense_tables: true, reduced_motion: false });
@@ -129,7 +130,7 @@ export default function App() {
   function renderView(state: BootstrapState) {
     switch (current) {
       case "generate": return <GenerateView bootstrap={state} voices={voices} onVoicesChange={setVoices} preferredVoiceId={preferredVoiceId} onOpenModels={() => setCurrent("models")} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
-      case "video": return <VideoStudioView service={videoService} initialProjectId={selectedVideoProjectId} assistantOpen={assistantOpen} onProjectChanged={(project) => { setSelectedVideoProjectId(project.id); markVideoChanged(); }} onMasterPublished={() => { markVideoChanged(); void refreshStudioData(); }} />;
+      case "video": return <Suspense fallback={<div className="route-loading" role="status" aria-live="polite">Loading Video Studio…</div>}><VideoStudioView service={videoService} initialProjectId={selectedVideoProjectId} assistantOpen={assistantOpen} bootstrap={state} voices={voices} onProjectChanged={(project) => { setSelectedVideoProjectId(project.id); markVideoChanged(); }} onMasterPublished={() => { markVideoChanged(); void refreshStudioData(); }} /></Suspense>;
       case "projects": return <ProjectsView bootstrap={state} projects={projects} voices={voices} onChange={setProjects} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "voices": return <VoicesView bootstrap={state} voices={voices} onChange={setVoices} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} onUseVoice={(id) => { setPreferredVoiceId(id); setCurrent("generate"); }} />;
       case "models": return <ModelsView bootstrap={state} onChanged={refreshBootstrap} />;

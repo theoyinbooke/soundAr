@@ -21,6 +21,20 @@ export interface VideoStudioState {
   error?: string;
 }
 
+export function formatVideoUpdatedAt(timestamp: string, now = Date.now()): string {
+  const value = new Date(timestamp).getTime();
+  if (!Number.isFinite(value)) return "Unknown";
+  const elapsed = Math.max(0, now - value);
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (elapsed < minute) return "Just now";
+  if (elapsed < hour) return `${Math.floor(elapsed / minute)}m ago`;
+  if (elapsed < day) return `${Math.floor(elapsed / hour)}h ago`;
+  if (elapsed < 7 * day) return `${Math.floor(elapsed / day)}d ago`;
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(value);
+}
+
 export type VideoStudioAction =
   | { type: "projects-loaded"; projects: VideoProjectSummary[] }
   | { type: "open-intake"; entry: VideoStudioEntry }
@@ -56,6 +70,7 @@ function selectedCandidates(project: VideoProject): string[] {
 
 function phaseForProject(project: VideoProject): VideoStudioPhase {
   if (project.master || project.status === "exported") return "exported";
+  if (project.recoverable_job || (project.workflow_job && ["queued", "preparing", "running"].includes(project.workflow_job.status))) return "analyzing";
   if (project.status === "review") return "review";
   if (project.status === "analyzing") return "analyzing";
   return "editor";

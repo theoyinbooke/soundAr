@@ -35,6 +35,7 @@ describe("VideoMasterCard", () => {
       id: "project-1",
       name: "Creator update",
       status: "exported",
+      revision: 3,
       duration_ms: 4_000,
       scene_count: 2,
       updated_at: "2026-08-27T20:00:00Z",

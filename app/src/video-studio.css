@@ -256,6 +256,7 @@ button.video-project-row:hover, button.video-project-row:focus-visible { backgro
 .video-inspector-form select { width: 100%; min-height: 29px; padding: 0 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); font-size: 8px; }
 .video-inspector-form input[type="range"] { width: 100%; accent-color: #252525; }
 .video-inspector-form input[type="checkbox"] { justify-self: end; width: 28px; height: 16px; accent-color: #252525; }
+.video-route-empty { margin: 0; color: var(--muted); font-size: 8px; line-height: 1.45; }
 .video-inspector-receipt { display: flex; gap: 7px; margin: 11px 13px; padding: 9px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); font-size: 8px; line-height: 1.45; }
 .video-inspector-receipt.is-dirty { color: var(--text); }
 

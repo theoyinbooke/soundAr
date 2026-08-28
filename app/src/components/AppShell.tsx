@@ -6,6 +6,7 @@ import {
   BookOpenText,
   Boxes,
   ChevronDown,
+  Clapperboard,
   Clock3,
   Columns3,
   Cpu,
@@ -41,6 +42,7 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
     label: "Create",
     items: [
       { key: "generate", label: "Generate", icon: AudioLines },
+      { key: "video", label: "Video Studio", icon: Clapperboard },
       { key: "projects", label: "Projects", icon: BookOpenText },
     ],
   },
@@ -62,7 +64,7 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
 ];
 
 const primaryNav = navGroups.flatMap((group) => group.items);
-const mobilePrimaryKeys = new Set<NavKey>(["generate", "projects", "voices", "history"]);
+const mobilePrimaryKeys = new Set<NavKey>(["generate", "video", "projects", "history"]);
 
 function WindowControls() {
   async function minimize() {
@@ -259,7 +261,7 @@ export function AppShell({
               {(["file", "edit", "view", "help"] as const).map((menu) => <button className={appMenu === menu ? "is-open" : ""} key={menu} type="button" aria-haspopup="menu" aria-expanded={appMenu === menu} onClick={() => setAppMenu((open) => open === menu ? undefined : menu)}>{menu[0].toUpperCase() + menu.slice(1)}</button>)}
             </div>
             {appMenu ? <div className={`topbar-menu-popover menu-${appMenu}`} role="menu" aria-label={`${appMenu} menu`}>
-              {appMenu === "file" ? <><button role="menuitem" type="button" onClick={() => navigateTo("generate")}><span>New generation</span><kbd>Ctrl+N</kbd></button><button role="menuitem" type="button" onClick={() => navigateTo("projects")}><span>Projects</span></button><div className="account-menu-separator" /><button role="menuitem" type="button" onClick={() => navigateTo("settings")}><span>Settings</span><kbd>Ctrl+,</kbd></button></> : null}
+              {appMenu === "file" ? <><button role="menuitem" type="button" onClick={() => navigateTo("generate")}><span>New generation</span><kbd>Ctrl+N</kbd></button><button role="menuitem" type="button" onClick={() => navigateTo("video")}><span>New video project</span></button><button role="menuitem" type="button" onClick={() => navigateTo("projects")}><span>Projects</span></button><div className="account-menu-separator" /><button role="menuitem" type="button" onClick={() => navigateTo("settings")}><span>Settings</span><kbd>Ctrl+,</kbd></button></> : null}
               {appMenu === "edit" ? <><button role="menuitem" type="button" onClick={() => { setAppMenu(undefined); document.querySelector<HTMLElement>("main textarea, main input")?.focus(); }}><span>Focus editor</span></button><button role="menuitem" type="button" onClick={() => { setAppMenu(undefined); document.execCommand("selectAll"); }}><span>Select all</span><kbd>Ctrl+A</kbd></button><button role="menuitem" type="button" onClick={() => { setAppMenu(undefined); document.execCommand("copy"); }}><span>Copy</span><kbd>Ctrl+C</kbd></button></> : null}
               {appMenu === "view" ? <><button role="menuitem" type="button" onClick={() => { setSidebarCollapsed((value) => !value); setAppMenu(undefined); }}><span>{sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}</span><kbd>Ctrl+B</kbd></button><button role="menuitem" type="button" onClick={() => navigateTo("history")}><span>History</span></button><div className="account-menu-separator" /><button role="menuitem" type="button" onClick={() => { onToggleTheme(); setAppMenu(undefined); }}><span>{theme === "dark" ? "Light appearance" : "Dark appearance"}</span></button></> : null}
               {appMenu === "help" ? <><button role="menuitem" type="button" onClick={() => navigateTo("about")}><span>About soundAr</span></button><button role="menuitem" type="button" onClick={() => navigateTo("settings")}><span>Runtime settings</span></button></> : null}

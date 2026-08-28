@@ -36,6 +36,61 @@ describe("AssistantPane", () => {
     expect(onOpenProject).toHaveBeenCalledWith("creator-update-master");
   });
 
+  it("restores the current playable video and compact phases when a saved task resumes", async () => {
+    const service = createBrowserPreviewVideoService();
+    render(<VideoIntegrationProvider service={service} onOpenProject={vi.fn()}>
+      <AssistantPane open onClose={vi.fn()} />
+    </VideoIntegrationProvider>);
+
+    await screen.findByRole("textbox", { name: "Message soundAr assistant" });
+    await userEvent.click(screen.getByRole("button", { name: "Conversation history" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Saved video production/i }));
+
+    const phases = await screen.findByRole("region", { name: "Video production progress" });
+    expect(within(phases).getByText("Video production complete")).toBeVisible();
+    expect(within(phases).getByText("Export")).toBeVisible();
+    const master = await screen.findByRole("article", {
+      name: "Final video master: Creator update · Portrait master",
+    });
+    expect(within(master).getByLabelText("Play Creator update · Portrait master")).toBeInstanceOf(HTMLVideoElement);
+    expect(within(master).getByRole("link", { name: "Download Creator update · Portrait master" }))
+      .toHaveAttribute("download", "creator-update-master-portrait-master.mp4");
+  });
+
+  it("restores the exact playable preview when a saved task has no final master", async () => {
+    const service = createBrowserPreviewVideoService();
+    await service.renderVideoPreview("creator-update");
+    render(<VideoIntegrationProvider service={service} onOpenProject={vi.fn()}>
+      <AssistantPane open onClose={vi.fn()} />
+    </VideoIntegrationProvider>);
+
+    await screen.findByRole("textbox", { name: "Message soundAr assistant" });
+    await userEvent.click(screen.getByRole("button", { name: "Conversation history" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Saved video preview/i }));
+
+    const preview = await screen.findByRole("article", {
+      name: "Video preview: Creator update · Reel draft preview",
+    });
+    expect(within(preview).getByLabelText("Play Creator update · Reel draft preview"))
+      .toBeInstanceOf(HTMLVideoElement);
+    expect(within(preview).getByRole("link", { name: "Download Creator update · Reel draft preview" }))
+      .toHaveAttribute("download", "creator-update-preview.mp4");
+    expect(screen.queryByText("Final video master")).not.toBeInTheDocument();
+  });
+
+  it("does not substitute a current master when a stale saved output falls back to its project", async () => {
+    render(<VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={vi.fn()}>
+      <AssistantPane open onClose={vi.fn()} />
+    </VideoIntegrationProvider>);
+
+    await screen.findByRole("textbox", { name: "Message soundAr assistant" });
+    await userEvent.click(screen.getByRole("button", { name: "Conversation history" }));
+    await userEvent.click(await screen.findByRole("menuitem", { name: /Saved unavailable output/i }));
+
+    expect(await screen.findByRole("region", { name: "Video production progress" })).toBeVisible();
+    expect(screen.queryByRole("article", { name: /Final video master|Video preview/i })).not.toBeInTheDocument();
+  });
+
   it("shows only the final master for project workflows and one clip for single requests", () => {
     const base = { voice: "Default", text: "", generation_kind: "speech" as const, audio_path: "/managed/audio.wav", sample_rate: 24000, duration_seconds: 1, inference_seconds: 0, rtf: 0, vram_peak_mb: 0, waveform: [], created_at: "2026-08-27T18:00:00Z", preview: false };
     const history = [

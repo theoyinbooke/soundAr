@@ -410,6 +410,7 @@ export const fallbackBootstrap: BootstrapState = {
   settings: { theme: "light", dense_tables: true, reduced_motion: false },
   features: {
     generate: "stable",
+    video: "stable",
     projects: "beta",
     models: "beta",
     voices: "beta",

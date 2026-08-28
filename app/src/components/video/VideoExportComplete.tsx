@@ -1,7 +1,7 @@
 import { Archive, Check, Download, FolderOpen, LoaderCircle, Play } from "lucide-react";
 import { useState } from "react";
 import type { VideoArtifact, VideoProject } from "../../types/video";
-import { formatVideoClock, selectMasterArtifact } from "../../lib/videoState";
+import { formatVideoClock, formatVideoUpdatedAt, selectMasterArtifact } from "../../lib/videoState";
 import { VideoTimeline } from "./VideoTimeline";
 
 export function VideoExportComplete({
@@ -51,7 +51,7 @@ export function VideoExportComplete({
         <aside className="video-export-summary"><header>Export summary</header><dl><div><dt>Format</dt><dd>MP4 ({master.codec})</dd></div><div><dt>Resolution</dt><dd>{master.width}×{master.height} (9:16)</dd></div><div><dt>Duration</dt><dd>{formatVideoClock(master.duration_ms ?? 0)}</dd></div><div><dt>Frame rate</dt><dd>{master.frame_rate} fps</dd></div><div><dt>Audio</dt><dd>AAC · 48 kHz · Stereo</dd></div><div><dt>Render mode</dt><dd>Hardware (NVENC)</dd></div><div><dt>File size</dt><dd>{((master.file_size_bytes ?? 0) / 1_000_000).toFixed(1)} MB</dd></div></dl></aside>
       </div>
       <VideoTimeline timeline={project.manifest.timeline} scenes={project.manifest.scenes} playheadMs={playheadMs} selectedSceneId={selectedSceneId} onPlayheadChange={onPlayheadChange} onSelectScene={onSelectScene} />
-      <footer className="video-project-status"><span>Project duration <strong>{formatVideoClock(project.duration_ms)}</strong></span><span>Source <strong>{formatVideoClock(project.manifest.source.duration_ms)}</strong></span><span>Cache <strong>2.1 GB</strong></span><span>Autosaved <strong>10:24:18</strong></span></footer>
+      <footer className="video-project-status"><span>Project duration <strong>{formatVideoClock(project.duration_ms)}</strong></span><span>Source <strong>{formatVideoClock(project.manifest.source.duration_ms)}</strong></span><span>Revision <strong>{project.revision}</strong></span><span>Saved <strong>{formatVideoUpdatedAt(project.updated_at)}</strong></span></footer>
     </div>
   );
 }

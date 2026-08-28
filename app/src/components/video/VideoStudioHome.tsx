@@ -1,6 +1,6 @@
 import { ArrowRight, Film, Link2, Mic2, Upload } from "lucide-react";
 import type { VideoProjectSummary, VideoStudioEntry } from "../../types/video";
-import { formatVideoClock } from "../../lib/videoState";
+import { formatVideoClock, formatVideoUpdatedAt } from "../../lib/videoState";
 
 export function VideoStudioHome({
   projects,
@@ -21,7 +21,7 @@ export function VideoStudioHome({
 
   return (
     <div className="video-studio-home">
-      <div className="video-entry-strip" aria-label="Start a video project">
+      <div className="video-entry-strip" role="group" aria-label="Start a video project">
         {entries.map((entry) => {
           const Icon = entry.icon;
           return <button key={entry.key} type="button" onClick={() => onEntry(entry.key)}><span className="video-entry-icon"><Icon aria-hidden="true" size={21} /></span><span><strong>{entry.title}</strong><small>{entry.description}</small></span></button>;
@@ -34,7 +34,7 @@ export function VideoStudioHome({
           <div className="video-project-row is-heading" aria-hidden="true"><span>Name</span><span>Updated</span><span>Duration</span><span /></div>
           {projects.map((project) => <button className="video-project-row" type="button" key={project.id} onClick={() => onOpenProject(project.id)}>
             <span><i><Film aria-hidden="true" size={14} /></i><strong>{project.name}</strong></span>
-            <span>{project.updated_at === "2026-08-27T20:24:18.000Z" ? "Just now" : new Date(project.updated_at).toLocaleDateString()}</span>
+            <span>{formatVideoUpdatedAt(project.updated_at)}</span>
             <span>{formatVideoClock(project.duration_ms)}</span>
             <span><ArrowRight aria-hidden="true" size={14} /></span>
           </button>)}

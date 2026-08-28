@@ -163,15 +163,17 @@ function makeProject(id = "creator-update", name = "Creator update · Reel draft
     transcript: candidates.map((candidate) => ({ id: `transcript-${candidate.id}`, start_ms: candidate.source_start_ms, end_ms: candidate.source_end_ms, text: candidate.transcript, speaker: "Creator", source_clock: true })),
     candidates,
     scenes,
+    narration_bindings: [],
     timeline: makeTimeline(scenes, source.duration_ms),
     artifacts: [{ id: `${id}-proxy`, project_id: id, version_id: `${id}-v1`, role: "proxy", title: `${name} proxy`, mime_type: "video/mp4", format: "mp4", url: FIXTURE_VIDEO_URL, duration_ms: source.duration_ms, width: 360, height: 640, codec: "H.264", playable: true, created_at: FIXED_NOW }],
     revisions: [],
     settings: { aspect_ratio: "9:16", caption_style: "clean-white", captions_enabled: true, hardware_render: true },
   };
-  const project: VideoProject = { id, name, status, duration_ms: manifest.timeline.duration_ms, scene_count: scenes.length, created_at: FIXED_NOW, updated_at: FIXED_NOW, poster_url: undefined, manifest };
+  const project: VideoProject = { id, name, status, revision: 0, duration_ms: manifest.timeline.duration_ms, scene_count: scenes.length, created_at: FIXED_NOW, updated_at: FIXED_NOW, poster_url: undefined, manifest };
   if (status === "exported") {
     const master = makeMasterArtifact(id, manifest.version_id, project.duration_ms);
     project.master = master;
+    project.deliverables = [master];
     project.manifest.artifacts.push(master);
   }
   return project;
@@ -315,6 +317,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       const revised = clone(current);
       const priorVersion = revised.manifest.version_id;
       revised.manifest.version_id = `${request.project_id}-v${revised.manifest.revisions.length + 2}`;
+      revised.revision += 1;
       const requestedCaptionStyle = request.instruction.toLowerCase().includes("calm") ? "calm" : revised.manifest.settings.caption_style;
       revised.manifest.settings.caption_style = requestedCaptionStyle;
       revised.manifest.scenes = revised.manifest.scenes.map((scene) => scene.id === request.scene_id && request.scene_patch
@@ -324,6 +327,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       revised.manifest.revisions.push({ id: `revision-${revised.manifest.revisions.length + 1}`, created_at: FIXED_NOW, instruction: request.instruction, affected_stages: ["preview", "export"], base_version_id: priorVersion, version_id: revised.manifest.version_id });
       revised.status = "editing";
       revised.master = undefined;
+      revised.deliverables = [];
       return store(revised);
     },
     async exportVideo(request, onProgress) {
@@ -337,9 +341,18 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       }
       const exported = clone(current);
       const master = makeMasterArtifact(request.project_id, request.version_id, exported.duration_ms);
+      const variations = Array.from({ length: Math.max(0, (request.variations ?? 1) - 1) }, (_, index): VideoArtifact => ({
+        ...makeMasterArtifact(`${request.project_id}-variation-${index + 2}`, request.version_id, exported.duration_ms),
+        id: `${request.project_id}-variation-${index + 2}`,
+        project_id: request.project_id,
+        role: "variation",
+        title: `${exported.name} · Variation ${index + 2}`,
+        download_name: `${request.project_id}-variation-${index + 2}.mp4`,
+      }));
       exported.master = master;
+      exported.deliverables = [master, ...variations];
       exported.status = "exported";
-      exported.manifest.artifacts = [...exported.manifest.artifacts.filter((artifact) => artifact.role !== "master"), master];
+      exported.manifest.artifacts = [...exported.manifest.artifacts.filter((artifact) => !["master", "variation"].includes(artifact.role)), master, ...variations];
       return store(exported);
     },
     async exportPublishPackage(projectId) {
@@ -347,6 +360,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       if (!current?.master) throw new Error("Export a final master before creating a publish package.");
       const artifact: VideoArtifact = { id: `${projectId}-publish-package`, project_id: projectId, version_id: current.manifest.version_id, role: "publish-package", title: `${current.name} publish package`, mime_type: "application/zip", format: "zip", url: FIXTURE_PUBLISH_PACKAGE_URL, download_name: `${projectId}-publish-package.zip`, playable: false, created_at: FIXED_NOW };
       current.manifest.artifacts.push(artifact);
+      current.deliverables = [...(current.deliverables ?? (current.master ? [current.master] : [])), artifact];
       store(current);
       return clone(artifact);
     },
@@ -382,9 +396,11 @@ function withNativeArtifactUrl(artifact: VideoArtifact): VideoArtifact {
 function withNativeProjectUrls(project: VideoProject): VideoProject {
   const artifacts = project.manifest.artifacts.map(withNativeArtifactUrl);
   const master = project.master ? withNativeArtifactUrl(project.master) : undefined;
+  const deliverables = project.deliverables?.map(withNativeArtifactUrl);
   return {
     ...project,
     master,
+    deliverables,
     manifest: {
       ...project.manifest,
       source: project.manifest.source.preview_url || !project.manifest.source.local_path
@@ -396,7 +412,11 @@ function withNativeProjectUrls(project: VideoProject): VideoProject {
 }
 
 function withNativeSummaryUrls(project: VideoProjectSummary): VideoProjectSummary {
-  return { ...project, master: project.master ? withNativeArtifactUrl(project.master) : undefined };
+  return {
+    ...project,
+    master: project.master ? withNativeArtifactUrl(project.master) : undefined,
+    deliverables: project.deliverables?.map(withNativeArtifactUrl),
+  };
 }
 
 function createNativeVideoService(): VideoStudioService {
