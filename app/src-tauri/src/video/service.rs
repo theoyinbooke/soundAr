@@ -805,6 +805,15 @@ struct ProjectExpectation {
     version_id: String,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SingleRenderTestFailpoint {
+    PortraitBeforeAtomicPublication,
+    PortraitAfterAtomicPublication,
+    TimelineBeforeAtomicPublication,
+    TimelineAfterAtomicPublication,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -827,6 +836,8 @@ pub struct VideoStudioService {
     package_test_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
     local_import_test_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)]
+    single_render_test_failpoint: Mutex<Option<SingleRenderTestFailpoint>>,
 }
 
 impl VideoStudioService {
@@ -4568,17 +4579,26 @@ fn expectation_from_optional(
     expected_revision: Option<i64>,
     expected_version_id: Option<&str>,
 ) -> ServiceResult<ProjectExpectation> {
-    let current = project_expectation(project)?;
+    let requested = declared_expectation(project, expected_revision, expected_version_id)?;
+    ensure_project_matches(project, &requested)?;
+    Ok(requested)
+}
+
+/// Parses an optional revision/version pair without asserting that it is the
+/// current project version. Durable render runners need this narrow form to
+/// recognize an exact atomic publication that committed before the worker
+/// could persist its terminal job state.
+fn declared_expectation(
+    project: &Value,
+    expected_revision: Option<i64>,
+    expected_version_id: Option<&str>,
+) -> ServiceResult<ProjectExpectation> {
     match (expected_revision, expected_version_id) {
-        (None, None) => Ok(current),
-        (Some(revision), Some(version_id)) => {
-            let requested = ProjectExpectation {
-                revision,
-                version_id: version_id.to_string(),
-            };
-            ensure_project_matches(project, &requested)?;
-            Ok(requested)
-        }
+        (None, None) => project_expectation(project),
+        (Some(revision), Some(version_id)) => Ok(ProjectExpectation {
+            revision,
+            version_id: version_id.to_string(),
+        }),
         _ => Err(VideoServiceError::new(
             "video.invalid_revision_expectation",
             "expected_revision and expected_version_id must be supplied together",
@@ -5357,6 +5377,85 @@ mod tests {
         for value in ["project-01", "cache.v2", "safe_namespace"] {
             validate_safe_component(value, "video.invalid_project_id")
                 .expect("ordinary safe component");
+        }
+    }
+
+    #[test]
+    fn deterministic_import_targets_reject_changed_local_and_link_extensions() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        workspace.create_project(&project_id, "Deterministic import publication");
+        let source_dir = workspace
+            .service
+            .project_dir(&project_id)
+            .expect("project directory")
+            .join("sources");
+        workspace
+            .service
+            .secure_managed_directory(&source_dir)
+            .expect("source directory");
+
+        for (role, original_extension, changed_extension) in [
+            ("local-primary", "wav", "mp3"),
+            ("link-primary", "webm", "mp4"),
+        ] {
+            let asset_id = stable_import_asset_id(&project_id, "durable-child", "source", role);
+            let original_bytes = format!("original-{role}-bytes").into_bytes();
+            let original_sha256 = sha256_bytes(&original_bytes);
+            let first_staging = source_dir.join(format!(".{asset_id}.first.partial"));
+            fs::write(&first_staging, &original_bytes).expect("stage original import bytes");
+            let original_target =
+                source_dir.join(format!("source-{asset_id}.{original_extension}"));
+            let (published, created) = workspace
+                .service
+                .publish_import_staging_once(
+                    &project_id,
+                    &asset_id,
+                    &first_staging,
+                    &original_target,
+                    &original_sha256,
+                    &AtomicBool::new(false),
+                    |_| Ok(()),
+                )
+                .expect("first deterministic publication");
+            assert!(created);
+            assert_eq!(published, original_target);
+
+            let changed_bytes = format!("changed-{role}-bytes").into_bytes();
+            let changed_sha256 = sha256_bytes(&changed_bytes);
+            let retry_staging = source_dir.join(format!(".{asset_id}.retry.partial"));
+            fs::write(&retry_staging, changed_bytes).expect("stage changed retry bytes");
+            let changed_target = source_dir.join(format!("source-{asset_id}.{changed_extension}"));
+            let error = workspace
+                .service
+                .publish_import_staging_once(
+                    &project_id,
+                    &asset_id,
+                    &retry_staging,
+                    &changed_target,
+                    &changed_sha256,
+                    &AtomicBool::new(false),
+                    |_| Ok(()),
+                )
+                .expect_err("changed durable import bytes must not replace or fork the target");
+            assert_eq!(error.code, "video.import_identity_conflict");
+            assert_eq!(
+                sha256_file(&original_target).expect("original target checksum"),
+                original_sha256
+            );
+            assert!(!changed_target.exists());
+            assert!(!retry_staging.exists());
+            let stable_targets = fs::read_dir(&source_dir)
+                .expect("list stable targets")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(&format!("source-{asset_id}.")))
+                })
+                .count();
+            assert_eq!(stable_targets, 1, "one stable asset id owns one inode");
         }
     }
 
@@ -6277,6 +6376,7 @@ mod tests {
             .status()
             .expect("generate prompt History fixture");
         assert!(status.success());
+        let original_generated_audio = fs::read(&generated_audio).expect("read History fixture");
         let synthesis_request = json!({
             "model_id": "test/prompt-voice-model",
             "text": "A prompt-generated narration artifact.",
@@ -6404,6 +6504,56 @@ mod tests {
             cancelled_manifest.source_assets.is_empty(),
             "cancellation after upsert must still stop the guarded manifest commit"
         );
+
+        let managed_sha_before_changed_retry = staged_asset_paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    sha256_file(path).expect("staged managed checksum before changed retry"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        OpenOptions::new()
+            .append(true)
+            .open(&generated_audio)
+            .and_then(|mut file| file.write_all(b"changed-before-durable-import-retry"))
+            .expect("change local History bytes before retry");
+        let changed_retry = workspace
+            .service
+            .resume_job(&queued.job_id, None)
+            .expect("dispatch exact changed-content retry");
+        let changed_error = workspace
+            .service
+            .wait_for_job(&changed_retry.job_id, &project_id, Duration::from_secs(30))
+            .expect_err("changed local bytes must reject durable import retry");
+        assert_eq!(changed_error.code, "video.job_failed");
+        let assets_after_changed_retry = workspace
+            .service
+            .store
+            .list_video_assets(&project_id)
+            .expect("asset rows after changed retry rejection");
+        assert_eq!(
+            assets_after_changed_retry, assets_before_cancel,
+            "changed retry must not rewrite a pending source or derived asset row"
+        );
+        for (path, expected_sha256) in &managed_sha_before_changed_retry {
+            assert_eq!(
+                sha256_file(path).expect("managed checksum after changed retry"),
+                *expected_sha256,
+                "changed retry must not overwrite any managed source/cache inode"
+            );
+        }
+        let changed_project = workspace
+            .service
+            .get_project(&project_id)
+            .expect("project after changed retry rejection");
+        assert_eq!(
+            project_expectation(&changed_project).expect("changed retry expectation"),
+            project_expectation(&cancelled_project).expect("cancelled baseline expectation")
+        );
+        fs::write(&generated_audio, &original_generated_audio)
+            .expect("restore exact registered History bytes");
 
         let resumed = workspace
             .service
@@ -6544,6 +6694,139 @@ mod tests {
                 .count(),
             1,
             "resume must import one managed speech source, never duplicate History"
+        );
+
+        // Re-enter the exact publication boundary after the source is fully
+        // bound in both Store and manifest. A changed retry with a different
+        // inferred extension must not touch the canonical row, revision, or
+        // inode; a missing canonical inode must fail closed as corruption
+        // rather than silently recreating it from potentially changed input.
+        let bound_project_before = workspace
+            .service
+            .get_project(&project_id)
+            .expect("bound import project snapshot");
+        let bound_expectation =
+            project_expectation(&bound_project_before).expect("bound import expectation");
+        let bound_source_row = assets
+            .iter()
+            .find(|asset| asset.get("id").and_then(Value::as_str) == Some(source.id.as_str()))
+            .cloned()
+            .expect("bound speech asset row");
+        let bound_source_path = workspace
+            .service
+            .resolve_managed_path(&source.managed_path)
+            .expect("bound managed speech path");
+        let bound_source_inode = fs::metadata(&bound_source_path)
+            .expect("bound source metadata")
+            .ino();
+        let bound_source_sha256 = sha256_file(&bound_source_path).expect("bound source checksum");
+        let bound_source_dir = bound_source_path.parent().expect("bound source parent");
+        let alternate_target = bound_source_dir.join(format!("source-{}.mp3", source.id));
+        let bound_changed_staging =
+            bound_source_dir.join(format!(".{}.bound-changed.partial", source.id));
+        fs::write(&bound_changed_staging, b"changed-bound-import-bytes")
+            .expect("stage changed bound retry");
+        let bound_changed_sha256 =
+            sha256_file(&bound_changed_staging).expect("changed bound staging checksum");
+        let bound_error = workspace
+            .service
+            .publish_import_staging_once(
+                &project_id,
+                &source.id,
+                &bound_changed_staging,
+                &alternate_target,
+                &bound_changed_sha256,
+                &AtomicBool::new(false),
+                |_| Ok(()),
+            )
+            .expect_err("changed bytes cannot replace a manifest-bound source");
+        assert_eq!(bound_error.code, "video.import_identity_conflict");
+        assert_eq!(
+            fs::metadata(&bound_source_path)
+                .expect("bound source after rejection")
+                .ino(),
+            bound_source_inode
+        );
+        assert_eq!(
+            sha256_file(&bound_source_path).expect("bound checksum after rejection"),
+            bound_source_sha256
+        );
+        assert!(!alternate_target.exists());
+        assert_eq!(
+            workspace
+                .service
+                .store
+                .list_video_assets(&project_id)
+                .expect("bound rows after rejection")
+                .into_iter()
+                .find(|asset| {
+                    asset.get("id").and_then(Value::as_str) == Some(source.id.as_str())
+                })
+                .expect("bound source row after rejection"),
+            bound_source_row
+        );
+        let bound_project_after = workspace
+            .service
+            .get_project(&project_id)
+            .expect("bound project after rejection");
+        assert_eq!(
+            project_expectation(&bound_project_after).expect("bound expectation after rejection"),
+            bound_expectation
+        );
+        assert_eq!(
+            bound_project_after.get("manifest"),
+            bound_project_before.get("manifest")
+        );
+
+        fs::remove_file(&bound_source_path).expect("simulate missing bound managed source");
+        let missing_retry_staging =
+            bound_source_dir.join(format!(".{}.missing-retry.partial", source.id));
+        fs::write(&missing_retry_staging, &original_generated_audio)
+            .expect("stage retry for missing bound source");
+        let missing_retry_sha256 =
+            sha256_file(&missing_retry_staging).expect("missing retry checksum");
+        let missing_error = workspace
+            .service
+            .publish_import_staging_once(
+                &project_id,
+                &source.id,
+                &missing_retry_staging,
+                &alternate_target,
+                &missing_retry_sha256,
+                &AtomicBool::new(false),
+                |_| Ok(()),
+            )
+            .expect_err("a missing manifest-bound source must fail closed");
+        assert!(matches!(
+            missing_error.code.as_str(),
+            "video.artifact_not_found" | "video.integrity_failed"
+        ));
+        assert!(!missing_retry_staging.exists());
+        assert!(!alternate_target.exists());
+        assert_eq!(
+            workspace
+                .service
+                .store
+                .list_video_assets(&project_id)
+                .expect("bound rows after missing-file rejection")
+                .into_iter()
+                .find(|asset| {
+                    asset.get("id").and_then(Value::as_str) == Some(source.id.as_str())
+                })
+                .expect("bound source row remains after missing-file rejection"),
+            bound_source_row
+        );
+        let missing_project_after = workspace
+            .service
+            .get_project(&project_id)
+            .expect("project after missing bound source rejection");
+        assert_eq!(
+            project_expectation(&missing_project_after).expect("missing source expectation"),
+            bound_expectation
+        );
+        assert_eq!(
+            missing_project_after.get("manifest"),
+            bound_project_before.get("manifest")
         );
 
         let tamper_project_id = format!("project-{}", new_id());
@@ -6951,7 +7234,7 @@ mod tests {
         let timeline_request = TimelineRenderRequest {
             project_id: video_project.clone(),
             expected_revision: reviewed_expectation.revision,
-            expected_version_id: reviewed_expectation.version_id,
+            expected_version_id: reviewed_expectation.version_id.clone(),
             profile: TimelineRenderProfile::Preview,
             caption_theme: CaptionTheme::Calm,
             portrait_layout: PortraitSourceLayout::CenterCrop,
@@ -6961,18 +7244,101 @@ mod tests {
             include_speaker_cards: true,
             burn_captions: true,
         };
+        *workspace
+            .service
+            .single_render_test_failpoint
+            .lock()
+            .expect("timeline pre-publication failpoint") =
+            Some(SingleRenderTestFailpoint::TimelineBeforeAtomicPublication);
         let timeline_job = workspace
             .service
-            .queue_timeline_render(timeline_request, None)
+            .queue_timeline_render(timeline_request.clone(), None)
             .expect("queue reviewed timeline");
-        let first_timeline = workspace
+        let before_atomic_error = workspace
             .service
             .wait_for_job(
                 &timeline_job.job_id,
                 &video_project,
                 Duration::from_secs(180),
             )
-            .expect("reviewed timeline completes");
+            .expect_err("pre-transaction timeline crash is durable");
+        assert_eq!(before_atomic_error.code, "video.job_failed");
+        let after_precommit_crash = workspace
+            .service
+            .get_project(&video_project)
+            .expect("project after pre-transaction timeline crash");
+        assert_eq!(
+            project_expectation(&after_precommit_crash).expect("precommit expectation"),
+            reviewed_expectation,
+            "the eliminated manifest-only boundary must publish neither revision nor output"
+        );
+        assert!(!after_precommit_crash
+            .get("outputs")
+            .and_then(Value::as_array)
+            .is_some_and(|outputs| outputs.iter().any(|output| {
+                output.get("job_id").and_then(Value::as_str) == Some(timeline_job.job_id.as_str())
+            })));
+
+        *workspace
+            .service
+            .single_render_test_failpoint
+            .lock()
+            .expect("timeline post-publication failpoint") =
+            Some(SingleRenderTestFailpoint::TimelineAfterAtomicPublication);
+        workspace
+            .service
+            .resume_job(&timeline_job.job_id, None)
+            .expect("resume timeline into atomic publication");
+        let after_atomic_error = workspace
+            .service
+            .wait_for_job(
+                &timeline_job.job_id,
+                &video_project,
+                Duration::from_secs(180),
+            )
+            .expect_err("post-transaction timeline crash is durable");
+        assert_eq!(after_atomic_error.code, "video.job_failed");
+        let after_atomic_crash = workspace
+            .service
+            .get_project(&video_project)
+            .expect("project after atomic timeline publication");
+        let atomic_timeline_expectation =
+            project_expectation(&after_atomic_crash).expect("atomic timeline expectation");
+        assert_eq!(
+            atomic_timeline_expectation.revision,
+            reviewed_expectation.revision + 1
+        );
+        assert_eq!(
+            after_atomic_crash
+                .get("outputs")
+                .and_then(Value::as_array)
+                .expect("atomic timeline outputs")
+                .iter()
+                .filter(|output| {
+                    output.get("job_id").and_then(Value::as_str)
+                        == Some(timeline_job.job_id.as_str())
+                })
+                .count(),
+            1,
+            "manifest and one playable output commit in the same transaction"
+        );
+        workspace
+            .service
+            .resume_job(&timeline_job.job_id, None)
+            .expect("resume already atomically published timeline");
+        let first_timeline = workspace
+            .service
+            .wait_for_job(
+                &timeline_job.job_id,
+                &video_project,
+                Duration::from_secs(30),
+            )
+            .expect("reviewed timeline post-commit result is adopted");
+        assert_eq!(
+            project_expectation(&first_timeline.project).expect("adopted timeline expectation"),
+            atomic_timeline_expectation,
+            "post-commit adoption must not create another artifact revision"
+        );
         let first_timeline_manifest: VideoProjectManifest = serde_json::from_value(
             first_timeline
                 .project
@@ -7570,10 +7936,18 @@ mod tests {
                 None,
             )
             .expect("queue audio import");
-        workspace
+        let audio_imported = workspace
             .service
             .wait_for_job(&import.job_id, &audio_project, Duration::from_secs(120))
             .expect("audio import completes");
+        let audio_render_base =
+            project_expectation(&audio_imported.project).expect("audio render base");
+        *workspace
+            .service
+            .single_render_test_failpoint
+            .lock()
+            .expect("portrait pre-publication failpoint") =
+            Some(SingleRenderTestFailpoint::PortraitBeforeAtomicPublication);
         let render = workspace
             .service
             .queue_portrait_render(
@@ -7591,10 +7965,77 @@ mod tests {
                 None,
             )
             .expect("queue audio portrait render");
-        let rendered = workspace
+        let before_atomic_error = workspace
             .service
             .wait_for_job(&render.job_id, &audio_project, Duration::from_secs(180))
-            .expect("audio portrait completes");
+            .expect_err("pre-transaction portrait crash is durable");
+        assert_eq!(before_atomic_error.code, "video.job_failed");
+        let after_precommit_crash = workspace
+            .service
+            .get_project(&audio_project)
+            .expect("project after pre-transaction portrait crash");
+        assert_eq!(
+            project_expectation(&after_precommit_crash).expect("portrait precommit expectation"),
+            audio_render_base,
+            "the eliminated portrait manifest-only boundary must publish no state"
+        );
+        assert!(!after_precommit_crash
+            .get("outputs")
+            .and_then(Value::as_array)
+            .is_some_and(|outputs| outputs.iter().any(|output| {
+                output.get("job_id").and_then(Value::as_str) == Some(render.job_id.as_str())
+            })));
+
+        *workspace
+            .service
+            .single_render_test_failpoint
+            .lock()
+            .expect("portrait post-publication failpoint") =
+            Some(SingleRenderTestFailpoint::PortraitAfterAtomicPublication);
+        workspace
+            .service
+            .resume_job(&render.job_id, None)
+            .expect("resume portrait into atomic publication");
+        let after_atomic_error = workspace
+            .service
+            .wait_for_job(&render.job_id, &audio_project, Duration::from_secs(180))
+            .expect_err("post-transaction portrait crash is durable");
+        assert_eq!(after_atomic_error.code, "video.job_failed");
+        let after_atomic_crash = workspace
+            .service
+            .get_project(&audio_project)
+            .expect("project after atomic portrait publication");
+        let atomic_portrait_expectation =
+            project_expectation(&after_atomic_crash).expect("atomic portrait expectation");
+        assert_eq!(
+            atomic_portrait_expectation.revision,
+            audio_render_base.revision + 1
+        );
+        assert_eq!(
+            after_atomic_crash
+                .get("outputs")
+                .and_then(Value::as_array)
+                .expect("atomic portrait outputs")
+                .iter()
+                .filter(|output| {
+                    output.get("job_id").and_then(Value::as_str) == Some(render.job_id.as_str())
+                })
+                .count(),
+            1
+        );
+        workspace
+            .service
+            .resume_job(&render.job_id, None)
+            .expect("resume already atomically published portrait");
+        let rendered = workspace
+            .service
+            .wait_for_job(&render.job_id, &audio_project, Duration::from_secs(30))
+            .expect("audio portrait post-commit result is adopted");
+        assert_eq!(
+            project_expectation(&rendered.project).expect("adopted portrait expectation"),
+            atomic_portrait_expectation,
+            "post-commit portrait adoption must not create another revision"
+        );
         let primary = rendered
             .project
             .get("outputs")
@@ -8641,6 +9082,7 @@ impl VideoStudioService {
     /// produce it is still current. This is the publication CAS boundary:
     /// expensive work may finish after an edit, but it can never be attached
     /// to that newer edit by accident.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn commit_manifest_mutation_at<F>(
         &self,
@@ -8985,6 +9427,171 @@ impl VideoStudioService {
             })?;
         let created_at = value_string(&job, "created_at")?;
         normalize_utc_timestamp(&created_at)
+    }
+
+    #[cfg(test)]
+    fn trigger_single_render_test_failpoint(
+        &self,
+        expected: SingleRenderTestFailpoint,
+    ) -> ServiceResult<()> {
+        let mut failpoint = self
+            .single_render_test_failpoint
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if failpoint.as_ref() != Some(&expected) {
+            return Ok(());
+        }
+        failpoint.take();
+        Err(VideoServiceError::new(
+            "video.test_crash",
+            "Simulated process stop at the single-render publication boundary",
+        ))
+    }
+
+    /// Recognizes only the exact single-render transaction owned by this
+    /// durable job. Manifest and output publication are atomic, but the
+    /// process can still stop before `complete_job`; a resumed worker adopts
+    /// that already-committed result instead of rejecting its original frozen
+    /// expectation or creating another artifact revision.
+    #[allow(clippy::too_many_arguments)]
+    fn recover_single_render_output(
+        &self,
+        project: &Value,
+        job_id: &str,
+        expectation: &ProjectExpectation,
+        actor: &str,
+        reason: &str,
+        invalidated_stage: RevisionStage,
+        request_sha256: &str,
+        semantic_role: &str,
+        variation: u16,
+        expected_kind: &str,
+        expected_primary: bool,
+        render_key_field: &str,
+        caption_key_field: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> ServiceResult<Option<Value>> {
+        let current = project_expectation(project)?;
+        if current.revision != expectation.revision.saturating_add(1) {
+            return Ok(None);
+        }
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            project
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+        let Some(record) = manifest.revision_history.last() else {
+            return Ok(None);
+        };
+        if i64::try_from(record.revision).ok() != Some(current.revision)
+            || record.actor != actor
+            || record.reason != reason
+            || record.changed_paths != ["/render_artifacts".to_string()]
+            || record.invalidated_stages != BTreeSet::from([invalidated_stage])
+        {
+            return Ok(None);
+        }
+        let outputs = project
+            .get("outputs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_store_shape("outputs"))?;
+        let matching = outputs
+            .iter()
+            .filter(|output| {
+                output.get("version_id").and_then(Value::as_str)
+                    == Some(current.version_id.as_str())
+                    && output.get("job_id").and_then(Value::as_str) == Some(job_id)
+                    && output
+                        .get("provenance")
+                        .and_then(|value| value.get("request_sha256"))
+                        .and_then(Value::as_str)
+                        == Some(request_sha256)
+            })
+            .collect::<Vec<_>>();
+        let [output] = matching.as_slice() else {
+            return Ok(None);
+        };
+        let provenance = output.get("provenance").ok_or_else(|| {
+            VideoServiceError::new(
+                "video.store_contract_failed",
+                "A recovered render output has no provenance",
+            )
+        })?;
+        if provenance.get("manifest_revision").and_then(Value::as_i64) != Some(expectation.revision)
+            || provenance.get("source_version_id").and_then(Value::as_str)
+                != Some(expectation.version_id.as_str())
+            || provenance.get("variation").and_then(Value::as_u64) != Some(u64::from(variation))
+            || output.get("kind").and_then(Value::as_str) != Some(expected_kind)
+            || output.get("is_primary").and_then(Value::as_bool) != Some(expected_primary)
+        {
+            return Ok(None);
+        }
+        let render_key = provenance
+            .get(render_key_field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_store_shape("outputs.provenance.render_cache_key"))?;
+        let expected_id = stable_output_id(
+            project
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_store_shape("id"))?,
+            current.revision,
+            semantic_role,
+            render_key,
+            variation,
+        );
+        if output.get("id").and_then(Value::as_str) != Some(expected_id.as_str()) {
+            return Ok(None);
+        }
+        let expected_sha256 = value_string(output, "sha256")?;
+        if !manifest
+            .render_artifacts
+            .iter()
+            .any(|artifact| artifact.cache_key == render_key && artifact.sha256 == expected_sha256)
+        {
+            return Ok(None);
+        }
+        if let Some(caption_key_field) = caption_key_field {
+            let caption_key = provenance
+                .get(caption_key_field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_store_shape("outputs.provenance.caption_cache_key"))?;
+            if !manifest
+                .render_artifacts
+                .iter()
+                .any(|artifact| artifact.cache_key == caption_key)
+            {
+                return Ok(None);
+            }
+        }
+        self.ensure_not_cancelled(cancel)?;
+        let output_path = self.resolve_absolute_managed_path(&PathBuf::from(value_string(
+            output,
+            "artifact_path",
+        )?))?;
+        if sha256_file_with_cancel(&output_path, Some(cancel))? != expected_sha256 {
+            return Err(VideoServiceError::new(
+                "video.integrity_failed",
+                "The atomically published render no longer matches its saved checksum",
+            ));
+        }
+        let runtime = self.runtime_status(false);
+        let ffprobe = required_tool_path(
+            &runtime.ffprobe,
+            "video.ffprobe_unavailable",
+            "FFprobe is required to recover a completed render",
+        )?;
+        let probe = probe_media(&output_path, ffprobe)?;
+        if probe.primary_video_stream.is_none() || probe.duration_us <= 0 {
+            return Err(VideoServiceError::new(
+                "video.invalid_render",
+                "The atomically published render is no longer playable",
+            ));
+        }
+        Ok(Some((*output).clone()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9597,6 +10204,8 @@ impl VideoStudioService {
             package_test_barrier: Mutex::new(None),
             #[cfg(test)]
             local_import_test_barrier: Mutex::new(None),
+            #[cfg(test)]
+            single_render_test_failpoint: Mutex::new(None),
         })
     }
 
@@ -11039,11 +11648,91 @@ impl VideoStudioService {
         }
         let started = Instant::now();
         let project = self.get_project(&request.project_id)?;
-        let expectation = expectation_from_optional(
+        let expectation = declared_expectation(
             &project,
             request.expected_revision,
             request.expected_version_id.as_deref(),
         )?;
+        let stage_key = match request.profile {
+            RenderProfile::Final => "final_render",
+            RenderProfile::Proxy | RenderProfile::Preview => "preview_render",
+        };
+        let reason = if request.profile == RenderProfile::Final {
+            "Published a final portrait master"
+        } else {
+            "Published a fast portrait preview"
+        };
+        let invalidated_stage = if request.profile == RenderProfile::Final {
+            RevisionStage::FinalRender
+        } else {
+            RevisionStage::Preview
+        };
+        let output_kind = if request.variation > 0 {
+            "variation"
+        } else if request.profile == RenderProfile::Final {
+            "master"
+        } else {
+            "preview"
+        };
+        let semantic_role = format!("portrait-{output_kind}");
+        let request_sha256 = sha256_bytes(&serde_json::to_vec(request).map_err(json_error)?);
+        if let Err(conflict) = ensure_project_matches(&project, &expectation) {
+            if let Some(output) = self.recover_single_render_output(
+                &project,
+                job_id,
+                &expectation,
+                &request.actor,
+                reason,
+                invalidated_stage,
+                &request_sha256,
+                &semantic_role,
+                request.variation,
+                output_kind,
+                request.profile == RenderProfile::Final && request.variation == 0,
+                "cache_key",
+                None,
+                cancel,
+            )? {
+                let current = project_expectation(&project)?;
+                let provenance = output
+                    .get("provenance")
+                    .ok_or_else(|| invalid_store_shape("outputs.provenance"))?;
+                let cache_key = provenance
+                    .get("cache_key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_store_shape("outputs.provenance.cache_key"))?;
+                let output_sha256 = value_string(&output, "sha256")?;
+                self.checkpoint_stage(
+                    &request.project_id,
+                    Some(&current.version_id),
+                    stage_key,
+                    &format!("variation-{}", request.variation),
+                    job_id,
+                    "completed",
+                    "light",
+                    1.0,
+                    cache_key,
+                    Some(&output_sha256),
+                    json!({ "output_id": output.get("id"), "idempotent_replay": true }),
+                    None,
+                )?;
+                self.store
+                    .update_job(job_id, "running", 0.99)
+                    .map_err(VideoServiceError::store)?;
+                emit_progress(
+                    callback,
+                    job_id,
+                    &request.project_id,
+                    "published",
+                    0.99,
+                    "The atomically published portrait render was recovered after restart",
+                    Some(output),
+                    Some(json!({ "idempotent_replay": true })),
+                );
+                return Ok(());
+            }
+            return Err(conflict);
+        }
         let manifest: VideoProjectManifest = serde_json::from_value(
             project
                 .get("manifest")
@@ -11081,10 +11770,6 @@ impl VideoStudioService {
         let stage = match request.profile {
             RenderProfile::Final => CacheStage::FinalRender,
             RenderProfile::Proxy | RenderProfile::Preview => CacheStage::PreviewRender,
-        };
-        let stage_key = match request.profile {
-            RenderProfile::Final => "final_render",
-            RenderProfile::Proxy | RenderProfile::Preview => "preview_render",
         };
         let profile_value = json!({
             "profile": request.profile,
@@ -11271,105 +11956,169 @@ impl VideoStudioService {
             created_at: utc_now(),
         };
         artifact.validate()?;
-        let artifact_for_manifest = artifact.clone();
-        let committed = if manifest
+        let has_render_artifact = manifest
             .render_artifacts
             .iter()
-            .any(|existing| existing.cache_key == cache_key)
-        {
-            let current = self.get_project(&request.project_id)?;
-            ensure_project_matches(&current, &expectation)?;
-            current
+            .any(|existing| existing.cache_key == cache_key);
+        let target_revision = if has_render_artifact {
+            expectation.revision
         } else {
-            self.commit_manifest_mutation_at(
-                &request.project_id,
-                &expectation,
-                &request.actor,
-                if request.profile == RenderProfile::Final {
-                    "Published a final portrait master"
-                } else {
-                    "Published a fast portrait preview"
-                },
-                Some(if request.profile == RenderProfile::Final {
-                    "completed"
-                } else {
-                    "ready"
-                }),
-                vec!["/render_artifacts".to_string()],
-                BTreeSet::from([if request.profile == RenderProfile::Final {
-                    RevisionStage::FinalRender
-                } else {
-                    RevisionStage::Preview
-                }]),
-                move |manifest| {
-                    manifest.render_artifacts.push(artifact_for_manifest);
-                    Ok(())
-                },
-            )?
-        };
-        let committed_expectation = project_expectation(&committed)?;
-        let publication_lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
-        let current = self.get_project(&request.project_id)?;
-        ensure_project_matches(&current, &committed_expectation)?;
-        let version_id = Some(committed_expectation.version_id.as_str());
-        let output_kind = if request.variation > 0 {
-            "variation"
-        } else if request.profile == RenderProfile::Final {
-            "master"
-        } else {
-            "preview"
+            expectation.revision.checked_add(1).ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.revision_overflow",
+                    "The portrait output version could not be advanced",
+                )
+            })?
         };
         let output_id = stable_output_id(
             &request.project_id,
-            committed_expectation.revision,
-            &format!("portrait-{output_kind}"),
+            target_revision,
+            &semantic_role,
             &cache_key,
             request.variation,
         );
-        let output = self
-            .store
-            .publish_video_output_current_cancellable(
-                &json!({
-                    "id": output_id,
-                    "project_id": request.project_id,
-                    "version_id": version_id,
-                    "job_id": job_id,
-                    "kind": output_kind,
-                    "label": match (request.profile, request.variation) {
-                        (RenderProfile::Final, 0) => "Final master".to_string(),
-                        (RenderProfile::Final, variation) => format!("Final variation {variation}"),
-                        (_, 0) => "Video preview".to_string(),
-                        (_, variation) => format!("Preview variation {variation}"),
-                    },
-                    "artifact_path": output_path,
-                    "mime_type": "video/mp4",
-                    "sha256": checksum,
-                    "duration_us": output_probe.duration_us,
-                    "width": width,
-                    "height": height,
-                    "is_primary": request.profile == RenderProfile::Final && request.variation == 0,
-                    "provenance": {
-                        "producer": "soundAr Video Studio",
-                        "producer_version": SERVICE_VERSION,
-                        "source_asset_id": source.id,
-                        "cache_key": cache_key,
-                        "profile": request.profile,
-                        "layout": request.layout,
-                        "variation": request.variation,
-                        "audio_only": !has_video,
-                    },
-                }),
-                committed_expectation.revision,
-                &committed_expectation.version_id,
-                &publication_lock.token,
-                cancel,
-            )
-            .map_err(VideoServiceError::store)?;
+        let build_output_request = |version_id: Option<&str>| {
+            json!({
+                "id": output_id,
+                "project_id": request.project_id,
+                "version_id": version_id,
+                "job_id": job_id,
+                "kind": output_kind,
+                "label": match (request.profile, request.variation) {
+                    (RenderProfile::Final, 0) => "Final master".to_string(),
+                    (RenderProfile::Final, variation) => format!("Final variation {variation}"),
+                    (_, 0) => "Video preview".to_string(),
+                    (_, variation) => format!("Preview variation {variation}"),
+                },
+                "artifact_path": output_path,
+                "mime_type": "video/mp4",
+                "sha256": checksum,
+                "duration_us": output_probe.duration_us,
+                "width": width,
+                "height": height,
+                "is_primary": request.profile == RenderProfile::Final && request.variation == 0,
+                "provenance": {
+                    "producer": "soundAr Video Studio",
+                    "producer_version": SERVICE_VERSION,
+                    "manifest_revision": expectation.revision,
+                    "source_version_id": expectation.version_id,
+                    "request_sha256": request_sha256,
+                    "source_asset_id": source.id,
+                    "cache_key": cache_key,
+                    "profile": request.profile,
+                    "layout": request.layout,
+                    "variation": request.variation,
+                    "audio_only": !has_video,
+                },
+            })
+        };
+        let publication_lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
+        let current = self.get_project(&request.project_id)?;
+        ensure_project_matches(&current, &expectation)?;
+        #[cfg(test)]
+        if !has_render_artifact {
+            self.trigger_single_render_test_failpoint(
+                SingleRenderTestFailpoint::PortraitBeforeAtomicPublication,
+            )?;
+        }
+        let (committed, output) = if has_render_artifact {
+            let request_value = build_output_request(Some(&expectation.version_id));
+            let output = self
+                .store
+                .publish_video_output_current_cancellable(
+                    &request_value,
+                    expectation.revision,
+                    &expectation.version_id,
+                    &publication_lock.token,
+                    cancel,
+                )
+                .map_err(VideoServiceError::store)?;
+            (current, output)
+        } else {
+            let actor = require_text(
+                &request.actor,
+                "video.invalid_actor",
+                "An actor is required",
+            )?;
+            let mut next_manifest = manifest.clone();
+            if i64::try_from(next_manifest.revision).ok() != Some(expectation.revision) {
+                return Err(VideoServiceError::new(
+                    "video.revision_integrity_failed",
+                    "The frozen portrait manifest and project revision are not aligned",
+                ));
+            }
+            let next_revision = next_manifest.revision.checked_add(1).ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.revision_overflow",
+                    "The portrait artifact revision could not be advanced",
+                )
+            })?;
+            next_manifest.render_artifacts.push(artifact);
+            let created_at = utc_now();
+            let parent_id = next_manifest
+                .revision_history
+                .last()
+                .map(|record| record.id.clone());
+            next_manifest.revision = next_revision;
+            next_manifest.updated_at = created_at.clone();
+            next_manifest.revision_history.push(RevisionRecord {
+                id: new_id(),
+                revision: next_revision,
+                parent_id,
+                actor: actor.to_string(),
+                reason: reason.to_string(),
+                changed_paths: vec!["/render_artifacts".to_string()],
+                invalidated_stages: BTreeSet::from([invalidated_stage]),
+                created_at,
+            });
+            next_manifest.validate_strict()?;
+            let output_request = build_output_request(None);
+            let committed = self
+                .store
+                .commit_video_manifest_with_outputs_cancellable(
+                    &request.project_id,
+                    expectation.revision,
+                    &serde_json::to_value(&next_manifest).map_err(json_error)?,
+                    actor,
+                    reason,
+                    &publication_lock.token,
+                    Some(if request.profile == RenderProfile::Final {
+                        "completed"
+                    } else {
+                        "ready"
+                    }),
+                    &[output_request],
+                    cancel,
+                )
+                .map_err(VideoServiceError::store)?;
+            let output = committed
+                .get("outputs")
+                .and_then(Value::as_array)
+                .and_then(|outputs| {
+                    outputs.iter().find(|output| {
+                        output.get("id").and_then(Value::as_str) == Some(output_id.as_str())
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.store_contract_failed",
+                        "The atomically published portrait output could not be reloaded",
+                    )
+                })?;
+            (committed, output)
+        };
+        #[cfg(test)]
+        self.trigger_single_render_test_failpoint(
+            SingleRenderTestFailpoint::PortraitAfterAtomicPublication,
+        )?;
+        let committed_expectation = project_expectation(&committed)?;
         ensure_project_matches(
             &self.get_project(&request.project_id)?,
             &committed_expectation,
         )?;
         drop(publication_lock);
+        let version_id = Some(committed_expectation.version_id.as_str());
         self.checkpoint_stage(
             &request.project_id,
             version_id,
@@ -12688,8 +13437,97 @@ impl VideoStudioService {
             revision: request.expected_revision,
             version_id: request.expected_version_id.clone(),
         };
+        let reason = match request.profile {
+            TimelineRenderProfile::Preview if request.variation > 0 => {
+                "Published a reviewed-timeline preview variation"
+            }
+            TimelineRenderProfile::Preview => "Published a reviewed-timeline preview",
+            TimelineRenderProfile::Final if request.variation > 0 => {
+                "Published an alternate reviewed final render"
+            }
+            TimelineRenderProfile::Final => "Published the reviewed final master",
+        };
+        let invalidated_stage = match request.profile {
+            TimelineRenderProfile::Preview => RevisionStage::Preview,
+            TimelineRenderProfile::Final => RevisionStage::FinalRender,
+        };
+        let stage_key = match request.profile {
+            TimelineRenderProfile::Preview => "preview_render",
+            TimelineRenderProfile::Final => "final_render",
+        };
+        let scope_key = format!("timeline-variation-{}", request.variation);
+        let output_kind = match (request.profile, request.variation) {
+            (_, variation) if variation > 0 => "variation",
+            (TimelineRenderProfile::Preview, _) => "preview",
+            (TimelineRenderProfile::Final, _) => "master",
+        };
+        let semantic_role = match request.profile {
+            TimelineRenderProfile::Preview => "timeline-preview",
+            TimelineRenderProfile::Final => "timeline-final",
+        };
+        let request_sha256 = sha256_bytes(&serde_json::to_vec(request).map_err(json_error)?);
         let project = self.get_project(&request.project_id)?;
-        ensure_project_matches(&project, &expectation)?;
+        if let Err(conflict) = ensure_project_matches(&project, &expectation) {
+            if !defer_publication {
+                if let Some(output) = self.recover_single_render_output(
+                    &project,
+                    job_id,
+                    &expectation,
+                    &request.actor,
+                    reason,
+                    invalidated_stage,
+                    &request_sha256,
+                    semantic_role,
+                    request.variation,
+                    output_kind,
+                    request.profile == TimelineRenderProfile::Final && request.variation == 0,
+                    "render_cache_key",
+                    Some("caption_cache_key"),
+                    cancel,
+                )? {
+                    let current = project_expectation(&project)?;
+                    let provenance = output
+                        .get("provenance")
+                        .ok_or_else(|| invalid_store_shape("outputs.provenance"))?;
+                    let render_key = provenance
+                        .get("render_cache_key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            invalid_store_shape("outputs.provenance.render_cache_key")
+                        })?;
+                    let output_sha256 = value_string(&output, "sha256")?;
+                    self.checkpoint_stage(
+                        &request.project_id,
+                        Some(&current.version_id),
+                        stage_key,
+                        &scope_key,
+                        job_id,
+                        "completed",
+                        "light",
+                        1.0,
+                        render_key,
+                        Some(&output_sha256),
+                        json!({ "output_id": output.get("id"), "idempotent_replay": true }),
+                        None,
+                    )?;
+                    self.store
+                        .update_job(job_id, "running", 0.99)
+                        .map_err(VideoServiceError::store)?;
+                    emit_progress(
+                        callback,
+                        job_id,
+                        &request.project_id,
+                        "published",
+                        0.99,
+                        "The atomically published timeline render was recovered after restart",
+                        Some(output),
+                        Some(json!({ "idempotent_replay": true })),
+                    );
+                    return Ok(None);
+                }
+            }
+            return Err(conflict);
+        }
         let manifest: VideoProjectManifest = serde_json::from_value(
             project
                 .get("manifest")
@@ -12913,11 +13751,6 @@ impl VideoStudioService {
             .manifest_slice(render_slice)
             .profile(render_profile_value.clone());
         let render_key = render_key_builder.build()?.into_string();
-        let stage_key = match request.profile {
-            TimelineRenderProfile::Preview => "preview_render",
-            TimelineRenderProfile::Final => "final_render",
-        };
-        let scope_key = format!("timeline-variation-{}", request.variation);
         self.checkpoint_stage(
             &request.project_id,
             Some(&expectation.version_id),
@@ -13128,107 +13961,165 @@ impl VideoStudioService {
             .render_artifacts
             .iter()
             .any(|artifact| artifact.cache_key == render_key);
-        let committed = if has_caption_artifact && has_render_artifact {
-            let current = self.get_project(&request.project_id)?;
-            ensure_project_matches(&current, &expectation)?;
-            current
+        let adds_render_artifacts = !has_caption_artifact || !has_render_artifact;
+        let target_revision = if adds_render_artifacts {
+            expectation.revision.checked_add(1).ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.revision_overflow",
+                    "The timeline output version could not be advanced",
+                )
+            })?
         } else {
-            self.commit_manifest_mutation_at(
-                &request.project_id,
-                &expectation,
-                &request.actor,
-                match request.profile {
-                    TimelineRenderProfile::Preview if request.variation > 0 => {
-                        "Published a reviewed-timeline preview variation"
-                    }
-                    TimelineRenderProfile::Preview => "Published a reviewed-timeline preview",
-                    TimelineRenderProfile::Final if request.variation > 0 => {
-                        "Published an alternate reviewed final render"
-                    }
-                    TimelineRenderProfile::Final => "Published the reviewed final master",
-                },
-                Some(match request.profile {
-                    TimelineRenderProfile::Preview => "ready",
-                    TimelineRenderProfile::Final => "completed",
-                }),
-                vec!["/render_artifacts".to_string()],
-                BTreeSet::from([match request.profile {
-                    TimelineRenderProfile::Preview => RevisionStage::Preview,
-                    TimelineRenderProfile::Final => RevisionStage::FinalRender,
-                }]),
-                move |manifest| {
-                    if !has_caption_artifact {
-                        manifest.render_artifacts.push(caption_artifact);
-                    }
-                    if !has_render_artifact {
-                        manifest.render_artifacts.push(render_artifact);
-                    }
-                    Ok(())
-                },
-            )?
-        };
-        let committed_expectation = project_expectation(&committed)?;
-        let publication_lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
-        let current = self.get_project(&request.project_id)?;
-        ensure_project_matches(&current, &committed_expectation)?;
-        let output_kind = match (request.profile, request.variation) {
-            (_, variation) if variation > 0 => "variation",
-            (TimelineRenderProfile::Preview, _) => "preview",
-            (TimelineRenderProfile::Final, _) => "master",
-        };
-        let semantic_role = match request.profile {
-            TimelineRenderProfile::Preview => "timeline-preview",
-            TimelineRenderProfile::Final => "timeline-final",
+            expectation.revision
         };
         let output_id = stable_output_id(
             &request.project_id,
-            committed_expectation.revision,
+            target_revision,
             semantic_role,
             &render_key,
             request.variation,
         );
-        let output = self
-            .store
-            .publish_video_output_current_cancellable(
-                &json!({
-                    "id": output_id,
-                    "project_id": request.project_id,
-                    "version_id": committed_expectation.version_id,
-                    "job_id": job_id,
-                    "kind": output_kind,
-                    "label": match (request.profile, request.variation) {
-                        (TimelineRenderProfile::Final, 0) => "Final master".to_string(),
-                        (TimelineRenderProfile::Final, variation) => format!("Final variation {variation}"),
-                        (TimelineRenderProfile::Preview, 0) => "Timeline preview".to_string(),
-                        (TimelineRenderProfile::Preview, variation) => format!("Preview variation {variation}"),
-                    },
-                    "artifact_path": output_path,
-                    "mime_type": "video/mp4",
-                    "sha256": output_sha,
-                    "duration_us": output_probe.duration_us,
-                    "width": width,
-                    "height": height,
-                    "is_primary": request.profile == TimelineRenderProfile::Final && request.variation == 0,
-                    "provenance": {
-                        "producer": "soundAr Video Studio timeline assembler",
-                        "producer_version": SERVICE_VERSION,
-                        "manifest_revision": request.expected_revision,
-                        "source_version_id": request.expected_version_id,
-                        "render_cache_key": render_key,
-                        "caption_cache_key": caption_key,
-                        "profile": request.profile,
-                        "variation": request.variation,
-                        "caption_theme": request.caption_theme,
-                        "portrait_layout": request.portrait_layout,
-                        "nvenc_with_software_fallback": runtime.h264_nvenc_runtime,
-                    },
-                }),
-                committed_expectation.revision,
-                &committed_expectation.version_id,
-                &publication_lock.token,
-                cancel,
-            )
-            .map_err(VideoServiceError::store)?;
+        let build_output_request = |version_id: Option<&str>| {
+            json!({
+                "id": output_id,
+                "project_id": request.project_id,
+                "version_id": version_id,
+                "job_id": job_id,
+                "kind": output_kind,
+                "label": match (request.profile, request.variation) {
+                    (TimelineRenderProfile::Final, 0) => "Final master".to_string(),
+                    (TimelineRenderProfile::Final, variation) => format!("Final variation {variation}"),
+                    (TimelineRenderProfile::Preview, 0) => "Timeline preview".to_string(),
+                    (TimelineRenderProfile::Preview, variation) => format!("Preview variation {variation}"),
+                },
+                "artifact_path": output_path,
+                "mime_type": "video/mp4",
+                "sha256": output_sha,
+                "duration_us": output_probe.duration_us,
+                "width": width,
+                "height": height,
+                "is_primary": request.profile == TimelineRenderProfile::Final && request.variation == 0,
+                "provenance": {
+                    "producer": "soundAr Video Studio timeline assembler",
+                    "producer_version": SERVICE_VERSION,
+                    "manifest_revision": expectation.revision,
+                    "source_version_id": expectation.version_id,
+                    "request_sha256": request_sha256,
+                    "render_cache_key": render_key,
+                    "caption_cache_key": caption_key,
+                    "profile": request.profile,
+                    "variation": request.variation,
+                    "caption_theme": request.caption_theme,
+                    "portrait_layout": request.portrait_layout,
+                    "nvenc_with_software_fallback": runtime.h264_nvenc_runtime,
+                },
+            })
+        };
+        let publication_lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
+        let current = self.get_project(&request.project_id)?;
+        ensure_project_matches(&current, &expectation)?;
+        #[cfg(test)]
+        if adds_render_artifacts {
+            self.trigger_single_render_test_failpoint(
+                SingleRenderTestFailpoint::TimelineBeforeAtomicPublication,
+            )?;
+        }
+        let (committed, output) = if adds_render_artifacts {
+            let actor = require_text(
+                &request.actor,
+                "video.invalid_actor",
+                "An actor is required",
+            )?;
+            let mut next_manifest = manifest.clone();
+            if i64::try_from(next_manifest.revision).ok() != Some(expectation.revision) {
+                return Err(VideoServiceError::new(
+                    "video.revision_integrity_failed",
+                    "The frozen timeline manifest and project revision are not aligned",
+                ));
+            }
+            if !has_caption_artifact {
+                next_manifest.render_artifacts.push(caption_artifact);
+            }
+            if !has_render_artifact {
+                next_manifest.render_artifacts.push(render_artifact);
+            }
+            let next_revision = next_manifest.revision.checked_add(1).ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.revision_overflow",
+                    "The timeline artifact revision could not be advanced",
+                )
+            })?;
+            let created_at = utc_now();
+            let parent_id = next_manifest
+                .revision_history
+                .last()
+                .map(|record| record.id.clone());
+            next_manifest.revision = next_revision;
+            next_manifest.updated_at = created_at.clone();
+            next_manifest.revision_history.push(RevisionRecord {
+                id: new_id(),
+                revision: next_revision,
+                parent_id,
+                actor: actor.to_string(),
+                reason: reason.to_string(),
+                changed_paths: vec!["/render_artifacts".to_string()],
+                invalidated_stages: BTreeSet::from([invalidated_stage]),
+                created_at,
+            });
+            next_manifest.validate_strict()?;
+            let output_request = build_output_request(None);
+            let committed = self
+                .store
+                .commit_video_manifest_with_outputs_cancellable(
+                    &request.project_id,
+                    expectation.revision,
+                    &serde_json::to_value(&next_manifest).map_err(json_error)?,
+                    actor,
+                    reason,
+                    &publication_lock.token,
+                    Some(match request.profile {
+                        TimelineRenderProfile::Preview => "ready",
+                        TimelineRenderProfile::Final => "completed",
+                    }),
+                    &[output_request],
+                    cancel,
+                )
+                .map_err(VideoServiceError::store)?;
+            let output = committed
+                .get("outputs")
+                .and_then(Value::as_array)
+                .and_then(|outputs| {
+                    outputs.iter().find(|output| {
+                        output.get("id").and_then(Value::as_str) == Some(output_id.as_str())
+                    })
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.store_contract_failed",
+                        "The atomically published timeline output could not be reloaded",
+                    )
+                })?;
+            (committed, output)
+        } else {
+            let output_request = build_output_request(Some(&expectation.version_id));
+            let output = self
+                .store
+                .publish_video_output_current_cancellable(
+                    &output_request,
+                    expectation.revision,
+                    &expectation.version_id,
+                    &publication_lock.token,
+                    cancel,
+                )
+                .map_err(VideoServiceError::store)?;
+            (current, output)
+        };
+        #[cfg(test)]
+        self.trigger_single_render_test_failpoint(
+            SingleRenderTestFailpoint::TimelineAfterAtomicPublication,
+        )?;
+        let committed_expectation = project_expectation(&committed)?;
         ensure_project_matches(
             &self.get_project(&request.project_id)?,
             &committed_expectation,
@@ -13932,18 +14823,26 @@ impl VideoStudioService {
             }
             let extension = safe_extension(&downloaded, probe.primary_video_stream.is_some());
             let final_path = source_dir.join(format!("source-{asset_id}.{extension}"));
-            let publication = publish_atomic(&downloaded, &final_path, |path| {
-                probe_media(path, ffprobe).map(|_| ())
-            })?;
-            published_path = Some(publication.path.clone());
-            secure_managed_file(&publication.path)?;
+            let staged_checksum = sha256_file_with_cancel(&downloaded, Some(cancel))?;
+            let (managed_path, newly_published) = self.publish_import_staging_once(
+                &request.project_id,
+                &asset_id,
+                &downloaded,
+                &final_path,
+                &staged_checksum,
+                cancel,
+                |path| probe_media(path, ffprobe).map(|_| ()),
+            )?;
+            if newly_published {
+                published_path = Some(managed_path.clone());
+            }
             self.ensure_not_cancelled(cancel)?;
-            let checksum = sha256_file_with_cancel(&publication.path, Some(cancel))?;
-            let final_probe = probe_media(&publication.path, ffprobe)?;
+            let checksum = sha256_file_with_cancel(&managed_path, Some(cancel))?;
+            let final_probe = probe_media(&managed_path, ffprobe)?;
             validate_source_size(final_probe.size_bytes)?;
             validate_media_duration(final_probe.duration_us)?;
-            let relative_path = self.relative_managed_path(&publication.path)?;
-            Ok((publication.path, relative_path, checksum, final_probe))
+            let relative_path = self.relative_managed_path(&managed_path)?;
+            Ok((managed_path, relative_path, checksum, final_probe))
         })();
         let (source_path, relative_path, checksum, final_probe) = match prepared {
             Ok(prepared) => prepared,
@@ -14015,6 +14914,259 @@ impl VideoStudioService {
         Ok(())
     }
 
+    /// Publishes one deterministic import source without ever replacing an
+    /// existing inode. Store/manifest identity wins over a newly inferred
+    /// extension, and crash leftovers are adopted only when their bytes match
+    /// the newly staged source exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_import_staging_once<F>(
+        &self,
+        project_id: &str,
+        asset_id: &str,
+        staging: &Path,
+        suggested_final_path: &Path,
+        staged_sha256: &str,
+        cancel: &AtomicBool,
+        validate: F,
+    ) -> ServiceResult<(PathBuf, bool)>
+    where
+        F: Fn(&Path) -> Result<(), MediaError>,
+    {
+        let result = (|| -> ServiceResult<(PathBuf, bool)> {
+            self.ensure_not_cancelled(cancel)?;
+            validate_hash(staged_sha256)?;
+            let source_dir = self.project_dir(project_id)?.join("sources");
+            self.secure_managed_directory(&source_dir)?;
+            let source_dir = fs::canonicalize(&source_dir).map_err(|error| {
+                VideoServiceError::io(
+                    "video.storage_unavailable",
+                    "The managed source directory could not be resolved",
+                    error,
+                )
+            })?;
+            if suggested_final_path.parent() != Some(source_dir.as_path()) {
+                return Err(VideoServiceError::new(
+                    "video.unsafe_artifact_path",
+                    "A deterministic import target escaped its managed source directory",
+                ));
+            }
+            let stable_prefix = format!("source-{asset_id}.");
+            let project = self.get_project(project_id)?;
+            let manifest: VideoProjectManifest = serde_json::from_value(
+                project
+                    .get("manifest")
+                    .cloned()
+                    .ok_or_else(|| invalid_store_shape("manifest"))?,
+            )
+            .map_err(json_error)?;
+            manifest.validate_strict()?;
+            let manifest_source = manifest
+                .source_assets
+                .iter()
+                .find(|source| source.id == asset_id);
+            let asset_row = project
+                .get("assets")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid_store_shape("assets"))?
+                .iter()
+                .find(|asset| asset.get("id").and_then(Value::as_str) == Some(asset_id));
+
+            let inspect_bound =
+                |path: &Path, expected_sha256: Option<&str>| -> ServiceResult<(PathBuf, bool)> {
+                    let path = self.resolve_absolute_managed_path(path)?;
+                    if path.parent() != Some(source_dir.as_path())
+                        || !path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(&stable_prefix))
+                    {
+                        return Err(VideoServiceError::new(
+                        "video.import_identity_conflict",
+                        "The durable import row points outside its exact managed source identity",
+                    ));
+                    }
+                    let actual_sha256 = sha256_file_with_cancel(&path, Some(cancel))?;
+                    if expected_sha256.is_some_and(|expected| expected != actual_sha256)
+                        || actual_sha256 != staged_sha256
+                    {
+                        return Err(VideoServiceError::new(
+                            "video.import_identity_conflict",
+                            "This durable import already owns different managed source bytes",
+                        )
+                        .details(json!({
+                            "managed_sha256": actual_sha256,
+                            "staged_sha256": staged_sha256,
+                        })));
+                    }
+                    validate(&path)?;
+                    fs::remove_file(staging).map_err(|error| {
+                        VideoServiceError::io(
+                            "video.import_cleanup_failed",
+                            "The duplicate import staging file could not be removed",
+                            error,
+                        )
+                    })?;
+                    Ok((path, false))
+                };
+
+            if let Some(asset_row) = asset_row {
+                let row_sha256 = value_string(asset_row, "content_sha256")?;
+                validate_hash(&row_sha256)?;
+                let row_path = PathBuf::from(value_string(asset_row, "local_path")?);
+                if let Some(manifest_source) = manifest_source {
+                    if manifest_source.sha256 != row_sha256
+                        || self.resolve_managed_path(&manifest_source.managed_path)?
+                            != self.resolve_absolute_managed_path(&row_path)?
+                    {
+                        return Err(VideoServiceError::new(
+                            "video.integrity_failed",
+                            "The durable import manifest and media row disagree",
+                        ));
+                    }
+                }
+                return inspect_bound(&row_path, Some(&row_sha256));
+            }
+            if manifest_source.is_some() {
+                return Err(VideoServiceError::new(
+                    "video.integrity_failed",
+                    "A manifest source has no durable media row",
+                ));
+            }
+
+            // A process may have stopped after the no-replace rename but
+            // before its pending row was written. Search by stable asset id so
+            // a changed container extension cannot create a second target.
+            let mut crash_candidates = Vec::new();
+            for entry in fs::read_dir(&source_dir).map_err(|error| {
+                VideoServiceError::io(
+                    "video.storage_unavailable",
+                    "Managed source storage could not be inspected",
+                    error,
+                )
+            })? {
+                let entry = entry.map_err(|error| {
+                    VideoServiceError::io(
+                        "video.storage_unavailable",
+                        "A managed source entry could not be inspected",
+                        error,
+                    )
+                })?;
+                let name = entry.file_name();
+                if !name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&stable_prefix))
+                {
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                    VideoServiceError::io(
+                        "video.storage_unavailable",
+                        "A deterministic managed source could not be inspected",
+                        error,
+                    )
+                })?;
+                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                    return Err(VideoServiceError::new(
+                        "video.unsafe_storage_path",
+                        "A deterministic managed source target is not a regular file",
+                    ));
+                }
+                crash_candidates.push(entry.path());
+            }
+            if crash_candidates.len() > 1 {
+                return Err(VideoServiceError::new(
+                    "video.import_identity_conflict",
+                    "A durable import identity has multiple managed source targets",
+                ));
+            }
+            if let Some(path) = crash_candidates.first() {
+                return inspect_bound(path, None);
+            }
+
+            validate(staging)?;
+            File::open(staging)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| {
+                    VideoServiceError::io(
+                        "video.publication_sync_failed",
+                        "The staged import source could not be synchronized",
+                        error,
+                    )
+                })?;
+            let staging_c = CString::new(staging.as_os_str().as_bytes()).map_err(|_| {
+                VideoServiceError::new(
+                    "video.invalid_artifact_path",
+                    "The import staging path contains an unsupported null byte",
+                )
+            })?;
+            let final_c =
+                CString::new(suggested_final_path.as_os_str().as_bytes()).map_err(|_| {
+                    VideoServiceError::new(
+                        "video.invalid_artifact_path",
+                        "The managed import path contains an unsupported null byte",
+                    )
+                })?;
+            let renamed = unsafe {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    staging_c.as_ptr(),
+                    libc::AT_FDCWD,
+                    final_c.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if renamed != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EEXIST) {
+                    return inspect_bound(suggested_final_path, None);
+                }
+                if error.raw_os_error() == Some(libc::ENOSYS) {
+                    match fs::hard_link(staging, suggested_final_path) {
+                        Ok(()) => {
+                            if let Err(remove_error) = fs::remove_file(staging) {
+                                let _ = fs::remove_file(suggested_final_path);
+                                return Err(VideoServiceError::io(
+                                    "video.import_cleanup_failed",
+                                    "The staged import link could not be finalized",
+                                    remove_error,
+                                ));
+                            }
+                        }
+                        Err(link_error)
+                            if link_error.kind() == std::io::ErrorKind::AlreadyExists =>
+                        {
+                            return inspect_bound(suggested_final_path, None);
+                        }
+                        Err(link_error) => {
+                            return Err(VideoServiceError::io(
+                                "video.publication_commit_failed",
+                                "The import source could not be atomically published",
+                                link_error,
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(VideoServiceError::io(
+                        "video.publication_commit_failed",
+                        "The import source could not be atomically published",
+                        error,
+                    ));
+                }
+            }
+            if let Err(error) =
+                secure_managed_file(suggested_final_path).and_then(|_| sync_directory(&source_dir))
+            {
+                let _ = fs::remove_file(suggested_final_path);
+                return Err(error);
+            }
+            Ok((suggested_final_path.to_path_buf(), true))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(staging);
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_local_source(
         &self,
@@ -14062,16 +15214,80 @@ impl VideoStudioService {
             "video.ffprobe_unavailable",
             "FFprobe is required to validate local media",
         )?;
-        let publication = publish_atomic(&staging, &final_path, |path| {
-            probe_media(path, ffprobe).map(|_| ())
-        })?;
-        let final_probe = probe_media(&publication.path, ffprobe)?;
+        let (published_path, _) = self.publish_import_staging_once(
+            project_id,
+            asset_id,
+            &staging,
+            &final_path,
+            &checksum,
+            cancel,
+            |path| probe_media(path, ffprobe).map(|_| ()),
+        )?;
+        let final_probe = probe_media(&published_path, ffprobe)?;
         Ok(PreparedManagedFile {
-            relative_path: self.relative_managed_path(&publication.path)?,
-            path: publication.path,
+            relative_path: self.relative_managed_path(&published_path)?,
+            path: published_path,
             sha256: checksum,
             probe: final_probe,
         })
+    }
+
+    /// Store upsert is intentionally general-purpose and mutable. Durable
+    /// import identities are stricter: once a child owns an asset id, no retry
+    /// may rewrite its path, bytes, probe, or provenance. Status alone may
+    /// advance from pending to ready after the guarded manifest commit.
+    fn upsert_import_asset_compatible(&self, record: &Value) -> ServiceResult<Value> {
+        let project_id = value_string(record, "project_id")?;
+        let asset_id = value_string(record, "id")?;
+        let existing = self
+            .store
+            .list_video_assets(&project_id)
+            .map_err(VideoServiceError::store)?
+            .into_iter()
+            .find(|asset| asset.get("id").and_then(Value::as_str) == Some(asset_id.as_str()));
+        if let Some(existing) = existing {
+            const IMMUTABLE_FIELDS: [&str; 10] = [
+                "kind",
+                "source_kind",
+                "local_path",
+                "original_url",
+                "mime_type",
+                "content_sha256",
+                "size_bytes",
+                "duration_us",
+                "probe",
+                "provenance",
+            ];
+            let mismatches = IMMUTABLE_FIELDS
+                .iter()
+                .copied()
+                .filter(|field| {
+                    existing.get(*field).cloned().unwrap_or(Value::Null)
+                        != record.get(*field).cloned().unwrap_or(Value::Null)
+                })
+                .collect::<Vec<_>>();
+            if !mismatches.is_empty() {
+                return Err(VideoServiceError::new(
+                    "video.import_identity_conflict",
+                    "A durable import asset id is already bound to different media",
+                )
+                .details(json!({
+                    "asset_id": asset_id,
+                    "mismatched_fields": mismatches,
+                })));
+            }
+            let existing_status = existing.get("status").and_then(Value::as_str);
+            let requested_status = record.get("status").and_then(Value::as_str);
+            if existing_status == Some("ready") && requested_status == Some("pending") {
+                return Ok(existing);
+            }
+            if existing_status == requested_status {
+                return Ok(existing);
+            }
+        }
+        self.store
+            .upsert_video_asset(record)
+            .map_err(VideoServiceError::store)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14127,9 +15343,7 @@ impl VideoStudioService {
             "probe": source.probe,
             "provenance": source.provenance,
         });
-        self.store
-            .upsert_video_asset(&source_asset_record)
-            .map_err(VideoServiceError::store)?;
+        self.upsert_import_asset_compatible(&source_asset_record)?;
 
         let mut derived = Vec::new();
         if has_video {
@@ -14188,24 +15402,17 @@ impl VideoStudioService {
                     "cache_key": product.cache_key,
                 },
             });
-            self.store
-                .upsert_video_asset(&record)
-                .map_err(VideoServiceError::store)?;
+            self.upsert_import_asset_compatible(&record)?;
             derived_asset_records.push(record);
         }
         let publish_asset_rows = || -> ServiceResult<Value> {
             let mut ready_source = source_asset_record.clone();
             ready_source["status"] = Value::String("ready".to_string());
-            let source_value = self
-                .store
-                .upsert_video_asset(&ready_source)
-                .map_err(VideoServiceError::store)?;
+            let source_value = self.upsert_import_asset_compatible(&ready_source)?;
             for pending in &derived_asset_records {
                 let mut ready = pending.clone();
                 ready["status"] = Value::String("ready".to_string());
-                self.store
-                    .upsert_video_asset(&ready)
-                    .map_err(VideoServiceError::store)?;
+                self.upsert_import_asset_compatible(&ready)?;
             }
             Ok(source_value)
         };
