@@ -3,7 +3,7 @@ import packageMetadata from "../../package.json" with { type: "json" };
 
 const routes = ["Generate", "Video Studio", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History"];
 const allRoutes = [...routes, "Settings", "About"];
-const mobileDirectRoutes = new Set(["Generate", "Video Studio", "Projects", "Voices", "History"]);
+const mobileDirectRoutes = new Set(["Generate", "Video Studio", "Projects", "History"]);
 
 async function openRoute(page: import("@playwright/test").Page, route: string) {
   const mobile = page.viewportSize()!.width <= 820;
