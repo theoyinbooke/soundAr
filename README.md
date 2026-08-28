@@ -5,7 +5,7 @@
 <h1 align="center">soundAr</h1>
 
 <p align="center">
-  A local-first Linux studio for turning text into speech and music.
+  A local-first Linux studio for speech, music, and finished video.
 </p>
 
 <p align="center">
@@ -15,13 +15,16 @@
   <img alt="Linux" src="https://img.shields.io/badge/platform-Linux-18181b?style=flat-square" />
 </p>
 
-soundAr is an open-source desktop application for high-quality, private audio generation. It keeps inference, projects, model files, and generated audio on your machine. There is no cloud inference, API-key dependency, telemetry requirement, or online fallback.
+soundAr is an open-source desktop application for high-quality, private media production. It keeps inference, source media, timelines, projects, model files, and generated artifacts on your machine. There is no cloud inference, API-key dependency, telemetry requirement, or online fallback.
 
-![soundAr Music Studio](design-qa/music-studio-1860x1168.png)
+![soundAr Video Studio timeline](design-qa/video-studio-editor-1440x900.png)
 
 ## What you can do
 
 - Generate speech from plain text, SSML, or batch inputs with local voice models.
+- Import one explicitly authorized link or local video, transcribe it on the source clock, review candidate moments, and export a portrait reel.
+- Start a video from a prompt, existing soundAr audio, or a project and build an animated podcast with captions, cards, waveform motion, speech, and music.
+- Revise a scene, voice, caption style, crop, mix, or opening conversationally and rerender only invalidated work.
 - Build longer work in chapter-based Projects and render chapters independently.
 - Create songs or instrumentals with ACE-Step 1.5 Studio, including structured sections and editable lyric timing.
 - Extend audio, edit a selected region, use permitted style or source references, and generate multiple variations.
@@ -31,7 +34,7 @@ soundAr is an open-source desktop application for high-quality, private audio ge
 - Queue independent jobs through a durable, GPU-aware scheduler or the optional loopback API.
 - Describe an unfinished creative goal to the integrated assistant and let it research, plan, write, generate, review, and revise the complete soundAr workflow with you.
 
-The interface is designed for Linux as a compact, resizable, light-first desktop workspace. Tauri 2 provides the native shell; React 19 renders the application UI; isolated Python workers keep supported models warm between jobs.
+The interface is designed for Linux as a compact, resizable, light-first desktop workspace. Tauri 2 provides the native shell; React 19 renders the application UI; Rust and FFmpeg own durable media work; isolated Python workers keep supported local models warm between jobs.
 
 ## Install on Linux
 
@@ -59,6 +62,25 @@ To install a package built locally:
 - Debian builds show an update notice and continue through the system package installer.
 
 Installing, opening, or updating soundAr never downloads model weights. A model download starts only after you review its upstream source, pinned revision, license, access conditions, storage requirement, and hardware fit in Models.
+
+## Video Studio
+
+Video Studio is one focused production workspace with three clear starts: **Import link**, **Upload video**, and **Start from prompt/audio**. Link intake requires an explicit rights basis for the exact canonical URL and defaults to one source—not a playlist or bulk downloader. Local intake validates ordinary media formats before FFmpeg opens them.
+
+Every project is backed by a versioned, microsecond timeline manifest. It records source assets, source-clock transcript and gaps, reviewed clips, scenes, captions, crop/layout, audio mix, generated artifacts, previews, masters, provenance, rights receipts, and revision history. Project locks, compare-and-swap revisions, durable job IDs, atomic publication, and content-addressed caches keep an interrupted or revised production recoverable.
+
+The Linux pipeline includes:
+
+- FFprobe validation, low-resolution proxies, thumbnails, waveforms, portrait crop/layout, captions, cards, mixing, scene assembly, and local MP4 export through FFmpeg;
+- faster-whisper CUDA transcription with word timing and preserved presentation gaps;
+- reviewed candidate and scene planning through the existing authenticated Codex app-server integration;
+- preview-first rendering and segment-level cache reuse, with H.264 NVENC when its runtime smoke passes and a visible software fallback otherwise;
+- playable masters and downloads in Video Studio, Projects, History, and the Assistant—never only an opaque filesystem path;
+- durable cancellation, resume, publish packages with checksums, and bounded CPU, IO, disk, VRAM, and encoder admission.
+
+The Assistant uses the same native services and contracts as the UI for preview, import, analysis, planning, revision, rendering, and export. It presents Source → Analyze → Plan and revise → Preview → Export as useful production phases, while the assembled master stays more prominent than chapter or scene artifacts.
+
+Video Studio needs FFmpeg/FFprobe for local media. Link import additionally needs yt-dlp with EJS and a supported JavaScript runtime; internal transcription needs a local faster-whisper or whisper.cpp model. The readiness screen discovers system, user, package-manager, managed, and explicitly configured locations without installing anything silently. See [Linux Video Studio setup](docs/video-studio-linux-setup.md) and the [exact-machine performance baseline](docs/video-studio-performance.md).
 
 ## Speech studio
 
@@ -137,6 +159,7 @@ Open `http://127.0.0.1:1421`.
 | --- | --- |
 | `app/src/` | React workspace, design system, routes, and interaction state |
 | `app/src-tauri/` | Native window, SQLite state, scheduler, updater, audio, and local API |
+| `app/src-tauri/src/video/` | Timeline contracts, secure ingest, media plans, renderer, cache, scheduler, and durable Video Studio service |
 | `bridge.py` | Persistent JSON-lines inference worker with an engine-scoped warm cache |
 | `core/` | Engine contracts, model registry, audio utilities, and benchmarks |
 | `engines/` | Model-specific local speech and music adapters |
@@ -182,6 +205,8 @@ npm run build
 npm run test:production
 cd src-tauri
 cargo test --locked
+cd ../../
+scripts/video/test-harness.sh
 ```
 
 Measure the installed Fish runtime without changing its default execution policy:
@@ -197,6 +222,20 @@ GPU qualification uses the packaged runtime and user-installed pinned models. Th
 
 ```bash
 ./scripts/run-packaged-acestep-acceptance.sh
+```
+
+On a release machine with a local faster-whisper model, qualify both the full video path and the only permitted inference/render overlap envelope:
+
+```bash
+scripts/video/run-smoke-benchmark.sh \
+  --output-dir evidence/video-studio-performance \
+  --transcription-model "$SOUNDAR_WHISPER_MODEL_PATH" \
+  --faster-whisper-python "$SOUNDAR_FASTER_WHISPER_PYTHON"
+scripts/video/qualify_gpu_overlap.py \
+  --output-dir evidence/video-studio-performance \
+  --fixture-dir "$SOUNDAR_VIDEO_FIXTURE_DIR" \
+  --transcription-model "$SOUNDAR_WHISPER_MODEL_PATH" \
+  --faster-whisper-python "$SOUNDAR_FASTER_WHISPER_PYTHON"
 ```
 
 Release evidence ownership and manual gates are documented in the [test matrix](docs/test-matrix.md) and [release checklist](docs/release-checklist.md).
