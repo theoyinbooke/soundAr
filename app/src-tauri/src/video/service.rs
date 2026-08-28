@@ -2894,6 +2894,49 @@ fn media_mime(path: &Path, has_video: bool) -> &'static str {
     }
 }
 
+/// Builds the one-source yt-dlp invocation used after exact URL validation and
+/// rights confirmation. `--max-downloads 1` must not be added here: yt-dlp
+/// reports its intentional limit with exit 101 even after the first download
+/// succeeds. Single-source behavior is instead enforced without a success
+/// sentinel by the exact positional URL, `--no-playlist`, the explicit first
+/// item selector, the unique output prefix/quota, and
+/// `single_downloaded_file` after a zero exit status.
+fn yt_dlp_single_source_download_args(
+    output_template: &Path,
+    canonical_url: &str,
+    proxy_url: &str,
+) -> Vec<OsString> {
+    vec![
+        OsString::from("--ignore-config"),
+        OsString::from("--no-playlist"),
+        OsString::from("--playlist-items"),
+        OsString::from("1"),
+        OsString::from("--max-filesize"),
+        OsString::from("8G"),
+        OsString::from("--match-filter"),
+        OsString::from("!is_live & duration <= 21600"),
+        OsString::from("--socket-timeout"),
+        OsString::from("20"),
+        OsString::from("--retries"),
+        OsString::from("3"),
+        OsString::from("--fragment-retries"),
+        OsString::from("3"),
+        OsString::from("--no-progress"),
+        OsString::from("--no-warnings"),
+        OsString::from("--restrict-filenames"),
+        OsString::from("--merge-output-format"),
+        OsString::from("mp4"),
+        OsString::from("--format"),
+        OsString::from("bv*+ba/b"),
+        OsString::from("--proxy"),
+        OsString::from(proxy_url),
+        OsString::from("--output"),
+        output_template.as_os_str().to_os_string(),
+        OsString::from("--"),
+        OsString::from(canonical_url),
+    ]
+}
+
 fn single_downloaded_file(directory: &Path, prefix: &str) -> ServiceResult<PathBuf> {
     let mut candidates = fs::read_dir(directory)
         .map_err(|error| {
@@ -5669,6 +5712,82 @@ mod tests {
             )
             .expect_err("mismatched exact URL must fail");
         assert_eq!(error.code, "video.rights_url_mismatch");
+    }
+
+    #[test]
+    fn link_download_args_omit_exit_101_sentinel_and_keep_single_source_guards() {
+        let output_template = Path::new("/managed/.download-fixture.%(ext)s");
+        let canonical_url = "https://example.com/one-authorized-source.webm";
+        let proxy_url = "http://127.0.0.1:43117/auth-token";
+        let args = yt_dlp_single_source_download_args(output_template, canonical_url, proxy_url);
+        assert!(args.iter().any(|arg| arg == "--no-playlist"));
+        assert!(args.iter().any(|arg| arg == "--playlist-items"));
+        assert!(args.iter().any(|arg| arg == "--ignore-config"));
+        assert!(args.iter().any(|arg| arg == "--max-filesize"));
+        assert!(args.iter().any(|arg| arg == "--match-filter"));
+        assert!(args.iter().any(|arg| arg == "--proxy"));
+        assert!(args.iter().any(|arg| arg == "--output"));
+        assert!(
+            !args.iter().any(|arg| arg == "--max-downloads"),
+            "yt-dlp turns a successful first download into exit 101 when this sentinel is present"
+        );
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("end-of-options separator");
+        assert_eq!(
+            &args[separator + 1..],
+            &[OsString::from(canonical_url)],
+            "the invocation has exactly one positional, already validated URL"
+        );
+        assert_eq!(args.iter().filter(|arg| *arg == "--no-playlist").count(), 1);
+        assert_eq!(
+            args.iter()
+                .position(|arg| arg == "--playlist-items")
+                .and_then(|index| args.get(index + 1)),
+            Some(&OsString::from("1")),
+            "playlist/feed extractors remain capped at one selected entry"
+        );
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--playlist-items").count(),
+            1
+        );
+        assert_eq!(
+            args.iter()
+                .position(|arg| arg == "--proxy")
+                .and_then(|index| args.get(index + 1)),
+            Some(&OsString::from(proxy_url))
+        );
+        assert_eq!(
+            args.iter()
+                .position(|arg| arg == "--output")
+                .and_then(|index| args.get(index + 1)),
+            Some(&output_template.as_os_str().to_os_string())
+        );
+
+        let workspace = TestWorkspace::new();
+        let directory = workspace.root.join("single-link-output");
+        fs::create_dir(&directory).expect("single-link fixture directory");
+        let prefix = ".download-fixture";
+        let completed = directory.join(format!("{prefix}.webm"));
+        fs::write(&completed, b"one completed source").expect("completed source fixture");
+        fs::write(directory.join(format!("{prefix}.part")), b"partial")
+            .expect("partial source fixture");
+        assert_eq!(
+            single_downloaded_file(&directory, prefix).expect("one completed source"),
+            completed
+        );
+        fs::write(
+            directory.join(format!("{prefix}.mp4")),
+            b"second completed source",
+        )
+        .expect("second source fixture");
+        assert_eq!(
+            single_downloaded_file(&directory, prefix)
+                .expect_err("multiple completed files must fail closed")
+                .code,
+            "video.single_source_required"
+        );
     }
 
     #[test]
@@ -14740,35 +14859,7 @@ impl VideoStudioService {
         let output_template = source_dir.join(format!("{prefix}.%(ext)s"));
         preflight_import_url_destination(&validated)?;
         let proxy = PublicHttpsProxy::start()?;
-        let args = vec![
-            OsString::from("--ignore-config"),
-            OsString::from("--no-playlist"),
-            OsString::from("--max-downloads"),
-            OsString::from("1"),
-            OsString::from("--max-filesize"),
-            OsString::from("8G"),
-            OsString::from("--match-filter"),
-            OsString::from("!is_live & duration <= 21600"),
-            OsString::from("--socket-timeout"),
-            OsString::from("20"),
-            OsString::from("--retries"),
-            OsString::from("3"),
-            OsString::from("--fragment-retries"),
-            OsString::from("3"),
-            OsString::from("--no-progress"),
-            OsString::from("--no-warnings"),
-            OsString::from("--restrict-filenames"),
-            OsString::from("--merge-output-format"),
-            OsString::from("mp4"),
-            OsString::from("--format"),
-            OsString::from("bv*+ba/b"),
-            OsString::from("--proxy"),
-            OsString::from(proxy.url()),
-            OsString::from("--output"),
-            output_template.as_os_str().to_os_string(),
-            OsString::from("--"),
-            OsString::from(canonical_url),
-        ];
+        let args = yt_dlp_single_source_download_args(&output_template, canonical_url, proxy.url());
         let output_quota = CommandOutputQuota {
             directory: source_dir.clone(),
             prefix: prefix.clone(),
