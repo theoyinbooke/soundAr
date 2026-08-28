@@ -55,6 +55,7 @@ pub(crate) enum VideoAgentOperationKind {
     ListVideoProjects,
     GetVideoProject,
     EditVideoTimeline,
+    RegisterGeneratedVisual,
     AddVisualAsset,
     RenderVideoPreview,
     ReviseVideo,
@@ -77,6 +78,7 @@ impl VideoAgentOperationKind {
             Self::ListVideoProjects => "list_video_projects",
             Self::GetVideoProject => "get_video_project",
             Self::EditVideoTimeline => "edit_video_timeline",
+            Self::RegisterGeneratedVisual => "register_generated_visual",
             Self::AddVisualAsset => "add_visual_asset",
             Self::RenderVideoPreview => "render_video_preview",
             Self::ReviseVideo => "revise_video",
@@ -92,7 +94,8 @@ impl VideoAgentOperationKind {
             Self::VideoRuntimeStatus
             | Self::PreviewLink
             | Self::ImportLink
-            | Self::CreateVideoProject => VideoProductionPhase::Source,
+            | Self::CreateVideoProject
+            | Self::RegisterGeneratedVisual => VideoProductionPhase::Source,
             Self::AnalyzeVideo => VideoProductionPhase::Analyze,
             Self::PlanVideo
             | Self::ReviseVideo
@@ -120,6 +123,7 @@ pub(crate) enum VideoAgentOperation {
     ListVideoProjects(EmptyRequest),
     GetVideoProject(GetVideoProjectRequest),
     EditVideoTimeline(video::VideoTimelineEditRequest),
+    RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
     AddVisualAsset(video::AddVisualAssetRequest),
     RenderVideoPreview(RenderVideoPreviewRequest),
     ReviseVideo(ReviseVideoRequest),
@@ -141,6 +145,7 @@ impl VideoAgentOperation {
             Self::ListVideoProjects(_) => VideoAgentOperationKind::ListVideoProjects,
             Self::GetVideoProject(_) => VideoAgentOperationKind::GetVideoProject,
             Self::EditVideoTimeline(_) => VideoAgentOperationKind::EditVideoTimeline,
+            Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
             Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
             Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
             Self::ReviseVideo(_) => VideoAgentOperationKind::ReviseVideo,
@@ -163,6 +168,7 @@ impl VideoAgentOperation {
             "list_video_projects" => Self::ListVideoProjects(decode(arguments)?),
             "get_video_project" => Self::GetVideoProject(decode(arguments)?),
             "edit_video_timeline" => Self::EditVideoTimeline(decode(arguments)?),
+            "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
             "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
             "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
             "revise_video" => Self::ReviseVideo(decode(arguments)?),
@@ -318,6 +324,21 @@ impl VideoAgentOperation {
                 }
                 Ok(())
             }
+            Self::RegisterGeneratedVisual(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.expected_version_id, "expected_version_id")?;
+                require_text(&request.generation_id, "generation_id")?;
+                if request.expected_revision < 1 {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "expected_revision",
+                        "Generated visual registration requires a positive current project revision",
+                    ));
+                }
+                if let Some(thread_id) = request.thread_id.as_deref() {
+                    require_text(thread_id, "thread_id")?;
+                }
+                Ok(())
+            }
             Self::AddVisualAsset(request) => {
                 require_text(&request.project_id, "project_id")?;
                 require_text(&request.expected_version_id, "expected_version_id")?;
@@ -329,19 +350,7 @@ impl VideoAgentOperation {
                         "Visual edits require a positive current project revision",
                     ));
                 }
-                match &request.origin {
-                    video::VisualAssetOrigin::UserSelected { user_confirmed } => {
-                        require_confirmation(*user_confirmed, "local image import")?;
-                    }
-                    video::VisualAssetOrigin::GeneratedLocally {
-                        producer,
-                        generation_id,
-                        ..
-                    } => {
-                        require_text(producer, "origin.producer")?;
-                        require_text(generation_id, "origin.generation_id")?;
-                    }
-                }
+                require_text(request.origin.receipt_id(), "origin.receipt_id")?;
                 Ok(())
             }
             Self::RenderVideoPreview(request) => {
@@ -410,6 +419,19 @@ impl VideoAgentOperation {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EmptyRequest {}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RegisterGeneratedVisualRequest {
+    pub project_id: String,
+    pub expected_revision: i64,
+    pub expected_version_id: String,
+    pub generation_id: String,
+    /// Required by the standalone headless CLI so it can verify the item via Codex thread/read.
+    /// In-app dispatch binds the authenticated app-server thread and rejects a different value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -753,6 +775,27 @@ impl VideoAgentResult {
         }
     }
 
+    pub(crate) fn project_data(
+        operation: VideoAgentOperationKind,
+        summary: impl Into<String>,
+        project_id: String,
+        data: Value,
+    ) -> Self {
+        Self {
+            schema_version: VIDEO_AGENT_SCHEMA_VERSION,
+            operation,
+            phase: operation.phase(),
+            status: VideoAgentResultStatus::Completed,
+            summary: summary.into(),
+            project_id: Some(project_id),
+            job_id: None,
+            output: VideoAgentOutput {
+                data: Some(data),
+                ..VideoAgentOutput::default()
+            },
+        }
+    }
+
     pub(crate) fn projects(
         operation: VideoAgentOperationKind,
         summary: impl Into<String>,
@@ -1015,6 +1058,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "list_video_projects" => VideoAgentOperationKind::ListVideoProjects,
         "get_video_project" => VideoAgentOperationKind::GetVideoProject,
         "edit_video_timeline" => VideoAgentOperationKind::EditVideoTimeline,
+        "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
         "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
         "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
         "revise_video" => VideoAgentOperationKind::ReviseVideo,
@@ -1035,6 +1079,7 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::PlanVideo
                 | VideoAgentOperationKind::CreateVideoProject
                 | VideoAgentOperationKind::EditVideoTimeline
+                | VideoAgentOperationKind::RegisterGeneratedVisual
                 | VideoAgentOperationKind::AddVisualAsset
                 | VideoAgentOperationKind::RenderVideoPreview
                 | VideoAgentOperationKind::ReviseVideo
@@ -1176,8 +1221,22 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
             timeline_edit_schema(),
         ),
         tool(
+            "register_generated_visual",
+            "Resolve one completed Codex image-generation item through authenticated app-server history, copy and hash its exact output server-side, and return a one-use receipt for add_visual_asset. In headless mode thread_id is required; in-app mode it is bound to the authenticated current thread. Requires Studio or Full access.",
+            object_schema(
+                &["project_id", "expected_revision", "expected_version_id", "generation_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("expected_revision", json!({"type":"integer","minimum":1})),
+                    ("expected_version_id", string("Exact current immutable version id")),
+                    ("generation_id", string("Codex image-generation item id")),
+                    ("thread_id", nullable_string("Required by the standalone headless CLI; optional in-app and rejected if it differs from the authenticated current thread")),
+                ]),
+            ),
+        ),
+        tool(
             "add_visual_asset",
-            "Import one user-selected or locally generated PNG, JPEG, or WebP and place it as a durable animated layer on the exact project clock. Generated images must include their producing tool and generation id. Requires Studio or Full access.",
+            "Claim one trusted one-use visual source receipt and place its exact PNG, JPEG, or WebP bytes as a durable animated layer on the exact project clock. Use register_generated_visual for Codex-generated images; native user selections receive a picker-minted receipt. Requires Studio or Full access.",
             visual_asset_schema(),
         ),
         tool(
@@ -1429,7 +1488,6 @@ fn visual_asset_schema() -> Value {
             "expected_revision",
             "expected_version_id",
             "operation_id",
-            "source_path",
             "actor",
             "origin",
             "range",
@@ -1453,10 +1511,6 @@ fn visual_asset_schema() -> Value {
                 "operation_id",
                 string("Stable idempotency identifier for this visual import and placement"),
             ),
-            (
-                "source_path",
-                string("Local PNG, JPEG, or WebP selected by the user or produced by the current agent workflow"),
-            ),
             ("actor", string("Auditable local actor name")),
             (
                 "origin",
@@ -1465,21 +1519,19 @@ fn visual_asset_schema() -> Value {
                         {
                             "type":"object",
                             "additionalProperties":false,
-                            "required":["kind","user_confirmed"],
+                            "required":["kind","receipt_id"],
                             "properties":{
                                 "kind":{"const":"user_selected"},
-                                "user_confirmed":{"type":"boolean","const":true,"description":"True only after the user selected or explicitly authorized this exact local image"}
+                                "receipt_id":{"type":"string","minLength":1,"maxLength":160,"description":"Opaque one-use receipt returned by the native backend file picker"}
                             }
                         },
                         {
                             "type":"object",
                             "additionalProperties":false,
-                            "required":["kind","producer","generation_id"],
+                            "required":["kind","receipt_id"],
                             "properties":{
                                 "kind":{"const":"generated_locally"},
-                                "producer":{"type":"string","minLength":1,"maxLength":256},
-                                "producer_version":{"type":["string","null"],"minLength":1,"maxLength":128},
-                                "generation_id":{"type":"string","minLength":1,"maxLength":256}
+                                "receipt_id":{"type":"string","minLength":1,"maxLength":160,"description":"Opaque one-use receipt returned by register_generated_visual"}
                             }
                         }
                     ]
@@ -1489,10 +1541,7 @@ fn visual_asset_schema() -> Value {
                 "scene_id",
                 nullable_string("Optional scene that owns this visual layer"),
             ),
-            (
-                "range",
-                visual_range_schema(),
-            ),
+            ("range", visual_range_schema()),
             (
                 "fit",
                 json!({"type":"string","enum":["cover","contain","stretch"]}),
@@ -1506,14 +1555,8 @@ fn visual_asset_schema() -> Value {
                 json!({"type":"integer","minimum":-32768,"maximum":32767}),
             ),
             ("motion", visual_motion_schema()),
-            (
-                "transition_in_us",
-                json!({"type":"integer","minimum":0}),
-            ),
-            (
-                "transition_out_us",
-                json!({"type":"integer","minimum":0}),
-            ),
+            ("transition_in_us", json!({"type":"integer","minimum":0})),
+            ("transition_out_us", json!({"type":"integer","minimum":0})),
         ]),
     )
 }
@@ -1739,8 +1782,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 16);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 16);
+        assert_eq!(names.len(), 17);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 17);
         for required in [
             "preview_link",
             "import_link",
@@ -1750,6 +1793,7 @@ mod tests {
             "list_video_projects",
             "get_video_project",
             "edit_video_timeline",
+            "register_generated_visual",
             "add_visual_asset",
             "render_video_preview",
             "revise_video",
@@ -1837,7 +1881,22 @@ mod tests {
     }
 
     #[test]
-    fn visual_asset_tool_exposes_generated_provenance_motion_and_exact_clock() {
+    fn visual_asset_tools_require_brokered_receipts_and_exact_clock() {
+        let registration = VideoAgentOperation::parse(
+            "register_generated_visual",
+            json!({
+                "project_id":"project-visual",
+                "expected_revision":3,
+                "expected_version_id":"version-3",
+                "generation_id":"generation-1",
+                "thread_id":"thread-headless"
+            }),
+        )
+        .expect("broker generation registration request");
+        assert_eq!(
+            registration.kind(),
+            VideoAgentOperationKind::RegisterGeneratedVisual
+        );
         let operation = VideoAgentOperation::parse(
             "add_visual_asset",
             json!({
@@ -1845,13 +1904,10 @@ mod tests {
                 "expected_revision":3,
                 "expected_version_id":"version-3",
                 "operation_id":"visual-operation-1",
-                "source_path":"/tmp/generated-illustration.png",
                 "actor":"codex-video-agent",
                 "origin":{
                     "kind":"generated_locally",
-                    "producer":"codex-image-tool",
-                    "producer_version":"1",
-                    "generation_id":"generation-1"
+                    "receipt_id":"visual-generation-receipt-1"
                 },
                 "scene_id":"scene-1",
                 "range":{"start_us":0,"end_us":2000000},
@@ -1878,6 +1934,9 @@ mod tests {
             .find(|tool| tool["name"] == "add_visual_asset")
             .expect("visual asset schema");
         assert_eq!(schema["inputSchema"]["additionalProperties"], false);
+        assert!(schema["inputSchema"]["properties"]
+            .get("source_path")
+            .is_none());
         assert_eq!(
             schema["inputSchema"]["properties"]["origin"]["oneOf"]
                 .as_array()
@@ -1910,9 +1969,18 @@ mod tests {
                 "transition_out_us":0
             }),
         )
-        .expect_err("agent cannot assert local image approval");
-        assert_eq!(error.code, "video.approval_required");
-        assert!(error.approval_required);
+        .expect_err("legacy self-attested approval must fail closed");
+        assert_eq!(error.code, "video.agent_invalid_arguments");
+        let registration_schema = tool_catalog()
+            .into_iter()
+            .find(|tool| tool["name"] == "register_generated_visual")
+            .expect("registration schema");
+        assert!(registration_schema["inputSchema"]["properties"]
+            .get("source_path")
+            .is_none());
+        assert!(registration_schema["inputSchema"]["properties"]
+            .get("producer")
+            .is_none());
     }
 
     #[test]

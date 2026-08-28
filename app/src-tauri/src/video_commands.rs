@@ -27,7 +27,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tauri::Emitter;
+use tauri::{AppHandle, Emitter};
+use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 const VIDEO_COMMAND_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
@@ -344,6 +345,10 @@ pub(crate) fn dispatch_video_operation(
                 Some(result.job_id),
             )
         }
+        VideoAgentOperation::RegisterGeneratedVisual(_) => Err(VideoAgentToolError::new(
+            "video.generation_broker_required",
+            "Generated visuals must be registered through authenticated Codex history",
+        )),
         VideoAgentOperation::AddVisualAsset(request) => {
             let result = runtime
                 .video
@@ -724,6 +729,35 @@ pub(crate) async fn edit_video_timeline(
     })
     .await
     .map_err(|error| format!("video.worker_failed: Timeline edit worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn choose_video_visual_asset(
+    app: AppHandle,
+    state: tauri::State<'_, RuntimeState>,
+    request: video::AuthorizeVisualSelectionRequest,
+) -> Result<Option<video::VisualSourceReceipt>, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected = app
+            .dialog()
+            .file()
+            .set_title("Choose a visual for this Video Studio project")
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+            .blocking_pick_file();
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let source_path = selected.into_path().map_err(|error| {
+            format!("video.invalid_visual_source: The selected image path is unavailable: {error}")
+        })?;
+        service
+            .authorize_user_visual_selection(request, source_path)
+            .map(Some)
+            .map_err(service_error)
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Visual selection worker failed: {error}"))?
 }
 
 #[tauri::command]

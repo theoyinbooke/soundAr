@@ -59,9 +59,11 @@ pub use scheduler::{
     AdmissionBlock, AdmissionOutcome, ResourceCapacity, ResourceClass, ResourceLease,
     ResourceRequest, ResourceScheduler, ResourceUsage, RTX_4080_LAPTOP_VRAM_MB,
 };
-pub(crate) use service::{invalidated_stages_for_manifest_changes, manifest_changed_paths};
+pub(crate) use service::{
+    invalidated_stages_for_manifest_changes, manifest_changed_paths, TrustedGeneratedVisual,
+};
 pub use service::{
-    AddVisualAssetRequest, AddVisualAssetResult,
+    AddVisualAssetRequest, AddVisualAssetResult, AuthorizeVisualSelectionRequest,
     CreateVideoProjectRequest as ServiceCreateVideoProjectRequest, LinkImportRequest, LinkPreview,
     LinkRightsRequest, LocalImportRequest, NarrationReplacement, PortraitRenderRequest,
     PortraitSourceLayout, ProgressCallback, PublishPackageRequest, QueuedVideoJob,
@@ -69,7 +71,7 @@ pub use service::{
     SharedGpuAdmissionLease, SharedGpuAdmissionOutcome, SharedGpuAdmissionRequest,
     SharedGpuAdmissionWait, TimelineEditServiceResult, TimelineRenderBatchRequest,
     TimelineRenderProfile, TimelineRenderRequest, VideoJobResult, VideoServiceError,
-    VideoServiceProgress, VideoStudioService, VisualAssetOrigin,
+    VideoServiceProgress, VideoStudioService, VisualAssetOrigin, VisualSourceReceipt,
 };
 pub use timeline::{
     frame_index_at, frame_time_us, map_source_endpoint_to_timeline, map_source_to_timeline,

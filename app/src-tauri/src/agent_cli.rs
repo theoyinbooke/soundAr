@@ -142,8 +142,58 @@ fn run_video(
             let _ = writeln!(io::stderr().lock(), "{envelope}");
         }) as super::video::ProgressCallback
     });
-    let dispatched = super::video_commands::dispatch_video_operation(&runtime, operation, callback)
-        .and_then(|result| settle_queued_result(&runtime, result));
+    let dispatched = match operation {
+        VideoAgentOperation::RegisterGeneratedVisual(request) => {
+            let thread_id = request
+                .thread_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    VideoAgentToolError::new(
+                        "video.generation_identity_required",
+                        "Headless generation registration requires thread_id",
+                    )
+                });
+            thread_id.and_then(|thread_id| {
+                codex_agent::resolve_headless_generated_visual(thread_id, &request.generation_id)
+                    .and_then(|generation| {
+                        runtime
+                            .video
+                            .register_trusted_generated_visual(
+                                super::video::AuthorizeVisualSelectionRequest {
+                                    project_id: request.project_id.clone(),
+                                    expected_revision: request.expected_revision,
+                                    expected_version_id: request.expected_version_id,
+                                },
+                                generation,
+                            )
+                            .map_err(VideoAgentToolError::from)
+                    })
+                    .and_then(|receipt| {
+                        serde_json::to_value(receipt)
+                            .map_err(|error| {
+                                VideoAgentToolError::new(
+                                    "video.agent_result_encode_failed",
+                                    format!("Could not encode the generation receipt: {error}"),
+                                )
+                            })
+                            .map(|data| {
+                                VideoAgentResult::project_data(
+                                    super::codex_agent::VideoAgentOperationKind::RegisterGeneratedVisual,
+                                    "Authenticated Codex generation registered; use this one-use receipt with add_visual_asset",
+                                    request.project_id,
+                                    data,
+                                )
+                            })
+                    })
+            })
+        }
+        operation => {
+            super::video_commands::dispatch_video_operation(&runtime, operation, callback)
+        }
+    }
+    .and_then(|result| settle_queued_result(&runtime, result));
     let exit = match dispatched {
         Ok(result) => {
             write_stdout(&AgentEnvelope::success(result), style);

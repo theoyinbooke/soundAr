@@ -16,7 +16,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 37;
+const SCHEMA_VERSION: i64 = 38;
 const HISTORY_RESULT_LIMIT: i64 = 500;
 
 pub struct Store {
@@ -4871,6 +4871,400 @@ impl Store {
             .map_err(|error| format!("video.store_failed: Could not inspect rights confirmation: {error}"))
     }
 
+    /// Persists an exact visual source authorization produced by a trusted native picker or
+    /// authenticated generation broker. Callers never reconstruct these fields from an
+    /// add-visual request: that request carries only the opaque receipt id.
+    pub(crate) fn create_video_visual_source_receipt(
+        &self,
+        receipt: &Value,
+    ) -> Result<Value, String> {
+        let id = required_trimmed(
+            receipt,
+            "id",
+            "video.invalid_visual_receipt: id is required",
+        )?;
+        let receipt_kind = required_trimmed(
+            receipt,
+            "receipt_kind",
+            "video.invalid_visual_receipt: receipt_kind is required",
+        )?;
+        if !matches!(receipt_kind, "user_selected" | "generated_locally") {
+            return Err("video.invalid_visual_receipt: Unsupported visual receipt kind".into());
+        }
+        let project_id = required_trimmed(
+            receipt,
+            "project_id",
+            "video.invalid_visual_receipt: project_id is required",
+        )?;
+        let expected_revision = receipt
+            .get("expected_revision")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or("video.invalid_visual_receipt: expected_revision must be positive")?;
+        let expected_version_id = required_trimmed(
+            receipt,
+            "expected_version_id",
+            "video.invalid_visual_receipt: expected_version_id is required",
+        )?;
+        let source_path = required_trimmed(
+            receipt,
+            "source_path",
+            "video.invalid_visual_receipt: source_path is required",
+        )?;
+        let source_device = required_trimmed(
+            receipt,
+            "source_device",
+            "video.invalid_visual_receipt: source_device is required",
+        )?;
+        let source_inode = required_trimmed(
+            receipt,
+            "source_inode",
+            "video.invalid_visual_receipt: source_inode is required",
+        )?;
+        let size_bytes = receipt
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or("video.invalid_visual_receipt: size_bytes must be positive")?;
+        let modified_seconds = receipt
+            .get("modified_seconds")
+            .and_then(Value::as_i64)
+            .ok_or("video.invalid_visual_receipt: modified_seconds is required")?;
+        let modified_nanoseconds = receipt
+            .get("modified_nanoseconds")
+            .and_then(Value::as_i64)
+            .filter(|value| (0..1_000_000_000).contains(value))
+            .ok_or(
+                "video.invalid_visual_receipt: modified_nanoseconds must be within one second",
+            )?;
+        let sha256 = required_trimmed(
+            receipt,
+            "sha256",
+            "video.invalid_visual_receipt: sha256 is required",
+        )?;
+        if sha256.len() != 64
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("video.invalid_visual_receipt: sha256 is invalid".into());
+        }
+        let mime_type = required_trimmed(
+            receipt,
+            "mime_type",
+            "video.invalid_visual_receipt: mime_type is required",
+        )?;
+        if !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
+            return Err("video.invalid_visual_receipt: mime_type is invalid".into());
+        }
+        let width = receipt
+            .get("width")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or("video.invalid_visual_receipt: width must be positive")?;
+        let height = receipt
+            .get("height")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or("video.invalid_visual_receipt: height must be positive")?;
+        let has_alpha = receipt
+            .get("has_alpha")
+            .and_then(Value::as_bool)
+            .ok_or("video.invalid_visual_receipt: has_alpha is required")?;
+        let producer = required_trimmed(
+            receipt,
+            "producer",
+            "video.invalid_visual_receipt: producer is required",
+        )?;
+        let producer_version = receipt.get("producer_version").and_then(Value::as_str);
+        let generation_id = receipt.get("generation_id").and_then(Value::as_str);
+        if receipt_kind == "generated_locally"
+            && generation_id.is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(
+                "video.invalid_visual_receipt: generated receipts require generation_id".into(),
+            );
+        }
+        if receipt_kind == "user_selected" && generation_id.is_some() {
+            return Err(
+                "video.invalid_visual_receipt: user selections cannot claim generation provenance"
+                    .into(),
+            );
+        }
+        let trust_context = receipt
+            .get("trust_context")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !trust_context.is_object() {
+            return Err("video.invalid_visual_receipt: trust_context must be an object".into());
+        }
+        let issued_at = required_trimmed(
+            receipt,
+            "issued_at",
+            "video.invalid_visual_receipt: issued_at is required",
+        )?;
+        let expires_at = required_trimmed(
+            receipt,
+            "expires_at",
+            "video.invalid_visual_receipt: expires_at is required",
+        )?;
+        let issued_timestamp = chrono::DateTime::parse_from_rfc3339(issued_at)
+            .map_err(|_| "video.invalid_visual_receipt: issued_at must be RFC 3339")?;
+        let expires_timestamp = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .map_err(|_| "video.invalid_visual_receipt: expires_at must be RFC 3339")?;
+        if expires_timestamp <= issued_timestamp {
+            return Err("video.invalid_visual_receipt: expires_at must follow issued_at".into());
+        }
+
+        let connection = self.lock()?;
+        let current_matches: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM projects p
+                    JOIN video_projects v ON v.project_id = p.id
+                    WHERE p.id = ?1 AND p.project_kind = 'video'
+                      AND p.current_revision = ?2 AND v.current_version_id = ?3
+                 )",
+                params![project_id, expected_revision, expected_version_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                format!("video.store_failed: Could not bind the visual receipt to the current project: {error}")
+            })?;
+        if !current_matches {
+            return Err(
+                "video.revision_conflict: The visual receipt target is no longer current".into(),
+            );
+        }
+        connection
+            .execute(
+                "INSERT INTO video_visual_source_receipts
+                 (id, receipt_kind, project_id, expected_revision, expected_version_id,
+                  source_path, source_device, source_inode, size_bytes, modified_seconds,
+                  modified_nanoseconds, sha256, mime_type, width, height, has_alpha, producer,
+                  producer_version, generation_id, trust_context_json, issued_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                params![
+                    id,
+                    receipt_kind,
+                    project_id,
+                    expected_revision,
+                    expected_version_id,
+                    source_path,
+                    source_device,
+                    source_inode,
+                    size_bytes,
+                    modified_seconds,
+                    modified_nanoseconds,
+                    sha256,
+                    mime_type,
+                    width,
+                    height,
+                    has_alpha,
+                    producer,
+                    producer_version,
+                    generation_id,
+                    trust_context.to_string(),
+                    issued_at,
+                    expires_at,
+                ],
+            )
+            .map_err(|error| {
+                format!("video.visual_receipt_conflict: Could not register the exact visual source: {error}")
+            })?;
+        drop(connection);
+        self.get_video_visual_source_receipt(id)?
+            .ok_or_else(|| "video.store_failed: The visual receipt could not be reloaded".into())
+    }
+
+    pub(crate) fn get_video_visual_source_receipt(
+        &self,
+        receipt_id: &str,
+    ) -> Result<Option<Value>, String> {
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT id, receipt_kind, project_id, expected_revision, expected_version_id,
+                        source_path, source_device, source_inode, size_bytes, modified_seconds,
+                        modified_nanoseconds, sha256, mime_type, width, height, has_alpha, producer,
+                        producer_version, generation_id, trust_context_json, issued_at, expires_at,
+                        claimed_by_job_id, claimed_at
+                 FROM video_visual_source_receipts WHERE id = ?1",
+                [receipt_id],
+                |row| {
+                    let trust_context: String = row.get(19)?;
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "receipt_kind": row.get::<_, String>(1)?,
+                        "project_id": row.get::<_, String>(2)?,
+                        "expected_revision": row.get::<_, i64>(3)?,
+                        "expected_version_id": row.get::<_, String>(4)?,
+                        "source_path": row.get::<_, String>(5)?,
+                        "source_device": row.get::<_, String>(6)?,
+                        "source_inode": row.get::<_, String>(7)?,
+                        "size_bytes": row.get::<_, i64>(8)?,
+                        "modified_seconds": row.get::<_, i64>(9)?,
+                        "modified_nanoseconds": row.get::<_, i64>(10)?,
+                        "sha256": row.get::<_, String>(11)?,
+                        "mime_type": row.get::<_, String>(12)?,
+                        "width": row.get::<_, i64>(13)?,
+                        "height": row.get::<_, i64>(14)?,
+                        "has_alpha": row.get::<_, bool>(15)?,
+                        "producer": row.get::<_, String>(16)?,
+                        "producer_version": row.get::<_, Option<String>>(17)?,
+                        "generation_id": row.get::<_, Option<String>>(18)?,
+                        "trust_context": serde_json::from_str::<Value>(&trust_context).unwrap_or_else(|_| json!({})),
+                        "issued_at": row.get::<_, String>(20)?,
+                        "expires_at": row.get::<_, String>(21)?,
+                        "claimed_by_job_id": row.get::<_, Option<String>>(22)?,
+                        "claimed_at": row.get::<_, Option<String>>(23)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                format!("video.store_failed: Could not read the visual source receipt: {error}")
+            })
+    }
+
+    /// Claims a receipt for exactly one durable add-visual job. A retry of that same job may
+    /// resolve it again, but every other job, project, origin, revision, or version fails closed.
+    pub(crate) fn claim_video_visual_source_receipt(
+        &self,
+        receipt_id: &str,
+        receipt_kind: &str,
+        project_id: &str,
+        expected_revision: i64,
+        expected_version_id: &str,
+        job_id: &str,
+    ) -> Result<Value, String> {
+        let timestamp = now();
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                format!("video.store_failed: Could not start visual receipt claim: {error}")
+            })?;
+        let job_matches: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM jobs
+                    WHERE id = ?1 AND kind = 'video_add_visual_asset'
+                      AND status IN ('queued','preparing','running')
+                      AND json_extract(request_json, '$.project_id') = ?2
+                      AND json_extract(request_json, '$.expected_revision') = ?3
+                      AND json_extract(request_json, '$.expected_version_id') = ?4
+                      AND json_extract(request_json, '$.origin.kind') = ?5
+                      AND json_extract(request_json, '$.origin.receipt_id') = ?6
+                 )",
+                params![
+                    job_id,
+                    project_id,
+                    expected_revision,
+                    expected_version_id,
+                    receipt_kind,
+                    receipt_id,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                format!("video.store_failed: Could not validate the visual import job: {error}")
+            })?;
+        if !job_matches {
+            return Err(
+                "video.approval_required: The visual receipt is not attached to an active import job"
+                    .into(),
+            );
+        }
+        let receipt: Option<Value> = transaction
+            .query_row(
+                "SELECT id, receipt_kind, project_id, expected_revision, expected_version_id,
+                        source_path, source_device, source_inode, size_bytes, modified_seconds,
+                        modified_nanoseconds, sha256, mime_type, width, height, has_alpha, producer,
+                        producer_version, generation_id, trust_context_json, issued_at, expires_at,
+                        claimed_by_job_id, claimed_at
+                 FROM video_visual_source_receipts WHERE id = ?1",
+                [receipt_id],
+                |row| {
+                    let trust_context: String = row.get(19)?;
+                    Ok(json!({
+                        "id": row.get::<_, String>(0)?,
+                        "receipt_kind": row.get::<_, String>(1)?,
+                        "project_id": row.get::<_, String>(2)?,
+                        "expected_revision": row.get::<_, i64>(3)?,
+                        "expected_version_id": row.get::<_, String>(4)?,
+                        "source_path": row.get::<_, String>(5)?,
+                        "source_device": row.get::<_, String>(6)?,
+                        "source_inode": row.get::<_, String>(7)?,
+                        "size_bytes": row.get::<_, i64>(8)?,
+                        "modified_seconds": row.get::<_, i64>(9)?,
+                        "modified_nanoseconds": row.get::<_, i64>(10)?,
+                        "sha256": row.get::<_, String>(11)?,
+                        "mime_type": row.get::<_, String>(12)?,
+                        "width": row.get::<_, i64>(13)?,
+                        "height": row.get::<_, i64>(14)?,
+                        "has_alpha": row.get::<_, bool>(15)?,
+                        "producer": row.get::<_, String>(16)?,
+                        "producer_version": row.get::<_, Option<String>>(17)?,
+                        "generation_id": row.get::<_, Option<String>>(18)?,
+                        "trust_context": serde_json::from_str::<Value>(&trust_context).unwrap_or_else(|_| json!({})),
+                        "issued_at": row.get::<_, String>(20)?,
+                        "expires_at": row.get::<_, String>(21)?,
+                        "claimed_by_job_id": row.get::<_, Option<String>>(22)?,
+                        "claimed_at": row.get::<_, Option<String>>(23)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                format!("video.store_failed: Could not inspect the visual source receipt: {error}")
+            })?;
+        let receipt = receipt
+            .ok_or("video.approval_required: A trusted visual source receipt is required")?;
+        let exact_scope = receipt.get("receipt_kind").and_then(Value::as_str) == Some(receipt_kind)
+            && receipt.get("project_id").and_then(Value::as_str) == Some(project_id)
+            && receipt.get("expected_revision").and_then(Value::as_i64) == Some(expected_revision)
+            && receipt.get("expected_version_id").and_then(Value::as_str)
+                == Some(expected_version_id);
+        if !exact_scope {
+            return Err(
+                "video.approval_required: The visual receipt does not authorize this exact project version and origin"
+                    .into(),
+            );
+        }
+        let claimed_by_job_id = receipt.get("claimed_by_job_id").and_then(Value::as_str);
+        if claimed_by_job_id.is_some_and(|claimed| claimed != job_id) {
+            return Err(
+                "video.approval_required: The visual source receipt was already used".into(),
+            );
+        }
+        if claimed_by_job_id.is_none() {
+            let expires_at = receipt
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .ok_or("video.approval_required: The visual source receipt expiry is invalid")?;
+            if expires_at <= Utc::now() {
+                return Err("video.approval_required: The visual source receipt expired".into());
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE video_visual_source_receipts
+                 SET claimed_by_job_id = ?2, claimed_at = COALESCE(claimed_at, ?3)
+                 WHERE id = ?1 AND (claimed_by_job_id IS NULL OR claimed_by_job_id = ?2)",
+                params![receipt_id, job_id, timestamp],
+            )
+            .map_err(|error| {
+                format!("video.store_failed: Could not claim the visual source receipt: {error}")
+            })?;
+        transaction.commit().map_err(|error| {
+            format!("video.store_failed: Could not commit the visual source receipt claim: {error}")
+        })?;
+        Ok(receipt)
+    }
+
     pub fn upsert_video_asset(&self, asset: &Value) -> Result<Value, String> {
         let project_id = required_trimmed(
             asset,
@@ -8084,6 +8478,56 @@ fn migrate(connection: &mut Connection, from_version: i64) -> Result<(), String>
             )
             .map_err(|error| {
                 format!("Could not harden Video Studio ownership identities: {error}")
+            })?;
+    }
+    if from_version < 38 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS video_visual_source_receipts (
+                    id TEXT PRIMARY KEY,
+                    receipt_kind TEXT NOT NULL CHECK(receipt_kind IN ('user_selected','generated_locally')),
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    expected_revision INTEGER NOT NULL CHECK(expected_revision > 0),
+                    expected_version_id TEXT NOT NULL REFERENCES video_project_versions(id) ON DELETE CASCADE,
+                    source_path TEXT NOT NULL,
+                    source_device TEXT NOT NULL,
+                    source_inode TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+                    modified_seconds INTEGER NOT NULL,
+                    modified_nanoseconds INTEGER NOT NULL CHECK(modified_nanoseconds >= 0 AND modified_nanoseconds < 1000000000),
+                    sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+                    mime_type TEXT NOT NULL CHECK(mime_type IN ('image/png','image/jpeg','image/webp')),
+                    width INTEGER NOT NULL CHECK(width > 0),
+                    height INTEGER NOT NULL CHECK(height > 0),
+                    has_alpha INTEGER NOT NULL CHECK(has_alpha IN (0,1)),
+                    producer TEXT NOT NULL,
+                    producer_version TEXT,
+                    generation_id TEXT,
+                    trust_context_json TEXT NOT NULL DEFAULT '{}',
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    claimed_by_job_id TEXT REFERENCES jobs(id),
+                    claimed_at TEXT,
+                    CHECK(
+                        (receipt_kind = 'user_selected' AND generation_id IS NULL)
+                        OR
+                        (receipt_kind = 'generated_locally' AND length(generation_id) > 0)
+                    ),
+                    CHECK(
+                        (claimed_by_job_id IS NULL AND claimed_at IS NULL)
+                        OR
+                        (claimed_by_job_id IS NOT NULL AND claimed_at IS NOT NULL)
+                    )
+                 );
+                 CREATE INDEX IF NOT EXISTS video_visual_receipt_expiry_idx
+                    ON video_visual_source_receipts(expires_at)
+                    WHERE claimed_by_job_id IS NULL;
+                 CREATE UNIQUE INDEX IF NOT EXISTS video_generated_visual_identity_idx
+                    ON video_visual_source_receipts(project_id, generation_id)
+                    WHERE receipt_kind = 'generated_locally';",
+            )
+            .map_err(|error| {
+                format!("Could not add trusted visual source receipts: {error}")
             })?;
     }
     transaction
@@ -12260,6 +12704,210 @@ mod tests {
             master.to_string_lossy().as_ref()
         );
         drop(reopened);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn schema_thirty_seven_adds_trusted_visual_source_receipts() {
+        let root = std::env::temp_dir().join(format!("soundar-schema37-{}", Uuid::new_v4()));
+        let data = root.join("data");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&data).expect("create schema 37 fixture");
+        let database = data.join("soundar.sqlite3");
+        let mut connection = rusqlite::Connection::open(&database).expect("open schema 37 fixture");
+        super::migrate(&mut connection, 0).expect("create current fixture");
+        connection
+            .execute("DROP TABLE video_visual_source_receipts", [])
+            .expect("remove schema 38 visual receipts");
+        connection
+            .pragma_update(None, "user_version", 37)
+            .expect("mark schema 37");
+        drop(connection);
+
+        let store = Store::open(data, artifacts).expect("migrate schema 37");
+        let connection = store.lock().expect("lock migrated fixture");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read schema version");
+        let receipt_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'video_visual_source_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect visual receipt table");
+        assert_eq!(version, super::SCHEMA_VERSION);
+        assert_eq!(receipt_table, 1);
+        drop(connection);
+        drop(store);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn visual_source_receipts_are_version_bound_expiring_and_one_use() {
+        let (store, root) = test_store();
+        let project_id = "visual-receipt-project";
+        let manifest = json!({
+            "schema_version": 1,
+            "project_id": project_id,
+            "name": "Visual receipt",
+            "revision": 1,
+            "timeline_duration_us": 1_000_000,
+            "layout": {"canvas": {"width": 1080, "height": 1920}}
+        });
+        let project = store
+            .create_video_project("Visual receipt", &manifest, "test-suite")
+            .expect("create visual receipt project");
+        let version_id = project["version"]["id"]
+            .as_str()
+            .expect("current version")
+            .to_string();
+        let receipt = |id: &str, expires_at: &str| {
+            json!({
+                "id": id,
+                "receipt_kind": "user_selected",
+                "project_id": project_id,
+                "expected_revision": 1,
+                "expected_version_id": version_id,
+                "source_path": "/tmp/exact-picked-image.png",
+                "source_device": "7",
+                "source_inode": "11",
+                "size_bytes": 30,
+                "modified_seconds": 1,
+                "modified_nanoseconds": 2,
+                "sha256": "a".repeat(64),
+                "mime_type": "image/png",
+                "width": 1,
+                "height": 1,
+                "has_alpha": true,
+                "producer": "soundAr native file picker",
+                "producer_version": "test",
+                "generation_id": null,
+                "trust_context": {"boundary": "native_file_picker"},
+                "issued_at": "2026-01-01T00:00:00.000Z",
+                "expires_at": expires_at,
+            })
+        };
+        store
+            .create_video_visual_source_receipt(&receipt(
+                "visual-selection-live",
+                "2999-01-01T00:00:00.000Z",
+            ))
+            .expect("create live receipt");
+        store
+            .create_video_visual_source_receipt(&receipt(
+                "visual-selection-expired",
+                "2026-01-02T00:00:00.000Z",
+            ))
+            .expect("create expired receipt");
+        let request_one = json!({
+            "project_id": project_id,
+            "expected_revision": 1,
+            "expected_version_id": version_id,
+            "operation_id": "one",
+            "origin": {"kind": "user_selected", "receipt_id": "visual-selection-live"}
+        });
+        let request_two = json!({
+            "project_id": project_id,
+            "expected_revision": 1,
+            "expected_version_id": version_id,
+            "operation_id": "two",
+            "origin": {"kind": "user_selected", "receipt_id": "visual-selection-live"}
+        });
+        let request_expired = json!({
+            "project_id": project_id,
+            "expected_revision": 1,
+            "expected_version_id": version_id,
+            "operation_id": "expired",
+            "origin": {"kind": "user_selected", "receipt_id": "visual-selection-expired"}
+        });
+        let (job_one, _) = store
+            .create_idempotent_job(
+                "video_add_visual_asset",
+                "visual-receipt-job-one",
+                &request_one,
+            )
+            .expect("create first receipt job")
+            .expect("first receipt job identity");
+        let (job_two, _) = store
+            .create_idempotent_job(
+                "video_add_visual_asset",
+                "visual-receipt-job-two",
+                &request_two,
+            )
+            .expect("create second receipt job")
+            .expect("second receipt job identity");
+        let (expired_job, _) = store
+            .create_idempotent_job(
+                "video_add_visual_asset",
+                "visual-receipt-job-expired",
+                &request_expired,
+            )
+            .expect("create expired receipt job")
+            .expect("expired receipt job identity");
+        let claimed = store
+            .claim_video_visual_source_receipt(
+                "visual-selection-live",
+                "user_selected",
+                project_id,
+                1,
+                &version_id,
+                &job_one,
+            )
+            .expect("claim exact receipt");
+        assert_eq!(claimed["sha256"], "a".repeat(64));
+        store
+            .claim_video_visual_source_receipt(
+                "visual-selection-live",
+                "user_selected",
+                project_id,
+                1,
+                &version_id,
+                &job_one,
+            )
+            .expect("same durable job may replay its receipt claim");
+        store
+            .connection
+            .lock()
+            .expect("lock receipt store")
+            .execute(
+                "UPDATE video_visual_source_receipts SET expires_at = '2026-01-02T00:00:00.000Z' WHERE id = 'visual-selection-live'",
+                [],
+            )
+            .expect("expire already-claimed receipt");
+        store
+            .claim_video_visual_source_receipt(
+                "visual-selection-live",
+                "user_selected",
+                project_id,
+                1,
+                &version_id,
+                &job_one,
+            )
+            .expect("same durable job may replay after receipt expiry");
+        assert!(store
+            .claim_video_visual_source_receipt(
+                "visual-selection-live",
+                "user_selected",
+                project_id,
+                1,
+                &version_id,
+                &job_two,
+            )
+            .expect_err("another job cannot reuse the receipt")
+            .contains("already used"));
+        assert!(store
+            .claim_video_visual_source_receipt(
+                "visual-selection-expired",
+                "user_selected",
+                project_id,
+                1,
+                &version_id,
+                &expired_job,
+            )
+            .expect_err("expired receipt fails closed")
+            .contains("expired"));
+        drop(store);
         fs::remove_dir_all(root).ok();
     }
 

@@ -22,7 +22,7 @@ use super::{
     MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
 };
 use crate::store::Store;
-use chrono::{SecondsFormat, Utc};
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -68,6 +68,7 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const SHAREABLE_FILE_MODE: u32 = 0o644;
 const MAX_RENDER_DURATION: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_MEDIA_DURATION_US: i64 = 6 * 60 * 60 * 1_000_000;
+const VISUAL_SOURCE_RECEIPT_TTL_MINUTES: i64 = 30;
 
 pub type ServiceResult<T> = Result<T, VideoServiceError>;
 pub type ProgressCallback = Arc<dyn Fn(VideoServiceProgress) + Send + Sync + 'static>;
@@ -574,16 +575,63 @@ pub struct TimelineEditServiceResult {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VisualAssetOrigin {
     UserSelected {
-        /// Native callers set this only after the file chooser returns; agent callers set it only
-        /// after the user explicitly asked to import that exact local image.
-        user_confirmed: bool,
+        /// Opaque, short-lived receipt minted only by the native backend file chooser.
+        receipt_id: String,
     },
     GeneratedLocally {
-        producer: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        producer_version: Option<String>,
-        generation_id: String,
+        /// Opaque receipt minted from an authenticated Codex image-generation result.
+        receipt_id: String,
     },
+}
+
+impl VisualAssetOrigin {
+    pub(crate) fn receipt_id(&self) -> &str {
+        match self {
+            Self::UserSelected { receipt_id } | Self::GeneratedLocally { receipt_id } => receipt_id,
+        }
+    }
+
+    fn receipt_kind(&self) -> &'static str {
+        match self {
+            Self::UserSelected { .. } => "user_selected",
+            Self::GeneratedLocally { .. } => "generated_locally",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizeVisualSelectionRequest {
+    pub project_id: String,
+    pub expected_revision: i64,
+    pub expected_version_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VisualSourceReceipt {
+    pub id: String,
+    pub receipt_kind: String,
+    pub project_id: String,
+    pub expected_revision: i64,
+    pub expected_version_id: String,
+    pub display_name: String,
+    pub sha256: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub width: u32,
+    pub height: u32,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrustedGeneratedVisual {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub generation_id: String,
+    pub source_path: PathBuf,
+    pub producer_version: Option<String>,
+    pub revised_prompt: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -593,7 +641,6 @@ pub struct AddVisualAssetRequest {
     pub expected_revision: i64,
     pub expected_version_id: String,
     pub operation_id: String,
-    pub source_path: PathBuf,
     pub actor: String,
     pub origin: VisualAssetOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1630,6 +1677,14 @@ struct LocalSourceIdentity {
     size: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+}
+
+struct ResolvedVisualSource {
+    path: PathBuf,
+    expected_identity: LocalSourceIdentity,
+    expected_sha256: String,
+    inspection: ImageInspection,
+    provenance: Provenance,
 }
 
 impl LocalSourceIdentity {
@@ -2741,6 +2796,83 @@ fn inspect_image_reader(file: &mut File, size_bytes: u64) -> Result<ImageInspect
         has_alpha,
         size_bytes,
     })
+}
+
+fn inspect_exact_visual_source(
+    path: &Path,
+) -> ServiceResult<(LocalSourceIdentity, ImageInspection, String)> {
+    if !path.is_absolute() {
+        return Err(VideoServiceError::new(
+            "video.invalid_visual_source",
+            "Visual source paths must be absolute",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            VideoServiceError::io(
+                "video.visual_not_found",
+                "The visual source could not be opened safely",
+                error,
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        VideoServiceError::io(
+            "video.visual_not_found",
+            "The visual source could not be inspected",
+            error,
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() < 16 || metadata.len() > MAX_VISUAL_ASSET_BYTES {
+        return Err(VideoServiceError::new(
+            "video.invalid_visual",
+            "The visual source is not a supported bounded regular file",
+        ));
+    }
+    let identity = LocalSourceIdentity::from_metadata(&metadata);
+    let inspection = inspect_image_reader(&mut file, metadata.len())?;
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        VideoServiceError::io(
+            "video.visual_read_failed",
+            "The visual source could not be prepared",
+            error,
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let size = file.read(&mut buffer).map_err(|error| {
+            VideoServiceError::io(
+                "video.visual_read_failed",
+                "The visual source could not be hashed",
+                error,
+            )
+        })?;
+        if size == 0 {
+            break;
+        }
+        hasher.update(&buffer[..size]);
+    }
+    let final_identity = LocalSourceIdentity::from_metadata(&file.metadata().map_err(|error| {
+        VideoServiceError::io(
+            "video.visual_not_found",
+            "The visual source could not be re-inspected",
+            error,
+        )
+    })?);
+    if final_identity != identity {
+        return Err(VideoServiceError::new(
+            "video.visual_changed",
+            "The visual source changed while its authorization was created",
+        ));
+    }
+    Ok((
+        identity,
+        inspection,
+        hex_digest(hasher.finalize().as_slice()),
+    ))
 }
 
 fn inspect_jpeg_dimensions(file: &mut File) -> Result<(u32, u32), MediaError> {
@@ -4820,6 +4952,39 @@ fn value_i64(value: &Value, key: &str) -> ServiceResult<i64> {
         .ok_or_else(|| invalid_store_shape(key))
 }
 
+fn visual_extension(mime_type: VisualMimeType) -> &'static str {
+    match mime_type {
+        VisualMimeType::Png => "png",
+        VisualMimeType::Jpeg => "jpg",
+        VisualMimeType::Webp => "webp",
+    }
+}
+
+fn visual_source_receipt(value: &Value) -> ServiceResult<VisualSourceReceipt> {
+    let source_path = Path::new(&value_string(value, "source_path")?)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("visual")
+        .to_string();
+    Ok(VisualSourceReceipt {
+        id: value_string(value, "id")?,
+        receipt_kind: value_string(value, "receipt_kind")?,
+        project_id: value_string(value, "project_id")?,
+        expected_revision: value_i64(value, "expected_revision")?,
+        expected_version_id: value_string(value, "expected_version_id")?,
+        display_name: source_path,
+        sha256: value_string(value, "sha256")?,
+        mime_type: value_string(value, "mime_type")?,
+        size_bytes: u64::try_from(value_i64(value, "size_bytes")?)
+            .map_err(|_| invalid_store_shape("size_bytes"))?,
+        width: u32::try_from(value_i64(value, "width")?)
+            .map_err(|_| invalid_store_shape("width"))?,
+        height: u32::try_from(value_i64(value, "height")?)
+            .map_err(|_| invalid_store_shape("height"))?,
+        expires_at: value_string(value, "expires_at")?,
+    })
+}
+
 fn project_expectation(project: &Value) -> ServiceResult<ProjectExpectation> {
     let revision = value_i64(project, "revision")?;
     let version_id = project
@@ -5579,6 +5744,40 @@ mod tests {
         .expect("valid empty manifest")
     }
 
+    fn test_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 30];
+        bytes[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        bytes[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        bytes[12..16].copy_from_slice(b"IHDR");
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        bytes[24] = 8;
+        bytes[25] = 6;
+        bytes
+    }
+
+    fn test_visual_motion() -> VisualMotion {
+        VisualMotion {
+            start_bounds: NormalizedRect {
+                x_bp: 0,
+                y_bp: 0,
+                width_bp: 10_000,
+                height_bp: 10_000,
+            },
+            end_bounds: NormalizedRect {
+                x_bp: 0,
+                y_bp: 0,
+                width_bp: 10_000,
+                height_bp: 10_000,
+            },
+            start_opacity_milli: 1_000,
+            end_opacity_milli: 1_000,
+            start_rotation_milli_degrees: 0,
+            end_rotation_milli_degrees: 0,
+            easing: super::super::VisualEasing::Linear,
+        }
+    }
+
     #[test]
     fn creation_and_revision_keep_store_and_manifest_aligned() {
         let workspace = TestWorkspace::new();
@@ -5773,17 +5972,33 @@ mod tests {
             .and_then(Value::as_str)
             .expect("initial version")
             .to_string();
+        let generation_receipt = workspace
+            .service
+            .register_trusted_generated_visual(
+                AuthorizeVisualSelectionRequest {
+                    project_id: project_id.clone(),
+                    expected_revision: 1,
+                    expected_version_id: version_id.clone(),
+                },
+                TrustedGeneratedVisual {
+                    thread_id: "thread-generated-visual".to_string(),
+                    turn_id: "turn-generated-visual".to_string(),
+                    generation_id: "image-generation-one".to_string(),
+                    source_path: source.clone(),
+                    producer_version: Some("test-broker-1".to_string()),
+                    revised_prompt: Some("A blue editorial illustration".to_string()),
+                },
+            )
+            .expect("register authenticated generation");
+        assert_eq!(generation_receipt.receipt_kind, "generated_locally");
         let request = AddVisualAssetRequest {
             project_id: project_id.clone(),
             expected_revision: 1,
             expected_version_id: version_id,
             operation_id: "generated-illustration-one".to_string(),
-            source_path: source,
             actor: "codex-video-agent".to_string(),
             origin: VisualAssetOrigin::GeneratedLocally {
-                producer: "codex-image-tool".to_string(),
-                producer_version: Some("1".to_string()),
-                generation_id: "image-generation-one".to_string(),
+                receipt_id: generation_receipt.id,
             },
             scene_id: None,
             range: TimeRange::new(0, 1_000_000).expect("visual range"),
@@ -5855,6 +6070,437 @@ mod tests {
             replay.project.get("revision").and_then(Value::as_i64),
             Some(2)
         );
+    }
+
+    #[test]
+    fn headless_broker_registration_adds_visual_without_desktop_state() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        let created = workspace.create_project(&project_id, "Headless generated visual");
+        let version_id = created
+            .pointer("/version/id")
+            .and_then(Value::as_str)
+            .expect("initial version")
+            .to_string();
+        let source = workspace.root.join("headless-generated.png");
+        fs::write(&source, test_png_bytes(96, 54)).expect("write headless generation output");
+        let hostile_source = workspace.root.join("hostile-generated.png");
+        fs::write(&hostile_source, test_png_bytes(12, 12)).expect("write hostile source");
+
+        let broker = workspace.root.join("fake-codex-broker");
+        let thread_response = json!({
+            "id": 2,
+            "result": {
+                "thread": {
+                    "id": "thread-headless",
+                    "turns": [{
+                        "id": "turn-headless",
+                        "items": [{
+                            "type": "imageGeneration",
+                            "id": "generation-headless",
+                            "status": "completed",
+                            "savedPath": source,
+                            "revisedPrompt": "A headless generated illustration",
+                            "failure": null
+                        }]
+                    }]
+                }
+            }
+        })
+        .to_string();
+        let c_response = thread_response.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut broker_source = String::from(
+            "#include <stdio.h>\n#include <string.h>\nstatic const char response[] = \"",
+        );
+        broker_source.push_str(&c_response);
+        broker_source.push_str(
+            "\";\nint main(void) { char line[65536]; while (fgets(line, sizeof(line), stdin)) { if (strstr(line, \"\\\"id\\\":1\")) puts(\"{\\\"id\\\":1,\\\"result\\\":{}}\"); else if (strstr(line, \"\\\"id\\\":2\")) puts(response); fflush(stdout); } return 0; }\n",
+        );
+        let broker_c = workspace.root.join("fake-codex-broker.c");
+        fs::write(&broker_c, broker_source).expect("write fake broker source");
+        let compiler = ["/usr/bin/cc", "/bin/cc"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .expect("C compiler for ELF broker regression");
+        let compile = Command::new(compiler)
+            .arg(&broker_c)
+            .arg("-O2")
+            .arg("-o")
+            .arg(&broker)
+            .status()
+            .expect("compile fake ELF broker");
+        assert!(compile.success());
+
+        let account_home = crate::codex_agent::account_home_dir_for_test();
+        let broker_test_root = account_home
+            .join(".config/soundar")
+            .join(format!("headless-broker-test-{}", Uuid::new_v4().simple()));
+        let codex_home = broker_test_root.join("codex-home");
+        let mut codex_home_builder = fs::DirBuilder::new();
+        codex_home_builder.recursive(true).mode(0o700);
+        codex_home_builder
+            .create(&codex_home)
+            .expect("create private test Codex home");
+        fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700))
+            .expect("secure test Codex home");
+        let identity_path = workspace
+            .root
+            .join("broker-identity/trusted-codex-generation-broker-v1.json");
+        crate::codex_agent::enroll_test_codex_broker_at(&identity_path, &broker, &codex_home)
+            .expect("enroll pinned ELF broker");
+
+        let hostile_shim = workspace.root.join("codex");
+        fs::write(
+            &hostile_shim,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 999.0.0'; exit 0; fi\nprintf '%s\\n' '{}'\n",
+                json!({
+                    "id": 2,
+                    "result": {"thread": {"id": "thread-headless", "turns": [{"id":"hostile-turn", "items":[{
+                        "type":"imageGeneration", "id":"generation-headless", "status":"completed", "savedPath": hostile_source, "failure": null
+                    }]}]}}
+                })
+            ),
+        )
+        .expect("write hostile Codex shim");
+        fs::set_permissions(&hostile_shim, fs::Permissions::from_mode(0o700))
+            .expect("make hostile shim executable");
+        let old_soundar_codex = std::env::var_os("SOUNDAR_CODEX_BIN");
+        let old_codex = std::env::var_os("CODEX_BIN");
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var("SOUNDAR_CODEX_BIN", &hostile_shim);
+        std::env::set_var("CODEX_BIN", &hostile_shim);
+        std::env::set_var("PATH", &workspace.root);
+        let missing_identity_error = crate::codex_agent::resolve_headless_generated_visual_at(
+            &identity_path.with_file_name("missing-broker-identity.json"),
+            "thread-headless",
+            "generation-headless",
+        )
+        .expect_err("hostile discovery variables cannot bootstrap a missing enrollment");
+        assert_eq!(
+            missing_identity_error.code,
+            "video.generation_broker_setup_required"
+        );
+        let generation_result = crate::codex_agent::resolve_headless_generated_visual_at(
+            &identity_path,
+            "thread-headless",
+            "generation-headless",
+        );
+        match old_soundar_codex {
+            Some(value) => std::env::set_var("SOUNDAR_CODEX_BIN", value),
+            None => std::env::remove_var("SOUNDAR_CODEX_BIN"),
+        }
+        match old_codex {
+            Some(value) => std::env::set_var("CODEX_BIN", value),
+            None => std::env::remove_var("CODEX_BIN"),
+        }
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        let generation = generation_result.expect("resolve only through pinned headless broker");
+        assert_eq!(generation.source_path, source);
+        let receipt = workspace
+            .service
+            .register_trusted_generated_visual(
+                AuthorizeVisualSelectionRequest {
+                    project_id: project_id.clone(),
+                    expected_revision: 1,
+                    expected_version_id: version_id.clone(),
+                },
+                generation,
+            )
+            .expect("register headless generation");
+        let added = workspace
+            .service
+            .add_visual_asset(AddVisualAssetRequest {
+                project_id,
+                expected_revision: 1,
+                expected_version_id: version_id,
+                operation_id: "headless-generated-visual".to_string(),
+                actor: "codex-video-agent-headless".to_string(),
+                origin: VisualAssetOrigin::GeneratedLocally {
+                    receipt_id: receipt.id,
+                },
+                scene_id: None,
+                range: TimeRange::new(0, 1_000_000).expect("visual range"),
+                fit: VisualFit::Contain,
+                crop: None,
+                z_index: 1,
+                motion: test_visual_motion(),
+                transition_in_us: Microseconds(0),
+                transition_out_us: Microseconds(0),
+            })
+            .expect("add headless registered generation");
+        assert_eq!(added.project["revision"], 2);
+        assert_eq!(
+            added.project["manifest"]["visual_assets"][0]["provenance"]["metadata"]
+                ["generation_id"],
+            "generation-headless"
+        );
+        let moved_broker = workspace.root.join("moved-fake-codex-broker");
+        fs::rename(&broker, &moved_broker).expect("move enrolled broker executable");
+        std::os::unix::fs::symlink(&hostile_shim, &broker)
+            .expect("replace enrolled broker path with hostile shim");
+        let changed = crate::codex_agent::resolve_headless_generated_visual_at(
+            &identity_path,
+            "thread-headless",
+            "generation-headless",
+        )
+        .expect_err("an enrolled broker path replacement must fail closed");
+        assert_eq!(changed.code, "video.generation_broker_identity_changed");
+        fs::remove_dir_all(broker_test_root).ok();
+    }
+
+    #[test]
+    fn native_selection_receipt_binds_exact_file_and_persists_authorization() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        let created = workspace.create_project(&project_id, "Native visual receipt");
+        let version_id = created
+            .pointer("/version/id")
+            .and_then(Value::as_str)
+            .expect("initial version")
+            .to_string();
+        let source = workspace.root.join("picked-image.png");
+        fs::write(&source, test_png_bytes(64, 32)).expect("write selected image");
+        let receipt = workspace
+            .service
+            .authorize_user_visual_selection(
+                AuthorizeVisualSelectionRequest {
+                    project_id: project_id.clone(),
+                    expected_revision: 1,
+                    expected_version_id: version_id.clone(),
+                },
+                source,
+            )
+            .expect("mint native picker receipt");
+        assert_eq!(receipt.receipt_kind, "user_selected");
+        let added = workspace
+            .service
+            .add_visual_asset(AddVisualAssetRequest {
+                project_id,
+                expected_revision: 1,
+                expected_version_id: version_id,
+                operation_id: "native-picked-image".to_string(),
+                actor: "local-user".to_string(),
+                origin: VisualAssetOrigin::UserSelected {
+                    receipt_id: receipt.id.clone(),
+                },
+                scene_id: None,
+                range: TimeRange::new(0, 1_000_000).expect("visual range"),
+                fit: VisualFit::Cover,
+                crop: None,
+                z_index: 1,
+                motion: test_visual_motion(),
+                transition_in_us: Microseconds(0),
+                transition_out_us: Microseconds(0),
+            })
+            .expect("add picker-authorized visual");
+        assert_eq!(added.project["revision"], 2);
+        assert_eq!(
+            added.project["manifest"]["visual_assets"][0]["provenance"]["metadata"]
+                ["authorization_receipt_id"],
+            receipt.id
+        );
+        assert_eq!(
+            added.project["manifest"]["visual_assets"][0]["provenance"]["producer"],
+            "soundAr native file picker"
+        );
+    }
+
+    #[test]
+    fn visual_receipt_rejects_source_replacement_and_unsafe_existing_target() {
+        for attack in ["source_symlink", "managed_hardlink"] {
+            let workspace = TestWorkspace::new();
+            let project_id = format!("project-{}", new_id());
+            let created = workspace.create_project(&project_id, "Visual receipt attacks");
+            let version_id = created
+                .pointer("/version/id")
+                .and_then(Value::as_str)
+                .expect("initial version")
+                .to_string();
+            let source = workspace.root.join(format!("picked-{attack}.png"));
+            let alternate = workspace.root.join(format!("alternate-{attack}.png"));
+            fs::write(&source, test_png_bytes(48, 48)).expect("write selected source");
+            fs::write(&alternate, test_png_bytes(48, 48)).expect("write alternate source");
+            let receipt = workspace
+                .service
+                .authorize_user_visual_selection(
+                    AuthorizeVisualSelectionRequest {
+                        project_id: project_id.clone(),
+                        expected_revision: 1,
+                        expected_version_id: version_id.clone(),
+                    },
+                    source.clone(),
+                )
+                .expect("mint exact source receipt");
+            let request = AddVisualAssetRequest {
+                project_id: project_id.clone(),
+                expected_revision: 1,
+                expected_version_id: version_id,
+                operation_id: format!("visual-attack-{attack}"),
+                actor: "local-user".to_string(),
+                origin: VisualAssetOrigin::UserSelected {
+                    receipt_id: receipt.id,
+                },
+                scene_id: None,
+                range: TimeRange::new(0, 1_000_000).expect("visual range"),
+                fit: VisualFit::Cover,
+                crop: None,
+                z_index: 1,
+                motion: test_visual_motion(),
+                transition_in_us: Microseconds(0),
+                transition_out_us: Microseconds(0),
+            };
+            if attack == "source_symlink" {
+                fs::remove_file(&source).expect("replace selected path");
+                std::os::unix::fs::symlink(&alternate, &source).expect("install source symlink");
+                let error = workspace
+                    .service
+                    .add_visual_asset(request)
+                    .expect_err("source replacement must fail closed");
+                assert!(
+                    matches!(
+                        error.code.as_str(),
+                        "video.visual_not_found" | "video.visual_receipt_mismatch"
+                    ),
+                    "unexpected source replacement error: {error:?}"
+                );
+                continue;
+            }
+
+            let request_value = serde_json::to_value(&request).expect("serialize attack request");
+            let idempotency_key = format!(
+                "visual-add:{}",
+                sha256_bytes(format!("{}:{}", request.project_id, request.operation_id).as_bytes())
+            );
+            let (job_id, created_job) = workspace
+                .service
+                .store
+                .create_idempotent_job("video_add_visual_asset", &idempotency_key, &request_value)
+                .expect("create attack import job")
+                .expect("stable attack job");
+            assert!(created_job);
+            workspace
+                .service
+                .store
+                .fail_job(&job_id, "test failpoint")
+                .expect("make attack job resumable");
+            let asset_id = stable_import_asset_id(
+                &request.project_id,
+                &job_id,
+                "visual",
+                &request.operation_id,
+            );
+            let visual_dir = workspace
+                .service
+                .project_dir(&request.project_id)
+                .expect("project directory")
+                .join("visuals");
+            workspace
+                .service
+                .secure_managed_directory(&visual_dir)
+                .expect("visual directory");
+            let final_path = visual_dir.join(format!("{asset_id}.png"));
+            fs::hard_link(&alternate, &final_path).expect("install managed hard-link alias");
+            let error = workspace
+                .service
+                .add_visual_asset(request)
+                .expect_err("pre-existing hard-link target must fail closed");
+            assert_eq!(error.code, "video.unsafe_artifact_path");
+        }
+    }
+
+    #[test]
+    fn generated_receipt_rejects_a_symlink_at_its_registered_path() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        let created = workspace.create_project(&project_id, "Generated receipt path attack");
+        let version_id = created
+            .pointer("/version/id")
+            .and_then(Value::as_str)
+            .expect("initial version")
+            .to_string();
+        let source = workspace.root.join("generated-path-attack.png");
+        fs::write(&source, test_png_bytes(48, 48)).expect("write generation output");
+        let receipt = workspace
+            .service
+            .register_trusted_generated_visual(
+                AuthorizeVisualSelectionRequest {
+                    project_id: project_id.clone(),
+                    expected_revision: 1,
+                    expected_version_id: version_id.clone(),
+                },
+                TrustedGeneratedVisual {
+                    thread_id: "thread-path-attack".to_string(),
+                    turn_id: "turn-path-attack".to_string(),
+                    generation_id: "image-path-attack".to_string(),
+                    source_path: source.clone(),
+                    producer_version: Some("test-broker-1".to_string()),
+                    revised_prompt: None,
+                },
+            )
+            .expect("register generated path");
+        let stored = workspace
+            .service
+            .store
+            .get_video_visual_source_receipt(&receipt.id)
+            .expect("read generated receipt")
+            .expect("stored generated receipt");
+        let registered_path = PathBuf::from(
+            stored["source_path"]
+                .as_str()
+                .expect("registered source path"),
+        );
+        let moved_path = registered_path.with_extension("moved.png");
+        fs::rename(&registered_path, &moved_path).expect("move registered bytes");
+        fs::copy(&moved_path, &registered_path).expect("replace with byte-identical new inode");
+        let replay_error = workspace
+            .service
+            .register_trusted_generated_visual(
+                AuthorizeVisualSelectionRequest {
+                    project_id: project_id.clone(),
+                    expected_revision: 1,
+                    expected_version_id: version_id.clone(),
+                },
+                TrustedGeneratedVisual {
+                    thread_id: "thread-path-attack".to_string(),
+                    turn_id: "turn-path-attack".to_string(),
+                    generation_id: "image-path-attack".to_string(),
+                    source_path: source,
+                    producer_version: Some("test-broker-1".to_string()),
+                    revised_prompt: None,
+                },
+            )
+            .expect_err("registration replay must retain exact managed file identity");
+        assert_eq!(replay_error.code, "video.generation_identity_conflict");
+        fs::remove_file(&registered_path).expect("remove byte-identical replacement");
+        std::os::unix::fs::symlink(&moved_path, &registered_path)
+            .expect("replace registered path with symlink");
+
+        let error = workspace
+            .service
+            .add_visual_asset(AddVisualAssetRequest {
+                project_id,
+                expected_revision: 1,
+                expected_version_id: version_id,
+                operation_id: "generated-path-symlink".to_string(),
+                actor: "codex-video-agent".to_string(),
+                origin: VisualAssetOrigin::GeneratedLocally {
+                    receipt_id: receipt.id,
+                },
+                scene_id: None,
+                range: TimeRange::new(0, 1_000_000).expect("visual range"),
+                fit: VisualFit::Cover,
+                crop: None,
+                z_index: 1,
+                motion: test_visual_motion(),
+                transition_in_us: Microseconds(0),
+                transition_out_us: Microseconds(0),
+            })
+            .expect_err("registered generated symlink must fail closed");
+        assert_eq!(error.code, "video.unsafe_artifact_path");
     }
 
     #[test]
@@ -11317,6 +11963,398 @@ impl VideoStudioService {
         })
     }
 
+    /// Records one exact local image selected by the trusted native backend picker. The returned
+    /// opaque receipt is short-lived and may be claimed by only one durable add-visual job.
+    pub(crate) fn authorize_user_visual_selection(
+        &self,
+        request: AuthorizeVisualSelectionRequest,
+        source_path: PathBuf,
+    ) -> ServiceResult<VisualSourceReceipt> {
+        let current = self.get_project(&request.project_id)?;
+        ensure_project_matches(
+            &current,
+            &ProjectExpectation {
+                revision: request.expected_revision,
+                version_id: request.expected_version_id.clone(),
+            },
+        )?;
+        let (identity, inspection, sha256) = inspect_exact_visual_source(&source_path)?;
+        let issued_at = Utc::now();
+        let receipt = json!({
+            "id": format!("visual-selection-{}", new_id()),
+            "receipt_kind": "user_selected",
+            "project_id": request.project_id,
+            "expected_revision": request.expected_revision,
+            "expected_version_id": request.expected_version_id,
+            "source_path": source_path.to_str().ok_or_else(|| VideoServiceError::new(
+                "video.invalid_visual_source",
+                "Selected visual paths must be valid UTF-8",
+            ))?,
+            "source_device": identity.device.to_string(),
+            "source_inode": identity.inode.to_string(),
+            "size_bytes": identity.size,
+            "modified_seconds": identity.modified_seconds,
+            "modified_nanoseconds": identity.modified_nanoseconds,
+            "sha256": sha256,
+            "mime_type": inspection.mime_type.as_mime(),
+            "width": inspection.width,
+            "height": inspection.height,
+            "has_alpha": inspection.has_alpha,
+            "producer": "soundAr native file picker",
+            "producer_version": env!("CARGO_PKG_VERSION"),
+            "generation_id": Value::Null,
+            "trust_context": {
+                "boundary": "native_file_picker",
+                "single_file": true,
+            },
+            "issued_at": issued_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "expires_at": (issued_at + ChronoDuration::minutes(VISUAL_SOURCE_RECEIPT_TTL_MINUTES))
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+        });
+        let saved = self
+            .store
+            .create_video_visual_source_receipt(&receipt)
+            .map_err(VideoServiceError::store)?;
+        visual_source_receipt(&saved)
+    }
+
+    /// Registers an image-generation result whose path and identity came from the authenticated
+    /// Codex app-server, not from model tool arguments. Registration copies the exact bytes into
+    /// private managed storage before minting the one-use receipt consumed by add_visual_asset.
+    pub(crate) fn register_trusted_generated_visual(
+        &self,
+        request: AuthorizeVisualSelectionRequest,
+        generation: TrustedGeneratedVisual,
+    ) -> ServiceResult<VisualSourceReceipt> {
+        let current = self.get_project(&request.project_id)?;
+        ensure_project_matches(
+            &current,
+            &ProjectExpectation {
+                revision: request.expected_revision,
+                version_id: request.expected_version_id.clone(),
+            },
+        )?;
+        let thread_id = require_text(
+            &generation.thread_id,
+            "video.invalid_generation_receipt",
+            "The authenticated generation thread is required",
+        )?;
+        let turn_id = require_text(
+            &generation.turn_id,
+            "video.invalid_generation_receipt",
+            "The authenticated generation turn is required",
+        )?;
+        let generation_id = require_text(
+            &generation.generation_id,
+            "video.invalid_generation_receipt",
+            "The authenticated generation item is required",
+        )?;
+        let producer = "OpenAI Codex image generation";
+        let receipt_id = format!(
+            "visual-generation-{}",
+            sha256_bytes(
+                json!([request.project_id, thread_id, turn_id, generation_id])
+                    .to_string()
+                    .as_bytes(),
+            )
+        );
+        if let Some(existing) = self
+            .store
+            .get_video_visual_source_receipt(&receipt_id)
+            .map_err(VideoServiceError::store)?
+        {
+            let exact = existing.get("receipt_kind").and_then(Value::as_str)
+                == Some("generated_locally")
+                && existing.get("project_id").and_then(Value::as_str)
+                    == Some(request.project_id.as_str())
+                && existing.get("expected_revision").and_then(Value::as_i64)
+                    == Some(request.expected_revision)
+                && existing.get("expected_version_id").and_then(Value::as_str)
+                    == Some(request.expected_version_id.as_str())
+                && existing.get("generation_id").and_then(Value::as_str) == Some(generation_id)
+                && existing
+                    .pointer("/trust_context/thread_id")
+                    .and_then(Value::as_str)
+                    == Some(thread_id)
+                && existing
+                    .pointer("/trust_context/turn_id")
+                    .and_then(Value::as_str)
+                    == Some(turn_id);
+            if !exact {
+                return Err(VideoServiceError::new(
+                    "video.generation_identity_conflict",
+                    "The authenticated generation identity is already bound differently",
+                ));
+            }
+            let path = PathBuf::from(value_string(&existing, "source_path")?);
+            secure_managed_file(&path)?;
+            let expected_identity = LocalSourceIdentity {
+                device: value_string(&existing, "source_device")?
+                    .parse()
+                    .map_err(|_| invalid_store_shape("source_device"))?,
+                inode: value_string(&existing, "source_inode")?
+                    .parse()
+                    .map_err(|_| invalid_store_shape("source_inode"))?,
+                size: u64::try_from(value_i64(&existing, "size_bytes")?)
+                    .map_err(|_| invalid_store_shape("size_bytes"))?,
+                modified_seconds: value_i64(&existing, "modified_seconds")?,
+                modified_nanoseconds: value_i64(&existing, "modified_nanoseconds")?,
+            };
+            let (actual_identity, inspection, actual_sha256) = inspect_exact_visual_source(&path)?;
+            if actual_identity != expected_identity
+                || actual_sha256 != value_string(&existing, "sha256")?
+                || inspection.mime_type.as_mime() != value_string(&existing, "mime_type")?.as_str()
+                || inspection.width
+                    != u32::try_from(value_i64(&existing, "width")?)
+                        .map_err(|_| invalid_store_shape("width"))?
+                || inspection.height
+                    != u32::try_from(value_i64(&existing, "height")?)
+                        .map_err(|_| invalid_store_shape("height"))?
+                || existing.get("has_alpha").and_then(Value::as_bool) != Some(inspection.has_alpha)
+            {
+                return Err(VideoServiceError::new(
+                    "video.generation_identity_conflict",
+                    "The registered generation bytes no longer match their receipt",
+                ));
+            }
+            return visual_source_receipt(&existing);
+        }
+
+        let (source_identity, inspection, source_sha256) =
+            inspect_exact_visual_source(&generation.source_path)?;
+        let extension = visual_extension(inspection.mime_type);
+        let generated_dir = self.video_root.join("registered-generations");
+        self.secure_managed_directory(&generated_dir)?;
+        let final_path = generated_dir.join(format!("{receipt_id}.{extension}"));
+        let staging_path =
+            generated_dir.join(format!(".{receipt_id}.{}.partial", Uuid::new_v4().simple()));
+        let staged_sha = copy_file_cancelable(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&generation.source_path)
+                .map_err(|error| {
+                    VideoServiceError::io(
+                        "video.visual_not_found",
+                        "The authenticated generation output could not be reopened",
+                        error,
+                    )
+                })?,
+            source_identity,
+            &staging_path,
+            &AtomicBool::new(false),
+            |_| {},
+        )?;
+        if staged_sha != source_sha256 || inspect_image_file(&staging_path)? != inspection {
+            let _ = fs::remove_file(&staging_path);
+            return Err(VideoServiceError::new(
+                "video.visual_changed",
+                "The authenticated generation output changed during registration",
+            ));
+        }
+        match fs::hard_link(&staging_path, &final_path) {
+            Ok(()) => {
+                fs::remove_file(&staging_path).map_err(|error| {
+                    VideoServiceError::io(
+                        "video.import_cleanup_failed",
+                        "The generation staging link could not be finalized",
+                        error,
+                    )
+                })?;
+                secure_managed_file(&final_path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&staging_path);
+                secure_managed_file(&final_path)?;
+                if sha256_file_with_cancel(&final_path, None)? != source_sha256
+                    || inspect_image_file(&final_path)? != inspection
+                {
+                    return Err(VideoServiceError::new(
+                        "video.generation_identity_conflict",
+                        "The generation identity already owns different managed bytes",
+                    ));
+                }
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&staging_path);
+                return Err(VideoServiceError::io(
+                    "video.publication_commit_failed",
+                    "The generation output could not be registered atomically",
+                    error,
+                ));
+            }
+        }
+        let (managed_identity, managed_inspection, managed_sha256) =
+            inspect_exact_visual_source(&final_path)?;
+        if managed_sha256 != source_sha256 || managed_inspection != inspection {
+            return Err(VideoServiceError::new(
+                "video.generation_identity_conflict",
+                "The registered generation bytes failed final verification",
+            ));
+        }
+        let issued_at = Utc::now();
+        let revised_prompt_sha256 = generation
+            .revised_prompt
+            .as_deref()
+            .map(|prompt| sha256_bytes(prompt.as_bytes()));
+        let receipt = json!({
+            "id": receipt_id,
+            "receipt_kind": "generated_locally",
+            "project_id": request.project_id,
+            "expected_revision": request.expected_revision,
+            "expected_version_id": request.expected_version_id,
+            "source_path": final_path,
+            "source_device": managed_identity.device.to_string(),
+            "source_inode": managed_identity.inode.to_string(),
+            "size_bytes": managed_identity.size,
+            "modified_seconds": managed_identity.modified_seconds,
+            "modified_nanoseconds": managed_identity.modified_nanoseconds,
+            "sha256": managed_sha256,
+            "mime_type": managed_inspection.mime_type.as_mime(),
+            "width": managed_inspection.width,
+            "height": managed_inspection.height,
+            "has_alpha": managed_inspection.has_alpha,
+            "producer": producer,
+            "producer_version": generation.producer_version,
+            "generation_id": generation_id,
+            "trust_context": {
+                "boundary": "codex_app_server",
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "item_id": generation_id,
+                "revised_prompt_sha256": revised_prompt_sha256,
+            },
+            "issued_at": issued_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            "expires_at": (issued_at + ChronoDuration::minutes(VISUAL_SOURCE_RECEIPT_TTL_MINUTES))
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+        });
+        let saved = self
+            .store
+            .create_video_visual_source_receipt(&receipt)
+            .map_err(VideoServiceError::store)?;
+        visual_source_receipt(&saved)
+    }
+
+    fn claim_visual_source(
+        &self,
+        request: &AddVisualAssetRequest,
+        job_id: &str,
+    ) -> ServiceResult<ResolvedVisualSource> {
+        let receipt_id = require_text(
+            request.origin.receipt_id(),
+            "video.approval_required",
+            "A trusted visual source receipt is required",
+        )?;
+        if receipt_id.chars().count() > 160 {
+            return Err(VideoServiceError::new(
+                "video.approval_required",
+                "The visual source receipt is invalid",
+            ));
+        }
+        let receipt = self
+            .store
+            .claim_video_visual_source_receipt(
+                receipt_id,
+                request.origin.receipt_kind(),
+                &request.project_id,
+                request.expected_revision,
+                &request.expected_version_id,
+                job_id,
+            )
+            .map_err(VideoServiceError::store)?;
+        let raw_path = PathBuf::from(value_string(&receipt, "source_path")?);
+        let path = if matches!(request.origin, VisualAssetOrigin::GeneratedLocally { .. }) {
+            secure_managed_file(&raw_path)?;
+            self.resolve_absolute_managed_path(&raw_path)?
+        } else {
+            raw_path
+        };
+        let expected_identity = LocalSourceIdentity {
+            device: value_string(&receipt, "source_device")?
+                .parse()
+                .map_err(|_| invalid_store_shape("source_device"))?,
+            inode: value_string(&receipt, "source_inode")?
+                .parse()
+                .map_err(|_| invalid_store_shape("source_inode"))?,
+            size: u64::try_from(value_i64(&receipt, "size_bytes")?)
+                .map_err(|_| invalid_store_shape("size_bytes"))?,
+            modified_seconds: value_i64(&receipt, "modified_seconds")?,
+            modified_nanoseconds: value_i64(&receipt, "modified_nanoseconds")?,
+        };
+        let expected_mime = match value_string(&receipt, "mime_type")?.as_str() {
+            "image/png" => VisualMimeType::Png,
+            "image/jpeg" => VisualMimeType::Jpeg,
+            "image/webp" => VisualMimeType::Webp,
+            _ => return Err(invalid_store_shape("mime_type")),
+        };
+        let expected_inspection = ImageInspection {
+            mime_type: expected_mime,
+            width: u32::try_from(value_i64(&receipt, "width")?)
+                .map_err(|_| invalid_store_shape("width"))?,
+            height: u32::try_from(value_i64(&receipt, "height")?)
+                .map_err(|_| invalid_store_shape("height"))?,
+            has_alpha: receipt
+                .get("has_alpha")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid_store_shape("has_alpha"))?,
+            size_bytes: expected_identity.size,
+        };
+        let expected_sha256 = value_string(&receipt, "sha256")?;
+        let (actual_identity, actual_inspection, actual_sha256) =
+            inspect_exact_visual_source(&path)?;
+        if actual_identity != expected_identity
+            || actual_inspection != expected_inspection
+            || actual_sha256 != expected_sha256
+        {
+            return Err(VideoServiceError::new(
+                "video.visual_receipt_mismatch",
+                "The authorized visual source no longer matches its exact-file receipt",
+            ));
+        }
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "authorization_receipt_id".to_string(),
+            Value::String(receipt_id.to_string()),
+        );
+        metadata.insert(
+            "source_sha256".to_string(),
+            Value::String(expected_sha256.clone()),
+        );
+        if let Some(generation_id) = receipt.get("generation_id").and_then(Value::as_str) {
+            metadata.insert(
+                "generation_id".to_string(),
+                Value::String(generation_id.to_string()),
+            );
+        }
+        if let Some(trust_context) = receipt
+            .get("trust_context")
+            .filter(|value| value.is_object())
+        {
+            metadata.insert("trust_context".to_string(), trust_context.clone());
+        }
+        let provenance = Provenance {
+            kind: match request.origin {
+                VisualAssetOrigin::UserSelected { .. } => ProvenanceKind::UserUpload,
+                VisualAssetOrigin::GeneratedLocally { .. } => ProvenanceKind::GeneratedLocally,
+            },
+            original_uri: None,
+            imported_at: utc_now(),
+            producer: value_string(&receipt, "producer")?,
+            producer_version: receipt
+                .get("producer_version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            metadata,
+        };
+        Ok(ResolvedVisualSource {
+            path,
+            expected_identity,
+            expected_sha256,
+            inspection: expected_inspection,
+            provenance,
+        })
+    }
+
     /// Imports one user-selected or locally generated still and places it on the canonical
     /// project clock. The durable operation owns deterministic asset/layer identities, a private
     /// no-clobber managed copy, project-version CAS, and terminal completion.
@@ -11342,15 +12380,10 @@ impl VideoStudioService {
         }
         request.range.validate()?;
         request.motion.validate()?;
-        if matches!(
-            request.origin,
-            VisualAssetOrigin::UserSelected {
-                user_confirmed: false
-            }
-        ) {
+        if request.origin.receipt_id().trim().is_empty() {
             return Err(VideoServiceError::new(
                 "video.approval_required",
-                "Importing a user-selected image requires explicit confirmation",
+                "Importing a visual requires a trusted exact-file receipt",
             ));
         }
         let request_value = serde_json::to_value(&request).map_err(json_error)?;
@@ -11494,45 +12527,20 @@ impl VideoStudioService {
             version_id: request.expected_version_id.clone(),
         };
         ensure_project_matches(&current, &expectation)?;
-
-        let mut source = OpenOptions::new()
+        let resolved_source = self.claim_visual_source(request, job_id)?;
+        let source = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&request.source_path)
+            .open(&resolved_source.path)
             .map_err(|error| {
                 VideoServiceError::io(
                     "video.visual_not_found",
-                    "The selected visual could not be opened safely",
+                    "The authorized visual could not be opened safely",
                     error,
                 )
             })?;
-        let metadata = source.metadata().map_err(|error| {
-            VideoServiceError::io(
-                "video.visual_not_found",
-                "The selected visual could not be inspected",
-                error,
-            )
-        })?;
-        if !metadata.is_file() || metadata.len() < 16 || metadata.len() > MAX_VISUAL_ASSET_BYTES {
-            return Err(VideoServiceError::new(
-                "video.invalid_visual",
-                "The selected visual is not a supported bounded regular file",
-            ));
-        }
-        let source_identity = LocalSourceIdentity::from_metadata(&metadata);
-        let inspection = inspect_image_reader(&mut source, metadata.len())?;
-        source.seek(SeekFrom::Start(0)).map_err(|error| {
-            VideoServiceError::io(
-                "video.visual_read_failed",
-                "The selected visual could not be prepared",
-                error,
-            )
-        })?;
-        let extension = match inspection.mime_type {
-            VisualMimeType::Png => "png",
-            VisualMimeType::Jpeg => "jpg",
-            VisualMimeType::Webp => "webp",
-        };
+        let inspection = resolved_source.inspection;
+        let extension = visual_extension(inspection.mime_type);
         let visual_dir = self.project_dir(&request.project_id)?.join("visuals");
         self.secure_managed_directory(&visual_dir)?;
         let final_path = visual_dir.join(format!("{asset_id}.{extension}"));
@@ -11546,17 +12554,17 @@ impl VideoStudioService {
         )?;
         let staged_sha = copy_file_cancelable(
             source,
-            source_identity,
+            resolved_source.expected_identity,
             &staging_path,
             cancel.as_ref(),
             |_| {},
         )?;
         let staged_inspection = inspect_image_file(&staging_path)?;
-        if staged_inspection != inspection {
+        if staged_sha != resolved_source.expected_sha256 || staged_inspection != inspection {
             let _ = fs::remove_file(&staging_path);
             return Err(VideoServiceError::new(
                 "video.visual_changed",
-                "The selected visual changed while it was copied",
+                "The authorized visual changed while it was copied",
             ));
         }
         let newly_published = match fs::hard_link(&staging_path, &final_path) {
@@ -11572,8 +12580,10 @@ impl VideoStudioService {
                 true
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let existing_sha = sha256_file_with_cancel(&final_path, Some(cancel.as_ref()))?;
+                let secure_result = secure_managed_file(&final_path);
                 let _ = fs::remove_file(&staging_path);
+                secure_result?;
+                let existing_sha = sha256_file_with_cancel(&final_path, Some(cancel.as_ref()))?;
                 if existing_sha != staged_sha || inspect_image_file(&final_path)? != inspection {
                     return Err(VideoServiceError::new(
                         "video.import_identity_conflict",
@@ -11601,54 +12611,14 @@ impl VideoStudioService {
             }
             return Err(error);
         }
-        let provenance_kind = match request.origin {
-            VisualAssetOrigin::UserSelected { .. } => ProvenanceKind::UserUpload,
-            VisualAssetOrigin::GeneratedLocally { .. } => ProvenanceKind::GeneratedLocally,
-        };
-        let (producer, producer_version, generation_id) = match &request.origin {
-            VisualAssetOrigin::UserSelected { .. } => {
-                ("soundAr Video Studio".to_string(), None, None)
-            }
-            VisualAssetOrigin::GeneratedLocally {
-                producer,
-                producer_version,
-                generation_id,
-            } => (
-                require_text(
-                    producer,
-                    "video.invalid_visual_provenance",
-                    "Generated visuals require a producer",
-                )?
-                .to_string(),
-                producer_version.clone(),
-                Some(
-                    require_text(
-                        generation_id,
-                        "video.invalid_visual_provenance",
-                        "Generated visuals require a generation identifier",
-                    )?
-                    .to_string(),
-                ),
-            ),
-        };
         let created_at = utc_now();
         let relative_path = self.relative_managed_path(&final_path)?;
-        let mut provenance_metadata = BTreeMap::new();
-        provenance_metadata.insert(
+        let mut provenance = resolved_source.provenance;
+        provenance.imported_at = created_at.clone();
+        provenance.metadata.insert(
             "operation_id".to_string(),
             Value::String(request.operation_id.clone()),
         );
-        if let Some(generation_id) = generation_id {
-            provenance_metadata.insert("generation_id".to_string(), Value::String(generation_id));
-        }
-        let provenance = Provenance {
-            kind: provenance_kind,
-            original_uri: None,
-            imported_at: created_at.clone(),
-            producer,
-            producer_version,
-            metadata: provenance_metadata,
-        };
         let visual_asset = VisualAsset {
             id: asset_id.clone(),
             managed_path: relative_path,
