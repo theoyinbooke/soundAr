@@ -24,6 +24,8 @@ soundAr is an open-source desktop application for high-quality, private media pr
 - Generate speech from plain text, SSML, or batch inputs with local voice models.
 - Import one explicitly authorized link or local video, transcribe it on the source clock, review candidate moments, and export a portrait reel.
 - Start a video from a prompt, existing soundAr audio, or a project and build an animated podcast with captions, cards, waveform motion, speech, and music.
+- Compose still images and locally generated illustrations as timed visual layers with crop, fit, fades, and keyframed pan-and-zoom motion—without a conventional video-generation model.
+- Split, trim, reorder, and merge scenes on the durable source-clock timeline; drag and resize captions directly on the portrait canvas and choose from eight rendered caption treatments.
 - Revise a scene, voice, caption style, crop, mix, or opening conversationally and rerender only invalidated work.
 - Build longer work in chapter-based Projects and render chapters independently.
 - Create songs or instrumentals with ACE-Step 1.5 Studio, including structured sections and editable lyric timing.
@@ -69,16 +71,19 @@ Video Studio is one focused production workspace with three clear starts: **Impo
 
 Every project is backed by a versioned, microsecond timeline manifest. It records source assets, source-clock transcript and gaps, reviewed clips, scenes, captions, crop/layout, audio mix, generated artifacts, previews, masters, provenance, rights receipts, and revision history. Project locks, compare-and-swap revisions, durable job IDs, atomic publication, and content-addressed caches keep an interrupted or revised production recoverable.
 
+The editor keeps the portrait canvas prominent while scenes, inspector, and the collapsible multi-lane timeline remain compact. Scene cards show only their useful title; the timeline exposes video, visuals, captions, voice, and music without repeating metadata. Caption placement, visual motion, and clip edits commit through the same revision-checked application services used by rendering rather than living as UI-only state.
+
 The Linux pipeline includes:
 
 - FFprobe validation, low-resolution proxies, thumbnails, waveforms, portrait crop/layout, captions, cards, mixing, scene assembly, and local MP4 export through FFmpeg;
 - faster-whisper CUDA transcription with word timing and preserved presentation gaps;
 - reviewed candidate and scene planning through the existing authenticated Codex app-server integration;
+- registered PNG, JPEG, and WebP visual assets, image-sequence composition, and scene-bound illustration motion using the same FFmpeg render graph;
 - preview-first rendering and segment-level cache reuse, with H.264 NVENC when its runtime smoke passes and a visible software fallback otherwise;
 - playable masters and downloads in Video Studio, Projects, History, and the Assistant—never only an opaque filesystem path;
 - durable cancellation, resume, publish packages with checksums, and bounded CPU, IO, disk, VRAM, and encoder admission.
 
-The Assistant uses the same native services and contracts as the UI for preview, import, analysis, planning, revision, rendering, and export. It presents Source → Analyze → Plan and revise → Preview → Export as useful production phases, while the assembled master stays more prominent than chapter or scene artifacts.
+The Assistant uses the same native services and contracts as the UI for preview, import, analysis, planning, visual-asset registration, timeline editing, revision, rendering, and export. It presents Source → Analyze → Plan and revise → Preview → Export as useful production phases, while the assembled master stays more prominent than chapter or scene artifacts. The same strict tools are available without opening the desktop window through `soundar-desktop agent tools` and `soundar-desktop agent video <tool>`, so a Codex CLI production can create or reopen a durable project instead of falling back to shell-only media files.
 
 Video Studio needs FFmpeg/FFprobe for local media. Link import additionally needs yt-dlp with EJS and a supported JavaScript runtime; internal transcription needs a local faster-whisper or whisper.cpp model. The readiness screen discovers system, user, package-manager, managed, and explicitly configured locations without installing anything silently. See [Linux Video Studio setup](docs/video-studio-linux-setup.md) and the [exact-machine performance baseline](docs/video-studio-performance.md).
 
