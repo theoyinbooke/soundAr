@@ -373,6 +373,21 @@ pub fn plan_reviewed_timeline(
         };
     }
 
+    // Track existence is a property of the complete plan, not whichever source
+    // happens to precede an inter-scene boundary. Once a track exists, every
+    // scene and transition must contribute either a clip or an explicit gap so
+    // preserve_gaps remains a truthful full-timeline contract for mixed media.
+    let includes_video_track = selected.iter().any(|candidate| {
+        source_by_id
+            .get(candidate.source_asset_id.as_str())
+            .is_some_and(|source| source.probe.has_video)
+    });
+    let includes_audio_track = selected.iter().any(|candidate| {
+        source_by_id
+            .get(candidate.source_asset_id.as_str())
+            .is_some_and(|source| source.probe.has_audio)
+    });
+
     let mut scenes = Vec::with_capacity(selected.len());
     let mut video_clips = Vec::new();
     let mut audio_clips = Vec::new();
@@ -394,7 +409,8 @@ pub fn plan_reviewed_timeline(
         let source_end = quantized.end_us.min(source.probe.duration_us);
         let source_range = TimeRange::new(source_start.0, source_end.0)?;
         let duration = source_range.duration()?;
-        let scene_id = format!("scene-{:03}-{}", index + 1, &candidate.id[10..18]);
+        let candidate_suffix = format!("{:x}", Sha256::digest(candidate.id.as_bytes()));
+        let scene_id = format!("scene-{:03}-{}", index + 1, &candidate_suffix[..8]);
         scenes.push(ReviewedScene {
             id: scene_id.clone(),
             candidate_id: Some(candidate.id.clone()),
@@ -429,11 +445,30 @@ pub fn plan_reviewed_timeline(
             muted: false,
             crop: None,
         };
+        let scene_end = cursor.checked_add(duration)?;
         if source.probe.has_video {
             video_clips.push(make_clip("video"));
+        } else if includes_video_track {
+            gaps.push(TimelineGap {
+                id: format!("gap-video-scene-{:03}", index + 1),
+                track_id: "video-main".into(),
+                range: TimeRange::new(cursor.0, scene_end.0)?,
+                reason: GapReason::Padding,
+                source_asset_id: None,
+                source_range: None,
+            });
         }
         if source.probe.has_audio {
             audio_clips.push(make_clip("audio"));
+        } else if includes_audio_track {
+            gaps.push(TimelineGap {
+                id: format!("gap-audio-scene-{:03}", index + 1),
+                track_id: "audio-main".into(),
+                range: TimeRange::new(cursor.0, scene_end.0)?,
+                reason: GapReason::Padding,
+                source_asset_id: None,
+                source_range: None,
+            });
         }
 
         for segment_id in &candidate.transcript_segment_ids {
@@ -460,12 +495,12 @@ pub fn plan_reviewed_timeline(
             });
         }
 
-        cursor = cursor.checked_add(duration)?;
+        cursor = scene_end;
         if index + 1 < selected.len() && request.inter_scene_gap_us.0 > 0 {
             let gap_end = cursor.checked_add(request.inter_scene_gap_us)?;
-            if source.probe.has_video {
+            if includes_video_track {
                 gaps.push(TimelineGap {
-                    id: format!("gap-video-{:03}", index + 1),
+                    id: format!("gap-video-transition-{:03}", index + 1),
                     track_id: "video-main".into(),
                     range: TimeRange::new(cursor.0, gap_end.0)?,
                     reason: GapReason::Transition,
@@ -473,9 +508,9 @@ pub fn plan_reviewed_timeline(
                     source_range: None,
                 });
             }
-            if source.probe.has_audio {
+            if includes_audio_track {
                 gaps.push(TimelineGap {
-                    id: format!("gap-audio-{:03}", index + 1),
+                    id: format!("gap-audio-transition-{:03}", index + 1),
                     track_id: "audio-main".into(),
                     range: TimeRange::new(cursor.0, gap_end.0)?,
                     reason: GapReason::Editorial,
@@ -897,6 +932,103 @@ mod tests {
             plan.tracks[0].clips[0].source_range.duration().unwrap().0,
             7_000_000
         );
+        let mut applied = manifest;
+        apply_scene_plan(&mut applied, plan).unwrap();
+        applied.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn mixed_stream_sources_form_complete_partitions_on_every_track() {
+        let transcript = transcript_from_runtime_json(&evidence(), &transcript_request()).unwrap();
+        let mut manifest = manifest_with_transcript(transcript);
+        manifest.source_assets[0].probe.has_audio = false;
+        manifest.source_assets.push(SourceAsset {
+            id: "source-audio".into(),
+            kind: SourceAssetKind::LocalVideo,
+            managed_path: "projects/project-1/audio.wav".into(),
+            sha256: "b".repeat(64),
+            probe: MediaProbe {
+                duration_us: Microseconds(12_000_000),
+                width: None,
+                height: None,
+                frame_rate: None,
+                has_video: false,
+                has_audio: true,
+                format_name: "wav".into(),
+            },
+            provenance: Provenance {
+                kind: ProvenanceKind::UserUpload,
+                original_uri: None,
+                imported_at: timestamp(),
+                producer: "soundAr Video Studio".into(),
+                producer_version: Some("1".into()),
+                metadata: BTreeMap::new(),
+            },
+            rights_confirmation_id: None,
+        });
+        manifest.candidates = vec![
+            ClipCandidate {
+                id: "video".into(),
+                source_asset_id: "source-1".into(),
+                source_range: TimeRange::new(1_000_000, 4_000_000).unwrap(),
+                title: "Video scene".into(),
+                rationale: "Exercises a video-only timeline scene.".into(),
+                transcript_segment_ids: vec!["segment-000000".into()],
+                score_milli: 900,
+                status: CandidateStatus::Proposed,
+            },
+            ClipCandidate {
+                id: "audio".into(),
+                source_asset_id: "source-audio".into(),
+                source_range: TimeRange::new(5_000_000, 8_000_000).unwrap(),
+                title: "Audio scene".into(),
+                rationale: "Exercises an audio-only timeline scene.".into(),
+                transcript_segment_ids: vec![],
+                score_milli: 850,
+                status: CandidateStatus::Proposed,
+            },
+        ];
+        manifest.validate_strict().unwrap();
+
+        let plan = plan_reviewed_timeline(
+            &manifest,
+            &ScenePlanRequest {
+                selected_candidate_ids: vec!["video".into(), "audio".into()],
+                caption_style_id: "caption-calm".into(),
+                inter_scene_gap_us: Microseconds(250_000),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.tracks.len(), 2);
+        let video = plan
+            .tracks
+            .iter()
+            .find(|track| matches!(track.kind, TrackKind::Video))
+            .unwrap();
+        let audio = plan
+            .tracks
+            .iter()
+            .find(|track| matches!(track.kind, TrackKind::Audio))
+            .unwrap();
+        assert_eq!(video.clips.len(), 1);
+        assert_eq!(audio.clips.len(), 1);
+        assert_eq!(plan.gaps.len(), 4);
+        assert_eq!(
+            plan.gaps
+                .iter()
+                .filter(|gap| gap.track_id == video.id)
+                .count(),
+            2
+        );
+        assert_eq!(
+            plan.gaps
+                .iter()
+                .filter(|gap| gap.track_id == audio.id)
+                .count(),
+            2
+        );
+
         let mut applied = manifest;
         apply_scene_plan(&mut applied, plan).unwrap();
         applied.validate_strict().unwrap();

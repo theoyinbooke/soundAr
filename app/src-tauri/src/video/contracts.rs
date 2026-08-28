@@ -190,7 +190,21 @@ impl TimeRange {
             })
     }
 
+    /// Returns whether a media sample belongs to this half-open range.
+    ///
+    /// Timeline samples use `[start_us, end_us)`, so two adjacent ranges never
+    /// claim the same sample. Use [`Self::contains_endpoint`] only when mapping
+    /// an edit boundary rather than locating media at an instant.
     pub fn contains(self, instant: Microseconds) -> bool {
+        instant >= self.start_us && instant < self.end_us
+    }
+
+    /// Returns whether an edit boundary lies on or within this range.
+    ///
+    /// Endpoints are closed for exact range conversion: the exclusive end of a
+    /// clip may be converted to the corresponding exclusive end in another
+    /// clock without making that endpoint a sample owned by the clip.
+    pub fn contains_endpoint(self, instant: Microseconds) -> bool {
         instant >= self.start_us && instant <= self.end_us
     }
 }
@@ -1288,10 +1302,10 @@ impl Validate for VideoProjectManifest {
             .iter()
             .map(|rights| (rights.id.as_str(), rights))
             .collect();
-        let artifact_ids: BTreeSet<&str> = self
+        let artifact_by_id: BTreeMap<&str, &RenderArtifact> = self
             .render_artifacts
             .iter()
-            .map(|artifact| artifact.id.as_str())
+            .map(|artifact| (artifact.id.as_str(), artifact))
             .collect();
         let candidate_ids: BTreeSet<&str> = self
             .candidates
@@ -1303,7 +1317,12 @@ impl Validate for VideoProjectManifest {
             .iter()
             .map(|scene| (scene.id.as_str(), scene))
             .collect();
-        let track_ids: BTreeSet<&str> = self.tracks.iter().map(|track| track.id.as_str()).collect();
+        let track_by_id: BTreeMap<&str, &TimelineTrack> = self
+            .tracks
+            .iter()
+            .map(|track| (track.id.as_str(), track))
+            .collect();
+        let track_ids: BTreeSet<&str> = track_by_id.keys().copied().collect();
 
         for rights in &self.rights_confirmations {
             rights.validate()?;
@@ -1477,8 +1496,38 @@ impl Validate for VideoProjectManifest {
                             VideoErrorCode::InvalidTrack,
                             "tracks.clips.source_range",
                         )?;
+                        validate_source_stream_for_track(track, source)?;
                     }
-                    (None, Some(artifact_id)) if artifact_ids.contains(artifact_id.as_str()) => {}
+                    (None, Some(artifact_id)) => {
+                        let artifact =
+                            artifact_by_id.get(artifact_id.as_str()).ok_or_else(|| {
+                                VideoError::new(
+                                    VideoErrorCode::MissingReference,
+                                    "timeline clip references a missing render artifact",
+                                )
+                            })?;
+                        let duration = artifact.duration_us.ok_or_else(|| {
+                            VideoError::new(
+                                VideoErrorCode::InvalidArtifact,
+                                "timeline media artifacts must declare their source-clock duration",
+                            )
+                            .at("render_artifacts.duration_us")
+                        })?;
+                        if !matches!(artifact.publication_state, PublicationState::Published) {
+                            return Err(VideoError::new(
+                                VideoErrorCode::InvalidArtifact,
+                                "timeline clips may reference only atomically published artifacts",
+                            )
+                            .at("render_artifacts.publication_state"));
+                        }
+                        validate_range_within(
+                            clip.source_range,
+                            duration,
+                            VideoErrorCode::InvalidTrack,
+                            "tracks.clips.source_range",
+                        )?;
+                        validate_artifact_stream_for_track(track, artifact)?;
+                    }
                     _ => {
                         return Err(VideoError::new(
                             VideoErrorCode::MissingReference,
@@ -1580,21 +1629,95 @@ impl Validate for VideoProjectManifest {
         }
         self.audio_mix.validate()?;
         for mix_track in &self.audio_mix.tracks {
-            if !track_ids.contains(mix_track.track_id.as_str())
-                || mix_track
-                    .ducking
-                    .as_ref()
-                    .is_some_and(|ducking| !track_ids.contains(ducking.sidechain_track_id.as_str()))
-            {
+            let track = track_by_id
+                .get(mix_track.track_id.as_str())
+                .ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::MissingReference,
+                        "audio mix references a missing timeline track",
+                    )
+                })?;
+            if !matches!(track.kind, TrackKind::Audio) {
                 return Err(VideoError::new(
-                    VideoErrorCode::MissingReference,
-                    "audio mix references a missing timeline track",
-                ));
+                    VideoErrorCode::InvalidAudioMix,
+                    "audio mix entries may reference only audio tracks",
+                )
+                .at("audio_mix.tracks.track_id"));
+            }
+            if let Some(ducking) = &mix_track.ducking {
+                let sidechain = track_by_id
+                    .get(ducking.sidechain_track_id.as_str())
+                    .ok_or_else(|| {
+                        VideoError::new(
+                            VideoErrorCode::MissingReference,
+                            "audio ducking references a missing sidechain track",
+                        )
+                    })?;
+                if !matches!(sidechain.kind, TrackKind::Audio) || sidechain.id == mix_track.track_id
+                {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidAudioMix,
+                        "audio ducking requires a different audio sidechain track",
+                    )
+                    .at("audio_mix.tracks.ducking.sidechain_track_id"));
+                }
             }
         }
 
         validate_revision_chain(&self.revision_history, self.revision)?;
         Ok(())
+    }
+}
+
+fn validate_source_stream_for_track(
+    track: &TimelineTrack,
+    source: &SourceAsset,
+) -> VideoResult<()> {
+    let valid = match track.kind {
+        TrackKind::Video | TrackKind::Overlay => source.probe.has_video,
+        TrackKind::Audio => source.probe.has_audio,
+        TrackKind::Caption => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(VideoError::new(
+            VideoErrorCode::InvalidTrack,
+            "timeline track kind is incompatible with the referenced source streams",
+        )
+        .at("tracks.clips.media.source_asset_id"))
+    }
+}
+
+fn validate_artifact_stream_for_track(
+    track: &TimelineTrack,
+    artifact: &RenderArtifact,
+) -> VideoResult<()> {
+    let mime = artifact.mime_type.to_ascii_lowercase();
+    let valid = match track.kind {
+        TrackKind::Video | TrackKind::Overlay => {
+            mime.starts_with("video/") && artifact.width.is_some() && artifact.height.is_some()
+        }
+        // A rendered video segment may legitimately provide an audio pad. The
+        // manifest lacks per-stream artifact probes, so video and audio MIME
+        // types are the strongest compatible contract available here.
+        TrackKind::Audio => mime.starts_with("audio/") || mime.starts_with("video/"),
+        TrackKind::Caption => {
+            mime.starts_with("text/")
+                || matches!(
+                    mime.as_str(),
+                    "application/x-ass" | "application/x-subrip" | "application/ttml+xml"
+                )
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(VideoError::new(
+            VideoErrorCode::InvalidTrack,
+            "timeline track kind is incompatible with the referenced artifact",
+        )
+        .at("tracks.clips.media.render_artifact_id"))
     }
 }
 
@@ -2064,6 +2187,129 @@ mod tests {
         assert_eq!(
             asset.validate().unwrap_err().code,
             VideoErrorCode::InvalidAsset
+        );
+    }
+
+    #[test]
+    fn media_sample_ranges_are_half_open_but_edit_endpoints_are_explicit() {
+        let range = TimeRange::new(10, 20).unwrap();
+        assert!(range.contains(Microseconds(10)));
+        assert!(range.contains(Microseconds(19)));
+        assert!(!range.contains(Microseconds(20)));
+        assert!(range.contains_endpoint(Microseconds(20)));
+    }
+
+    #[test]
+    fn artifact_backed_clips_must_fit_declared_artifact_duration() {
+        let mut manifest = manifest();
+        manifest.render_artifacts.push(RenderArtifact {
+            id: "artifact-1".into(),
+            role: RenderArtifactRole::SceneSegment,
+            scene_id: None,
+            managed_path: "renders/artifact-1.mp4".into(),
+            sha256: hash('b'),
+            cache_key: hash('c'),
+            mime_type: "video/mp4".into(),
+            duration_us: Some(Microseconds(500_000)),
+            width: Some(1080),
+            height: Some(1920),
+            publication_state: PublicationState::Published,
+            created_at: timestamp(),
+        });
+        manifest.tracks[0].clips[0].media = MediaReference {
+            source_asset_id: None,
+            render_artifact_id: Some("artifact-1".into()),
+        };
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidTrack);
+        assert_eq!(error.field.as_deref(), Some("tracks.clips.source_range"));
+    }
+
+    #[test]
+    fn timeline_artifacts_require_duration_and_a_compatible_stream_kind() {
+        let mut manifest = manifest();
+        manifest.render_artifacts.push(RenderArtifact {
+            id: "artifact-1".into(),
+            role: RenderArtifactRole::SceneSegment,
+            scene_id: None,
+            managed_path: "renders/artifact-1.wav".into(),
+            sha256: hash('b'),
+            cache_key: hash('c'),
+            mime_type: "audio/wav".into(),
+            duration_us: None,
+            width: None,
+            height: None,
+            publication_state: PublicationState::Published,
+            created_at: timestamp(),
+        });
+        manifest.tracks[0].clips[0].media = MediaReference {
+            source_asset_id: None,
+            render_artifact_id: Some("artifact-1".into()),
+        };
+        assert_eq!(
+            manifest.validate_strict().unwrap_err().code,
+            VideoErrorCode::InvalidArtifact
+        );
+
+        manifest.render_artifacts[0].duration_us = Some(Microseconds(3_000_000));
+        assert_eq!(
+            manifest.validate_strict().unwrap_err().code,
+            VideoErrorCode::InvalidTrack
+        );
+
+        manifest.render_artifacts[0].mime_type = "video/mp4".into();
+        manifest.render_artifacts[0].width = Some(1080);
+        manifest.render_artifacts[0].height = Some(1920);
+        manifest.render_artifacts[0].publication_state = PublicationState::Staged;
+        assert_eq!(
+            manifest.validate_strict().unwrap_err().code,
+            VideoErrorCode::InvalidArtifact
+        );
+    }
+
+    #[test]
+    fn track_stream_kinds_and_audio_mix_references_are_enforced() {
+        let mut no_audio = manifest();
+        no_audio.tracks[0].kind = TrackKind::Audio;
+        no_audio.source_assets[0].probe.has_audio = false;
+        assert_eq!(
+            no_audio.validate_strict().unwrap_err().code,
+            VideoErrorCode::InvalidTrack
+        );
+
+        let mut mixed_as_video = manifest();
+        mixed_as_video.audio_mix.tracks.push(AudioMixTrack {
+            track_id: "video-main".into(),
+            gain_db_milli: 0,
+            pan_milli: 0,
+            ducking: None,
+        });
+        assert_eq!(
+            mixed_as_video.validate_strict().unwrap_err().code,
+            VideoErrorCode::InvalidAudioMix
+        );
+
+        let mut invalid_sidechain = manifest();
+        invalid_sidechain.tracks.push(TimelineTrack {
+            id: "audio-main".into(),
+            kind: TrackKind::Audio,
+            clips: vec![],
+            preserve_gaps: false,
+        });
+        invalid_sidechain.audio_mix.tracks.push(AudioMixTrack {
+            track_id: "audio-main".into(),
+            gain_db_milli: 0,
+            pan_milli: 0,
+            ducking: Some(DuckingSpec {
+                sidechain_track_id: "video-main".into(),
+                reduction_db_milli: -12_000,
+                attack_us: Microseconds(10_000),
+                release_us: Microseconds(100_000),
+            }),
+        });
+        assert_eq!(
+            invalid_sidechain.validate_strict().unwrap_err().code,
+            VideoErrorCode::InvalidAudioMix
         );
     }
 }

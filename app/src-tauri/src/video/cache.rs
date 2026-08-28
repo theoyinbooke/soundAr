@@ -255,7 +255,12 @@ impl InvalidationPlan {
             ManifestChange::SceneScript { scene_id } => {
                 self.add_scene(
                     &scene_id,
-                    [Stage::Speech, Stage::Captions, Stage::SceneRender],
+                    [
+                        Stage::Speech,
+                        Stage::Captions,
+                        Stage::AudioMix,
+                        Stage::SceneRender,
+                    ],
                 )?;
                 self.add_aggregate_renders();
             }
@@ -527,6 +532,7 @@ mod tests {
         }])
         .unwrap();
         assert!(plan.invalidates(CacheStage::Speech, Some("scene-2")));
+        assert!(plan.invalidates(CacheStage::AudioMix, Some("scene-2")));
         assert!(plan.invalidates(CacheStage::SceneRender, Some("scene-2")));
         assert!(!plan.invalidates(CacheStage::SceneRender, Some("scene-1")));
         assert!(!plan.invalidates(CacheStage::Music, Some("scene-2")));

@@ -115,12 +115,41 @@ pub fn map_timeline_to_source(
     timeline_us: Microseconds,
     mode: QuantizeMode,
 ) -> VideoResult<Microseconds> {
+    map_timeline_to_source_inner(clip, timeline_us, mode, false)
+}
+
+/// Converts a timeline edit boundary, including a clip's exclusive end, to the
+/// corresponding source-clock boundary. This is deliberately separate from
+/// [`map_timeline_to_source`], whose half-open semantics locate media samples.
+pub fn map_timeline_endpoint_to_source(
+    clip: &TimelineClip,
+    timeline_us: Microseconds,
+    mode: QuantizeMode,
+) -> VideoResult<Microseconds> {
+    map_timeline_to_source_inner(clip, timeline_us, mode, true)
+}
+
+fn map_timeline_to_source_inner(
+    clip: &TimelineClip,
+    timeline_us: Microseconds,
+    mode: QuantizeMode,
+    endpoint: bool,
+) -> VideoResult<Microseconds> {
     clip.validate()?;
     let timeline_range = clip.timeline_range()?;
-    if !timeline_range.contains(timeline_us) {
+    let in_range = if endpoint {
+        timeline_range.contains_endpoint(timeline_us)
+    } else {
+        timeline_range.contains(timeline_us)
+    };
+    if !in_range {
         return Err(VideoError::new(
             VideoErrorCode::InvalidTimestamp,
-            "timeline timestamp is outside the clip",
+            if endpoint {
+                "timeline endpoint is outside the clip"
+            } else {
+                "timeline sample is outside the clip"
+            },
         ));
     }
     let offset = timeline_us
@@ -138,7 +167,12 @@ pub fn map_timeline_to_source(
         .checked_add(source_offset)
         .ok_or_else(arithmetic_overflow)?;
     let mapped = Microseconds(checked_i128_to_i64(mapped)?);
-    if !clip.source_range.contains(mapped) {
+    let mapped_in_range = if endpoint {
+        clip.source_range.contains_endpoint(mapped)
+    } else {
+        clip.source_range.contains(mapped)
+    };
+    if !mapped_in_range {
         return Err(VideoError::new(
             VideoErrorCode::InvalidTimestamp,
             "mapped timestamp escaped the clip source range",
@@ -152,11 +186,40 @@ pub fn map_source_to_timeline(
     source_us: Microseconds,
     mode: QuantizeMode,
 ) -> VideoResult<Microseconds> {
+    map_source_to_timeline_inner(clip, source_us, mode, false)
+}
+
+/// Converts a source edit boundary, including a source range's exclusive end,
+/// to its exact timeline boundary. Sample lookup remains half-open through
+/// [`map_source_to_timeline`].
+pub fn map_source_endpoint_to_timeline(
+    clip: &TimelineClip,
+    source_us: Microseconds,
+    mode: QuantizeMode,
+) -> VideoResult<Microseconds> {
+    map_source_to_timeline_inner(clip, source_us, mode, true)
+}
+
+fn map_source_to_timeline_inner(
+    clip: &TimelineClip,
+    source_us: Microseconds,
+    mode: QuantizeMode,
+    endpoint: bool,
+) -> VideoResult<Microseconds> {
     clip.validate()?;
-    if !clip.source_range.contains(source_us) {
+    let in_range = if endpoint {
+        clip.source_range.contains_endpoint(source_us)
+    } else {
+        clip.source_range.contains(source_us)
+    };
+    if !in_range {
         return Err(VideoError::new(
             VideoErrorCode::InvalidTimestamp,
-            "source timestamp is outside the clip",
+            if endpoint {
+                "source endpoint is outside the clip"
+            } else {
+                "source sample is outside the clip"
+            },
         ));
     }
     let offset = source_us
@@ -174,7 +237,13 @@ pub fn map_source_to_timeline(
         .checked_add(timeline_offset)
         .ok_or_else(arithmetic_overflow)?;
     let mapped = Microseconds(checked_i128_to_i64(mapped)?);
-    if !clip.timeline_range()?.contains(mapped) {
+    let timeline_range = clip.timeline_range()?;
+    let mapped_in_range = if endpoint {
+        timeline_range.contains_endpoint(mapped)
+    } else {
+        timeline_range.contains(mapped)
+    };
+    if !mapped_in_range {
         return Err(VideoError::new(
             VideoErrorCode::InvalidTimestamp,
             "mapped timestamp escaped the clip timeline range",
@@ -452,8 +521,46 @@ mod tests {
         );
         assert_eq!(
             map_timeline_to_source(&clip, Microseconds(11_000_000), QuantizeMode::Nearest,)
-                .unwrap(),
+                .unwrap_err()
+                .code,
+            VideoErrorCode::InvalidTimestamp
+        );
+        assert_eq!(
+            map_timeline_endpoint_to_source(
+                &clip,
+                Microseconds(11_000_000),
+                QuantizeMode::Nearest,
+            )
+            .unwrap(),
             Microseconds(4_000_000)
+        );
+        assert_eq!(
+            map_source_endpoint_to_timeline(&clip, Microseconds(4_000_000), QuantizeMode::Nearest,)
+                .unwrap(),
+            Microseconds(11_000_000)
+        );
+    }
+
+    #[test]
+    fn adjacent_clips_have_single_sample_owner_at_boundary() {
+        let first = clip("first", 0, 1_000_000, 0, 1_000_000, RationalRate::ONE);
+        let second = clip(
+            "second",
+            1_000_000,
+            2_000_000,
+            1_000_000,
+            1_000_000,
+            RationalRate::ONE,
+        );
+        let boundary = Microseconds(1_000_000);
+        assert!(map_timeline_to_source(&first, boundary, QuantizeMode::Nearest).is_err());
+        assert_eq!(
+            map_timeline_to_source(&second, boundary, QuantizeMode::Nearest).unwrap(),
+            Microseconds(1_000_000)
+        );
+        assert_eq!(
+            map_timeline_endpoint_to_source(&first, boundary, QuantizeMode::Nearest).unwrap(),
+            Microseconds(1_000_000)
         );
     }
 
