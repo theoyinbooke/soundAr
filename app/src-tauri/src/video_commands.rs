@@ -750,7 +750,7 @@ fn revise_project(
         &mut changed_paths,
         &mut invalidated,
     )?;
-    changed_paths = manifest_diff_paths(&original_manifest, &manifest);
+    changed_paths = manifest_diff_paths(&original_manifest, &manifest)?;
     let has_manifest_edit = !changed_paths.is_empty();
     if !has_manifest_edit && voice_route.is_none() {
         return Err("video.revision_unsupported: That request did not identify a change. Try a caption style, crop, layout, gain, opening-length, or voice adjustment".into());
@@ -763,7 +763,7 @@ fn revise_project(
     if has_manifest_edit {
         invalidated = invalidation_for_manifest_changes(&changed_paths);
         discard_invalidated_render_artifacts(&mut manifest, &invalidated);
-        changed_paths = manifest_diff_paths(&original_manifest, &manifest);
+        changed_paths = manifest_diff_paths(&original_manifest, &manifest)?;
         let changed_paths = changed_paths.into_iter().collect::<Vec<_>>();
         advance_manifest_revision(
             &mut manifest,
@@ -2784,143 +2784,12 @@ fn shorten_opening(manifest: &mut video::VideoProjectManifest) -> Result<(), Str
 fn manifest_diff_paths(
     before: &video::VideoProjectManifest,
     after: &video::VideoProjectManifest,
-) -> BTreeSet<String> {
-    let mut paths = BTreeSet::new();
-    let fields = [
-        (before.name != after.name, "/name"),
-        (
-            before.timeline_duration_us != after.timeline_duration_us,
-            "/timeline_duration_us",
-        ),
-        (before.frame_rate != after.frame_rate, "/frame_rate"),
-        (
-            before.source_assets != after.source_assets,
-            "/source_assets",
-        ),
-        (
-            before.rights_confirmations != after.rights_confirmations,
-            "/rights_confirmations",
-        ),
-        (before.transcript != after.transcript, "/transcript"),
-        (before.candidates != after.candidates, "/candidates"),
-        (
-            before.reviewed_scenes != after.reviewed_scenes,
-            "/reviewed_scenes",
-        ),
-        (before.tracks != after.tracks, "/tracks"),
-        (before.gaps != after.gaps, "/gaps"),
-        (before.captions != after.captions, "/captions"),
-        (before.layout != after.layout, "/layout"),
-        (before.audio_mix != after.audio_mix, "/audio_mix"),
-        (
-            before.narration_bindings != after.narration_bindings,
-            "/narration_bindings",
-        ),
-        (
-            before.render_artifacts != after.render_artifacts,
-            "/render_artifacts",
-        ),
-    ];
-    for (changed, path) in fields {
-        if changed {
-            paths.insert(path.into());
-        }
-    }
-    paths
+) -> Result<BTreeSet<String>, String> {
+    video::manifest_changed_paths(before, after).map_err(service_error)
 }
 
 fn invalidation_for_manifest_changes(paths: &BTreeSet<String>) -> BTreeSet<video::RevisionStage> {
-    let mut stages = BTreeSet::new();
-    if paths.contains("/source_assets") {
-        stages.extend([
-            video::RevisionStage::Ingest,
-            video::RevisionStage::Transcript,
-            video::RevisionStage::Analysis,
-            video::RevisionStage::Plan,
-            video::RevisionStage::Captions,
-            video::RevisionStage::Tracking,
-            video::RevisionStage::SceneRender,
-            video::RevisionStage::Preview,
-            video::RevisionStage::FinalRender,
-            video::RevisionStage::PublishPackage,
-        ]);
-    }
-    if paths.contains("/transcript") {
-        stages.extend([
-            video::RevisionStage::Transcript,
-            video::RevisionStage::Analysis,
-            video::RevisionStage::Plan,
-            video::RevisionStage::Captions,
-            video::RevisionStage::Tracking,
-            video::RevisionStage::SceneRender,
-            video::RevisionStage::Preview,
-            video::RevisionStage::FinalRender,
-            video::RevisionStage::PublishPackage,
-        ]);
-    }
-    if paths.contains("/candidates") {
-        stages.extend([
-            video::RevisionStage::Analysis,
-            video::RevisionStage::Plan,
-            video::RevisionStage::Captions,
-            video::RevisionStage::Tracking,
-            video::RevisionStage::SceneRender,
-            video::RevisionStage::Preview,
-            video::RevisionStage::FinalRender,
-            video::RevisionStage::PublishPackage,
-        ]);
-    }
-    if paths.contains("/reviewed_scenes")
-        || paths.contains("/tracks")
-        || paths.contains("/gaps")
-        || paths.contains("/timeline_duration_us")
-        || paths.contains("/frame_rate")
-    {
-        stages.extend([
-            video::RevisionStage::Plan,
-            video::RevisionStage::Speech,
-            video::RevisionStage::Captions,
-            video::RevisionStage::Tracking,
-            video::RevisionStage::SceneRender,
-            video::RevisionStage::Preview,
-            video::RevisionStage::FinalRender,
-            video::RevisionStage::PublishPackage,
-        ]);
-    }
-    if paths.contains("/captions") {
-        stages.extend([
-            video::RevisionStage::Captions,
-            video::RevisionStage::SceneRender,
-            video::RevisionStage::Preview,
-            video::RevisionStage::FinalRender,
-            video::RevisionStage::PublishPackage,
-        ]);
-    }
-    if paths.contains("/layout") {
-        stages.extend([
-            video::RevisionStage::Tracking,
-            video::RevisionStage::SceneRender,
-            video::RevisionStage::Preview,
-            video::RevisionStage::FinalRender,
-            video::RevisionStage::PublishPackage,
-        ]);
-    }
-    if paths.contains("/audio_mix") {
-        invalidate_audio_render(&mut stages);
-    }
-    if paths.contains("/narration_bindings") {
-        stages.extend([
-            video::RevisionStage::Speech,
-            video::RevisionStage::SceneRender,
-            video::RevisionStage::Preview,
-            video::RevisionStage::FinalRender,
-            video::RevisionStage::PublishPackage,
-        ]);
-    }
-    if paths.contains("/name") || paths.contains("/rights_confirmations") {
-        stages.insert(video::RevisionStage::PublishPackage);
-    }
-    stages
+    video::invalidated_stages_for_manifest_changes(paths)
 }
 
 fn invalidate_caption_render(stages: &mut BTreeSet<video::RevisionStage>) {
@@ -3327,7 +3196,7 @@ fn run_plan_job(
     )
     .map_err(|error| error.to_string())?;
     video::apply_scene_plan(&mut manifest, plan).map_err(|error| error.to_string())?;
-    let changed_path_set = manifest_diff_paths(&original_manifest, &manifest);
+    let changed_path_set = manifest_diff_paths(&original_manifest, &manifest)?;
     if changed_path_set.is_empty() {
         return Err(
             "video.plan_unchanged: The selected candidates already match this timeline".into(),
@@ -6207,11 +6076,11 @@ mod tests {
             &mut requested_stages,
         )
         .unwrap();
-        let paths = manifest_diff_paths(&before, &after);
+        let paths = manifest_diff_paths(&before, &after).unwrap();
         assert_eq!(
             paths,
             BTreeSet::from([
-                "/audio_mix".to_string(),
+                "/audio_mix/tracks".to_string(),
                 "/captions".to_string(),
                 "/tracks".to_string(),
             ])
@@ -6269,7 +6138,7 @@ mod tests {
             script_sha256: sha256_text("A concise opening statement."),
             created_at: "2026-08-27T20:00:00.000Z".into(),
         });
-        let paths = manifest_diff_paths(&before, &after);
+        let paths = manifest_diff_paths(&before, &after).unwrap();
         assert_eq!(paths, BTreeSet::from(["/narration_bindings".to_string()]));
         let invalidated = invalidation_for_manifest_changes(&paths);
         assert!(invalidated.contains(&video::RevisionStage::Speech));

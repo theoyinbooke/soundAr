@@ -52,6 +52,7 @@ pub use scheduler::{
     AdmissionBlock, AdmissionOutcome, ResourceCapacity, ResourceClass, ResourceLease,
     ResourceRequest, ResourceScheduler, ResourceUsage, RTX_4080_LAPTOP_VRAM_MB,
 };
+pub(crate) use service::{invalidated_stages_for_manifest_changes, manifest_changed_paths};
 pub use service::{
     CreateVideoProjectRequest as ServiceCreateVideoProjectRequest, LinkImportRequest, LinkPreview,
     LinkRightsRequest, LocalImportRequest, NarrationReplacement, PortraitRenderRequest,

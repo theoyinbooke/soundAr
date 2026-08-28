@@ -4778,7 +4778,11 @@ fn collect_manifest_diff(
     }
 }
 
-fn actual_manifest_changed_paths(
+/// Return the canonical JSON-pointer paths for versioned manifest content changes.
+///
+/// Every command surface must use this implementation so revision declarations cannot drift
+/// from the optimistic-CAS validation performed by [`VideoStudioService::revise_manifest`].
+pub(crate) fn manifest_changed_paths(
     before: &VideoProjectManifest,
     after: &VideoProjectManifest,
 ) -> ServiceResult<BTreeSet<String>> {
@@ -4789,7 +4793,10 @@ fn actual_manifest_changed_paths(
     Ok(changed)
 }
 
-fn inferred_invalidated_stages(paths: &BTreeSet<String>) -> BTreeSet<RevisionStage> {
+/// Derive the exact invalidation set required for canonical manifest change paths.
+pub(crate) fn invalidated_stages_for_manifest_changes(
+    paths: &BTreeSet<String>,
+) -> BTreeSet<RevisionStage> {
     let all = BTreeSet::from([
         RevisionStage::Ingest,
         RevisionStage::Transcript,
@@ -4877,6 +4884,14 @@ fn inferred_invalidated_stages(paths: &BTreeSet<String>) -> BTreeSet<RevisionSta
             ])
         } else if path.starts_with("/audio_mix") {
             BTreeSet::from([
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ])
+        } else if path.starts_with("/narration_bindings") {
+            BTreeSet::from([
+                RevisionStage::Speech,
                 RevisionStage::SceneRender,
                 RevisionStage::Preview,
                 RevisionStage::FinalRender,
@@ -10493,7 +10508,7 @@ impl VideoStudioService {
                 "The replacement manifest revision metadata does not match the request",
             ));
         }
-        let actual_paths = actual_manifest_changed_paths(&current_manifest, &request.manifest)?;
+        let actual_paths = manifest_changed_paths(&current_manifest, &request.manifest)?;
         if actual_paths.is_empty() {
             return Err(VideoServiceError::new(
                 "video.empty_revision",
@@ -10525,7 +10540,7 @@ impl VideoStudioService {
                 "recorded_changed_paths": recorded_paths,
             })));
         }
-        let inferred_stages = inferred_invalidated_stages(&actual_paths);
+        let inferred_stages = invalidated_stages_for_manifest_changes(&actual_paths);
         if request.invalidated_stages != inferred_stages
             || record.invalidated_stages != inferred_stages
         {

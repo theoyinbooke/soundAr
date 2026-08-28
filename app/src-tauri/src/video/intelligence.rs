@@ -961,9 +961,17 @@ mod tests {
             plan.tracks[0].clips[0].source_range.duration().unwrap().0,
             7_000_000
         );
+        let original = manifest.clone();
         let mut applied = manifest;
         apply_scene_plan(&mut applied, plan).unwrap();
         applied.validate_strict().unwrap();
+        let changed = crate::video::service::manifest_changed_paths(&original, &applied).unwrap();
+        assert!(changed.contains("/audio_mix/tracks"));
+        assert!(!changed.contains("/audio_mix"));
+        let invalidated = crate::video::service::invalidated_stages_for_manifest_changes(&changed);
+        assert!(invalidated.contains(&crate::video::RevisionStage::Plan));
+        assert!(invalidated.contains(&crate::video::RevisionStage::FinalRender));
+        assert!(!invalidated.contains(&crate::video::RevisionStage::Speech));
     }
 
     #[test]
