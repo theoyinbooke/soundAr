@@ -25,7 +25,7 @@ RTF is wall time divided by source duration. Values below 1.0 are faster than re
 
 ## Exact-machine baseline
 
-Reference run: `20260828T030526Z-945104` on 2026-08-28 UTC at harness commit `5c9d3dc25aefbeb868d006c606a71b9807f0e122`. The immutable report SHA-256 is `876fa2727523e330724e559ddd754fa48769832ede33e0aef4e94b835879cef3`.
+Reference run: `20260828T030608Z-946269` on 2026-08-28 UTC at harness commit `45ca914b697c648ab9cf83e99f77e4974aa3d981`. The immutable report SHA-256 is `0bff485d6c684d16d4f43c8f971326001e866873b68e18ec9d87772da8c0b396`.
 
 | Component | Baseline |
 |---|---|
@@ -42,15 +42,15 @@ The benchmark used one 6.000 s moving imported-source fixture and one 5.205 s an
 
 | Stage | Wall time | RTF | Encoder | Peak VRAM | Peak delta |
 |---|---:|---:|---|---:|---:|
-| Imported-source probe | 0.071 s | 0.0118 | n/a | 1,264 MiB | 0 MiB |
-| Podcast-source probe | 0.071 s | 0.0136 | n/a | 1,264 MiB | 0 MiB |
-| 640×360 proxy, cache miss | 0.245 s | 0.0408 | libx264 ultrafast | 1,264 MiB | 0 MiB |
-| 640×360 proxy, validated cache hit | 0.127 s | 0.0211 | no render | n/a | n/a |
-| 540×960 portrait preview | 0.297 s | 0.0496 | libx264 ultrafast | 1,264 MiB | 0 MiB |
-| 1080×1920 imported reel final | 0.858 s | 0.1430 | H.264 NVENC | 1,603 MiB | 339 MiB |
-| 1080×1920 animated podcast final | 0.742 s | 0.1426 | H.264 NVENC | 1,603 MiB | 339 MiB |
+| Imported-source probe | 0.074 s | 0.0123 | n/a | 1,264 MiB | 0 MiB |
+| Podcast-source probe | 0.065 s | 0.0125 | n/a | 1,264 MiB | 0 MiB |
+| 640×360 proxy, cache miss | 0.237 s | 0.0394 | libx264 ultrafast | 1,264 MiB | 0 MiB |
+| 640×360 proxy, validated cache hit | 0.139 s | 0.0232 | no render | n/a | n/a |
+| 540×960 portrait preview | 0.300 s | 0.0500 | libx264 ultrafast | 1,264 MiB | 0 MiB |
+| 1080×1920 imported reel final | 0.863 s | 0.1439 | H.264 NVENC | 1,603 MiB | 339 MiB |
+| 1080×1920 animated podcast final | 0.724 s | 0.1393 | H.264 NVENC | 1,603 MiB | 339 MiB |
 
-End-to-end wall time was 5.075 s, including 1.508 s of rights-clear fixture generation, all probes, proxy miss/hit, preview, two final renders, checksums, FFprobe validation, and first-frame decode checks. All ten regression checks passed. The test cache hit ratio is intentionally 0.5 because it issues one miss followed by one hit for the same canonical key.
+End-to-end wall time was 5.058 s, including 1.480 s of rights-clear fixture generation, all probes, proxy miss/hit, preview, two final renders, checksums, FFprobe validation, and first-frame decode checks. All ten regression checks passed. The test cache hit ratio is intentionally 0.5 because it issues one miss followed by one hit for the same canonical key.
 
 Output validation evidence:
 
