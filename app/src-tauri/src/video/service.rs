@@ -463,19 +463,17 @@ impl VideoStudioService {
         let master = outputs
             .iter()
             .find(|output| {
-                output.get("is_primary").and_then(Value::as_bool) == Some(true)
+                output.get("version_id").and_then(Value::as_str)
+                    == Some(expectation.version_id.as_str())
+                    && output.get("status").and_then(Value::as_str) == Some("ready")
+                    && output.get("kind").and_then(Value::as_str) == Some("master")
+                    && output.get("is_primary").and_then(Value::as_bool) == Some(true)
                     && output.get("mime_type").and_then(Value::as_str) == Some("video/mp4")
-            })
-            .or_else(|| {
-                outputs.iter().find(|output| {
-                    output.get("kind").and_then(Value::as_str) == Some("master")
-                        && output.get("status").and_then(Value::as_str) == Some("ready")
-                })
             })
             .ok_or_else(|| {
                 VideoServiceError::new(
                     "video.final_master_required",
-                    "Render a final master before exporting a publish package",
+                    "Render a final master for the current timeline before exporting a publish package",
                 )
             })?;
         let master_path = PathBuf::from(value_string(master, "artifact_path")?);
@@ -587,43 +585,12 @@ impl VideoStudioService {
         write_publish_zip_atomic(&package_path, &archive_path)?;
         validate_publish_zip(&archive_path, &package_path)?;
         let archive_sha = sha256_file(&archive_path)?;
-        let package_artifact = RenderArtifact {
-            id: new_id(),
-            role: RenderArtifactRole::PublishPackage,
-            scene_id: None,
-            managed_path: self.relative_managed_path(&archive_path)?,
-            sha256: archive_sha.clone(),
-            cache_key: cache_key.clone(),
-            mime_type: "application/zip".to_string(),
-            duration_us: None,
-            width: None,
-            height: None,
-            publication_state: PublicationState::Published,
-            created_at: utc_now(),
-        };
-        package_artifact.validate()?;
-        let committed = if manifest.render_artifacts.iter().any(|artifact| {
-            artifact.cache_key == cache_key
-                && artifact.mime_type == "application/zip"
-                && artifact.sha256 == archive_sha
-        }) {
-            ensure_project_matches(&self.get_project(&request.project_id)?, &expectation)?;
-            project
-        } else {
-            self.commit_manifest_mutation_at(
-                &request.project_id,
-                &expectation,
-                &request.actor,
-                "Exported a self-describing publish package",
-                Some("completed"),
-                vec!["/render_artifacts".to_string()],
-                BTreeSet::from([RevisionStage::PublishPackage]),
-                move |manifest| {
-                    manifest.render_artifacts.push(package_artifact);
-                    Ok(())
-                },
-            )?
-        };
+        // A publish package is an output of the current timeline, not an edit
+        // to it. Registering it in Store keeps Projects/History/assistant parity
+        // without advancing the manifest and immediately making its master
+        // stale. The managed ZIP remains content-addressed and durable.
+        let committed = self.get_project(&request.project_id)?;
+        ensure_project_matches(&committed, &expectation)?;
         self.store
             .put_video_cache(
                 &cache_key,
@@ -633,11 +600,7 @@ impl VideoStudioService {
                 &archive_path,
             )
             .map_err(VideoServiceError::store)?;
-        let committed_expectation = project_expectation(&committed)?;
-        ensure_project_matches(
-            &self.get_project(&request.project_id)?,
-            &committed_expectation,
-        )?;
+        let committed_expectation = expectation;
         let export_path = if let Some(destination) = &request.destination_dir {
             // Hold the project lease across the user-visible copy. The package
             // may be prepared optimistically, but it cannot be exported from a
@@ -732,9 +695,10 @@ impl VideoStudioService {
     ) -> ServiceResult<()> {
         let packaged_master = staging.join("master.mp4");
         copy_file_verified(master_path, &packaged_master)?;
+        let (publish_manifest, query_parameters_redacted) = redact_publish_manifest_urls(manifest);
         write_new_file(
             &staging.join("timeline-manifest.json"),
-            &serde_json::to_vec_pretty(manifest).map_err(json_error)?,
+            &serde_json::to_vec_pretty(&publish_manifest).map_err(json_error)?,
         )?;
         if !manifest.captions.is_empty() {
             write_new_file(
@@ -743,14 +707,19 @@ impl VideoStudioService {
             )?;
         }
         let readme = format!(
-            "soundAr publish package\n\nProject: {}\nGenerated: {}\n\nContents\n- master.mp4: final assembled video\n- timeline-manifest.json: versioned edit source of truth\n- package-manifest.json: checksums, provenance and rights receipts\n{}\nThis package was rendered locally. Verify destination-specific publishing requirements before upload.\n",
+            "soundAr publish package\n\nProject: {}\nGenerated: {}\n\nContents\n- master.mp4: final assembled video\n- timeline-manifest.json: versioned edit source of truth\n- package-manifest.json: checksums, provenance and rights receipts\n{}{}\nThis package was rendered locally. Verify destination-specific publishing requirements before upload.\n",
             manifest.name,
             manifest.updated_at,
             if manifest.captions.is_empty() {
                 ""
             } else {
                 "- captions.srt: timed captions\n"
-            }
+            },
+            if query_parameters_redacted {
+                "\nPrivacy: secret-bearing source URL query parameters were removed from exported JSON. Exact authorized URLs remain cryptographically bound by their SHA-256 receipts.\n"
+            } else {
+                ""
+            },
         );
         write_new_file(&staging.join("README.txt"), readme.as_bytes())?;
         let mut files = Vec::new();
@@ -782,6 +751,10 @@ impl VideoStudioService {
             "generated_at": manifest.updated_at,
             "producer": { "name": "soundAr Video Studio", "version": SERVICE_VERSION },
             "cache_key": cache_key,
+            "privacy": {
+                "query_parameters_redacted": query_parameters_redacted,
+                "exact_source_urls_bound_by_sha256": true,
+            },
             "master": {
                 "output_id": master.get("id"),
                 "sha256": master_sha,
@@ -791,8 +764,8 @@ impl VideoStudioService {
                 "mime_type": "video/mp4",
             },
             "files": files,
-            "rights_confirmations": manifest.rights_confirmations,
-            "source_provenance": manifest.source_assets.iter().map(|asset| json!({
+            "rights_confirmations": publish_manifest.rights_confirmations,
+            "source_provenance": publish_manifest.source_assets.iter().map(|asset| json!({
                 "source_asset_id": asset.id,
                 "sha256": asset.sha256,
                 "provenance": asset.provenance,
@@ -3436,6 +3409,7 @@ fn require_text<'a>(
 
 fn validate_safe_component(value: &str, code: &'static str) -> ServiceResult<()> {
     if value.is_empty()
+        || matches!(value, "." | "..")
         || value.len() > 128
         || !value
             .bytes()
@@ -3447,6 +3421,48 @@ fn validate_safe_component(value: &str, code: &'static str) -> ServiceResult<()>
         ));
     }
     Ok(())
+}
+
+fn redact_publish_manifest_urls(manifest: &VideoProjectManifest) -> (VideoProjectManifest, bool) {
+    let mut published = manifest.clone();
+    let mut redacted = false;
+    for source in &mut published.source_assets {
+        if let Some(uri) = source.provenance.original_uri.as_mut() {
+            let (safe, changed) = publish_safe_source_uri(uri);
+            *uri = safe;
+            redacted |= changed;
+        }
+    }
+    for receipt in &mut published.rights_confirmations {
+        let (safe, changed) = publish_safe_source_uri(&receipt.source_uri);
+        receipt.source_uri = safe;
+        redacted |= changed;
+        // `source_uri_sha256` deliberately remains bound to the exact URL that
+        // was authorized. The exported display URI is privacy-redacted only.
+    }
+    (published, redacted)
+}
+
+fn publish_safe_source_uri(uri: &str) -> (String, bool) {
+    if !uri.starts_with("https://") || !uri.contains('?') {
+        return (uri.to_string(), false);
+    }
+    if let Ok(validated) = validate_import_url(uri) {
+        // A canonical YouTube `v` value is public source identity, not an
+        // access credential. Extra tracking parameters were already removed at
+        // ingest, so retain the useful, canonical reference in publish exports.
+        if validated.source_id.is_some() {
+            return (validated.canonical, false);
+        }
+    }
+    let public_path = uri
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(uri)
+        .split('#')
+        .next()
+        .unwrap_or_default();
+    (public_path.to_string(), true)
 }
 
 fn validate_hash(value: &str) -> ServiceResult<()> {
@@ -3694,6 +3710,60 @@ mod tests {
         assert_eq!(
             normalize_utc_timestamp("2026-08-27T12:34:56+00:00").expect("valid timestamp"),
             "2026-08-27T12:34:56.000Z"
+        );
+    }
+
+    #[test]
+    fn managed_path_components_reject_dot_traversal_names() {
+        for value in [".", "..", "../project", "project/..", "project\\.."] {
+            assert!(
+                validate_safe_component(value, "video.invalid_project_id").is_err(),
+                "unsafe managed component {value:?} must be rejected"
+            );
+        }
+        for value in ["project-01", "cache.v2", "safe_namespace"] {
+            validate_safe_component(value, "video.invalid_project_id")
+                .expect("ordinary safe component");
+        }
+    }
+
+    #[test]
+    fn publish_manifest_redacts_secret_query_values_but_keeps_exact_url_evidence() {
+        let exact = "https://media.example.com/source.mp4?token=do-not-export&expires=9999";
+        let exact_sha = sha256_bytes(exact.as_bytes());
+        let mut manifest = empty_manifest("project-private-link", "Private link");
+        manifest.rights_confirmations.push(RightsConfirmation {
+            id: "rights-private-link".to_string(),
+            source_uri: exact.to_string(),
+            source_uri_sha256: exact_sha.clone(),
+            basis: RightsBasis::Owned,
+            confirmation_text: "I own this source".to_string(),
+            confirmed_by: "service-test".to_string(),
+            confirmed_at: utc_now(),
+            single_source_only: true,
+        });
+
+        let (published, redacted) = redact_publish_manifest_urls(&manifest);
+        assert!(redacted);
+        assert_eq!(
+            published.rights_confirmations[0].source_uri,
+            "https://media.example.com/source.mp4"
+        );
+        assert_eq!(
+            published.rights_confirmations[0].source_uri_sha256, exact_sha,
+            "the exact authorized URL remains bound without disclosing its secret query"
+        );
+        let serialized = serde_json::to_string(&published).expect("published manifest JSON");
+        assert!(!serialized.contains("do-not-export"));
+        assert!(!serialized.contains("expires=9999"));
+
+        assert_eq!(
+            publish_safe_source_uri("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            (
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                false
+            ),
+            "the canonical public YouTube video identifier remains useful"
         );
     }
 
@@ -4459,7 +4529,7 @@ mod tests {
         let exported = workspace
             .service
             .export_publish_package(PublishPackageRequest {
-                project_id: audio_project,
+                project_id: audio_project.clone(),
                 expected_revision: None,
                 expected_version_id: None,
                 destination_dir: Some(export_parent),
@@ -4495,6 +4565,33 @@ mod tests {
         );
         assert!(valid_package_directory(&package_path));
         assert!(!valid_package_directory(&exported_path));
+
+        workspace
+            .service
+            .commit_manifest_mutation(
+                &audio_project,
+                "service-test",
+                "Changed the publish title after the final render",
+                Some("draft"),
+                vec!["/name".to_string()],
+                BTreeSet::from([RevisionStage::PublishPackage]),
+                |manifest| {
+                    manifest.name = "Animated podcast revised".to_string();
+                    Ok(())
+                },
+            )
+            .expect("advance editorial timeline beyond the master");
+        let stale_error = workspace
+            .service
+            .export_publish_package(PublishPackageRequest {
+                project_id: audio_project,
+                expected_revision: None,
+                expected_version_id: None,
+                destination_dir: None,
+                actor: "service-test".to_string(),
+            })
+            .expect_err("an older-version master must not be packaged for a revised timeline");
+        assert_eq!(stale_error.code, "video.final_master_required");
     }
 }
 
