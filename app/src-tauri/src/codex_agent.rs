@@ -1,3 +1,5 @@
+mod video_tools;
+
 use super::{prepare_music_generation_request, RuntimeState};
 use serde_json::{json, Value};
 use std::{
@@ -16,11 +18,17 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 
+pub(crate) use video_tools::{
+    VideoAgentDispatcher, VideoAgentOperation, VideoAgentOperationKind, VideoAgentResult,
+    VideoAgentResultStatus, VideoAgentToolError, VideoDispatchCallback,
+};
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_NAME: &str = "soundAr";
 
 pub struct CodexAgentState {
     session: Mutex<Option<Arc<CodexSession>>>,
+    video_dispatcher: VideoAgentDispatcher,
 }
 
 struct CodexSession {
@@ -58,6 +66,17 @@ impl CodexAgentState {
     pub fn new() -> Self {
         Self {
             session: Mutex::new(None),
+            video_dispatcher: VideoAgentDispatcher::unavailable(),
+        }
+    }
+
+    /// Connects Codex dynamic tools to the exact dispatcher used by the native Video Studio
+    /// commands. Keeping this a function pointer prevents either transport from owning workflow
+    /// state or creating a second renderer.
+    pub(crate) fn with_video_dispatcher(callback: VideoDispatchCallback) -> Self {
+        Self {
+            session: Mutex::new(None),
+            video_dispatcher: VideoAgentDispatcher::new(callback),
         }
     }
 
@@ -142,12 +161,18 @@ impl CodexAgentState {
             .session
             .lock()
             .map_err(|_| "Codex session lock failed")? = Some(session.clone());
-        spawn_reader(session.clone(), stdout, app, runtime);
-        session.request("initialize", json!({
-            "clientInfo": { "name": CLIENT_NAME, "title": "soundAr Studio Assistant", "version": env!("CARGO_PKG_VERSION") },
-            "capabilities": { "experimentalApi": true }
-        }))?;
-        session.notify("initialized", Value::Null)?;
+        spawn_reader(session.clone(), stdout, app, runtime, self.video_dispatcher);
+        let initialized = session
+            .request("initialize", json!({
+                "clientInfo": { "name": CLIENT_NAME, "title": "soundAr Studio Assistant", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true, "requestAttestation": false }
+            }))
+            .and_then(|_| session.notify("initialized", Value::Null));
+        if let Err(error) = initialized {
+            session.child.lock().ok().map(|mut child| child.kill().ok());
+            self.session.lock().ok().map(|mut current| current.take());
+            return Err(error);
+        }
         Ok(json!({ "connected": true, "path": executable, "version": version }))
     }
 
@@ -234,7 +259,11 @@ impl CodexSession {
     }
 
     fn notify(&self, method: &str, params: Value) -> Result<(), String> {
-        self.write(json!({ "method": method, "params": params }))
+        if params.is_null() {
+            self.write(json!({ "method": method }))
+        } else {
+            self.write(json!({ "method": method, "params": params }))
+        }
     }
 
     fn request(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -251,9 +280,16 @@ impl CodexSession {
                 .map(|mut pending| pending.remove(&id));
             return Err(error);
         }
-        receiver
-            .recv_timeout(REQUEST_TIMEOUT)
-            .map_err(|_| format!("Codex did not answer {method} within 30 seconds"))?
+        match receiver.recv_timeout(REQUEST_TIMEOUT) {
+            Ok(result) => result,
+            Err(_) => {
+                self.pending
+                    .lock()
+                    .ok()
+                    .map(|mut pending| pending.remove(&id));
+                Err(format!("Codex did not answer {method} within 30 seconds"))
+            }
+        }
     }
 }
 
@@ -262,6 +298,7 @@ fn spawn_reader(
     stdout: std::process::ChildStdout,
     app: AppHandle,
     runtime: RuntimeState,
+    video_dispatcher: VideoAgentDispatcher,
 ) {
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -269,34 +306,79 @@ fn spawn_reader(
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if let Some(id) = message.get("id").and_then(Value::as_u64) {
+            if let Some(request_id) = message.get("id").cloned() {
                 if message.get("method").is_none() {
-                    if let Some(sender) = session
-                        .pending
-                        .lock()
-                        .ok()
-                        .and_then(|mut pending| pending.remove(&id))
-                    {
-                        let result = message
-                            .get("error")
-                            .map(|error| Err(error.to_string()))
-                            .unwrap_or_else(|| {
-                                Ok(message.get("result").cloned().unwrap_or(Value::Null))
-                            });
-                        sender.send(result).ok();
+                    // soundAr originates numeric ids, while the app-server protocol also permits
+                    // string ids for requests initiated by the server. Only numeric responses can
+                    // belong to this pending map.
+                    if let Some(id) = request_id.as_u64() {
+                        if let Some(sender) = session
+                            .pending
+                            .lock()
+                            .ok()
+                            .and_then(|mut pending| pending.remove(&id))
+                        {
+                            let result = message
+                                .get("error")
+                                .map(|error| Err(error.to_string()))
+                                .unwrap_or_else(|| {
+                                    Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                                });
+                            sender.send(result).ok();
+                        }
                     }
                     continue;
                 }
                 if message.get("method").and_then(Value::as_str) == Some("item/tool/call") {
-                    let result = execute_dynamic_tool(
-                        &runtime,
-                        &session,
-                        message.get("params").cloned().unwrap_or(Value::Null),
-                    );
-                    session.write(json!({ "id": id, "result": {
-                        "success": result.is_ok(),
-                        "contentItems": [{ "type": "inputText", "text": result.unwrap_or_else(|error| format!("Tool failed: {error}")) }]
-                    }})).ok();
+                    // Tool calls may include transcription, link ingest and final rendering. Run
+                    // them away from the stdout reader so app-server notifications, interruption
+                    // requests and other conversations remain responsive while local work runs.
+                    let tool_session = Arc::clone(&session);
+                    let tool_runtime = runtime.clone();
+                    let tool_app = app.clone();
+                    let params = message.get("params").cloned().unwrap_or(Value::Null);
+                    thread::spawn(move || {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            execute_dynamic_tool(
+                                &tool_runtime,
+                                &tool_session,
+                                &tool_app,
+                                video_dispatcher,
+                                params,
+                            )
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(VideoAgentToolError::new(
+                                "soundar.tool_panicked",
+                                "The local soundAr tool stopped unexpectedly; its durable job can be inspected or resumed",
+                            )
+                            .retryable(true))
+                        });
+                        let (success, text) = match result {
+                            Ok(value) => (
+                                true,
+                                serde_json::to_string_pretty(&value)
+                                    .unwrap_or_else(|_| value.to_string()),
+                            ),
+                            Err(error) => {
+                                let value = json!({
+                                    "schema_version": 1,
+                                    "error": error,
+                                });
+                                (
+                                    false,
+                                    serde_json::to_string_pretty(&value)
+                                        .unwrap_or_else(|_| value.to_string()),
+                                )
+                            }
+                        };
+                        tool_session
+                            .write(json!({ "id": request_id, "result": {
+                                "success": success,
+                                "contentItems": [{ "type": "inputText", "text": text }]
+                            }}))
+                            .ok();
+                    });
                     continue;
                 }
             }
@@ -311,7 +393,7 @@ fn spawn_reader(
 }
 
 pub fn dynamic_tools() -> Value {
-    json!([
+    let mut tools = json!([
         { "name": "get_studio_state", "description": "Inspect soundAr models, voices, projects, generation history, jobs, and scheduler state before planning audio work.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "queue_music_generation", "description": "Queue local text-to-music generation in soundAr and return a durable job id. Requires Studio or Full access.", "inputSchema": { "type": "object", "required": ["prompt"], "properties": { "prompt": {"type":"string"}, "lyrics": {"type":"string"}, "model_id": {"type":"string"}, "duration_seconds": {"type":"number","minimum":1,"maximum":300}, "title": {"type":"string"}, "priority": {"type":"string","enum":["low","normal","high"]}, "seed": {"type":"integer"} } } },
         { "name": "queue_speech_generation", "description": "Queue local text-to-speech generation in soundAr and return a durable job id. Requires Studio or Full access.", "inputSchema": { "type": "object", "required": ["text", "model_id", "voice_id"], "properties": { "text":{"type":"string"}, "model_id":{"type":"string"}, "voice_id":{"type":"string"}, "title":{"type":"string"}, "language":{"type":"string"}, "priority":{"type":"string","enum":["low","normal","high"]} } } },
@@ -320,22 +402,44 @@ pub fn dynamic_tools() -> Value {
         { "name": "export_project_master", "description": "Assemble rendered project chapters into one registered, playable soundAr master. Use this for every completed multi-part project instead of shell commands or raw filesystem paths. Requires Studio or Full access.", "inputSchema": { "type":"object", "required":["project_id"], "properties": { "project_id":{"type":"string"}, "settings":{"type":"object","properties":{"format":{"type":"string","enum":["wav","flac"]},"sample_rate":{"type":"integer","enum":[24000,44100,48000]},"gap_ms":{"type":"integer","minimum":0,"maximum":5000},"fade_ms":{"type":"integer","minimum":0,"maximum":1000},"target_lufs":{"type":"number","minimum":-24,"maximum":-9}}} } } },
         { "name": "list_jobs", "description": "List current queued, running, completed, cancelled, and failed soundAr jobs.", "inputSchema": { "type":"object", "properties":{} } },
         { "name": "cancel_job", "description": "Cancel a queued or running soundAr job by id. Requires Studio or Full access and user confirmation.", "inputSchema": { "type":"object", "required":["job_id"], "properties":{"job_id":{"type":"string"}} } }
-    ])
+    ]);
+    tools
+        .as_array_mut()
+        .expect("soundAr dynamic tool catalog is always an array")
+        .extend(video_tools::tool_catalog());
+    for tool in tools
+        .as_array_mut()
+        .expect("soundAr dynamic tool catalog is always an array")
+    {
+        if let Some(specification) = tool.as_object_mut() {
+            // DynamicToolSpec is a tagged union in the current app-server protocol.
+            specification
+                .entry("type".to_string())
+                .or_insert_with(|| Value::String("function".to_string()));
+        }
+    }
+    tools
 }
 
 fn execute_dynamic_tool(
     runtime: &RuntimeState,
     session: &CodexSession,
+    app: &AppHandle,
+    video_dispatcher: VideoAgentDispatcher,
     params: Value,
-) -> Result<String, String> {
-    let tool = params
-        .get("tool")
-        .and_then(Value::as_str)
-        .ok_or("Dynamic tool name is missing")?;
+) -> Result<Value, VideoAgentToolError> {
+    let tool = params.get("tool").and_then(Value::as_str).ok_or_else(|| {
+        VideoAgentToolError::new("soundar.tool_name_missing", "Dynamic tool name is missing")
+    })?;
     let thread_id = params
         .get("threadId")
         .and_then(Value::as_str)
-        .ok_or("Dynamic tool thread is missing")?;
+        .ok_or_else(|| {
+            VideoAgentToolError::new(
+                "soundar.tool_thread_missing",
+                "Dynamic tool thread is missing",
+            )
+        })?;
     let access = session
         .thread_access
         .lock()
@@ -351,23 +455,61 @@ fn execute_dynamic_tool(
             | "save_project"
             | "export_project_master"
             | "cancel_job"
-    ) && !access.permits_studio_writes()
+    ) || video_tools::requires_studio_access(tool)
     {
-        return Err("This conversation is in read-only mode. Choose Studio access or Full access before asking soundAr to make changes.".to_string());
+        if !access.permits_studio_writes() {
+            return Err(VideoAgentToolError::new(
+                "soundar.read_only",
+                "This conversation is in read-only mode. Choose Studio access or Full access before asking soundAr to make changes.",
+            ));
+        }
     }
     let arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if video_tools::is_video_tool(tool) {
+        let operation = VideoAgentOperation::parse(tool, arguments)?;
+        let fallback_phase = operation.kind().phase();
+        let result = video_dispatcher.dispatch(
+            runtime,
+            operation,
+            Some(video_tools::compact_progress_callback(
+                app.clone(),
+                fallback_phase,
+            )),
+        )?;
+        return serde_json::to_value(result).map_err(|error| {
+            VideoAgentToolError::new(
+                "video.agent_result_encode_failed",
+                "Video Studio completed the operation but its result could not be encoded",
+            )
+            .details(json!({ "diagnostic": error.to_string() }))
+        });
+    }
     let value = match tool {
-        "get_studio_state" => json!({
-            "models": super::read_json(runtime.model_registry_path.clone(), json!({"models":[]})).get("models").cloned().unwrap_or_else(|| json!([])),
-            "voices": runtime.store.list_voices()?,
-            "projects": runtime.store.list_projects()?,
-            "history": runtime.store.list_history(None)?,
-            "jobs": runtime.store.list_jobs()?,
-            "scheduler": runtime.scheduler_status()?,
-        }),
+        "get_studio_state" => {
+            let video_root = runtime.store.video_artifacts_root();
+            let video_projects = runtime
+                .video
+                .list_projects()
+                .map_err(VideoAgentToolError::from)?
+                .iter()
+                .map(|project| {
+                    super::video::present_video_project_summary(project, &video_root)
+                        .map_err(VideoAgentToolError::from)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            json!({
+                "models": super::read_json(runtime.model_registry_path.clone(), json!({"models":[]})).get("models").cloned().unwrap_or_else(|| json!([])),
+                "voices": runtime.store.list_voices()?,
+                "projects": runtime.store.list_projects()?,
+                "video_projects": video_projects,
+                "history": runtime.store.list_history(None)?,
+                "jobs": runtime.store.list_jobs()?,
+                "scheduler": runtime.scheduler_status()?,
+            })
+        }
         "list_jobs" => json!(runtime.store.list_jobs()?),
         "save_project" => runtime.store.save_project(&arguments)?,
         "export_project_master" => super::build_project_master(
@@ -375,7 +517,9 @@ fn execute_dynamic_tool(
             arguments
                 .get("project_id")
                 .and_then(Value::as_str)
-                .ok_or("project_id is required")?
+                .ok_or_else(|| {
+                    VideoAgentToolError::new("soundar.invalid_arguments", "project_id is required")
+                })?
                 .to_string(),
             arguments
                 .get("settings")
@@ -383,14 +527,19 @@ fn execute_dynamic_tool(
                 .unwrap_or_else(|| json!({})),
         )?,
         "cancel_job" => {
-            json!({ "cancelled": runtime.cancel_job(arguments.get("job_id").and_then(Value::as_str).ok_or("job_id is required")?)? })
+            json!({ "cancelled": runtime.cancel_job(arguments.get("job_id").and_then(Value::as_str).ok_or_else(|| VideoAgentToolError::new("soundar.invalid_arguments", "job_id is required"))?)? })
         }
         "queue_music_generation" => queue_music(runtime, arguments)?,
         "queue_speech_generation" => queue_speech(runtime, arguments)?,
         "queue_speech_batch" => queue_speech_batch(runtime, arguments)?,
-        _ => return Err(format!("Unknown soundAr tool: {tool}")),
+        _ => {
+            return Err(VideoAgentToolError::new(
+                "soundar.unknown_tool",
+                format!("Unknown soundAr tool: {tool}"),
+            ))
+        }
     };
-    serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
+    Ok(value)
 }
 
 fn queue_music(runtime: &RuntimeState, request: Value) -> Result<Value, String> {
@@ -570,11 +719,23 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 8);
+        assert!(tools
+            .as_array()
+            .expect("tool catalog")
+            .iter()
+            .all(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("function")));
+        assert_eq!(names.len(), 22);
         assert!(names.contains(&"get_studio_state"));
         assert!(names.contains(&"queue_speech_generation"));
         assert!(names.contains(&"queue_music_generation"));
         assert!(names.contains(&"export_project_master"));
+        assert!(names.contains(&"preview_link"));
+        assert!(names.contains(&"import_link"));
+        assert!(names.contains(&"analyze_video"));
+        assert!(names.contains(&"render_video_preview"));
+        assert!(names.contains(&"revise_video"));
+        assert!(names.contains(&"export_video"));
+        assert!(names.contains(&"export_publish_package"));
     }
 
     #[test]

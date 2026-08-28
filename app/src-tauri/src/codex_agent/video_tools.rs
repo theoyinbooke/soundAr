@@ -1,0 +1,1545 @@
+//! Stable Video Studio contracts for Codex dynamic tools.
+//!
+//! This module deliberately contains no media workflow implementation. The UI and the
+//! authenticated Codex assistant both dispatch these operations into the same native adapter,
+//! which in turn owns calls into `VideoStudioService`. Keeping parsing, policy and presentation
+//! here prevents an assistant-only shadow renderer from emerging over time.
+
+use crate::{video, RuntimeState};
+use chrono::{SecondsFormat, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
+use tauri::{AppHandle, Emitter};
+
+pub(crate) const VIDEO_AGENT_SCHEMA_VERSION: u16 = 1;
+
+pub(crate) type VideoDispatchCallback = fn(
+    &RuntimeState,
+    VideoAgentOperation,
+    Option<video::ProgressCallback>,
+) -> Result<VideoAgentResult, VideoAgentToolError>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct VideoAgentDispatcher {
+    callback: VideoDispatchCallback,
+}
+
+impl VideoAgentDispatcher {
+    pub(crate) fn new(callback: VideoDispatchCallback) -> Self {
+        Self { callback }
+    }
+
+    pub(crate) fn unavailable() -> Self {
+        Self::new(unavailable_dispatch)
+    }
+
+    pub(crate) fn dispatch(
+        self,
+        runtime: &RuntimeState,
+        operation: VideoAgentOperation,
+        progress: Option<video::ProgressCallback>,
+    ) -> Result<VideoAgentResult, VideoAgentToolError> {
+        (self.callback)(runtime, operation, progress)
+    }
+}
+
+fn unavailable_dispatch(
+    _runtime: &RuntimeState,
+    _operation: VideoAgentOperation,
+    _progress: Option<video::ProgressCallback>,
+) -> Result<VideoAgentResult, VideoAgentToolError> {
+    Err(VideoAgentToolError::new(
+        "video.agent_dispatch_unavailable",
+        "Video Studio is not connected to the shared native operation dispatcher",
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VideoAgentOperationKind {
+    VideoRuntimeStatus,
+    PreviewLink,
+    ImportLink,
+    AnalyzeVideo,
+    PlanVideo,
+    CreateVideoProject,
+    ListVideoProjects,
+    GetVideoProject,
+    RenderVideoPreview,
+    ReviseVideo,
+    ExportVideo,
+    ExportPublishPackage,
+    CancelVideoJob,
+    ResumeVideoJob,
+}
+
+impl VideoAgentOperationKind {
+    pub(crate) fn tool_name(self) -> &'static str {
+        match self {
+            Self::VideoRuntimeStatus => "video_runtime_status",
+            Self::PreviewLink => "preview_link",
+            Self::ImportLink => "import_link",
+            Self::AnalyzeVideo => "analyze_video",
+            Self::PlanVideo => "plan_video",
+            Self::CreateVideoProject => "create_video_project",
+            Self::ListVideoProjects => "list_video_projects",
+            Self::GetVideoProject => "get_video_project",
+            Self::RenderVideoPreview => "render_video_preview",
+            Self::ReviseVideo => "revise_video",
+            Self::ExportVideo => "export_video",
+            Self::ExportPublishPackage => "export_publish_package",
+            Self::CancelVideoJob => "cancel_video_job",
+            Self::ResumeVideoJob => "resume_video_job",
+        }
+    }
+
+    pub(crate) fn phase(self) -> VideoProductionPhase {
+        match self {
+            Self::VideoRuntimeStatus
+            | Self::PreviewLink
+            | Self::ImportLink
+            | Self::CreateVideoProject => VideoProductionPhase::Source,
+            Self::AnalyzeVideo => VideoProductionPhase::Analyze,
+            Self::PlanVideo | Self::ReviseVideo => VideoProductionPhase::Review,
+            Self::RenderVideoPreview => VideoProductionPhase::Preview,
+            Self::ExportVideo | Self::ExportPublishPackage => VideoProductionPhase::Export,
+            Self::ListVideoProjects
+            | Self::GetVideoProject
+            | Self::CancelVideoJob
+            | Self::ResumeVideoJob => VideoProductionPhase::Project,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "operation", content = "request", rename_all = "snake_case")]
+pub(crate) enum VideoAgentOperation {
+    VideoRuntimeStatus(EmptyRequest),
+    PreviewLink(PreviewLinkRequest),
+    ImportLink(ImportLinkRequest),
+    AnalyzeVideo(AnalyzeVideoRequest),
+    PlanVideo(PlanVideoRequest),
+    CreateVideoProject(CreateVideoProjectRequest),
+    ListVideoProjects(EmptyRequest),
+    GetVideoProject(GetVideoProjectRequest),
+    RenderVideoPreview(RenderVideoPreviewRequest),
+    ReviseVideo(ReviseVideoRequest),
+    ExportVideo(ExportVideoRequest),
+    ExportPublishPackage(ExportPublishPackageRequest),
+    CancelVideoJob(VideoJobControlRequest),
+    ResumeVideoJob(VideoJobControlRequest),
+}
+
+impl VideoAgentOperation {
+    pub(crate) fn kind(&self) -> VideoAgentOperationKind {
+        match self {
+            Self::VideoRuntimeStatus(_) => VideoAgentOperationKind::VideoRuntimeStatus,
+            Self::PreviewLink(_) => VideoAgentOperationKind::PreviewLink,
+            Self::ImportLink(_) => VideoAgentOperationKind::ImportLink,
+            Self::AnalyzeVideo(_) => VideoAgentOperationKind::AnalyzeVideo,
+            Self::PlanVideo(_) => VideoAgentOperationKind::PlanVideo,
+            Self::CreateVideoProject(_) => VideoAgentOperationKind::CreateVideoProject,
+            Self::ListVideoProjects(_) => VideoAgentOperationKind::ListVideoProjects,
+            Self::GetVideoProject(_) => VideoAgentOperationKind::GetVideoProject,
+            Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
+            Self::ReviseVideo(_) => VideoAgentOperationKind::ReviseVideo,
+            Self::ExportVideo(_) => VideoAgentOperationKind::ExportVideo,
+            Self::ExportPublishPackage(_) => VideoAgentOperationKind::ExportPublishPackage,
+            Self::CancelVideoJob(_) => VideoAgentOperationKind::CancelVideoJob,
+            Self::ResumeVideoJob(_) => VideoAgentOperationKind::ResumeVideoJob,
+        }
+    }
+
+    pub(crate) fn parse(tool: &str, arguments: Value) -> Result<Self, VideoAgentToolError> {
+        let arguments = parse_argument_object(arguments)?;
+        let operation = match tool {
+            "video_runtime_status" => Self::VideoRuntimeStatus(decode(arguments)?),
+            "preview_link" => Self::PreviewLink(decode(arguments)?),
+            "import_link" => Self::ImportLink(decode(arguments)?),
+            "analyze_video" => Self::AnalyzeVideo(decode(arguments)?),
+            "plan_video" => Self::PlanVideo(decode(arguments)?),
+            "create_video_project" => Self::CreateVideoProject(decode(arguments)?),
+            "list_video_projects" => Self::ListVideoProjects(decode(arguments)?),
+            "get_video_project" => Self::GetVideoProject(decode(arguments)?),
+            "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
+            "revise_video" => Self::ReviseVideo(decode(arguments)?),
+            "export_video" => Self::ExportVideo(decode(arguments)?),
+            "export_publish_package" => Self::ExportPublishPackage(decode(arguments)?),
+            "cancel_video_job" => Self::CancelVideoJob(decode(arguments)?),
+            "resume_video_job" => Self::ResumeVideoJob(decode(arguments)?),
+            _ => {
+                return Err(VideoAgentToolError::new(
+                    "video.agent_unknown_tool",
+                    format!("Unknown Video Studio tool: {tool}"),
+                ))
+            }
+        };
+        operation.validate()?;
+        Ok(operation)
+    }
+
+    fn validate(&self) -> Result<(), VideoAgentToolError> {
+        match self {
+            Self::VideoRuntimeStatus(_) | Self::ListVideoProjects(_) => Ok(()),
+            Self::PreviewLink(request) => {
+                require_text(&request.exact_url, "exact_url")?;
+                video::validate_import_url(&request.exact_url)
+                    .map(|_| ())
+                    .map_err(VideoAgentToolError::from)
+            }
+            Self::ImportLink(request) => {
+                require_text(&request.exact_url, "exact_url")?;
+                require_text(&request.rights_confirmation_url, "rights_confirmation_url")?;
+                if !request.rights_confirmed || !request.single_source_only {
+                    return Err(VideoAgentToolError::approval(
+                        "video.rights_required",
+                        "Confirm authorization for exactly one source URL before importing",
+                        "rights_confirmed",
+                    ));
+                }
+                let validated = video::validate_import_url(&request.exact_url)
+                    .map_err(VideoAgentToolError::from)?;
+                if validated.is_playlist {
+                    return Err(VideoAgentToolError::new(
+                        "video.playlist_not_allowed",
+                        "Import one exact source URL at a time; playlists are not enabled",
+                    ));
+                }
+                if request.rights_confirmation_url != validated.canonical {
+                    return Err(VideoAgentToolError::approval(
+                        "video.rights_url_mismatch",
+                        "Rights confirmation must match the exact canonical source URL",
+                        "rights_confirmation_url",
+                    )
+                    .details(json!({ "expected_url": validated.canonical })));
+                }
+                Ok(())
+            }
+            Self::AnalyzeVideo(request) => {
+                require_text(&request.project_id, "project_id")?;
+                if request
+                    .language
+                    .as_deref()
+                    .is_some_and(|language| language.trim().is_empty() || language.len() > 64)
+                {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "language",
+                        "Language hints must be a non-empty BCP-47 tag of 64 characters or fewer",
+                    ));
+                }
+                Ok(())
+            }
+            Self::PlanVideo(request) => {
+                require_text(&request.project_id, "project_id")?;
+                if request
+                    .creative_brief
+                    .as_deref()
+                    .is_some_and(|brief| brief.trim().is_empty() || brief.chars().count() > 12_000)
+                {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "creative_brief",
+                        "Creative briefs must be 12,000 characters or fewer",
+                    ));
+                }
+                if request
+                    .selected_candidate_ids
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+                {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "selected_candidate_ids",
+                        "Select at least one candidate or omit the field to use reviewed defaults",
+                    ));
+                }
+                if request
+                    .selected_candidate_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.len() > 24)
+                {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "selected_candidate_ids",
+                        "A scene plan supports at most 24 selected candidates",
+                    ));
+                }
+                if request.selected_candidate_ids.as_ref().is_some_and(|ids| {
+                    ids.iter().any(|id| id.trim().is_empty())
+                        || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+                }) {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "selected_candidate_ids",
+                        "Candidate ids must be non-empty and unique",
+                    ));
+                }
+                Ok(())
+            }
+            Self::CreateVideoProject(request) => {
+                if request.prompt.chars().count() > 12_000 {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "prompt",
+                        "Creative prompts must be 12,000 characters or fewer",
+                    ));
+                }
+                if request.prompt.trim().is_empty()
+                    && request
+                        .audio_local_path
+                        .as_deref()
+                        .is_none_or(|value| value.trim().is_empty())
+                    && request
+                        .source_project_id
+                        .as_deref()
+                        .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "prompt",
+                        "Describe the video, provide one local soundAr audio path, or select one soundAr project",
+                    ));
+                }
+                if request.audio_local_path.is_some() && request.source_project_id.is_some() {
+                    return Err(VideoAgentToolError::new(
+                        "video.single_source_required",
+                        "Start with one soundAr project or one local audio source",
+                    ));
+                }
+                Ok(())
+            }
+            Self::GetVideoProject(request) => require_text(&request.project_id, "project_id"),
+            Self::RenderVideoPreview(request) => {
+                require_text(&request.project_id, "project_id")?;
+                if let Some(version) = request.version_id.as_deref() {
+                    require_text(version, "version_id")?;
+                }
+                Ok(())
+            }
+            Self::ReviseVideo(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.instruction, "instruction")?;
+                require_text(&request.base_version_id, "base_version_id")?;
+                if request.instruction.chars().count() > 4_000 {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "instruction",
+                        "Revision instructions must be 4,000 characters or fewer",
+                    ));
+                }
+                if let Some(patch) = &request.scene_patch {
+                    patch.validate()?;
+                }
+                Ok(())
+            }
+            Self::ExportVideo(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.version_id, "version_id")?;
+                if request.format != "mp4" || request.profile != "final" {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "profile",
+                        "Final Video Studio export uses the MP4 final profile",
+                    ));
+                }
+                require_confirmation(request.user_confirmed, "export_video")?;
+                if !(1..=8).contains(&request.variations.unwrap_or(1)) {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "variations",
+                        "Render between one and eight variations",
+                    ));
+                }
+                Ok(())
+            }
+            Self::ExportPublishPackage(request) => {
+                require_text(&request.project_id, "project_id")?;
+                if request
+                    .destination_dir
+                    .as_deref()
+                    .is_some_and(|path| path.trim().is_empty())
+                {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "destination_dir",
+                        "The optional destination directory must not be empty",
+                    ));
+                }
+                require_confirmation(request.user_confirmed, "export_publish_package")
+            }
+            Self::CancelVideoJob(request) => {
+                require_text(&request.job_id, "job_id")?;
+                require_confirmation(request.user_confirmed, "cancel_video_job")
+            }
+            Self::ResumeVideoJob(request) => require_text(&request.job_id, "job_id"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EmptyRequest {}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreviewLinkRequest {
+    pub exact_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImportLinkRequest {
+    pub exact_url: String,
+    pub rights_confirmed: bool,
+    pub rights_confirmation_url: String,
+    pub single_source_only: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnalyzeVideoRequest {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanVideoRequest {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_candidate_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creative_brief: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateVideoProjectRequest {
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_local_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GetVideoProjectRequest {
+    pub project_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RenderVideoPreviewRequest {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ScenePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captions_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_gain_db: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music_gain_db: Option<f64>,
+}
+
+impl ScenePatch {
+    fn validate(&self) -> Result<(), VideoAgentToolError> {
+        if self
+            .layout
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "portrait" | "landscape" | "square"))
+        {
+            return Err(VideoAgentToolError::invalid_field(
+                "scene_patch.layout",
+                "Layout must be portrait, landscape, or square",
+            ));
+        }
+        if self
+            .crop_mode
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "auto-center" | "fit" | "manual"))
+        {
+            return Err(VideoAgentToolError::invalid_field(
+                "scene_patch.crop_mode",
+                "Crop mode must be auto-center, fit, or manual",
+            ));
+        }
+        if self
+            .caption_style
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "clean-white" | "calm" | "kinetic"))
+        {
+            return Err(VideoAgentToolError::invalid_field(
+                "scene_patch.caption_style",
+                "Caption style must be clean-white, calm, or kinetic",
+            ));
+        }
+        for (field, gain) in [
+            ("scene_patch.voice_gain_db", self.voice_gain_db),
+            ("scene_patch.music_gain_db", self.music_gain_db),
+        ] {
+            if gain.is_some_and(|value| !value.is_finite() || !(-60.0..=12.0).contains(&value)) {
+                return Err(VideoAgentToolError::invalid_field(
+                    field,
+                    "Audio gain must be between -60 dB and +12 dB",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviseVideoRequest {
+    pub project_id: String,
+    pub instruction: String,
+    pub base_version_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_patch: Option<ScenePatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExportVideoRequest {
+    pub project_id: String,
+    pub version_id: String,
+    pub format: String,
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variations: Option<u16>,
+    pub user_confirmed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExportPublishPackageRequest {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_dir: Option<String>,
+    pub user_confirmed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VideoJobControlRequest {
+    pub job_id: String,
+    #[serde(default)]
+    pub user_confirmed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VideoProductionPhase {
+    Source,
+    Analyze,
+    Review,
+    Preview,
+    Export,
+    Project,
+}
+
+impl VideoProductionPhase {
+    fn as_progress_phase(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Analyze => "analyze",
+            Self::Review => "review",
+            Self::Preview => "preview",
+            Self::Export => "export",
+            Self::Project => "source",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VideoAgentResultStatus {
+    Ready,
+    Queued,
+    Running,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VideoAgentOutput {
+    /// Always place the assembled, playable master here when it exists. Chapter/scene products
+    /// remain secondary so the assistant cannot accidentally foreground an intermediate file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_master: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_artifacts: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VideoAgentResult {
+    pub schema_version: u16,
+    pub operation: VideoAgentOperationKind,
+    pub phase: VideoProductionPhase,
+    pub status: VideoAgentResultStatus,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    pub output: VideoAgentOutput,
+}
+
+impl VideoAgentResult {
+    pub(crate) fn ready(
+        operation: VideoAgentOperationKind,
+        summary: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            schema_version: VIDEO_AGENT_SCHEMA_VERSION,
+            operation,
+            phase: operation.phase(),
+            status: VideoAgentResultStatus::Ready,
+            summary: summary.into(),
+            project_id: None,
+            job_id: None,
+            output: VideoAgentOutput {
+                data: Some(data),
+                ..VideoAgentOutput::default()
+            },
+        }
+    }
+
+    pub(crate) fn projects(
+        operation: VideoAgentOperationKind,
+        summary: impl Into<String>,
+        projects: Vec<Value>,
+    ) -> Self {
+        Self {
+            schema_version: VIDEO_AGENT_SCHEMA_VERSION,
+            operation,
+            phase: operation.phase(),
+            status: VideoAgentResultStatus::Ready,
+            summary: summary.into(),
+            project_id: None,
+            job_id: None,
+            output: VideoAgentOutput {
+                projects,
+                ..VideoAgentOutput::default()
+            },
+        }
+    }
+
+    pub(crate) fn project(
+        operation: VideoAgentOperationKind,
+        status: VideoAgentResultStatus,
+        summary: impl Into<String>,
+        project: Value,
+        job_id: Option<String>,
+    ) -> Result<Self, VideoAgentToolError> {
+        let project_id = project
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                VideoAgentToolError::new(
+                    "video.invalid_project_result",
+                    "The shared video dispatcher returned a project without an identifier",
+                )
+            })?
+            .to_string();
+        let (final_master, secondary_artifacts) = prominent_artifacts(&project)?;
+        Ok(Self {
+            schema_version: VIDEO_AGENT_SCHEMA_VERSION,
+            operation,
+            phase: operation.phase(),
+            status,
+            summary: summary.into(),
+            project_id: Some(project_id),
+            job_id,
+            output: VideoAgentOutput {
+                final_master,
+                project: Some(project),
+                secondary_artifacts,
+                ..VideoAgentOutput::default()
+            },
+        })
+    }
+
+    pub(crate) fn artifact(
+        operation: VideoAgentOperationKind,
+        summary: impl Into<String>,
+        project_id: String,
+        job_id: Option<String>,
+        artifact: Value,
+    ) -> Result<Self, VideoAgentToolError> {
+        validate_artifact(&artifact)?;
+        let final_master = (artifact.get("role").and_then(Value::as_str) == Some("master"))
+            .then(|| artifact.clone());
+        Ok(Self {
+            schema_version: VIDEO_AGENT_SCHEMA_VERSION,
+            operation,
+            phase: operation.phase(),
+            status: VideoAgentResultStatus::Completed,
+            summary: summary.into(),
+            project_id: Some(project_id),
+            job_id,
+            output: VideoAgentOutput {
+                final_master,
+                artifact: Some(artifact),
+                ..VideoAgentOutput::default()
+            },
+        })
+    }
+
+    pub(crate) fn job(
+        operation: VideoAgentOperationKind,
+        summary: impl Into<String>,
+        project_id: String,
+        job_id: String,
+    ) -> Self {
+        Self {
+            schema_version: VIDEO_AGENT_SCHEMA_VERSION,
+            operation,
+            phase: operation.phase(),
+            status: VideoAgentResultStatus::Queued,
+            summary: summary.into(),
+            project_id: Some(project_id),
+            job_id: Some(job_id),
+            output: VideoAgentOutput::default(),
+        }
+    }
+
+    pub(crate) fn job_state(
+        operation: VideoAgentOperationKind,
+        status: VideoAgentResultStatus,
+        summary: impl Into<String>,
+        project_id: Option<String>,
+        job_id: String,
+        data: Option<Value>,
+    ) -> Self {
+        Self {
+            schema_version: VIDEO_AGENT_SCHEMA_VERSION,
+            operation,
+            phase: operation.phase(),
+            status,
+            summary: summary.into(),
+            project_id,
+            job_id: Some(job_id),
+            output: VideoAgentOutput {
+                data,
+                ..VideoAgentOutput::default()
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VideoAgentToolError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub approval_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+impl VideoAgentToolError {
+    pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable: false,
+            approval_required: false,
+            field: None,
+            details: None,
+        }
+    }
+
+    pub(crate) fn retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
+    }
+
+    pub(crate) fn details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    fn invalid_field(field: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new("video.agent_invalid_arguments", message).field(field)
+    }
+
+    fn approval(code: impl Into<String>, message: impl Into<String>, field: &str) -> Self {
+        let mut error = Self::new(code, message).field(field);
+        error.approval_required = true;
+        error
+    }
+
+    fn field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
+        self
+    }
+}
+
+impl std::fmt::Display for VideoAgentToolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for VideoAgentToolError {}
+
+impl From<String> for VideoAgentToolError {
+    fn from(value: String) -> Self {
+        let (code, message) = value
+            .split_once(':')
+            .filter(|(code, _)| code.trim().starts_with("video."))
+            .map(|(code, message)| (code.trim(), message.trim()))
+            .unwrap_or(("video.agent_operation_failed", value.as_str()));
+        Self::new(code, message)
+    }
+}
+
+impl From<&str> for VideoAgentToolError {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_string())
+    }
+}
+
+impl From<video::VideoServiceError> for VideoAgentToolError {
+    fn from(value: video::VideoServiceError) -> Self {
+        Self {
+            code: value.code,
+            message: value.message,
+            retryable: value.retryable,
+            approval_required: false,
+            field: None,
+            details: value.details,
+        }
+    }
+}
+
+impl From<video::MediaError> for VideoAgentToolError {
+    fn from(value: video::MediaError) -> Self {
+        let code = if value.code.starts_with("video.") {
+            value.code
+        } else {
+            format!("video.media.{}", value.code)
+        };
+        Self {
+            code,
+            message: value.message,
+            retryable: value.retryable,
+            approval_required: false,
+            field: None,
+            details: value
+                .detail
+                .map(|diagnostic| json!({ "diagnostic": diagnostic })),
+        }
+    }
+}
+
+impl From<video::VideoError> for VideoAgentToolError {
+    fn from(value: video::VideoError) -> Self {
+        Self {
+            code: value.stable_code().to_string(),
+            message: value.message,
+            retryable: value.retryable,
+            approval_required: false,
+            field: value.field,
+            details: value.details,
+        }
+    }
+}
+
+pub(crate) fn is_video_tool(tool: &str) -> bool {
+    operation_kind(tool).is_some()
+}
+
+pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
+    Some(match tool {
+        "video_runtime_status" => VideoAgentOperationKind::VideoRuntimeStatus,
+        "preview_link" => VideoAgentOperationKind::PreviewLink,
+        "import_link" => VideoAgentOperationKind::ImportLink,
+        "analyze_video" => VideoAgentOperationKind::AnalyzeVideo,
+        "plan_video" => VideoAgentOperationKind::PlanVideo,
+        "create_video_project" => VideoAgentOperationKind::CreateVideoProject,
+        "list_video_projects" => VideoAgentOperationKind::ListVideoProjects,
+        "get_video_project" => VideoAgentOperationKind::GetVideoProject,
+        "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
+        "revise_video" => VideoAgentOperationKind::ReviseVideo,
+        "export_video" => VideoAgentOperationKind::ExportVideo,
+        "export_publish_package" => VideoAgentOperationKind::ExportPublishPackage,
+        "cancel_video_job" => VideoAgentOperationKind::CancelVideoJob,
+        "resume_video_job" => VideoAgentOperationKind::ResumeVideoJob,
+        _ => return None,
+    })
+}
+
+pub(crate) fn requires_studio_access(tool: &str) -> bool {
+    matches!(
+        operation_kind(tool),
+        Some(
+            VideoAgentOperationKind::ImportLink
+                | VideoAgentOperationKind::AnalyzeVideo
+                | VideoAgentOperationKind::PlanVideo
+                | VideoAgentOperationKind::CreateVideoProject
+                | VideoAgentOperationKind::RenderVideoPreview
+                | VideoAgentOperationKind::ReviseVideo
+                | VideoAgentOperationKind::ExportVideo
+                | VideoAgentOperationKind::ExportPublishPackage
+                | VideoAgentOperationKind::CancelVideoJob
+                | VideoAgentOperationKind::ResumeVideoJob
+        )
+    )
+}
+
+pub(crate) fn compact_progress_callback(
+    app: AppHandle,
+    fallback_phase: VideoProductionPhase,
+) -> video::ProgressCallback {
+    let emitted = Arc::new(Mutex::new(HashSet::<String>::new()));
+    Arc::new(move |update| {
+        let phase = compact_phase(&update.phase, fallback_phase);
+        // At most eleven percentage milestones per high-level phase, plus every playable partial.
+        // This keeps the Studio and assistant informative without producing a card per FFmpeg step.
+        let bucket = (update.progress.clamp(0.0, 1.0) * 10.0).floor() as u8;
+        let key = format!("{}:{phase}:{bucket}", update.job_id);
+        let should_emit = update.playable_artifact.is_some()
+            || emitted
+                .lock()
+                .map(|mut emitted| emitted.insert(key))
+                .unwrap_or(true);
+        if !should_emit {
+            return;
+        }
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let payload = json!({
+            "job": {
+                "id": update.job_id,
+                "project_id": update.project_id,
+                "phase": phase,
+                "status": match update.phase.as_str() {
+                    "failed" => "failed",
+                    "cancelled" => "cancelled",
+                    _ if update.progress >= 1.0 || update.phase == "completed" => "completed",
+                    _ => "running",
+                },
+                "progress": update.progress.clamp(0.0, 1.0),
+                "title": phase_title(phase),
+                "detail": update.message,
+                "durable": true,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            },
+            "partial_artifact": update.playable_artifact,
+            "metrics": update.metrics,
+        });
+        app.emit("video-job-progress", &payload).ok();
+        app.emit(
+            "codex-agent-event",
+            json!({ "method": "soundar/video-phase-progress", "params": payload }),
+        )
+        .ok();
+    })
+}
+
+pub(crate) fn tool_catalog() -> Vec<Value> {
+    vec![
+        tool(
+            "video_runtime_status",
+            "Check local Video Studio dependencies and hardware readiness before promising an ingest, transcription, preview, or final render.",
+            object_schema(&[], Map::new()),
+        ),
+        tool(
+            "preview_link",
+            "Preview metadata for one exact authorized link without downloading it. Read-only; playlists and bulk sources are rejected.",
+            object_schema(
+                &["exact_url"],
+                properties([( "exact_url", string("One exact HTTP or HTTPS video URL") )]),
+            ),
+        ),
+        tool(
+            "import_link",
+            "Import one exact link into a durable Video Studio project. Use only after the user explicitly confirms rights for the canonical URL returned by preview_link. Requires Studio or Full access.",
+            object_schema(
+                &["exact_url", "rights_confirmed", "rights_confirmation_url", "single_source_only"],
+                properties([
+                    ("exact_url", string("The exact canonical URL returned by preview_link")),
+                    ("rights_confirmed", true_schema("True only after explicit user authorization")),
+                    ("rights_confirmation_url", string("Must exactly equal exact_url")),
+                    ("single_source_only", true_schema("Must remain true; playlists are disabled")),
+                ]),
+            ),
+        ),
+        tool(
+            "analyze_video",
+            "Run durable local source analysis and timestamped transcription while preserving original source-clock gaps. Requires Studio or Full access.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("language", nullable_string("Optional BCP-47 language hint")),
+                ]),
+            ),
+        ),
+        tool(
+            "plan_video",
+            "Turn reviewed candidates and an optional researched creative brief into the project scene timeline. Requires Studio or Full access.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("selected_candidate_ids", json!({"type":"array","minItems":1,"maxItems":24,"uniqueItems":true,"items":{"type":"string","minLength":1}})),
+                    ("creative_brief", nullable_bounded_string("Optional research, story angle, audience and structure", 12_000)),
+                ]),
+            ),
+        ),
+        tool(
+            "create_video_project",
+            "Create one durable Video Studio project from a prompt, one existing local soundAr audio artifact, or one soundAr project. Requires Studio or Full access.",
+            object_schema(
+                &["prompt"],
+                properties([
+                    ("prompt", bounded_string("Creative brief; may be empty only when a source is supplied", 12_000)),
+                    ("audio_local_path", nullable_string("Managed local path for one existing soundAr audio artifact")),
+                    ("audio_display_name", nullable_string("Display name for the selected audio")),
+                    ("source_project_id", nullable_string("Existing soundAr project id")),
+                ]),
+            ),
+        ),
+        tool(
+            "list_video_projects",
+            "List durable Video Studio projects, including final-master availability. Read-only.",
+            object_schema(&[], Map::new()),
+        ),
+        tool(
+            "get_video_project",
+            "Read one Video Studio project with its reviewed scenes, revision, jobs, and playable artifacts. Read-only.",
+            object_schema(&["project_id"], properties([("project_id", string("Video Studio project id"))])),
+        ),
+        tool(
+            "render_video_preview",
+            "Render or reuse a fast low-resolution preview for the requested project version. Returns a durable job/result and playable artifact when complete. Requires Studio or Full access.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("version_id", nullable_string("Expected project version; omit only to use the current version")),
+                ]),
+            ),
+        ),
+        tool(
+            "revise_video",
+            "Apply conversational feedback to one project version and invalidate only affected stages. Requires Studio or Full access.",
+            revise_schema(),
+        ),
+        tool(
+            "export_video",
+            "Render and atomically register the final local MP4. Set user_confirmed only when the user explicitly requested this export. Requires Studio or Full access.",
+            object_schema(
+                &["project_id", "version_id", "format", "profile", "user_confirmed"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("version_id", string("Exact version id being approved for export")),
+                    ("format", json!({"type":"string","enum":["mp4"]})),
+                    ("profile", json!({"type":"string","enum":["final"]})),
+                    ("variations", json!({"type":["integer","null"],"minimum":1,"maximum":8})),
+                    ("user_confirmed", true_schema("True only when this final export was explicitly requested")),
+                ]),
+            ),
+        ),
+        tool(
+            "export_publish_package",
+            "Create a registered publish package from an existing final master. Set user_confirmed only after an explicit user request. Requires Studio or Full access.",
+            object_schema(
+                &["project_id", "user_confirmed"],
+                properties([
+                    ("project_id", string("Video Studio project id with a final master")),
+                    ("destination_dir", nullable_string("Optional user-authorized destination directory")),
+                    ("user_confirmed", true_schema("True only when package export was explicitly requested")),
+                ]),
+            ),
+        ),
+        tool(
+            "cancel_video_job",
+            "Cancel one durable Video Studio job. Set user_confirmed only after the user requests cancellation. Requires Studio or Full access.",
+            object_schema(
+                &["job_id", "user_confirmed"],
+                properties([
+                    ("job_id", string("Durable Video Studio job id")),
+                    ("user_confirmed", true_schema("True only after explicit cancellation approval")),
+                ]),
+            ),
+        ),
+        tool(
+            "resume_video_job",
+            "Resume one interrupted or recoverable durable Video Studio job using its persisted request. Requires Studio or Full access.",
+            object_schema(&["job_id"], properties([("job_id", string("Durable Video Studio job id"))])),
+        ),
+    ]
+}
+
+fn tool(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({ "name": name, "description": description, "inputSchema": input_schema })
+}
+
+fn object_schema(required: &[&str], properties: Map<String, Value>) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": required,
+        "properties": properties,
+    })
+}
+
+fn properties<const N: usize>(entries: [(&str, Value); N]) -> Map<String, Value> {
+    entries
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect()
+}
+
+fn string(description: &str) -> Value {
+    json!({ "type": "string", "minLength": 1, "description": description })
+}
+
+fn bounded_string(description: &str, maximum: usize) -> Value {
+    json!({ "type": "string", "maxLength": maximum, "description": description })
+}
+
+fn nullable_string(description: &str) -> Value {
+    json!({ "type": ["string", "null"], "minLength": 1, "description": description })
+}
+
+fn nullable_bounded_string(description: &str, maximum: usize) -> Value {
+    json!({ "type": ["string", "null"], "minLength": 1, "maxLength": maximum, "description": description })
+}
+
+fn true_schema(description: &str) -> Value {
+    json!({ "type": "boolean", "const": true, "description": description })
+}
+
+fn revise_schema() -> Value {
+    object_schema(
+        &["project_id", "instruction", "base_version_id"],
+        properties([
+            ("project_id", string("Video Studio project id")),
+            (
+                "instruction",
+                bounded_string("Requested creative revision", 4_000),
+            ),
+            ("base_version_id", string("Exact version being revised")),
+            (
+                "scene_id",
+                nullable_string("Optional scene to revise; omit for project-wide feedback"),
+            ),
+            (
+                "scene_patch",
+                json!({
+                    "type": ["object", "null"],
+                    "additionalProperties": false,
+                    "properties": {
+                        "layout": {"type":["string","null"],"enum":["portrait","landscape","square",null]},
+                        "crop_mode": {"type":["string","null"],"enum":["auto-center","fit","manual",null]},
+                        "captions_enabled": {"type":["boolean","null"]},
+                        "caption_style": {"type":["string","null"],"enum":["clean-white","calm","kinetic",null]},
+                        "voice_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12},
+                        "music_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12}
+                    }
+                }),
+            ),
+        ]),
+    )
+}
+
+fn parse_argument_object(arguments: Value) -> Result<Value, VideoAgentToolError> {
+    let value = match arguments {
+        Value::String(raw) => serde_json::from_str::<Value>(&raw).map_err(|error| {
+            VideoAgentToolError::new(
+                "video.agent_invalid_json",
+                "Video tool arguments were not valid JSON",
+            )
+            .details(json!({ "diagnostic": error.to_string() }))
+        })?,
+        value => value,
+    };
+    if !value.is_object() {
+        return Err(VideoAgentToolError::new(
+            "video.agent_invalid_arguments",
+            "Video tool arguments must be a JSON object",
+        ));
+    }
+    Ok(value)
+}
+
+fn decode<T: DeserializeOwned>(value: Value) -> Result<T, VideoAgentToolError> {
+    serde_json::from_value(value).map_err(|error| {
+        VideoAgentToolError::new(
+            "video.agent_invalid_arguments",
+            "Video tool arguments did not match the stable schema",
+        )
+        .details(json!({ "diagnostic": error.to_string() }))
+    })
+}
+
+fn require_text(value: &str, field: &str) -> Result<(), VideoAgentToolError> {
+    if value.trim().is_empty() {
+        return Err(VideoAgentToolError::invalid_field(
+            field,
+            format!("{field} must not be empty"),
+        ));
+    }
+    Ok(())
+}
+
+fn require_confirmation(value: bool, operation: &str) -> Result<(), VideoAgentToolError> {
+    if value {
+        Ok(())
+    } else {
+        Err(VideoAgentToolError::approval(
+            "video.approval_required",
+            format!("The user must explicitly request {operation} before it runs"),
+            "user_confirmed",
+        ))
+    }
+}
+
+fn prominent_artifacts(
+    project: &Value,
+) -> Result<(Option<Value>, Vec<Value>), VideoAgentToolError> {
+    let explicit_master = project
+        .get("master")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let artifacts = project
+        .pointer("/manifest/artifacts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let master = explicit_master.or_else(|| {
+        artifacts
+            .iter()
+            .find(|artifact| artifact.get("role").and_then(Value::as_str) == Some("master"))
+            .cloned()
+    });
+    if let Some(master) = &master {
+        validate_artifact(master)?;
+        if master.get("playable").and_then(Value::as_bool) != Some(true) {
+            return Err(VideoAgentToolError::new(
+                "video.master_not_playable",
+                "The final video master must be registered as a playable artifact",
+            ));
+        }
+    }
+    let master_id = master
+        .as_ref()
+        .and_then(|artifact| artifact.get("id"))
+        .and_then(Value::as_str);
+    let secondary = artifacts
+        .into_iter()
+        .filter(|artifact| artifact.get("id").and_then(Value::as_str) != master_id)
+        .collect();
+    Ok((master, secondary))
+}
+
+fn validate_artifact(artifact: &Value) -> Result<(), VideoAgentToolError> {
+    let object = artifact.as_object().ok_or_else(|| {
+        VideoAgentToolError::new(
+            "video.invalid_artifact_result",
+            "The shared dispatcher returned an invalid artifact",
+        )
+    })?;
+    for field in ["id", "project_id", "role", "mime_type"] {
+        if object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(VideoAgentToolError::new(
+                "video.invalid_artifact_result",
+                format!("The shared dispatcher artifact is missing {field}"),
+            ));
+        }
+    }
+    let has_location = ["url", "local_path"].into_iter().any(|field| {
+        object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    });
+    if !has_location {
+        return Err(VideoAgentToolError::new(
+            "video.artifact_not_registered",
+            "The artifact must expose a registered playable or downloadable media location",
+        ));
+    }
+    Ok(())
+}
+
+fn compact_phase(phase: &str, fallback: VideoProductionPhase) -> &'static str {
+    match phase {
+        "validating" | "copying" | "downloading" | "downloaded" | "source_ready" => "source",
+        "transcribing" | "analyzing" | "proxy_ready" | "thumbnail_ready" | "waveform_ready" => {
+            "analyze"
+        }
+        "planning" | "reviewing" | "revising" => "review",
+        "rendering_preview" | "preview_ready" => "preview",
+        "rendering_final" | "publishing" => "export",
+        "rendering" if matches!(fallback, VideoProductionPhase::Preview) => "preview",
+        "rendering" => "export",
+        _ => fallback.as_progress_phase(),
+    }
+}
+
+fn phase_title(phase: &str) -> &'static str {
+    match phase {
+        "source" => "Preparing source",
+        "analyze" => "Analyzing source",
+        "review" => "Planning and revising",
+        "preview" => "Rendering preview",
+        "export" => "Exporting video",
+        _ => "Producing video",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_is_strict_complete_and_stably_named() {
+        let catalog = tool_catalog();
+        let names = catalog
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("name"))
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 14);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 14);
+        for required in [
+            "preview_link",
+            "import_link",
+            "analyze_video",
+            "plan_video",
+            "create_video_project",
+            "list_video_projects",
+            "get_video_project",
+            "render_video_preview",
+            "revise_video",
+            "export_video",
+            "export_publish_package",
+        ] {
+            assert!(names.contains(&required), "missing {required}");
+        }
+        for name in &names {
+            let kind = operation_kind(name).unwrap_or_else(|| panic!("unmapped tool {name}"));
+            assert_eq!(kind.tool_name(), *name);
+        }
+        assert!(catalog
+            .iter()
+            .all(|tool| tool["inputSchema"]["additionalProperties"] == false));
+    }
+
+    #[test]
+    fn parses_json_strings_and_rejects_unknown_fields() {
+        let parsed = VideoAgentOperation::parse(
+            "get_video_project",
+            Value::String(r#"{"project_id":"project-7"}"#.into()),
+        )
+        .expect("valid JSON argument string");
+        assert_eq!(parsed.kind(), VideoAgentOperationKind::GetVideoProject);
+
+        let error = VideoAgentOperation::parse(
+            "get_video_project",
+            json!({"project_id":"project-7","surprise":true}),
+        )
+        .expect_err("unknown fields must fail closed");
+        assert_eq!(error.code, "video.agent_invalid_arguments");
+    }
+
+    #[test]
+    fn link_import_requires_exact_per_url_rights_confirmation() {
+        let error = VideoAgentOperation::parse(
+            "import_link",
+            json!({
+                "exact_url":"https://www.youtube.com/watch?v=rights-safe",
+                "rights_confirmed":true,
+                "rights_confirmation_url":"https://www.youtube.com/watch?v=another-source",
+                "single_source_only":true
+            }),
+        )
+        .expect_err("mismatched confirmation");
+        assert_eq!(error.code, "video.rights_url_mismatch");
+        assert!(error.approval_required);
+
+        let error = VideoAgentOperation::parse(
+            "import_link",
+            json!({
+                "exact_url":"https://www.youtube.com/watch?v=rights-safe&list=bulk",
+                "rights_confirmed":true,
+                "rights_confirmation_url":"https://www.youtube.com/watch?v=rights-safe&list=bulk",
+                "single_source_only":true
+            }),
+        )
+        .expect_err("playlist");
+        assert_eq!(error.code, "video.media.playlist_not_allowed");
+    }
+
+    #[test]
+    fn export_and_cancellation_require_explicit_user_confirmation() {
+        for (tool, arguments) in [
+            (
+                "export_video",
+                json!({"project_id":"project-1","version_id":"version-2","format":"mp4","profile":"final","user_confirmed":false}),
+            ),
+            (
+                "export_publish_package",
+                json!({"project_id":"project-1","user_confirmed":false}),
+            ),
+            (
+                "cancel_video_job",
+                json!({"job_id":"job-1","user_confirmed":false}),
+            ),
+        ] {
+            let error = VideoAgentOperation::parse(tool, arguments).expect_err("approval");
+            assert_eq!(error.code, "video.approval_required");
+            assert!(error.approval_required);
+        }
+    }
+
+    #[test]
+    fn write_policy_leaves_inspection_available_in_read_only_mode() {
+        assert!(!requires_studio_access("preview_link"));
+        assert!(!requires_studio_access("list_video_projects"));
+        assert!(!requires_studio_access("get_video_project"));
+        assert!(requires_studio_access("import_link"));
+        assert!(requires_studio_access("revise_video"));
+        assert!(requires_studio_access("export_video"));
+    }
+
+    #[test]
+    fn project_result_promotes_only_the_playable_final_master() {
+        let project = json!({
+            "id":"project-1",
+            "name":"Project",
+            "master":{
+                "id":"master-1","project_id":"project-1","version_id":"version-2",
+                "role":"master","mime_type":"video/mp4","playable":true,
+                "local_path":"/managed/master.mp4"
+            },
+            "manifest":{"artifacts":[
+                {"id":"preview-1","project_id":"project-1","role":"preview","mime_type":"video/mp4","playable":true},
+                {"id":"master-1","project_id":"project-1","role":"master","mime_type":"video/mp4","playable":true}
+            ]}
+        });
+        let result = VideoAgentResult::project(
+            VideoAgentOperationKind::ExportVideo,
+            VideoAgentResultStatus::Completed,
+            "Final master ready",
+            project,
+            Some("job-1".into()),
+        )
+        .expect("project result");
+        assert_eq!(
+            result.output.final_master.as_ref().unwrap()["id"],
+            "master-1"
+        );
+        assert_eq!(result.output.secondary_artifacts.len(), 1);
+        assert_eq!(result.output.secondary_artifacts[0]["role"], "preview");
+        let serialized = serde_json::to_string(&result.output).expect("serialize");
+        assert!(serialized.find("final_master").unwrap() < serialized.find("\"project\"").unwrap());
+    }
+
+    #[test]
+    fn unplayable_master_fails_closed() {
+        let project = json!({
+            "id":"project-1",
+            "master":{"id":"master-1","project_id":"project-1","role":"master","mime_type":"video/mp4","playable":false,"local_path":"/managed/master.mp4"},
+            "manifest":{"artifacts":[]}
+        });
+        let error = VideoAgentResult::project(
+            VideoAgentOperationKind::ExportVideo,
+            VideoAgentResultStatus::Completed,
+            "bad",
+            project,
+            None,
+        )
+        .expect_err("opaque master must not be surfaced");
+        assert_eq!(error.code, "video.master_not_playable");
+    }
+
+    #[test]
+    fn stable_errors_are_machine_readable() {
+        let error = VideoAgentToolError::new("video.project_locked", "Project is busy")
+            .retryable(true)
+            .details(json!({"owner":"job-2"}));
+        let value = serde_json::to_value(error).expect("serialize");
+        assert_eq!(value["code"], "video.project_locked");
+        assert_eq!(value["retryable"], true);
+        assert_eq!(value["approval_required"], false);
+    }
+
+    #[test]
+    fn queued_results_always_expose_durable_project_and_job_ids() {
+        let result = VideoAgentResult::job(
+            VideoAgentOperationKind::RenderVideoPreview,
+            "Preview queued",
+            "project-1".into(),
+            "job-durable-1".into(),
+        );
+        assert_eq!(result.status, VideoAgentResultStatus::Queued);
+        assert_eq!(result.project_id.as_deref(), Some("project-1"));
+        assert_eq!(result.job_id.as_deref(), Some("job-durable-1"));
+        assert_eq!(result.phase, VideoProductionPhase::Preview);
+    }
+
+    #[test]
+    fn low_level_media_events_collapse_into_five_production_phases() {
+        assert_eq!(
+            compact_phase("downloading", VideoProductionPhase::Export),
+            "source"
+        );
+        assert_eq!(
+            compact_phase("transcribing", VideoProductionPhase::Source),
+            "analyze"
+        );
+        assert_eq!(
+            compact_phase("revising", VideoProductionPhase::Source),
+            "review"
+        );
+        assert_eq!(
+            compact_phase("preview_ready", VideoProductionPhase::Source),
+            "preview"
+        );
+        assert_eq!(
+            compact_phase("publishing", VideoProductionPhase::Source),
+            "export"
+        );
+        assert_eq!(
+            compact_phase("completed", VideoProductionPhase::Preview),
+            "preview"
+        );
+    }
+}
