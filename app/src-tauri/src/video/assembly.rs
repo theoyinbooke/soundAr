@@ -7,9 +7,10 @@
 //! deterministic.
 
 use super::contracts::{
-    AudioMixTrack, CanvasMode, CaptionCue, CaptionPresetId, LayoutPlan, LayoutRole, Microseconds,
-    NormalizedRect, RationalRate, RenderArtifact, SourceAsset, TimeRange, TimelineClip,
-    TimelineTrack, TrackKind, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
+    caption_bounds_for_scene, AudioMixTrack, CanvasMode, CaptionCue, CaptionPresetId, LayoutPlan,
+    LayoutRole, Microseconds, NormalizedRect, RationalRate, RenderArtifact, SourceAsset, TimeRange,
+    TimelineClip, TimelineTrack, TrackKind, VideoError, VideoErrorCode, VideoProjectManifest,
+    VideoResult, NORMALIZED_BASIS_POINTS,
 };
 use super::media::local_media_input_args;
 use super::renderer::{
@@ -105,6 +106,9 @@ pub struct CaptionPreviewPage {
     pub end_us: Microseconds,
     pub text: String,
     pub style_id: String,
+    pub bounds: NormalizedRect,
+    /// Font size normalized to canvas height (10_000 == full canvas height).
+    pub font_size_bp: u16,
     pub words: Vec<CaptionPreviewWord>,
 }
 
@@ -476,7 +480,7 @@ pub fn build_ass_document(
         ))
     });
     for caption in ordered_captions {
-        append_caption_events(&mut document, manifest, caption)?;
+        append_caption_events(&mut document, manifest, caption, width, height)?;
     }
     if options.include_title_cards {
         for scene in &manifest.reviewed_scenes {
@@ -507,6 +511,7 @@ pub fn plan_caption_preview_pages(
     for caption in &manifest.captions {
         let (preset, pages) = planned_caption_pages_for_cue(manifest, caption)?;
         for (index, page) in pages.into_iter().enumerate() {
+            let geometry = caption_geometry_for_page(manifest, caption, preset, &page)?;
             let id = format!("{}-page-{:03}", caption.id, index + 1);
             let words = page
                 .tokens
@@ -529,6 +534,8 @@ pub fn plan_caption_preview_pages(
                 end_us: page.end_us,
                 text: plain_caption_page_text(&page, preset),
                 style_id: preset.id.public_id().to_string(),
+                bounds: geometry.bounds,
+                font_size_bp: geometry.font_size_bp,
                 words,
             });
         }
@@ -1225,6 +1232,77 @@ fn caption_font_size(preset: AssCaptionPreset, height: u32) -> u32 {
     ((height as f64 * preset.relative_size).round() as u32).clamp(22, 112)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptionRenderGeometry {
+    bounds: NormalizedRect,
+    font_size_bp: u16,
+}
+
+fn caption_geometry_for_page(
+    manifest: &VideoProjectManifest,
+    caption: &CaptionCue,
+    preset: AssCaptionPreset,
+    page: &CaptionPage,
+) -> VideoResult<CaptionRenderGeometry> {
+    let bounds = caption_bounds_for_scene(&manifest.layout, caption.scene_id.as_deref())?;
+    let breaks = caption_line_breaks(&page.tokens, preset.paging)
+        .expect("caption pages are measured before geometry");
+    let mut line_count = 1_u64;
+    let mut current_chars = 0_u64;
+    let mut maximum_line_chars = 1_u64;
+    for (index, token) in page.tokens.iter().enumerate() {
+        let token_chars = u64::try_from(token.text.chars().count()).unwrap_or(u64::MAX);
+        if index > 0 && breaks[index] {
+            maximum_line_chars = maximum_line_chars.max(current_chars);
+            current_chars = token_chars;
+            line_count = line_count.saturating_add(1);
+        } else {
+            current_chars = current_chars
+                .saturating_add(u64::from(index > 0 && token.space_before))
+                .saturating_add(token_chars);
+        }
+    }
+    maximum_line_chars = maximum_line_chars.max(current_chars).max(1);
+
+    let base_bp = (preset.relative_size * f64::from(NORMALIZED_BASIS_POINTS)).round() as u64;
+    // Reserve 1.35 em per line (outline/background included), and conservatively budget an
+    // average glyph at 0.68 em. These normalized limits are profile-independent, so proxy,
+    // preview, final ASS, and the live presentation all agree on the exact relative size.
+    let height_cap_bp = u64::try_from(bounds.height_bp)
+        .unwrap_or_default()
+        .saturating_mul(100)
+        / line_count.saturating_mul(135).max(1);
+    let width_cap_bp = u64::try_from(bounds.width_bp)
+        .unwrap_or_default()
+        .saturating_mul(u64::from(manifest.layout.canvas.width))
+        .saturating_mul(100)
+        / u64::from(manifest.layout.canvas.height)
+            .saturating_mul(maximum_line_chars)
+            .saturating_mul(68)
+            .max(1);
+    let font_size_bp = base_bp.min(height_cap_bp).min(width_cap_bp).clamp(1, 1_000) as u16;
+    Ok(CaptionRenderGeometry {
+        bounds,
+        font_size_bp,
+    })
+}
+
+fn scale_basis_point(value_bp: i32, pixels: u32) -> u32 {
+    let value = u64::try_from(value_bp.max(0)).unwrap_or_default();
+    ((value.saturating_mul(u64::from(pixels))
+        + u64::try_from(NORMALIZED_BASIS_POINTS / 2).unwrap_or_default())
+        / u64::try_from(NORMALIZED_BASIS_POINTS).unwrap_or(10_000)) as u32
+}
+
+fn ass_geometry_override(geometry: CaptionRenderGeometry, width: u32, height: u32) -> String {
+    let center_x_bp = geometry.bounds.x_bp + geometry.bounds.width_bp / 2;
+    let center_y_bp = geometry.bounds.y_bp + geometry.bounds.height_bp / 2;
+    let x = scale_basis_point(center_x_bp, width);
+    let y = scale_basis_point(center_y_bp, height);
+    let font_size = scale_basis_point(i32::from(geometry.font_size_bp), height).max(1);
+    format!(r"{{\an5\pos({x},{y})\fs{font_size}\q2}}")
+}
+
 fn ass_caption_style(preset: AssCaptionPreset, width: u32, height: u32) -> String {
     let font_size = caption_font_size(preset, height);
     let margin_horizontal = ((width as f64 * 0.065).round() as u32).max(36);
@@ -1255,11 +1333,15 @@ fn append_caption_events(
     document: &mut String,
     manifest: &VideoProjectManifest,
     caption: &CaptionCue,
+    width: u32,
+    height: u32,
 ) -> VideoResult<()> {
     let (preset, pages) = planned_caption_pages_for_cue(manifest, caption)?;
     let speaker = caption.speaker_id.as_deref().unwrap_or_default();
 
     for page in pages {
+        let geometry = caption_geometry_for_page(manifest, caption, preset, &page)?;
+        let geometry_override = ass_geometry_override(geometry, width, height);
         match preset.reveal {
             CaptionRevealMode::Page => {
                 let mut text = caption_page_text(&page, preset, None, None, None);
@@ -1267,6 +1349,7 @@ fn append_caption_events(
                 if !animation.is_empty() {
                     text.insert_str(0, animation);
                 }
+                text.insert_str(0, &geometry_override);
                 document.push_str(&ass_dialogue(
                     10,
                     page.start_us,
@@ -1277,13 +1360,29 @@ fn append_caption_events(
                 ));
             }
             CaptionRevealMode::ActiveWord => {
-                append_stateful_caption_events(document, &page, preset, speaker, true, false)?;
+                append_stateful_caption_events(
+                    document,
+                    &page,
+                    preset,
+                    speaker,
+                    &geometry_override,
+                    true,
+                    false,
+                )?;
             }
             CaptionRevealMode::Karaoke => {
-                append_stateful_caption_events(document, &page, preset, speaker, false, true)?;
+                append_stateful_caption_events(
+                    document,
+                    &page,
+                    preset,
+                    speaker,
+                    &geometry_override,
+                    false,
+                    true,
+                )?;
             }
             CaptionRevealMode::Typewriter => {
-                append_typewriter_events(document, &page, preset, speaker)?;
+                append_typewriter_events(document, &page, preset, speaker, &geometry_override)?;
             }
         }
     }
@@ -1729,6 +1828,7 @@ fn append_stateful_caption_events(
     page: &CaptionPage,
     preset: AssCaptionPreset,
     speaker: &str,
+    geometry_override: &str,
     active_word: bool,
     progressive: bool,
 ) -> VideoResult<()> {
@@ -1759,7 +1859,10 @@ fn append_stateful_caption_events(
                 .take_while(|token| token.start_us <= midpoint)
                 .count()
         });
-        let text = caption_page_text(page, preset, active, spoken, None);
+        let text = format!(
+            "{geometry_override}{}",
+            caption_page_text(page, preset, active, spoken, None)
+        );
         document.push_str(&ass_dialogue(
             10,
             start,
@@ -1777,6 +1880,7 @@ fn append_typewriter_events(
     page: &CaptionPage,
     preset: AssCaptionPreset,
     speaker: &str,
+    geometry_override: &str,
 ) -> VideoResult<()> {
     let mut boundaries = BTreeSet::from([page.start_us, page.end_us]);
     boundaries.extend(
@@ -1800,7 +1904,10 @@ fn append_typewriter_events(
         if visible == 0 {
             continue;
         }
-        let text = caption_page_text(page, preset, None, None, Some(visible));
+        let text = format!(
+            "{geometry_override}{}",
+            caption_page_text(page, preset, None, None, Some(visible))
+        );
         document.push_str(&ass_dialogue(
             10,
             start,
@@ -2000,11 +2107,11 @@ fn validate_output_path(path: &Path) -> VideoResult<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::super::contracts::{
-        AudioMix, AudioMixTrack, CanvasSpec, GapReason, LayoutPlan, MediaProbe, MediaReference,
-        NormalizedRect, Provenance, ProvenanceKind, RationalFrameRate, RationalRate, ReviewState,
-        ReviewedScene, SourceAsset, SourceAssetKind, TimeRange, TimelineClip, TimelineGap,
-        TimelineTrack, TrackKind, TranscriptSegment, TranscriptTimingSource, TranscriptVersion,
-        TranscriptWord,
+        default_caption_bounds, AudioMix, AudioMixTrack, CanvasSpec, GapReason, LayoutElement,
+        LayoutPlan, MediaProbe, MediaReference, NormalizedRect, Provenance, ProvenanceKind,
+        RationalFrameRate, RationalRate, ReviewState, ReviewedScene, SourceAsset, SourceAssetKind,
+        TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, TranscriptSegment,
+        TranscriptTimingSource, TranscriptVersion, TranscriptWord,
     };
     use super::*;
     use std::process::{Command, Stdio};
@@ -2571,6 +2678,79 @@ mod tests {
     }
 
     #[test]
+    fn caption_geometry_is_authoritative_without_changing_page_or_word_clocks() {
+        let root = std::env::temp_dir().join(format!(
+            "soundar-caption-geometry-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        fs::write(&source, b"fixture").unwrap();
+        let mut manifest = fixture_manifest(&source);
+        manifest.captions[0].style_id = "caption-karaoke".into();
+
+        let default_pages = plan_caption_preview_pages(&manifest).unwrap();
+        let expected_default = default_caption_bounds(&manifest.layout).unwrap();
+        assert!(default_pages
+            .iter()
+            .all(|page| page.bounds == expected_default));
+        let default_document = build_ass_document(&manifest, &AssemblyOptions::default()).unwrap();
+
+        let moved = NormalizedRect {
+            x_bp: 100,
+            y_bp: 100,
+            width_bp: 3_000,
+            height_bp: 1_200,
+        };
+        manifest.layout.elements.push(LayoutElement {
+            id: "caption-layout-scene-1".into(),
+            role: LayoutRole::Captions,
+            scene_id: Some("scene-1".into()),
+            bounds: moved,
+            z_index: 100,
+            style_id: None,
+        });
+        manifest.validate_strict().unwrap();
+        let moved_pages = plan_caption_preview_pages(&manifest).unwrap();
+        assert!(moved_pages.iter().all(|page| page.bounds == moved));
+        assert_ne!(
+            moved_pages[0].font_size_bp, default_pages[0].font_size_bp,
+            "resize must bind the authoritative font size"
+        );
+        let page_clock = |pages: &[CaptionPreviewPage]| {
+            pages
+                .iter()
+                .map(|page| {
+                    (
+                        page.id.clone(),
+                        page.start_us,
+                        page.end_us,
+                        page.text.clone(),
+                        page.words
+                            .iter()
+                            .map(|word| (word.text.clone(), word.start_us, word.end_us))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(page_clock(&default_pages), page_clock(&moved_pages));
+
+        let moved_document = build_ass_document(&manifest, &AssemblyOptions::default()).unwrap();
+        // Preview is 720x1280: center (1600,700) basis points maps to (115,90).
+        assert!(moved_document.contains(r"{\an5\pos(115,90)\fs"));
+        let event_clock = |document: &str| {
+            document
+                .lines()
+                .filter(|line| line.starts_with("Dialogue: 10,"))
+                .map(|line| line.splitn(6, ',').take(5).collect::<Vec<_>>().join(","))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(event_clock(&default_document), event_clock(&moved_document));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn assembly_plan_is_shell_free_and_has_software_fallback() {
         if !Path::new("/usr/bin/ffmpeg").is_file() {
             return;
@@ -2721,6 +2901,19 @@ mod tests {
         assert!(fixture_status.success());
         let mut manifest = fixture_manifest(&source);
         manifest.captions[0].style_id = "caption-karaoke".into();
+        manifest.layout.elements.push(LayoutElement {
+            id: "caption-layout-smoke".into(),
+            role: LayoutRole::Captions,
+            scene_id: Some("scene-1".into()),
+            bounds: NormalizedRect {
+                x_bp: 1_000,
+                y_bp: 1_200,
+                width_bp: 4_000,
+                height_bp: 1_000,
+            },
+            z_index: 100,
+            style_id: None,
+        });
         let options = AssemblyOptions {
             profile: RenderProfile::Proxy,
             portrait_layout: PortraitLayout::Contain,
@@ -2728,11 +2921,10 @@ mod tests {
             ..AssemblyOptions::default()
         };
         let captions_path = root.join("captions.ass");
-        write_ass_document_atomic(
-            &captions_path,
-            &build_ass_document(&manifest, &options).unwrap(),
-        )
-        .unwrap();
+        let ass = build_ass_document(&manifest, &options).unwrap();
+        // Proxy is 540x960: center (3000,1700) basis points maps to (162,163).
+        assert!(ass.contains(r"{\an5\pos(162,163)\fs"));
+        write_ass_document_atomic(&captions_path, &ass).unwrap();
         let output = root.join("assembled.mp4");
         let plan = build_timeline_render_plan(
             ffmpeg,

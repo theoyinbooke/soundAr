@@ -434,6 +434,8 @@ pub(crate) struct ScenePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption_style: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption_bounds: Option<video::NormalizedRect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_gain_db: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music_gain_db: Option<f64>,
@@ -508,6 +510,14 @@ impl ScenePatch {
                         "Caption style must be {}",
                         video::CaptionPresetId::PUBLIC_IDS.join(", ")
                     ),
+                )
+            })?;
+        }
+        if let Some(bounds) = self.caption_bounds {
+            video::canonical_caption_bounds(bounds).map_err(|_| {
+                VideoAgentToolError::invalid_field(
+                    "scene_patch.caption_bounds",
+                    "Caption bounds need an in-canvas anchor and dimensions of at least 1600x600 basis points",
                 )
             })?;
         }
@@ -1242,6 +1252,18 @@ fn revise_schema() -> Value {
                         },
                         "captions_enabled": {"type":["boolean","null"]},
                         "caption_style": {"type":["string","null"],"enum":["clean-white","calm","kinetic","bold-pop","highlight","karaoke","typewriter","podcast",null]},
+                        "caption_bounds": {
+                            "type":["object","null"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "x_bp": {"type":"integer","minimum":0,"maximum":9999},
+                                "y_bp": {"type":"integer","minimum":0,"maximum":9999},
+                                "width_bp": {"type":"integer","minimum":1600,"maximum":2147483647},
+                                "height_bp": {"type":"integer","minimum":600,"maximum":2147483647}
+                            },
+                            "required":["x_bp","y_bp","width_bp","height_bp"],
+                            "description":"Per-scene caption rectangle in 0..10000 canvas basis points; edge-crossing resize is canonicalized into frame"
+                        },
                         "voice_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12},
                         "music_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12},
                         "voice_id": {"type":["string","null"],"minLength":1,"maxLength":128,"description":"Stable soundAr Voice library id"},
@@ -1537,6 +1559,74 @@ mod tests {
         for style in video::CaptionPresetId::PUBLIC_IDS {
             assert!(values.iter().any(|value| value.as_str() == Some(style)));
         }
+    }
+
+    #[test]
+    fn caption_geometry_agent_contract_matches_native_canvas_canonicalization() {
+        let operation = VideoAgentOperation::parse(
+            "revise_video",
+            json!({
+                "project_id": "project-7",
+                "instruction": "Move and resize the opening captions",
+                "base_version_id": "version-2",
+                "scene_id": "scene-opening",
+                "scene_patch": {
+                    "caption_bounds": {
+                        "x_bp": 9500,
+                        "y_bp": 9200,
+                        "width_bp": 2500,
+                        "height_bp": 1200
+                    }
+                }
+            }),
+        )
+        .expect("edge-crossing resize is accepted for canonicalization");
+        let VideoAgentOperation::ReviseVideo(request) = operation else {
+            panic!("expected revise operation");
+        };
+        let raw = request
+            .scene_patch
+            .and_then(|patch| patch.caption_bounds)
+            .expect("caption geometry");
+        assert_eq!(
+            video::canonical_caption_bounds(raw).unwrap(),
+            video::NormalizedRect {
+                x_bp: 7_500,
+                y_bp: 8_800,
+                width_bp: 2_500,
+                height_bp: 1_200,
+            }
+        );
+
+        let too_small = VideoAgentOperation::parse(
+            "revise_video",
+            json!({
+                "project_id": "project-7",
+                "instruction": "Make captions impossibly small",
+                "base_version_id": "version-2",
+                "scene_patch": {
+                    "caption_bounds": {"x_bp":0,"y_bp":0,"width_bp":1599,"height_bp":600}
+                }
+            }),
+        )
+        .expect_err("agent cannot bypass the editor's usable caption minimum");
+        assert_eq!(too_small.code, "video.agent_invalid_field");
+        assert_eq!(
+            too_small.field.as_deref(),
+            Some("scene_patch.caption_bounds")
+        );
+
+        let schema = revise_schema();
+        let geometry = &schema["properties"]["scene_patch"]["properties"]["caption_bounds"];
+        assert_eq!(
+            geometry["properties"]["width_bp"]["minimum"],
+            video::MIN_CAPTION_WIDTH_BP
+        );
+        assert_eq!(
+            geometry["properties"]["height_bp"]["minimum"],
+            video::MIN_CAPTION_HEIGHT_BP
+        );
+        assert_eq!(geometry["additionalProperties"], false);
     }
 
     #[test]

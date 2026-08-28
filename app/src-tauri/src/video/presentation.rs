@@ -7,9 +7,9 @@
 
 use super::assembly::CaptionPreviewPage;
 use super::contracts::{
-    CandidateStatus, CanvasMode, CaptionPresetId, LayoutRole, Microseconds, PublicationState,
-    RenderArtifact, RenderArtifactRole, RevisionStage, SourceAsset, SourceAssetKind, TrackKind,
-    VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
+    caption_bounds_for_scene, CandidateStatus, CanvasMode, CaptionPresetId, LayoutRole,
+    Microseconds, PublicationState, RenderArtifact, RenderArtifactRole, RevisionStage, SourceAsset,
+    SourceAssetKind, TrackKind, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
 };
 use super::media::{MediaRuntimeStatus, MediaToolStatus};
 use serde_json::{json, Value};
@@ -178,6 +178,14 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
         .iter()
         .filter_map(|binding| Some((binding.scene_id.as_deref()?, binding)))
         .collect::<BTreeMap<_, _>>();
+    let caption_bounds_by_scene = manifest
+        .reviewed_scenes
+        .iter()
+        .map(|scene| {
+            caption_bounds_for_scene(&manifest.layout, Some(&scene.id))
+                .map(|bounds| (scene.id.as_str(), bounds))
+        })
+        .collect::<VideoResult<BTreeMap<_, _>>>()?;
     let scenes = manifest
         .reviewed_scenes
         .iter()
@@ -206,6 +214,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "crop_rect": scene_crop_rect(&manifest, &scene.id),
                 "captions_enabled": manifest.captions.iter().any(|caption| caption.scene_id.as_deref() == Some(scene.id.as_str())),
                 "caption_style": scene_caption_style,
+                "caption_bounds": caption_bounds_by_scene.get(scene.id.as_str()),
                 "voice_gain_db": gain_for_track(&manifest, "audio-main"),
                 "music_gain_db": gain_for_track(&manifest, "music-main"),
                 "narration_binding_id": narration.map(|binding| binding.id.as_str()),
@@ -607,6 +616,8 @@ fn present_timeline(
                 "label": page.text,
                 "scene_id": page.scene_id,
                 "caption_style": page.style_id,
+                "bounds": page.bounds,
+                "font_size_bp": page.font_size_bp,
             })).collect::<Vec<_>>(),
         }));
     }
@@ -632,6 +643,8 @@ fn present_caption_page(page: &CaptionPreviewPage) -> Value {
         "end_ms": micros_to_millis(page.end_us),
         "text": page.text,
         "style_id": page.style_id,
+        "bounds": page.bounds,
+        "font_size_bp": page.font_size_bp,
         "words": page.words.iter().map(|word| json!({
             "text": word.text,
             "start_ms": micros_to_millis(word.start_us),
@@ -884,8 +897,9 @@ fn presentation_error(message: impl Into<String>) -> VideoError {
 #[cfg(test)]
 mod tests {
     use super::super::contracts::{
-        AudioMix, CanvasSpec, CaptionCue, LayoutPlan, NormalizedRect, RationalFrameRate,
-        ReviewState, ReviewedScene, RevisionRecord, TimeRange, TimelineTrack, TrackKind,
+        AudioMix, CanvasSpec, CaptionCue, LayoutElement, LayoutPlan, NormalizedRect,
+        RationalFrameRate, ReviewState, ReviewedScene, RevisionRecord, TimeRange, TimelineTrack,
+        TrackKind,
     };
     use super::*;
     use std::collections::BTreeSet;
@@ -1017,6 +1031,36 @@ mod tests {
             clips: vec![],
             preserve_gaps: false,
         });
+        let opening_bounds = NormalizedRect {
+            x_bp: 100,
+            y_bp: 200,
+            width_bp: 3_600,
+            height_bp: 1_200,
+        };
+        let close_bounds = NormalizedRect {
+            x_bp: 5_000,
+            y_bp: 7_000,
+            width_bp: 4_500,
+            height_bp: 1_800,
+        };
+        manifest.layout.elements.extend([
+            LayoutElement {
+                id: "caption-layout-opening".into(),
+                role: LayoutRole::Captions,
+                scene_id: Some("scene-opening".into()),
+                bounds: opening_bounds,
+                z_index: 100,
+                style_id: None,
+            },
+            LayoutElement {
+                id: "caption-layout-close".into(),
+                role: LayoutRole::Captions,
+                scene_id: Some("scene-close".into()),
+                bounds: close_bounds,
+                z_index: 100,
+                style_id: None,
+            },
+        ]);
         manifest.validate_strict().unwrap();
         let canonical_pages = super::super::assembly::plan_caption_preview_pages(&manifest)
             .expect("canonical preview pages");
@@ -1051,6 +1095,14 @@ mod tests {
             presented["manifest"]["scenes"][1]["caption_style"],
             "karaoke"
         );
+        assert_eq!(
+            presented["manifest"]["scenes"][0]["caption_bounds"],
+            serde_json::to_value(opening_bounds).unwrap()
+        );
+        assert_eq!(
+            presented["manifest"]["scenes"][1]["caption_bounds"],
+            serde_json::to_value(close_bounds).unwrap()
+        );
         let presented_pages = presented["manifest"]["caption_pages"]
             .as_array()
             .expect("presented caption pages");
@@ -1075,6 +1127,19 @@ mod tests {
             assert_eq!(page["start_ms"], canonical.start_us.0 / 1_000);
             assert_eq!(page["end_ms"], canonical.end_us.0 / 1_000);
             assert_eq!(page["text"], canonical.text);
+            assert_eq!(
+                page["bounds"],
+                serde_json::to_value(canonical.bounds).unwrap()
+            );
+            assert_eq!(page["font_size_bp"], canonical.font_size_bp);
+            let timeline_item = caption_track["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == canonical.id)
+                .expect("authoritative caption timeline item");
+            assert_eq!(timeline_item["bounds"], page["bounds"]);
+            assert_eq!(timeline_item["font_size_bp"], page["font_size_bp"]);
             if canonical.style_id == "podcast" {
                 let start = ass_time_for_test(canonical.start_us);
                 let end = ass_time_for_test(canonical.end_us);
@@ -1089,6 +1154,8 @@ mod tests {
                 );
             }
         }
+        assert!(ass.contains(r"{\an5\pos(137,102)\fs"));
+        assert!(ass.contains(r"{\an5\pos(522,1011)\fs"));
     }
 
     fn strip_ass_overrides(value: &str) -> String {

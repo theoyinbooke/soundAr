@@ -10,7 +10,7 @@ use super::{
     discover_media_runtime, local_media_input_args, preflight_import_url_destination, probe_media,
     publish_atomic, sibling_staging_path, terminate_process_group, validate_import_url,
     write_ass_document_atomic, AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage,
-    CaptionTheme, FfmpegProgressParser, MediaError, MediaRuntimeStatus, Microseconds,
+    CaptionTheme, FfmpegProgressParser, LayoutRole, MediaError, MediaRuntimeStatus, Microseconds,
     NarrationBinding, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
     PublicationState, RationalFrameRate, RationalRate, RenderArtifact, RenderArtifactRole,
     RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass,
@@ -4791,10 +4791,42 @@ pub(crate) fn manifest_changed_paths(
     before: &VideoProjectManifest,
     after: &VideoProjectManifest,
 ) -> ServiceResult<BTreeSet<String>> {
+    let before_caption_elements = before
+        .layout
+        .elements
+        .iter()
+        .filter(|element| matches!(element.role, LayoutRole::Captions))
+        .collect::<Vec<_>>();
+    let after_caption_elements = after
+        .layout
+        .elements
+        .iter()
+        .filter(|element| matches!(element.role, LayoutRole::Captions))
+        .collect::<Vec<_>>();
+    let before_other_elements = before
+        .layout
+        .elements
+        .iter()
+        .filter(|element| !matches!(element.role, LayoutRole::Captions))
+        .collect::<Vec<_>>();
+    let after_other_elements = after
+        .layout
+        .elements
+        .iter()
+        .filter(|element| !matches!(element.role, LayoutRole::Captions))
+        .collect::<Vec<_>>();
     let before = manifest_content_value(before)?;
     let after = manifest_content_value(after)?;
     let mut changed = BTreeSet::new();
     collect_manifest_diff(&before, &after, "", &mut changed);
+    if changed.remove("/layout/elements") {
+        if before_caption_elements != after_caption_elements {
+            changed.insert("/layout/elements/captions".to_string());
+        }
+        if before_other_elements != after_other_elements {
+            changed.insert("/layout/elements".to_string());
+        }
+    }
     Ok(changed)
 }
 
@@ -4871,7 +4903,7 @@ pub(crate) fn invalidated_stages_for_manifest_changes(
                 RevisionStage::FinalRender,
                 RevisionStage::PublishPackage,
             ])
-        } else if path.starts_with("/captions") {
+        } else if path.starts_with("/captions") || path.starts_with("/layout/elements/captions") {
             BTreeSet::from([
                 RevisionStage::Captions,
                 RevisionStage::SceneRender,
@@ -6057,6 +6089,41 @@ mod tests {
             "layout-dependent ASS documents must never share a cache key"
         );
 
+        let before_geometry = manifest.clone();
+        manifest.layout.elements.push(super::super::LayoutElement {
+            id: "caption-layout-cache".to_string(),
+            role: LayoutRole::Captions,
+            scene_id: None,
+            bounds: super::super::NormalizedRect {
+                x_bp: 100,
+                y_bp: 200,
+                width_bp: 3_600,
+                height_bp: 1_200,
+            },
+            z_index: 100,
+            style_id: None,
+        });
+        manifest.validate_strict().expect("valid caption geometry");
+        let geometry_key =
+            timeline_caption_cache_key(&manifest, &request).expect("geometry caption key");
+        assert_ne!(custom_key, geometry_key);
+        let geometry_paths =
+            manifest_changed_paths(&before_geometry, &manifest).expect("caption geometry diff");
+        assert_eq!(
+            geometry_paths,
+            BTreeSet::from(["/layout/elements/captions".to_string()])
+        );
+        assert_eq!(
+            invalidated_stages_for_manifest_changes(&geometry_paths),
+            BTreeSet::from([
+                RevisionStage::Captions,
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ])
+        );
+
         manifest.captions.push(super::super::CaptionCue {
             id: "caption-cache-cue".to_string(),
             range: TimeRange::new(0, 1_000_000).expect("caption range"),
@@ -6072,7 +6139,7 @@ mod tests {
         manifest.captions[0].style_id = "caption-karaoke".to_string();
         let karaoke_key =
             timeline_caption_cache_key(&manifest, &request).expect("karaoke caption key");
-        assert_ne!(custom_key, podcast_key);
+        assert_ne!(geometry_key, podcast_key);
         assert_ne!(
             podcast_key, karaoke_key,
             "per-cue preset changes must invalidate the caption document cache"

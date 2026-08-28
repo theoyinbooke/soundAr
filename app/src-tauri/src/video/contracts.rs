@@ -8,6 +8,8 @@ use std::fmt;
 pub const VIDEO_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const SHA256_HEX_LENGTH: usize = 64;
 pub const NORMALIZED_BASIS_POINTS: i32 = 10_000;
+pub const MIN_CAPTION_WIDTH_BP: i32 = 1_600;
+pub const MIN_CAPTION_HEIGHT_BP: i32 = 600;
 pub const MAX_SOURCE_DURATION_US: i64 = 6 * 60 * 60 * 1_000_000;
 pub const MAX_TIMELINE_DURATION_US: i64 = MAX_SOURCE_DURATION_US;
 
@@ -750,6 +752,99 @@ impl Validate for NormalizedRect {
         }
         Ok(())
     }
+}
+
+/// Canonicalize an explicit caption drag/resize rectangle onto the normalized canvas.
+///
+/// Coordinates that already fit are returned byte-for-byte. A resize that crosses the right or
+/// bottom edge is translated back into frame, while dimensions larger than the canvas are shrunk
+/// to the canvas. Negative/off-canvas anchors and dimensions below the editor's usable minimum
+/// fail closed. The layout
+/// safe area is intentionally not applied here: it is a default/snap guide, not a restriction on
+/// an explicit editor placement.
+pub fn canonical_caption_bounds(bounds: NormalizedRect) -> VideoResult<NormalizedRect> {
+    if bounds.x_bp < 0
+        || bounds.x_bp >= NORMALIZED_BASIS_POINTS
+        || bounds.y_bp < 0
+        || bounds.y_bp >= NORMALIZED_BASIS_POINTS
+        || bounds.width_bp < MIN_CAPTION_WIDTH_BP
+        || bounds.height_bp < MIN_CAPTION_HEIGHT_BP
+    {
+        return Err(VideoError::new(
+            VideoErrorCode::InvalidLayout,
+            "caption bounds need an in-canvas anchor and dimensions of at least 1600x600 basis points",
+        )
+        .at("layout.elements.bounds"));
+    }
+    let width_bp = bounds.width_bp.min(NORMALIZED_BASIS_POINTS);
+    let height_bp = bounds.height_bp.min(NORMALIZED_BASIS_POINTS);
+    Ok(NormalizedRect {
+        x_bp: bounds
+            .x_bp
+            .min(NORMALIZED_BASIS_POINTS.saturating_sub(width_bp)),
+        y_bp: bounds
+            .y_bp
+            .min(NORMALIZED_BASIS_POINTS.saturating_sub(height_bp)),
+        width_bp,
+        height_bp,
+    })
+}
+
+/// Deterministic lower-third fallback used by legacy manifests without caption layout elements.
+/// It is derived solely from the validated safe area and therefore remains stable across preview
+/// and final profiles without mutating old projects during read/presentation.
+pub fn default_caption_bounds(layout: &LayoutPlan) -> VideoResult<NormalizedRect> {
+    layout.safe_area.validate()?;
+    let safe = layout.safe_area;
+    let width_bp = (safe.width_bp * 9 / 10).clamp(MIN_CAPTION_WIDTH_BP, NORMALIZED_BASIS_POINTS);
+    let height_bp =
+        (safe.height_bp * 22 / 100).clamp(MIN_CAPTION_HEIGHT_BP, NORMALIZED_BASIS_POINTS);
+    let bottom_inset_bp = safe.height_bp * 6 / 100;
+    let x_bp =
+        (safe.x_bp + (safe.width_bp - width_bp) / 2).clamp(0, NORMALIZED_BASIS_POINTS - width_bp);
+    let y_bp = (safe.y_bp + safe.height_bp - bottom_inset_bp - height_bp)
+        .clamp(0, NORMALIZED_BASIS_POINTS - height_bp);
+    canonical_caption_bounds(NormalizedRect {
+        x_bp,
+        y_bp,
+        width_bp,
+        height_bp,
+    })
+}
+
+/// Resolve the one effective caption rectangle for a scene. Scene-scoped elements win over a
+/// legacy project-wide element; duplicate legacy entries are resolved by stable identifier order.
+/// Explicit legacy bounds are canvas-canonicalized on read, while absence uses the safe-area
+/// lower-third fallback.
+pub fn caption_bounds_for_scene(
+    layout: &LayoutPlan,
+    scene_id: Option<&str>,
+) -> VideoResult<NormalizedRect> {
+    let pick = |required_scene: Option<&str>| {
+        layout
+            .elements
+            .iter()
+            .filter(|element| {
+                matches!(element.role, LayoutRole::Captions)
+                    && element.scene_id.as_deref() == required_scene
+            })
+            .min_by(|left, right| left.id.cmp(&right.id))
+    };
+    let explicit = scene_id
+        .and_then(|scene_id| pick(Some(scene_id)))
+        .or_else(|| pick(None));
+    explicit
+        .map(|element| {
+            // Caption layout roles predate the interactive geometry contract. Keep those manifests
+            // readable even if an old hand-authored element was smaller than today's editor
+            // minimum; new mutation surfaces still fail closed before persistence.
+            canonical_caption_bounds(NormalizedRect {
+                width_bp: element.bounds.width_bp.max(MIN_CAPTION_WIDTH_BP),
+                height_bp: element.bounds.height_bp.max(MIN_CAPTION_HEIGHT_BP),
+                ..element.bounds
+            })
+        })
+        .unwrap_or_else(|| default_caption_bounds(layout))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2331,6 +2426,109 @@ mod tests {
             created_at: timestamp(),
             updated_at: timestamp(),
         }
+    }
+
+    #[test]
+    fn caption_bounds_preserve_free_canvas_placement_and_normalize_edge_resize() {
+        let layout = manifest().layout;
+        assert_eq!(
+            default_caption_bounds(&layout).unwrap(),
+            NormalizedRect {
+                x_bp: 950,
+                y_bp: 6_980,
+                width_bp: 8_100,
+                height_bp: 1_980,
+            }
+        );
+        let outside_safe_area = NormalizedRect {
+            x_bp: 100,
+            y_bp: 100,
+            width_bp: 2_400,
+            height_bp: 900,
+        };
+        assert_eq!(
+            canonical_caption_bounds(outside_safe_area).unwrap(),
+            outside_safe_area,
+            "safe area is a guide, not a drag restriction"
+        );
+        assert_eq!(
+            canonical_caption_bounds(NormalizedRect {
+                x_bp: 9_500,
+                y_bp: 9_200,
+                width_bp: 2_500,
+                height_bp: 1_200,
+            })
+            .unwrap(),
+            NormalizedRect {
+                x_bp: 7_500,
+                y_bp: 8_800,
+                width_bp: 2_500,
+                height_bp: 1_200,
+            }
+        );
+        assert_eq!(
+            canonical_caption_bounds(NormalizedRect {
+                x_bp: 123,
+                y_bp: 456,
+                width_bp: 20_000,
+                height_bp: 20_000,
+            })
+            .unwrap(),
+            NormalizedRect {
+                x_bp: 0,
+                y_bp: 0,
+                width_bp: 10_000,
+                height_bp: 10_000,
+            }
+        );
+        for invalid in [
+            NormalizedRect {
+                x_bp: -1,
+                y_bp: 0,
+                width_bp: 1_600,
+                height_bp: 600,
+            },
+            NormalizedRect {
+                x_bp: 0,
+                y_bp: 0,
+                width_bp: 1_599,
+                height_bp: 600,
+            },
+            NormalizedRect {
+                x_bp: 0,
+                y_bp: 0,
+                width_bp: 1_600,
+                height_bp: 599,
+            },
+        ] {
+            assert!(canonical_caption_bounds(invalid).is_err());
+        }
+
+        let mut legacy_layout = layout;
+        legacy_layout.elements.push(LayoutElement {
+            id: "legacy-caption-geometry".into(),
+            role: LayoutRole::Captions,
+            scene_id: None,
+            bounds: NormalizedRect {
+                x_bp: 9_999,
+                y_bp: 9_999,
+                width_bp: 1,
+                height_bp: 1,
+            },
+            z_index: 10,
+            style_id: None,
+        });
+        assert_eq!(
+            caption_bounds_for_scene(&legacy_layout, Some("scene-with-no-explicit-layout"))
+                .unwrap(),
+            NormalizedRect {
+                x_bp: 8_400,
+                y_bp: 9_400,
+                width_bp: MIN_CAPTION_WIDTH_BP,
+                height_bp: MIN_CAPTION_HEIGHT_BP,
+            },
+            "pre-geometry manifests stay readable while new mutations enforce the usable minimum"
+        );
     }
 
     #[test]

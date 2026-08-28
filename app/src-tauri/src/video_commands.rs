@@ -66,6 +66,7 @@ pub(crate) struct UiScenePatch {
     crop_rect: Option<video::NormalizedRect>,
     captions_enabled: Option<bool>,
     caption_style: Option<String>,
+    caption_bounds: Option<video::NormalizedRect>,
     voice_gain_db: Option<f64>,
     music_gain_db: Option<f64>,
     voice_id: Option<String>,
@@ -351,6 +352,7 @@ pub(crate) fn dispatch_video_operation(
                 crop_rect: patch.crop_rect,
                 captions_enabled: patch.captions_enabled,
                 caption_style: patch.caption_style,
+                caption_bounds: patch.caption_bounds,
                 voice_gain_db: patch.voice_gain_db,
                 music_gain_db: patch.music_gain_db,
                 voice_id: patch.voice_id,
@@ -2154,6 +2156,11 @@ fn apply_scene_patch(
         changed_paths.insert("/captions".into());
         invalidate_caption_render(invalidated);
     }
+    if let Some(bounds) = patch.caption_bounds {
+        set_scene_caption_bounds(manifest, &scene_id, bounds)?;
+        changed_paths.insert("/layout/elements/captions".into());
+        invalidate_caption_render(invalidated);
+    }
     if let Some(gain) = patch.voice_gain_db {
         set_mix_gain(manifest, "audio-main", gain)?;
         changed_paths.insert("/audio_mix/tracks/audio-main".into());
@@ -2650,6 +2657,65 @@ fn set_caption_style(
         );
     }
     Ok(())
+}
+
+fn set_scene_caption_bounds(
+    manifest: &mut video::VideoProjectManifest,
+    scene_id: &str,
+    requested: video::NormalizedRect,
+) -> Result<video::NormalizedRect, String> {
+    if !manifest
+        .reviewed_scenes
+        .iter()
+        .any(|scene| scene.id == scene_id)
+    {
+        return Err(
+            "video.scene_not_found: The selected scene is no longer in this version".into(),
+        );
+    }
+    let bounds = video::canonical_caption_bounds(requested).map_err(|_| {
+        "video.invalid_caption_bounds: Caption bounds need an in-canvas anchor and dimensions of at least 1600x600 basis points"
+            .to_string()
+    })?;
+    let existing = manifest
+        .layout
+        .elements
+        .iter()
+        .filter(|element| {
+            matches!(element.role, video::LayoutRole::Captions)
+                && element.scene_id.as_deref() == Some(scene_id)
+        })
+        .min_by(|left, right| left.id.cmp(&right.id))
+        .cloned();
+    manifest.layout.elements.retain(|element| {
+        !(matches!(element.role, video::LayoutRole::Captions)
+            && element.scene_id.as_deref() == Some(scene_id))
+    });
+    let id = if let Some(existing) = &existing {
+        existing.id.clone()
+    } else {
+        let digest = sha256_text(scene_id);
+        [16_usize, 24, 32, 64]
+            .into_iter()
+            .map(|length| format!("caption-layout-{}", &digest[..length]))
+            .find(|candidate| {
+                manifest
+                    .layout
+                    .elements
+                    .iter()
+                    .all(|element| element.id != *candidate)
+            })
+            .ok_or("video.layout_id_conflict: Could not allocate caption layout identity")?
+    };
+    manifest.layout.elements.push(video::LayoutElement {
+        id,
+        role: video::LayoutRole::Captions,
+        scene_id: Some(scene_id.to_string()),
+        bounds,
+        z_index: existing.as_ref().map_or(100, |element| element.z_index),
+        style_id: existing.and_then(|element| element.style_id),
+    });
+    Ok(bounds)
 }
 
 fn caption_style_id(style: &str) -> Result<String, String> {
@@ -5560,6 +5626,7 @@ mod tests {
             crop_rect: None,
             captions_enabled: None,
             caption_style: None,
+            caption_bounds: None,
             voice_gain_db: None,
             music_gain_db: None,
             voice_id: Some("af_heart".into()),
@@ -6084,6 +6151,7 @@ mod tests {
                 }),
                 captions_enabled: Some(true),
                 caption_style: Some("calm".into()),
+                caption_bounds: None,
                 voice_gain_db: Some(-3.0),
                 music_gain_db: Some(-12.0),
                 voice_id: None,
@@ -6138,6 +6206,119 @@ mod tests {
                 .expect_err("manual framing needs exact normalized coordinates")
                 .starts_with("video.invalid_crop:")
         );
+    }
+
+    #[test]
+    fn caption_geometry_patch_is_canvas_canonical_and_invalidates_only_caption_renders() {
+        let before = revision_fixture();
+        let before_pages = video::plan_caption_preview_pages(&before).unwrap();
+        let mut after = before.clone();
+        let mut requested_paths = BTreeSet::new();
+        let mut requested_stages = BTreeSet::new();
+        apply_scene_patch(
+            &mut after,
+            Some("scene-opening"),
+            &UiScenePatch {
+                layout: None,
+                crop_mode: None,
+                crop_rect: None,
+                captions_enabled: None,
+                caption_style: None,
+                caption_bounds: Some(video::NormalizedRect {
+                    x_bp: 9_500,
+                    y_bp: 9_200,
+                    width_bp: 2_500,
+                    height_bp: 1_200,
+                }),
+                voice_gain_db: None,
+                music_gain_db: None,
+                voice_id: None,
+                model_id: None,
+                speaker: None,
+                language: None,
+            },
+            &mut requested_paths,
+            &mut requested_stages,
+        )
+        .unwrap();
+        let expected = video::NormalizedRect {
+            x_bp: 7_500,
+            y_bp: 8_800,
+            width_bp: 2_500,
+            height_bp: 1_200,
+        };
+        assert_eq!(
+            video::caption_bounds_for_scene(&after.layout, Some("scene-opening")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            after
+                .layout
+                .elements
+                .iter()
+                .filter(|element| {
+                    matches!(element.role, video::LayoutRole::Captions)
+                        && element.scene_id.as_deref() == Some("scene-opening")
+                })
+                .count(),
+            1
+        );
+        let paths = manifest_diff_paths(&before, &after).unwrap();
+        assert_eq!(
+            paths,
+            BTreeSet::from(["/layout/elements/captions".to_string()])
+        );
+        let invalidated = invalidation_for_manifest_changes(&paths);
+        assert_eq!(
+            invalidated,
+            BTreeSet::from([
+                video::RevisionStage::Captions,
+                video::RevisionStage::SceneRender,
+                video::RevisionStage::Preview,
+                video::RevisionStage::FinalRender,
+                video::RevisionStage::PublishPackage,
+            ])
+        );
+        for forbidden in [
+            video::RevisionStage::Transcript,
+            video::RevisionStage::Speech,
+            video::RevisionStage::Music,
+            video::RevisionStage::Tracking,
+        ] {
+            assert!(!invalidated.contains(&forbidden));
+        }
+        let after_pages = video::plan_caption_preview_pages(&after).unwrap();
+        let clocks = |pages: &[video::CaptionPreviewPage]| {
+            pages
+                .iter()
+                .map(|page| {
+                    (
+                        page.id.clone(),
+                        page.start_us,
+                        page.end_us,
+                        page.words
+                            .iter()
+                            .map(|word| (word.start_us, word.end_us))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(clocks(&before_pages), clocks(&after_pages));
+        after.validate_strict().unwrap();
+
+        let error = set_scene_caption_bounds(
+            &mut after,
+            "scene-opening",
+            video::NormalizedRect {
+                x_bp: 0,
+                y_bp: 0,
+                width_bp: video::MIN_CAPTION_WIDTH_BP - 1,
+                height_bp: video::MIN_CAPTION_HEIGHT_BP,
+            },
+        )
+        .expect_err("headless/native callers must share the editor minimum");
+        assert!(error.starts_with("video.invalid_caption_bounds:"));
     }
 
     #[test]
