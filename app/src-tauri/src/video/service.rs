@@ -3202,6 +3202,33 @@ fn manifest_content_value(manifest: &VideoProjectManifest) -> ServiceResult<Valu
     Ok(value)
 }
 
+fn timeline_caption_cache_key(
+    manifest: &VideoProjectManifest,
+    request: &TimelineRenderRequest,
+) -> ServiceResult<String> {
+    CacheKeyBuilder::new(CacheStage::Captions, format!("{SERVICE_VERSION}:ass-v2"))
+        .manifest_slice(json!({
+            "reviewed_scenes": &manifest.reviewed_scenes,
+            "captions": &manifest.captions,
+            "timeline_duration_us": manifest.timeline_duration_us,
+            "frame_rate": manifest.frame_rate,
+            // ASS PlayRes, font sizing, and vertical margins are layout-aware.
+            // Bind the complete layout so future layout-driven overlay changes
+            // cannot silently reuse a caption document from another canvas.
+            "layout": &manifest.layout,
+        }))
+        .profile(json!({
+            "profile": request.profile,
+            "caption_theme": request.caption_theme,
+            "include_title_cards": request.include_title_cards,
+            "include_speaker_cards": request.include_speaker_cards,
+            "burn_captions": request.burn_captions,
+        }))
+        .build()
+        .map(|key| key.into_string())
+        .map_err(VideoServiceError::from)
+}
+
 fn escape_json_pointer_component(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
@@ -3694,6 +3721,51 @@ mod tests {
             )
             .expect_err("mismatched exact URL must fail");
         assert_eq!(error.code, "video.rights_url_mismatch");
+    }
+
+    #[test]
+    fn caption_cache_key_changes_with_the_effective_canvas() {
+        let mut manifest = empty_manifest("project-caption-cache", "Caption cache");
+        let request = TimelineRenderRequest {
+            project_id: manifest.project_id.clone(),
+            expected_revision: 1,
+            expected_version_id: "version-caption-cache".to_string(),
+            profile: TimelineRenderProfile::Preview,
+            caption_theme: CaptionTheme::Calm,
+            portrait_layout: PortraitSourceLayout::CenterCrop,
+            actor: "service-test".to_string(),
+            variation: 0,
+            include_title_cards: true,
+            include_speaker_cards: true,
+            burn_captions: true,
+        };
+        let options = AssemblyOptions {
+            profile: RenderProfile::Preview,
+            portrait_layout: PortraitLayout::CenterCrop,
+            caption_theme: CaptionTheme::Calm,
+            include_title_cards: true,
+            include_speaker_cards: true,
+            burn_captions: true,
+        };
+        let portrait_key =
+            timeline_caption_cache_key(&manifest, &request).expect("portrait caption key");
+        let portrait_document =
+            build_ass_document(&manifest, &options).expect("portrait caption document");
+
+        manifest.layout.mode = CanvasMode::Custom;
+        manifest.layout.canvas.width = 864;
+        manifest.layout.canvas.height = 1_080;
+        manifest.validate_strict().expect("valid custom canvas");
+        let custom_key =
+            timeline_caption_cache_key(&manifest, &request).expect("custom caption key");
+        let custom_document =
+            build_ass_document(&manifest, &options).expect("custom caption document");
+
+        assert_ne!(portrait_document, custom_document);
+        assert_ne!(
+            portrait_key, custom_key,
+            "layout-dependent ASS documents must never share a cache key"
+        );
     }
 
     #[test]
@@ -6564,25 +6636,7 @@ impl VideoStudioService {
             }
         }
 
-        let overlay_slice = json!({
-            "reviewed_scenes": manifest.reviewed_scenes,
-            "captions": manifest.captions,
-            "timeline_duration_us": manifest.timeline_duration_us,
-            "frame_rate": manifest.frame_rate,
-        });
-        let overlay_profile = json!({
-            "profile": request.profile,
-            "caption_theme": request.caption_theme,
-            "include_title_cards": request.include_title_cards,
-            "include_speaker_cards": request.include_speaker_cards,
-            "burn_captions": request.burn_captions,
-        });
-        let caption_key =
-            CacheKeyBuilder::new(CacheStage::Captions, format!("{SERVICE_VERSION}:ass-v1"))
-                .manifest_slice(overlay_slice)
-                .profile(overlay_profile)
-                .build()?
-                .into_string();
+        let caption_key = timeline_caption_cache_key(&manifest, request)?;
         let ass_document = build_ass_document(&manifest, &options)?;
         let expected_ass_sha = sha256_bytes(ass_document.as_bytes());
         let (ass_path, caption_cache_hit) = if let Some(cache) = self
