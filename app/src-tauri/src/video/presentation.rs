@@ -298,11 +298,26 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
         .and_then(Value::as_str)
         .unwrap_or(manifest.updated_at.as_str());
     let duration_ms = micros_to_millis(manifest.timeline_duration_us);
-    let poster_url = artifacts
-        .iter()
-        .find(|artifact| artifact.get("format").and_then(Value::as_str) == Some("image"))
-        .and_then(|artifact| artifact.get("local_path"))
+    // A generated still is the most faithful idle preview for illustrated/audio-led projects.
+    // Imported video projects fall back to their derived source thumbnail; waveforms are never
+    // promoted to a video poster merely because they are images.
+    let poster_url = visual_assets
+        .first()
+        .and_then(|asset| asset.get("local_path"))
         .cloned()
+        .or_else(|| {
+            artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.get("format").and_then(Value::as_str) == Some("image")
+                        && artifact
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .is_some_and(|title| title.to_ascii_lowercase().contains("thumbnail"))
+                })
+                .and_then(|artifact| artifact.get("local_path"))
+                .cloned()
+        })
         .unwrap_or(Value::Null);
 
     Ok(json!({
@@ -1121,6 +1136,7 @@ mod tests {
             visual["local_path"],
             "/tmp/video-root/projects/video-project/visuals/visual-illustration.png"
         );
+        assert_eq!(presented["poster_url"], visual["local_path"]);
         let layer = &presented["manifest"]["visual_layers"][0];
         assert_eq!(layer["id"], "visual-layer-illustration");
         assert_eq!(layer["start_ms"], 500);
