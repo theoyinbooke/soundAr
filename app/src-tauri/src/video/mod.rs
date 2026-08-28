@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod contracts;
+pub mod intelligence;
 pub mod media;
 pub mod renderer;
 pub mod scheduler;
@@ -16,6 +17,11 @@ pub use cache::{
     ManifestChange,
 };
 pub use contracts::*;
+pub use intelligence::{
+    apply_scene_plan, identify_clip_candidates, plan_reviewed_timeline, source_range_fingerprint,
+    transcript_from_runtime_json, CandidateAnalysis, CandidatePolicy, ScenePlan, ScenePlanRequest,
+    TranscriptImportRequest,
+};
 pub use media::{
     discover_media_runtime, probe_h264_nvenc_runtime, probe_media, validate_caption_cues,
     validate_import_url, CaptionCueInput, CaptionValidation, ImportProvider, MediaChapterProbe,
