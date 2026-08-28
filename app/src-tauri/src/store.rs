@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Transaction};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -10,7 +10,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 36;
 const HISTORY_RESULT_LIMIT: i64 = 500;
 
 pub struct Store {
@@ -26,6 +26,8 @@ impl Store {
             .map_err(|error| format!("Could not create the soundAr data directory: {error}"))?;
         fs::create_dir_all(&artifacts_root)
             .map_err(|error| format!("Could not create the artifact directory: {error}"))?;
+        fs::create_dir_all(artifacts_root.join("video"))
+            .map_err(|error| format!("Could not create the video artifact directory: {error}"))?;
         let voices_root = data_root.join("voices");
         fs::create_dir_all(&voices_root)
             .map_err(|error| format!("Could not create the voice library: {error}"))?;
@@ -114,6 +116,20 @@ impl Store {
                 [now()],
             )
             .map_err(|error| format!("Could not recover interrupted comparisons: {error}"))?;
+        connection
+            .execute(
+                "UPDATE video_workflow_stages
+                 SET status = 'interrupted', error_json = json_object('code', 'video.interrupted', 'message', 'Interrupted when soundAr last closed'), updated_at = ?1
+                 WHERE status = 'running'",
+                [&recovered_at],
+            )
+            .map_err(|error| format!("Could not checkpoint interrupted video work: {error}"))?;
+        connection
+            .execute(
+                "DELETE FROM video_project_locks WHERE lease_expires_at <= ?1",
+                [&recovered_at],
+            )
+            .map_err(|error| format!("Could not expire stale video project leases: {error}"))?;
 
         Ok(Self {
             connection: Mutex::new(connection),
@@ -3260,6 +3276,1046 @@ impl Store {
             .map_err(|error| format!("Could not read projects: {error}"))
     }
 
+    pub fn video_artifacts_root(&self) -> PathBuf {
+        self.artifacts_root.join("video")
+    }
+
+    pub fn create_video_project(
+        &self,
+        name: &str,
+        manifest: &Value,
+        actor: &str,
+    ) -> Result<Value, String> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 160 {
+            return Err(
+                "video.invalid_name: A video project name must contain 1 to 160 characters".into(),
+            );
+        }
+        if !manifest.is_object() {
+            return Err(
+                "video.invalid_manifest: The timeline manifest must be a JSON object".into(),
+            );
+        }
+        let schema_version = manifest
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or("video.invalid_manifest: schema_version must be a positive integer")?;
+        let project_id = manifest
+            .get("project_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let version_id = Uuid::new_v4().simple().to_string();
+        let manifest_json = manifest.to_string();
+        let manifest_sha256 = sha256_bytes(manifest_json.as_bytes());
+        let aspect_ratio = manifest_aspect_ratio(manifest);
+        let duration_us = manifest_duration_us(manifest);
+        let timestamp = now();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction().map_err(|error| {
+            format!("video.store_failed: Could not create the video project: {error}")
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO projects (id, name, document_json, created_at, updated_at, project_kind, current_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 'video', 1)",
+                params![project_id, name, manifest_json, timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not create the project record: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO video_projects (project_id, status, aspect_ratio, duration_us, current_version_id, source_summary_json, created_at, updated_at)
+                 VALUES (?1, 'draft', ?2, ?3, ?4, '{}', ?5, ?5)",
+                params![project_id, aspect_ratio, duration_us, version_id, timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not create video project state: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO video_project_versions (id, project_id, revision, schema_version, manifest_json, manifest_sha256, base_revision, actor, reason, created_at)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, 0, ?6, 'Project created', ?7)",
+                params![version_id, project_id, schema_version, manifest_json, manifest_sha256, actor, timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not save the initial timeline: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO video_project_events (id, project_id, version_id, event_kind, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, 'project.created', ?4, ?5)",
+                params![Uuid::new_v4().simple().to_string(), project_id, version_id, json!({"actor": actor}).to_string(), timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not record project creation: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("video.store_failed: Could not commit the video project: {error}")
+        })?;
+        drop(connection);
+        self.get_video_project(&project_id)?
+            .ok_or_else(|| "video.store_failed: The created project could not be reloaded".into())
+    }
+
+    pub fn list_video_projects(&self) -> Result<Vec<Value>, String> {
+        let ids = {
+            let connection = self.lock()?;
+            let mut statement = connection
+                .prepare(
+                    "SELECT p.id FROM projects p JOIN video_projects v ON v.project_id = p.id
+                     WHERE p.project_kind = 'video' ORDER BY p.updated_at DESC",
+                )
+                .map_err(|error| {
+                    format!("video.store_failed: Could not prepare video projects: {error}")
+                })?;
+            let ids = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| {
+                    format!("video.store_failed: Could not list video projects: {error}")
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    format!("video.store_failed: Could not read video projects: {error}")
+                })?;
+            ids
+        };
+        ids.iter()
+            .map(|id| {
+                self.get_video_project(id)?.ok_or_else(|| {
+                    format!("video.store_failed: Video project {id} disappeared while listing")
+                })
+            })
+            .collect()
+    }
+
+    pub fn get_video_project(&self, project_id: &str) -> Result<Option<Value>, String> {
+        let record: Option<(
+            String,
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+        )> = {
+            let connection = self.lock()?;
+            connection
+                .query_row(
+                    "SELECT p.id, p.name, p.current_revision, p.created_at, p.updated_at,
+                            v.duration_us, v.status, v.aspect_ratio, vv.id, vv.schema_version,
+                            vv.manifest_json, vv.manifest_sha256, vv.created_at
+                     FROM projects p
+                     JOIN video_projects v ON v.project_id = p.id
+                     JOIN video_project_versions vv ON vv.id = v.current_version_id
+                     WHERE p.id = ?1 AND p.project_kind = 'video'",
+                    [project_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                            row.get(12)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| {
+                    format!("video.store_failed: Could not load the video project: {error}")
+                })?
+        };
+        let Some((
+            id,
+            name,
+            revision,
+            created_at,
+            updated_at,
+            duration_us,
+            status,
+            aspect_ratio,
+            version_id,
+            schema_version,
+            manifest_json,
+            manifest_sha256,
+            version_created_at,
+        )) = record
+        else {
+            return Ok(None);
+        };
+        Ok(Some(json!({
+            "id": id,
+            "name": name,
+            "project_kind": "video",
+            "revision": revision,
+            "status": status,
+            "aspect_ratio": aspect_ratio,
+            "duration_us": duration_us,
+            "created_at": created_at,
+            "updated_at": updated_at,
+            "version": {
+                "id": version_id,
+                "schema_version": schema_version,
+                "sha256": manifest_sha256,
+                "created_at": version_created_at,
+            },
+            "manifest": serde_json::from_str::<Value>(&manifest_json).unwrap_or_else(|_| json!({})),
+            "assets": self.list_video_assets(&id)?,
+            "outputs": self.list_video_outputs(&id)?,
+            "stages": self.list_video_stages(&id)?,
+        })))
+    }
+
+    pub fn commit_video_manifest(
+        &self,
+        project_id: &str,
+        expected_revision: i64,
+        manifest: &Value,
+        actor: &str,
+        reason: &str,
+        lock_token: &str,
+        status: Option<&str>,
+    ) -> Result<Value, String> {
+        if !manifest.is_object() {
+            return Err(
+                "video.invalid_manifest: The timeline manifest must be a JSON object".into(),
+            );
+        }
+        let schema_version = manifest
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or("video.invalid_manifest: schema_version must be a positive integer")?;
+        let status = status.unwrap_or("draft");
+        if !matches!(
+            status,
+            "draft"
+                | "ingesting"
+                | "analyzing"
+                | "review"
+                | "ready"
+                | "rendering"
+                | "completed"
+                | "failed"
+                | "archived"
+        ) {
+            return Err("video.invalid_status: Unsupported project status".into());
+        }
+        let manifest_json = manifest.to_string();
+        let manifest_sha256 = sha256_bytes(manifest_json.as_bytes());
+        let timestamp = now();
+        let duration_us = manifest_duration_us(manifest);
+        let aspect_ratio = manifest_aspect_ratio(manifest);
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction().map_err(|error| {
+            format!("video.store_failed: Could not start the timeline revision: {error}")
+        })?;
+        let active_lock: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM video_project_locks WHERE project_id = ?1 AND token = ?2 AND lease_expires_at > ?3)",
+                params![project_id, lock_token, timestamp],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("video.store_failed: Could not validate the project lease: {error}"))?;
+        if !active_lock {
+            return Err(
+                "video.lock_required: Acquire or renew the project lease before saving".into(),
+            );
+        }
+        let current_revision: i64 = transaction
+            .query_row(
+                "SELECT current_revision FROM projects WHERE id = ?1 AND project_kind = 'video'",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                format!("video.store_failed: Could not inspect the project revision: {error}")
+            })?
+            .ok_or("video.not_found: The video project was not found")?;
+        if current_revision != expected_revision {
+            return Err(format!(
+                "video.revision_conflict: Expected revision {expected_revision}, but the project is at revision {current_revision}"
+            ));
+        }
+        let next_revision = current_revision + 1;
+        let version_id = Uuid::new_v4().simple().to_string();
+        transaction
+            .execute(
+                "INSERT INTO video_project_versions (id, project_id, revision, schema_version, manifest_json, manifest_sha256, base_revision, actor, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![version_id, project_id, next_revision, schema_version, manifest_json, manifest_sha256, current_revision, actor, reason, timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not save the timeline revision: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE projects SET document_json = ?2, current_revision = ?3, updated_at = ?4 WHERE id = ?1",
+                params![project_id, manifest_json, next_revision, timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not update project state: {error}"))?;
+        transaction
+            .execute(
+                "UPDATE video_projects SET status = ?2, aspect_ratio = ?3, duration_us = ?4, current_version_id = ?5, updated_at = ?6 WHERE project_id = ?1",
+                params![project_id, status, aspect_ratio, duration_us, version_id, timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not advance the timeline version: {error}"))?;
+        transaction
+            .execute(
+                "INSERT INTO video_project_events (id, project_id, version_id, event_kind, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, 'timeline.revised', ?4, ?5)",
+                params![Uuid::new_v4().simple().to_string(), project_id, version_id, json!({"actor": actor, "reason": reason, "base_revision": current_revision, "revision": next_revision}).to_string(), timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not record the timeline revision: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("video.store_failed: Could not commit the timeline revision: {error}")
+        })?;
+        drop(connection);
+        self.get_video_project(project_id)?
+            .ok_or_else(|| "video.store_failed: The revised project could not be reloaded".into())
+    }
+
+    pub fn acquire_video_project_lock(
+        &self,
+        project_id: &str,
+        owner: &str,
+        lease_seconds: i64,
+    ) -> Result<Value, String> {
+        let lease_seconds = lease_seconds.clamp(15, 300);
+        let timestamp = now();
+        let expires_at = (Utc::now() + ChronoDuration::seconds(lease_seconds)).to_rfc3339();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction().map_err(|error| {
+            format!("video.store_failed: Could not start project locking: {error}")
+        })?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM video_projects WHERE project_id = ?1)",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                format!("video.store_failed: Could not inspect the video project: {error}")
+            })?;
+        if !exists {
+            return Err("video.not_found: The video project was not found".into());
+        }
+        transaction
+            .execute(
+                "DELETE FROM video_project_locks WHERE project_id = ?1 AND lease_expires_at <= ?2",
+                params![project_id, timestamp],
+            )
+            .map_err(|error| {
+                format!("video.store_failed: Could not clear an expired project lease: {error}")
+            })?;
+        let existing: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT token, owner, lease_expires_at FROM video_project_locks WHERE project_id = ?1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("video.store_failed: Could not inspect the project lease: {error}"))?;
+        let token = match existing {
+            Some((token, current_owner, _)) if current_owner == owner => {
+                transaction
+                    .execute(
+                        "UPDATE video_project_locks SET heartbeat_at = ?2, lease_expires_at = ?3 WHERE token = ?1",
+                        params![token, timestamp, expires_at],
+                    )
+                    .map_err(|error| format!("video.store_failed: Could not renew the project lease: {error}"))?;
+                token
+            }
+            Some((_, current_owner, current_expiry)) => {
+                return Err(format!(
+                    "video.project_locked: {current_owner} holds this project until {current_expiry}"
+                ));
+            }
+            None => {
+                let token = Uuid::new_v4().simple().to_string();
+                transaction
+                    .execute(
+                        "INSERT INTO video_project_locks (project_id, token, owner, acquired_at, heartbeat_at, lease_expires_at)
+                         VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                        params![project_id, token, owner, timestamp, expires_at],
+                    )
+                    .map_err(|error| format!("video.store_failed: Could not acquire the project lease: {error}"))?;
+                token
+            }
+        };
+        transaction.commit().map_err(|error| {
+            format!("video.store_failed: Could not commit the project lease: {error}")
+        })?;
+        Ok(json!({
+            "project_id": project_id,
+            "token": token,
+            "owner": owner,
+            "lease_seconds": lease_seconds,
+            "lease_expires_at": expires_at,
+        }))
+    }
+
+    pub fn heartbeat_video_project_lock(
+        &self,
+        project_id: &str,
+        token: &str,
+        lease_seconds: i64,
+    ) -> Result<Value, String> {
+        let lease_seconds = lease_seconds.clamp(15, 300);
+        let timestamp = now();
+        let expires_at = (Utc::now() + ChronoDuration::seconds(lease_seconds)).to_rfc3339();
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE video_project_locks SET heartbeat_at = ?3, lease_expires_at = ?4
+                 WHERE project_id = ?1 AND token = ?2 AND lease_expires_at > ?3",
+                params![project_id, token, timestamp, expires_at],
+            )
+            .map_err(|error| {
+                format!("video.store_failed: Could not renew the project lease: {error}")
+            })?;
+        if changed == 0 {
+            return Err(
+                "video.lock_lost: The project lease expired or belongs to another editor".into(),
+            );
+        }
+        Ok(json!({"project_id": project_id, "token": token, "lease_expires_at": expires_at}))
+    }
+
+    pub fn release_video_project_lock(
+        &self,
+        project_id: &str,
+        token: &str,
+    ) -> Result<bool, String> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "DELETE FROM video_project_locks WHERE project_id = ?1 AND token = ?2",
+                params![project_id, token],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|error| {
+                format!("video.store_failed: Could not release the project lease: {error}")
+            })
+    }
+
+    pub fn record_video_rights_receipt(
+        &self,
+        project_id: Option<&str>,
+        canonical_url: &str,
+        statement: &str,
+        confirmed_by: &str,
+    ) -> Result<Value, String> {
+        let canonical_url = canonical_url.trim();
+        if canonical_url.is_empty() || statement.trim().is_empty() {
+            return Err(
+                "video.rights_required: The exact URL and rights statement are required".into(),
+            );
+        }
+        let id = Uuid::new_v4().simple().to_string();
+        let url_sha256 = sha256_bytes(canonical_url.as_bytes());
+        let timestamp = now();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO video_rights_receipts (id, project_id, canonical_url, url_sha256, assertion_version, statement, confirmed_by, confirmed_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
+                params![id, project_id, canonical_url, url_sha256, statement.trim(), confirmed_by, timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not record the rights confirmation: {error}"))?;
+        Ok(json!({
+            "id": id,
+            "project_id": project_id,
+            "canonical_url": canonical_url,
+            "url_sha256": url_sha256,
+            "assertion_version": 1,
+            "statement": statement.trim(),
+            "confirmed_by": confirmed_by,
+            "confirmed_at": timestamp,
+        }))
+    }
+
+    pub fn has_video_rights_receipt(
+        &self,
+        project_id: Option<&str>,
+        canonical_url: &str,
+    ) -> Result<bool, String> {
+        let hash = sha256_bytes(canonical_url.trim().as_bytes());
+        let connection = self.lock()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM video_rights_receipts
+                 WHERE project_id IS ?1 AND url_sha256 = ?2 AND canonical_url = ?3 AND revoked_at IS NULL)",
+                params![project_id, hash, canonical_url.trim()],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("video.store_failed: Could not inspect rights confirmation: {error}"))
+    }
+
+    pub fn upsert_video_asset(&self, asset: &Value) -> Result<Value, String> {
+        let project_id = required_trimmed(
+            asset,
+            "project_id",
+            "video.invalid_asset: project_id is required",
+        )?;
+        let kind = required_trimmed(asset, "kind", "video.invalid_asset: kind is required")?;
+        let source_kind = required_trimmed(
+            asset,
+            "source_kind",
+            "video.invalid_asset: source_kind is required",
+        )?;
+        let status = asset
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("ready");
+        let id = asset
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let timestamp = now();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO video_media_assets
+                 (id, project_id, kind, source_kind, local_path, original_url, mime_type, content_sha256, size_bytes, duration_us, status, probe_json, provenance_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+                 ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, source_kind = excluded.source_kind,
+                    local_path = excluded.local_path, original_url = excluded.original_url, mime_type = excluded.mime_type,
+                    content_sha256 = excluded.content_sha256, size_bytes = excluded.size_bytes, duration_us = excluded.duration_us,
+                    status = excluded.status, probe_json = excluded.probe_json, provenance_json = excluded.provenance_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    id,
+                    project_id,
+                    kind,
+                    source_kind,
+                    asset.get("local_path").and_then(Value::as_str),
+                    asset.get("original_url").and_then(Value::as_str),
+                    asset.get("mime_type").and_then(Value::as_str),
+                    asset.get("content_sha256").and_then(Value::as_str),
+                    asset.get("size_bytes").and_then(Value::as_i64),
+                    asset.get("duration_us").and_then(Value::as_i64),
+                    status,
+                    asset.get("probe").cloned().unwrap_or_else(|| json!({})).to_string(),
+                    asset.get("provenance").cloned().unwrap_or_else(|| json!({})).to_string(),
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("video.store_failed: Could not save the media asset: {error}"))?;
+        drop(connection);
+        self.list_video_assets(project_id)?
+            .into_iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            .ok_or_else(|| "video.store_failed: The saved asset could not be reloaded".into())
+    }
+
+    pub fn list_video_assets(&self, project_id: &str) -> Result<Vec<Value>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, kind, source_kind, local_path, original_url, mime_type, content_sha256,
+                        size_bytes, duration_us, status, probe_json, provenance_json, created_at, updated_at
+                 FROM video_media_assets WHERE project_id = ?1 ORDER BY created_at, id",
+            )
+            .map_err(|error| format!("video.store_failed: Could not prepare media assets: {error}"))?;
+        let assets = statement
+            .query_map([project_id], |row| {
+                let probe: String = row.get(10)?;
+                let provenance: String = row.get(11)?;
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "project_id": project_id,
+                    "kind": row.get::<_, String>(1)?,
+                    "source_kind": row.get::<_, String>(2)?,
+                    "local_path": row.get::<_, Option<String>>(3)?,
+                    "original_url": row.get::<_, Option<String>>(4)?,
+                    "mime_type": row.get::<_, Option<String>>(5)?,
+                    "content_sha256": row.get::<_, Option<String>>(6)?,
+                    "size_bytes": row.get::<_, Option<i64>>(7)?,
+                    "duration_us": row.get::<_, Option<i64>>(8)?,
+                    "status": row.get::<_, String>(9)?,
+                    "probe": serde_json::from_str::<Value>(&probe).unwrap_or_else(|_| json!({})),
+                    "provenance": serde_json::from_str::<Value>(&provenance).unwrap_or_else(|_| json!({})),
+                    "created_at": row.get::<_, String>(12)?,
+                    "updated_at": row.get::<_, String>(13)?,
+                }))
+            })
+            .map_err(|error| format!("video.store_failed: Could not list media assets: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("video.store_failed: Could not read media assets: {error}"))?;
+        Ok(assets)
+    }
+
+    pub fn publish_video_output(&self, output: &Value) -> Result<Value, String> {
+        let project_id = required_trimmed(
+            output,
+            "project_id",
+            "video.invalid_output: project_id is required",
+        )?;
+        let kind = required_trimmed(output, "kind", "video.invalid_output: kind is required")?;
+        let label = required_trimmed(output, "label", "video.invalid_output: label is required")?;
+        let raw_path = required_trimmed(
+            output,
+            "artifact_path",
+            "video.invalid_output: artifact_path is required",
+        )?;
+        let path = self.validate_artifact_path(raw_path)?;
+        if !path.is_file() {
+            return Err("video.invalid_output: The published artifact does not exist".into());
+        }
+        let size_bytes = fs::metadata(&path)
+            .map_err(|error| {
+                format!("video.invalid_output: Could not inspect the published artifact: {error}")
+            })?
+            .len() as i64;
+        let checksum = sha256_file(&path)?;
+        if let Some(expected) = output.get("sha256").and_then(Value::as_str) {
+            if expected != checksum {
+                return Err(
+                    "video.integrity_failed: The published artifact checksum did not match".into(),
+                );
+            }
+        }
+        let id = output
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let primary = output
+            .get("is_primary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let timestamp = now();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction().map_err(|error| {
+            format!("video.store_failed: Could not publish the video output: {error}")
+        })?;
+        if primary {
+            transaction
+                .execute(
+                    "UPDATE video_output_records SET is_primary = 0, updated_at = ?2 WHERE project_id = ?1 AND is_primary = 1",
+                    params![project_id, timestamp],
+                )
+                .map_err(|error| format!("video.store_failed: Could not replace the project master: {error}"))?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO video_output_records
+                 (id, project_id, version_id, job_id, kind, label, artifact_path, mime_type, size_bytes, sha256, duration_us, width, height, status, is_primary, provenance_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'ready', ?14, ?15, ?16, ?16)",
+                params![
+                    id,
+                    project_id,
+                    output.get("version_id").and_then(Value::as_str),
+                    output.get("job_id").and_then(Value::as_str),
+                    kind,
+                    label,
+                    path.to_string_lossy(),
+                    output.get("mime_type").and_then(Value::as_str).unwrap_or("video/mp4"),
+                    size_bytes,
+                    checksum,
+                    output.get("duration_us").and_then(Value::as_i64),
+                    output.get("width").and_then(Value::as_i64),
+                    output.get("height").and_then(Value::as_i64),
+                    primary,
+                    output.get("provenance").cloned().unwrap_or_else(|| json!({})).to_string(),
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("video.store_failed: Could not record the published video: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("video.store_failed: Could not commit the published video: {error}")
+        })?;
+        drop(connection);
+        self.list_video_outputs(project_id)?
+            .into_iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            .ok_or_else(|| "video.store_failed: The published video could not be reloaded".into())
+    }
+
+    pub fn list_video_outputs(&self, project_id: &str) -> Result<Vec<Value>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, version_id, job_id, kind, label, artifact_path, mime_type, size_bytes, sha256,
+                        duration_us, width, height, status, is_primary, provenance_json, created_at, updated_at
+                 FROM video_output_records WHERE project_id = ?1 ORDER BY is_primary DESC, created_at DESC, id DESC",
+            )
+            .map_err(|error| format!("video.store_failed: Could not prepare video outputs: {error}"))?;
+        let outputs = statement
+            .query_map([project_id], |row| {
+                let provenance: String = row.get(14)?;
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "project_id": project_id,
+                    "version_id": row.get::<_, Option<String>>(1)?,
+                    "job_id": row.get::<_, Option<String>>(2)?,
+                    "kind": row.get::<_, String>(3)?,
+                    "label": row.get::<_, String>(4)?,
+                    "artifact_path": row.get::<_, String>(5)?,
+                    "mime_type": row.get::<_, String>(6)?,
+                    "size_bytes": row.get::<_, i64>(7)?,
+                    "sha256": row.get::<_, String>(8)?,
+                    "duration_us": row.get::<_, Option<i64>>(9)?,
+                    "width": row.get::<_, Option<i64>>(10)?,
+                    "height": row.get::<_, Option<i64>>(11)?,
+                    "status": row.get::<_, String>(12)?,
+                    "is_primary": row.get::<_, bool>(13)?,
+                    "provenance": serde_json::from_str::<Value>(&provenance).unwrap_or_else(|_| json!({})),
+                    "created_at": row.get::<_, String>(15)?,
+                    "updated_at": row.get::<_, String>(16)?,
+                }))
+            })
+            .map_err(|error| format!("video.store_failed: Could not list video outputs: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("video.store_failed: Could not read video outputs: {error}"))?;
+        Ok(outputs)
+    }
+
+    pub fn upsert_video_stage(&self, stage: &Value) -> Result<Value, String> {
+        let project_id = required_trimmed(
+            stage,
+            "project_id",
+            "video.invalid_stage: project_id is required",
+        )?;
+        let stage_key = required_trimmed(
+            stage,
+            "stage_key",
+            "video.invalid_stage: stage_key is required",
+        )?;
+        let version_id = stage.get("version_id").and_then(Value::as_str);
+        let scope_key = stage.get("scope_key").and_then(Value::as_str).unwrap_or("");
+        let status = stage
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("queued");
+        let resource_class = stage
+            .get("resource_class")
+            .and_then(Value::as_str)
+            .unwrap_or("light");
+        let input_sha256 = required_trimmed(
+            stage,
+            "input_sha256",
+            "video.invalid_stage: input_sha256 is required",
+        )?;
+        let timestamp = now();
+        let id = stage
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO video_workflow_stages
+                 (id, project_id, version_id, stage_key, scope_key, job_id, status, resource_class, attempt, progress, input_sha256, output_sha256, checkpoint_json, error_json, started_at, completed_at, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                         CASE WHEN ?7 = 'running' THEN ?15 ELSE NULL END,
+                         CASE WHEN ?7 = 'completed' THEN ?15 ELSE NULL END, ?15, ?15)
+                 ON CONFLICT(project_id, version_id, stage_key, scope_key) DO UPDATE SET
+                    job_id = COALESCE(excluded.job_id, video_workflow_stages.job_id),
+                    status = excluded.status, resource_class = excluded.resource_class,
+                    attempt = excluded.attempt, progress = excluded.progress,
+                    input_sha256 = excluded.input_sha256, output_sha256 = excluded.output_sha256,
+                    checkpoint_json = excluded.checkpoint_json, error_json = excluded.error_json,
+                    started_at = CASE WHEN excluded.status = 'running' THEN COALESCE(video_workflow_stages.started_at, excluded.updated_at) ELSE video_workflow_stages.started_at END,
+                    completed_at = CASE WHEN excluded.status = 'completed' THEN excluded.updated_at ELSE NULL END,
+                    updated_at = excluded.updated_at",
+                params![
+                    id,
+                    project_id,
+                    version_id,
+                    stage_key,
+                    scope_key,
+                    stage.get("job_id").and_then(Value::as_str),
+                    status,
+                    resource_class,
+                    stage.get("attempt").and_then(Value::as_i64).unwrap_or(0),
+                    stage.get("progress").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 1.0),
+                    input_sha256,
+                    stage.get("output_sha256").and_then(Value::as_str),
+                    stage.get("checkpoint").cloned().unwrap_or_else(|| json!({})).to_string(),
+                    stage.get("error").map(Value::to_string),
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("video.store_failed: Could not checkpoint the video stage: {error}"))?;
+        drop(connection);
+        self.list_video_stages(project_id)?
+            .into_iter()
+            .find(|item| {
+                item.get("stage_key").and_then(Value::as_str) == Some(stage_key)
+                    && item.get("scope_key").and_then(Value::as_str) == Some(scope_key)
+                    && item.get("version_id").and_then(Value::as_str) == version_id
+            })
+            .ok_or_else(|| "video.store_failed: The saved stage could not be reloaded".into())
+    }
+
+    pub fn list_video_stages(&self, project_id: &str) -> Result<Vec<Value>, String> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, version_id, stage_key, scope_key, job_id, status, resource_class, attempt,
+                        progress, input_sha256, output_sha256, checkpoint_json, error_json,
+                        started_at, completed_at, created_at, updated_at
+                 FROM video_workflow_stages WHERE project_id = ?1 ORDER BY created_at, stage_key, scope_key",
+            )
+            .map_err(|error| format!("video.store_failed: Could not prepare video stages: {error}"))?;
+        let stages = statement
+            .query_map([project_id], |row| {
+                let checkpoint: String = row.get(11)?;
+                let error: Option<String> = row.get(12)?;
+                Ok(json!({
+                    "id": row.get::<_, String>(0)?,
+                    "project_id": project_id,
+                    "version_id": row.get::<_, Option<String>>(1)?,
+                    "stage_key": row.get::<_, String>(2)?,
+                    "scope_key": row.get::<_, String>(3)?,
+                    "job_id": row.get::<_, Option<String>>(4)?,
+                    "status": row.get::<_, String>(5)?,
+                    "resource_class": row.get::<_, String>(6)?,
+                    "attempt": row.get::<_, i64>(7)?,
+                    "progress": row.get::<_, f64>(8)?,
+                    "input_sha256": row.get::<_, String>(9)?,
+                    "output_sha256": row.get::<_, Option<String>>(10)?,
+                    "checkpoint": serde_json::from_str::<Value>(&checkpoint).unwrap_or_else(|_| json!({})),
+                    "error": error.and_then(|value| serde_json::from_str::<Value>(&value).ok()),
+                    "started_at": row.get::<_, Option<String>>(13)?,
+                    "completed_at": row.get::<_, Option<String>>(14)?,
+                    "created_at": row.get::<_, String>(15)?,
+                    "updated_at": row.get::<_, String>(16)?,
+                }))
+            })
+            .map_err(|error| format!("video.store_failed: Could not list video stages: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("video.store_failed: Could not read video stages: {error}"))?;
+        Ok(stages)
+    }
+
+    pub fn get_video_cache(&self, cache_key: &str) -> Result<Option<Value>, String> {
+        let record: Option<(
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            String,
+        )> = {
+            let connection = self.lock()?;
+            connection
+                .query_row(
+                    "SELECT cache_key, namespace, project_id, input_json, artifact_path, artifact_sha256,
+                            size_bytes, hit_count, created_at, last_used_at
+                     FROM video_cache_entries WHERE cache_key = ?1",
+                    [cache_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?)),
+                )
+                .optional()
+                .map_err(|error| format!("video.store_failed: Could not inspect the render cache: {error}"))?
+        };
+        let Some((
+            key,
+            namespace,
+            project_id,
+            input_json,
+            path,
+            checksum,
+            size_bytes,
+            hit_count,
+            created_at,
+            _,
+        )) = record
+        else {
+            return Ok(None);
+        };
+        let valid = self
+            .validate_artifact_path(&path)
+            .and_then(|path| sha256_file(&path))
+            .is_ok_and(|actual| actual == checksum);
+        let connection = self.lock()?;
+        if !valid {
+            connection
+                .execute(
+                    "DELETE FROM video_cache_entries WHERE cache_key = ?1",
+                    [cache_key],
+                )
+                .map_err(|error| {
+                    format!("video.store_failed: Could not discard an invalid cache entry: {error}")
+                })?;
+            return Ok(None);
+        }
+        let last_used_at = now();
+        connection
+            .execute(
+                "UPDATE video_cache_entries SET hit_count = hit_count + 1, last_used_at = ?2 WHERE cache_key = ?1",
+                params![cache_key, last_used_at],
+            )
+            .map_err(|error| format!("video.store_failed: Could not update render cache usage: {error}"))?;
+        Ok(Some(json!({
+            "cache_key": key,
+            "namespace": namespace,
+            "project_id": project_id,
+            "input": serde_json::from_str::<Value>(&input_json).unwrap_or_else(|_| json!({})),
+            "artifact_path": path,
+            "artifact_sha256": checksum,
+            "size_bytes": size_bytes,
+            "hit_count": hit_count + 1,
+            "created_at": created_at,
+            "last_used_at": last_used_at,
+        })))
+    }
+
+    pub fn put_video_cache(
+        &self,
+        cache_key: &str,
+        namespace: &str,
+        project_id: Option<&str>,
+        input: &Value,
+        artifact_path: &Path,
+    ) -> Result<Value, String> {
+        let managed = self.validate_artifact_path(&artifact_path.to_string_lossy())?;
+        let checksum = sha256_file(&managed)?;
+        let size_bytes = fs::metadata(&managed)
+            .map_err(|error| {
+                format!("video.store_failed: Could not inspect the cached artifact: {error}")
+            })?
+            .len() as i64;
+        let timestamp = now();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO video_cache_entries
+                 (cache_key, namespace, project_id, input_json, artifact_path, artifact_sha256, size_bytes, hit_count, created_at, last_used_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?8)
+                 ON CONFLICT(cache_key) DO UPDATE SET namespace = excluded.namespace, project_id = excluded.project_id,
+                    input_json = excluded.input_json, artifact_path = excluded.artifact_path,
+                    artifact_sha256 = excluded.artifact_sha256, size_bytes = excluded.size_bytes,
+                    hit_count = 0, created_at = excluded.created_at, last_used_at = excluded.last_used_at",
+                params![cache_key, namespace, project_id, input.to_string(), managed.to_string_lossy(), checksum, size_bytes, timestamp],
+            )
+            .map_err(|error| format!("video.store_failed: Could not save the render cache entry: {error}"))?;
+        Ok(json!({
+            "cache_key": cache_key,
+            "namespace": namespace,
+            "project_id": project_id,
+            "input": input,
+            "artifact_path": managed,
+            "artifact_sha256": checksum,
+            "size_bytes": size_bytes,
+            "hit_count": 0,
+            "created_at": timestamp,
+            "last_used_at": timestamp,
+        }))
+    }
+
+    pub fn record_video_performance(&self, sample: &Value) -> Result<Value, String> {
+        let operation = required_trimmed(
+            sample,
+            "operation",
+            "video.invalid_metric: operation is required",
+        )?;
+        let wall_seconds = sample
+            .get("wall_seconds")
+            .and_then(Value::as_f64)
+            .filter(|value| *value >= 0.0)
+            .ok_or("video.invalid_metric: wall_seconds must be non-negative")?;
+        let id = Uuid::new_v4().simple().to_string();
+        let timestamp = now();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO video_performance_samples
+                 (id, project_id, job_id, operation, profile, wall_seconds, media_seconds, realtime_factor, gpu_peak_mb, cache_hit, details_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    id,
+                    sample.get("project_id").and_then(Value::as_str),
+                    sample.get("job_id").and_then(Value::as_str),
+                    operation,
+                    sample.get("profile").and_then(Value::as_str).unwrap_or("default"),
+                    wall_seconds,
+                    sample.get("media_seconds").and_then(Value::as_f64),
+                    sample.get("realtime_factor").and_then(Value::as_f64),
+                    sample.get("gpu_peak_mb").and_then(Value::as_i64),
+                    sample.get("cache_hit").and_then(Value::as_bool).unwrap_or(false),
+                    sample.get("details").cloned().unwrap_or_else(|| json!({})).to_string(),
+                    timestamp,
+                ],
+            )
+            .map_err(|error| format!("video.store_failed: Could not save the performance sample: {error}"))?;
+        Ok(
+            json!({"id": id, "operation": operation, "wall_seconds": wall_seconds, "created_at": timestamp}),
+        )
+    }
+
+    pub fn link_assistant_video_artifact(&self, link: &Value) -> Result<Value, String> {
+        let thread_id = required_trimmed(
+            link,
+            "thread_id",
+            "video.invalid_link: thread_id is required",
+        )?;
+        let project_id = required_trimmed(
+            link,
+            "project_id",
+            "video.invalid_link: project_id is required",
+        )?;
+        let relationship = link
+            .get("relationship")
+            .and_then(Value::as_str)
+            .unwrap_or("project");
+        let id = Uuid::new_v4().simple().to_string();
+        let timestamp = now();
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO assistant_video_artifacts
+                 (id, thread_id, turn_id, item_id, project_id, output_id, relationship, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(thread_id, item_id, project_id, output_id) DO UPDATE SET
+                    relationship = excluded.relationship",
+                params![
+                    id,
+                    thread_id,
+                    link.get("turn_id").and_then(Value::as_str),
+                    link.get("item_id").and_then(Value::as_str),
+                    project_id,
+                    link.get("output_id").and_then(Value::as_str),
+                    relationship,
+                    timestamp,
+                ],
+            )
+            .map_err(|error| {
+                format!("video.store_failed: Could not link the assistant artifact: {error}")
+            })?;
+        Ok(json!({
+            "id": id,
+            "thread_id": thread_id,
+            "turn_id": link.get("turn_id").cloned().unwrap_or(Value::Null),
+            "item_id": link.get("item_id").cloned().unwrap_or(Value::Null),
+            "project_id": project_id,
+            "output_id": link.get("output_id").cloned().unwrap_or(Value::Null),
+            "relationship": relationship,
+            "created_at": timestamp,
+        }))
+    }
+
     pub fn attach_project_master(
         &self,
         project_id: &str,
@@ -4900,6 +5956,261 @@ fn migrate(connection: &mut Connection, from_version: i64) -> Result<(), String>
             }
         }
     }
+    if from_version < 33 {
+        let project_kind_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'project_kind')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Could not inspect project-kind storage: {error}"))?;
+        if !project_kind_exists {
+            transaction
+                .execute(
+                    "ALTER TABLE projects ADD COLUMN project_kind TEXT NOT NULL DEFAULT 'audio' CHECK(project_kind IN ('audio','video'))",
+                    [],
+                )
+                .map_err(|error| format!("Could not add video project kinds: {error}"))?;
+        }
+        let project_revision_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name = 'current_revision')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Could not inspect project revision storage: {error}"))?;
+        if !project_revision_exists {
+            transaction
+                .execute(
+                    "ALTER TABLE projects ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 0 CHECK(current_revision >= 0)",
+                    [],
+                )
+                .map_err(|error| format!("Could not add project revision counters: {error}"))?;
+        }
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS video_projects (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL CHECK(status IN ('draft','ingesting','analyzing','review','ready','rendering','completed','failed','archived')),
+                    aspect_ratio TEXT NOT NULL DEFAULT '9:16',
+                    duration_us INTEGER NOT NULL DEFAULT 0 CHECK(duration_us >= 0),
+                    current_version_id TEXT,
+                    source_summary_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS video_project_versions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+                    manifest_json TEXT NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    base_revision INTEGER CHECK(base_revision >= 0),
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(project_id, revision)
+                 );
+                 CREATE INDEX IF NOT EXISTS video_project_versions_latest_idx
+                    ON video_project_versions(project_id, revision DESC);
+                 CREATE TABLE IF NOT EXISTS video_project_locks (
+                    project_id TEXT PRIMARY KEY REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    token TEXT NOT NULL UNIQUE,
+                    owner TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    lease_expires_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS projects_kind_updated_idx
+                    ON projects(project_kind, updated_at DESC);",
+            )
+            .map_err(|error| format!("Could not add versioned video projects: {error}"))?;
+    }
+    if from_version < 34 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS video_rights_receipts (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    canonical_url TEXT NOT NULL,
+                    url_sha256 TEXT NOT NULL,
+                    assertion_version INTEGER NOT NULL CHECK(assertion_version > 0),
+                    statement TEXT NOT NULL,
+                    confirmed_by TEXT NOT NULL,
+                    confirmed_at TEXT NOT NULL,
+                    revoked_at TEXT
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS video_rights_active_url_idx
+                    ON video_rights_receipts(project_id, url_sha256, assertion_version)
+                    WHERE revoked_at IS NULL;
+                 CREATE TABLE IF NOT EXISTS video_media_assets (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL CHECK(kind IN ('source','audio','speech','music','image','caption','proxy','thumbnail','waveform','analysis','other')),
+                    source_kind TEXT NOT NULL CHECK(source_kind IN ('local','link','generated','derived')),
+                    local_path TEXT,
+                    original_url TEXT,
+                    mime_type TEXT,
+                    content_sha256 TEXT,
+                    size_bytes INTEGER CHECK(size_bytes IS NULL OR size_bytes >= 0),
+                    duration_us INTEGER CHECK(duration_us IS NULL OR duration_us >= 0),
+                    status TEXT NOT NULL CHECK(status IN ('pending','ready','invalid','missing','failed')),
+                    probe_json TEXT NOT NULL DEFAULT '{}',
+                    provenance_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS video_media_assets_project_idx
+                    ON video_media_assets(project_id, kind, created_at);
+                 CREATE INDEX IF NOT EXISTS video_media_assets_hash_idx
+                    ON video_media_assets(content_sha256) WHERE content_sha256 IS NOT NULL;
+                 CREATE TABLE IF NOT EXISTS video_output_records (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    version_id TEXT REFERENCES video_project_versions(id) ON DELETE SET NULL,
+                    job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+                    kind TEXT NOT NULL CHECK(kind IN ('preview','master','variation','publish-package','subtitle','thumbnail')),
+                    label TEXT NOT NULL,
+                    artifact_path TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+                    sha256 TEXT NOT NULL,
+                    duration_us INTEGER CHECK(duration_us IS NULL OR duration_us >= 0),
+                    width INTEGER CHECK(width IS NULL OR width > 0),
+                    height INTEGER CHECK(height IS NULL OR height > 0),
+                    status TEXT NOT NULL CHECK(status IN ('publishing','ready','invalid','missing','failed')),
+                    is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN (0,1)),
+                    provenance_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS video_output_project_idx
+                    ON video_output_records(project_id, is_primary DESC, created_at DESC);
+                 CREATE UNIQUE INDEX IF NOT EXISTS video_output_primary_idx
+                    ON video_output_records(project_id) WHERE is_primary = 1 AND status = 'ready';",
+            )
+            .map_err(|error| format!("Could not add video provenance and artifact storage: {error}"))?;
+    }
+    if from_version < 35 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS video_workflow_stages (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    version_id TEXT REFERENCES video_project_versions(id) ON DELETE CASCADE,
+                    stage_key TEXT NOT NULL,
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+                    status TEXT NOT NULL CHECK(status IN ('queued','running','interrupted','completed','failed','cancelled','superseded')),
+                    resource_class TEXT NOT NULL CHECK(resource_class IN ('light','medium','heavy','exclusive')),
+                    attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+                    progress REAL NOT NULL DEFAULT 0 CHECK(progress >= 0 AND progress <= 1),
+                    input_sha256 TEXT NOT NULL,
+                    output_sha256 TEXT,
+                    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                    error_json TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, version_id, stage_key, scope_key)
+                 );
+                 CREATE INDEX IF NOT EXISTS video_stage_resume_idx
+                    ON video_workflow_stages(status, updated_at);
+                 CREATE TABLE IF NOT EXISTS video_stage_dependencies (
+                    stage_id TEXT NOT NULL REFERENCES video_workflow_stages(id) ON DELETE CASCADE,
+                    depends_on_stage_id TEXT NOT NULL REFERENCES video_workflow_stages(id) ON DELETE CASCADE,
+                    PRIMARY KEY(stage_id, depends_on_stage_id),
+                    CHECK(stage_id <> depends_on_stage_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS video_cache_entries (
+                    cache_key TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    project_id TEXT REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    input_json TEXT NOT NULL,
+                    artifact_path TEXT NOT NULL,
+                    artifact_sha256 TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+                    hit_count INTEGER NOT NULL DEFAULT 0 CHECK(hit_count >= 0),
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS video_cache_lru_idx
+                    ON video_cache_entries(last_used_at, namespace);
+                 CREATE TABLE IF NOT EXISTS video_review_records (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    version_id TEXT NOT NULL REFERENCES video_project_versions(id) ON DELETE CASCADE,
+                    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('candidate','scene','transcript','export')),
+                    subject_id TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','changes-requested')),
+                    review_json TEXT NOT NULL DEFAULT '{}',
+                    reviewed_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(project_id, version_id, subject_kind, subject_id)
+                 );",
+            )
+            .map_err(|error| format!("Could not add resumable video workflows: {error}"))?;
+    }
+    if from_version < 36 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS assistant_video_artifacts (
+                    id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    turn_id TEXT,
+                    item_id TEXT,
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    output_id TEXT REFERENCES video_output_records(id) ON DELETE CASCADE,
+                    relationship TEXT NOT NULL CHECK(relationship IN ('project','preview','master','variation','publish-package')),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(thread_id, item_id, project_id, output_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS assistant_video_thread_idx
+                    ON assistant_video_artifacts(thread_id, created_at DESC);
+                 CREATE TABLE IF NOT EXISTS video_performance_samples (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT REFERENCES video_projects(project_id) ON DELETE SET NULL,
+                    job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL,
+                    operation TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    wall_seconds REAL NOT NULL CHECK(wall_seconds >= 0),
+                    media_seconds REAL CHECK(media_seconds IS NULL OR media_seconds >= 0),
+                    realtime_factor REAL CHECK(realtime_factor IS NULL OR realtime_factor >= 0),
+                    gpu_peak_mb INTEGER CHECK(gpu_peak_mb IS NULL OR gpu_peak_mb >= 0),
+                    cache_hit INTEGER NOT NULL DEFAULT 0 CHECK(cache_hit IN (0,1)),
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS video_performance_operation_idx
+                    ON video_performance_samples(operation, created_at DESC);
+                 CREATE TABLE IF NOT EXISTS video_publish_receipts (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    output_id TEXT REFERENCES video_output_records(id) ON DELETE SET NULL,
+                    destination_path TEXT NOT NULL,
+                    package_manifest_json TEXT NOT NULL,
+                    package_sha256 TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS video_publish_project_idx
+                    ON video_publish_receipts(project_id, created_at DESC);
+                 CREATE TABLE IF NOT EXISTS video_project_events (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES video_projects(project_id) ON DELETE CASCADE,
+                    version_id TEXT REFERENCES video_project_versions(id) ON DELETE SET NULL,
+                    event_kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS video_project_events_idx
+                    ON video_project_events(project_id, created_at, id);",
+            )
+            .map_err(|error| format!("Could not add assistant and performance video evidence: {error}"))?;
+    }
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|error| format!("Could not record database schema version: {error}"))?;
@@ -5978,6 +7289,33 @@ fn title_from_text(text: &str) -> String {
         return "Untitled generation".to_string();
     }
     value.chars().take(56).collect()
+}
+
+fn manifest_duration_us(manifest: &Value) -> i64 {
+    manifest
+        .get("timeline_duration_us")
+        .or_else(|| manifest.get("duration_us"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0)
+}
+
+fn manifest_aspect_ratio(manifest: &Value) -> &'static str {
+    let width = manifest
+        .pointer("/layout/canvas/width")
+        .and_then(Value::as_u64)
+        .unwrap_or(1080);
+    let height = manifest
+        .pointer("/layout/canvas/height")
+        .and_then(Value::as_u64)
+        .unwrap_or(1920);
+    if width == height {
+        "1:1"
+    } else if width > height {
+        "16:9"
+    } else {
+        "9:16"
+    }
 }
 
 fn now() -> String {
@@ -8462,6 +9800,187 @@ mod tests {
         assert_eq!(winner["tie"], false);
         assert_eq!(winner["winner_take_id"], selected);
         drop(store);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn video_projects_require_leases_and_optimistic_revisions() {
+        let (store, root) = test_store();
+        let manifest = json!({
+            "schema_version": 1,
+            "project_id": "video-project-one",
+            "name": "Interview reel",
+            "revision": 1,
+            "timeline_duration_us": 5_000_000,
+            "layout": {"canvas": {"width": 1080, "height": 1920}}
+        });
+        let created = store
+            .create_video_project("Interview reel", &manifest, "test-suite")
+            .expect("create video project");
+        assert_eq!(created["revision"], 1);
+        assert_eq!(created["project_kind"], "video");
+
+        let lease = store
+            .acquire_video_project_lock("video-project-one", "editor-one", 60)
+            .expect("acquire project lease");
+        let renewed = store
+            .acquire_video_project_lock("video-project-one", "editor-one", 60)
+            .expect("renew own lease");
+        assert_eq!(lease["token"], renewed["token"]);
+        assert!(store
+            .acquire_video_project_lock("video-project-one", "editor-two", 60)
+            .expect_err("reject competing editor")
+            .starts_with("video.project_locked:"));
+
+        let mut revision = manifest.clone();
+        revision["revision"] = json!(2);
+        revision["timeline_duration_us"] = json!(4_500_000);
+        let saved = store
+            .commit_video_manifest(
+                "video-project-one",
+                1,
+                &revision,
+                "editor-one",
+                "Shorten the opening",
+                lease["token"].as_str().expect("lease token"),
+                Some("review"),
+            )
+            .expect("save locked revision");
+        assert_eq!(saved["revision"], 2);
+        assert_eq!(saved["status"], "review");
+        assert!(store
+            .commit_video_manifest(
+                "video-project-one",
+                1,
+                &revision,
+                "editor-one",
+                "stale write",
+                lease["token"].as_str().expect("lease token"),
+                None,
+            )
+            .expect_err("reject stale revision")
+            .starts_with("video.revision_conflict:"));
+        assert!(store
+            .release_video_project_lock(
+                "video-project-one",
+                lease["token"].as_str().expect("lease token"),
+            )
+            .expect("release lease"));
+        drop(store);
+
+        let reopened =
+            Store::open(root.join("data"), root.join("artifacts")).expect("reopen video store");
+        let persisted = reopened
+            .get_video_project("video-project-one")
+            .expect("load project")
+            .expect("persisted project");
+        assert_eq!(persisted["revision"], 2);
+        assert_eq!(persisted["manifest"]["timeline_duration_us"], 4_500_000);
+        drop(reopened);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn video_rights_outputs_cache_and_recovery_remain_project_scoped() {
+        let (store, root) = test_store();
+        let project_id = "video-evidence-one";
+        let manifest = json!({
+            "schema_version": 1,
+            "project_id": project_id,
+            "name": "Authorized source",
+            "revision": 1,
+            "timeline_duration_us": 2_000_000,
+            "layout": {"canvas": {"width": 1080, "height": 1920}}
+        });
+        let project = store
+            .create_video_project("Authorized source", &manifest, "test-suite")
+            .expect("create project");
+        let canonical_url = "https://www.youtube.com/watch?v=abcdefghijk";
+        store
+            .record_video_rights_receipt(
+                Some(project_id),
+                canonical_url,
+                "I own or am authorized to use this exact source.",
+                "local-user",
+            )
+            .expect("record rights receipt");
+        assert!(store
+            .has_video_rights_receipt(Some(project_id), canonical_url)
+            .expect("match exact URL"));
+        assert!(!store
+            .has_video_rights_receipt(
+                Some(project_id),
+                "https://www.youtube.com/watch?v=other-source",
+            )
+            .expect("reject another URL"));
+
+        let render_dir = root.join("artifacts/video/video-evidence-one/renders");
+        fs::create_dir_all(&render_dir).expect("create render directory");
+        let master = render_dir.join("master.mp4");
+        fs::write(&master, b"validated-video-output").expect("write output fixture");
+        let published = store
+            .publish_video_output(&json!({
+                "project_id": project_id,
+                "version_id": project["version"]["id"],
+                "kind": "master",
+                "label": "Final master",
+                "artifact_path": master,
+                "mime_type": "video/mp4",
+                "duration_us": 2_000_000,
+                "width": 1080,
+                "height": 1920,
+                "is_primary": true,
+                "provenance": {"renderer": "ffmpeg"}
+            }))
+            .expect("publish master");
+        assert_eq!(published["is_primary"], true);
+        let cached = store
+            .put_video_cache(
+                &"a".repeat(64),
+                "final-render",
+                Some(project_id),
+                &json!({"revision": 1}),
+                &master,
+            )
+            .expect("cache master");
+        assert_eq!(cached["hit_count"], 0);
+        assert_eq!(
+            store
+                .get_video_cache(&"a".repeat(64))
+                .expect("read cache")
+                .expect("cache hit")["hit_count"],
+            1
+        );
+        store
+            .upsert_video_stage(&json!({
+                "project_id": project_id,
+                "version_id": project["version"]["id"],
+                "stage_key": "final-render",
+                "scope_key": "master",
+                "status": "running",
+                "resource_class": "heavy",
+                "attempt": 1,
+                "progress": 0.42,
+                "input_sha256": "b".repeat(64),
+                "checkpoint": {"completed_scenes": ["scene-one"]}
+            }))
+            .expect("checkpoint running render");
+        drop(store);
+
+        let reopened =
+            Store::open(root.join("data"), root.join("artifacts")).expect("recover video store");
+        let stages = reopened
+            .list_video_stages(project_id)
+            .expect("list recovered stages");
+        assert_eq!(stages[0]["status"], "interrupted");
+        assert_eq!(stages[0]["checkpoint"]["completed_scenes"][0], "scene-one");
+        assert_eq!(
+            reopened
+                .list_video_outputs(project_id)
+                .expect("list outputs")[0]["artifact_path"],
+            master.to_string_lossy().as_ref()
+        );
+        drop(reopened);
         fs::remove_dir_all(root).ok();
     }
 }
