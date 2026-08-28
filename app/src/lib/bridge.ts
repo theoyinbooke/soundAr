@@ -845,6 +845,18 @@ export async function loadGeneratedAudio(path: string): Promise<string> {
   return URL.createObjectURL(new Blob([bytes], { type: format === "flac" ? "audio/flac" : "audio/wav" }));
 }
 
+export async function loadJobPreview(jobId: string): Promise<string> {
+  if (import.meta.env.DEV && !hasTauriRuntime()) {
+    throw new Error("Progressive audio previews are available in the soundAr desktop app.");
+  }
+  const payload = await invoke<ArrayBuffer | Uint8Array | number[]>("read_job_preview", { jobId });
+  const bytes = payload instanceof ArrayBuffer ? new Uint8Array(payload) : Uint8Array.from(payload);
+  if (String.fromCharCode(...bytes.subarray(0, 4)) !== "RIFF") {
+    throw new Error("The progressive WAV preview has an invalid header.");
+  }
+  return URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+}
+
 export async function loadTranscriptionAudio(path: string): Promise<string> {
   if (import.meta.env.DEV && !hasTauriRuntime()) return path;
   const payload = await invoke<ArrayBuffer | Uint8Array | number[]>("read_transcription_audio", { path });

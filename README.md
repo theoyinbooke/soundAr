@@ -48,7 +48,7 @@ The installer adds the Debian package and prepares soundAr's managed Python runt
 To install a package built locally:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.5.4_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.5.5_amd64.deb
 ```
 
 ### Storage and updates
@@ -64,7 +64,7 @@ Installing, opening, or updating soundAr never downloads model weights. A model 
 
 Generate speech with model-aware controls for voice, language, pacing, sampling, cloning support, and output format. The current curated catalog includes Kokoro-82M, Chatterbox and Chatterbox Turbo, SpeechT5, Breeze TTS 2, and Fish Speech 1.5. Availability and allowed use differ by model.
 
-Independent generations, project chapters, and batch rows use one durable scheduler. Jobs move through queued, in-progress, and completed states; supported actions include pause, resume, cancel, retry, dismiss, playback, and export. The default concurrency ceiling is four workers and can be changed from 1 to 8 with `SOUNDAR_MAX_PARALLEL_JOBS`; GPU admission is additionally bounded by declared VRAM requirements and current free memory.
+Independent generations, project chapters, and batch rows use one durable scheduler. Jobs move through queued, in-progress, and completed states; supported actions include pause, resume, cancel, retry, dismiss, playback, and export. The default concurrency ceiling is four workers and can be changed from 1 to 8 with `SOUNDAR_MAX_PARALLEL_JOBS`; GPU admission is additionally bounded by declared VRAM requirements and current free memory. Fish Speech defaults to one warm resident render at a time so queued requests reuse the loaded model instead of competing for its GPU allocation. Longer Fish work publishes a validated progressive WAV preview and first-audio timing while the final artifact continues rendering.
 
 ## Creative Producer
 
@@ -76,7 +76,8 @@ The assistant is designed for goals, not just exact generation commands. It can:
 - write scripts, lyrics, directions, chapter structures, and batch content;
 - inspect the local model, voice, project, scheduler, and generation state before choosing a route;
 - queue speech, music, and batch work, create long-form projects, and follow durable jobs;
-- surface completed audio as a compact player in the conversation, then preserve the creative brief while revising from feedback.
+- show active generation progress, offer a playable progressive preview for supported single-audio work, and surface the final artifact as a compact player for revision;
+- keep multi-chapter work focused on one aggregate project state and its assembled master instead of filling the conversation with every intermediate clip.
 
 Read-only, Studio, and Full access modes control what the conversation can do. Read-only can inspect and plan. Studio can research and manage work inside soundAr's local studio. Full access exposes the broader machine capabilities of Codex and keeps approval prompts visible before sensitive actions.
 
@@ -182,6 +183,15 @@ npm run test:production
 cd src-tauri
 cargo test --locked
 ```
+
+Measure the installed Fish runtime without changing its default execution policy:
+
+```bash
+python3 scripts/benchmark-fish-runtime.py
+python3 scripts/benchmark-fish-runtime.py --compile
+```
+
+Compilation is opt-in: it improves repeated warm inference on qualified hardware but can add substantial first-run and first-audio latency. soundAr therefore keeps the noncompiled path as the reliable default.
 
 GPU qualification uses the packaged runtime and user-installed pinned models. The ACE-Step acceptance script verifies consecutive cold and warm native-bridge renders, playable 48 kHz stereo output, durable history metadata, unload, and scheduler quiescence:
 

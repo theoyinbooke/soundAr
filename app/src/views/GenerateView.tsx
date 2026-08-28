@@ -93,6 +93,9 @@ export function GenerateView({
   const selectedVoice = compatibleVoices.find((voice) => voice.id === voiceId);
   const referenceRequired = capability?.voice_modes.length === 1 && capability.voice_modes[0] === "reference";
   const voiceReady = !referenceRequired || Boolean(selectedVoice?.local_path);
+  const selectedEngineLimit = selectedModel
+    ? scheduler.engine_limits?.[selectedModel.engine] ?? scheduler.max_workers
+    : scheduler.max_workers;
 
   function useCreatedVoice(voice: VoiceProfile) {
     pendingCreatedVoiceId.current = voice.id;
@@ -147,6 +150,10 @@ export function GenerateView({
       setVoiceId(nextVoices[0] ?? "");
     }
   }, [bootstrap, modelId, voices, voiceId]);
+
+  useEffect(() => {
+    setParallelism((current) => Math.min(current, selectedEngineLimit));
+  }, [selectedEngineLimit]);
 
   useEffect(() => {
     let active = true;
@@ -248,8 +255,9 @@ export function GenerateView({
 
   async function generate() {
     if (!runtimeReady || !text.trim() || !modelId || !voiceReady) return;
-    if (jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length >= scheduler.max_workers) {
-      setError(`All ${scheduler.max_workers} generation slots are in use. Wait for one to finish before starting another.`);
+    const activeJobs = jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status));
+    if (activeJobs.length >= 100) {
+      setError("The local queue already contains 100 active generations. Clear or finish existing work before adding more.");
       return;
     }
     cancelRequested.current = false;
@@ -582,7 +590,7 @@ export function GenerateView({
   const activeTaskCount = jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length
     + batches.filter((batch) => ["queued", "running", "paused"].includes(batch.status)).length;
   const activeGenerationCount = jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length;
-  const generationCapacityReached = activeGenerationCount >= scheduler.max_workers;
+  const generationCapacityReached = activeGenerationCount >= 100;
   const musicInformationControl = <details className="music-info-disclosure music-header-info">
     <summary role="button" title="Music studio information" aria-label="Music studio information"><Info aria-hidden="true" size={14} /></summary>
     <div className="music-info-card" role="note">
@@ -700,8 +708,8 @@ export function GenerateView({
             <CompactField label="Priority"><Dropdown ariaLabel="Queue priority" value={priority} onChange={(value) => setPriority(value as QueuePriority)} options={[{ value: "low", label: "Low" }, { value: "normal", label: "Normal" }, { value: "high", label: "High" }, { value: "urgent", label: "Urgent" }]} /></CompactField>
             {mode === "batch" ? <CompactField label="Parallel jobs">
               <div className="range-value">
-                <input aria-label="Parallel jobs" min="1" max={bootstrap.scheduler.max_workers} step="1" type="range" value={parallelism} onChange={(event) => setParallelism(Number(event.target.value))} />
-                <strong>{parallelism}/{bootstrap.scheduler.max_workers}</strong>
+                <input aria-label="Parallel jobs" min="1" max={selectedEngineLimit} step="1" type="range" value={parallelism} onChange={(event) => setParallelism(Number(event.target.value))} />
+                <strong>{parallelism}/{selectedEngineLimit}</strong>
               </div>
             </CompactField> : null}
             {capability?.controls.speed ? <CompactField label="Speed">
@@ -757,7 +765,7 @@ export function GenerateView({
               Save preset
             </button>
             {isGenerating ? <button className="button button-secondary danger-button" type="button" onClick={() => void cancelGeneration()}><Pause aria-hidden="true" size={14} />Cancel all</button> : null}
-            <button className="button button-primary" type="button" onClick={generate} disabled={!runtimeReady || !text.trim() || !modelId || !voiceReady || generationCapacityReached} title={generationCapacityReached ? `All ${scheduler.max_workers} generation slots are in use` : undefined}>
+            <button className="button button-primary" type="button" onClick={generate} disabled={!runtimeReady || !text.trim() || !modelId || !voiceReady || generationCapacityReached} title={generationCapacityReached ? "The local generation queue is full" : undefined}>
               {mode === "batch" ? "Start batch" : "Generate audio"}
             </button>
           </div>
@@ -770,7 +778,6 @@ export function GenerateView({
               <span className="section-label">Runtime</span>
               <strong>{selectedModel?.model_id.split("/").at(-1) ?? "No model"}</strong>
             </div>
-            <span className="rail-heading-actions"><StatusText tone={runtimeReady && selectedModel ? "success" : "warning"}>{!runtimeReady ? "Setup required" : selectedModel ? `${activeGenerationCount}/${scheduler.max_workers} active` : "Install a model"}</StatusText></span>
           </div>
 
           <MetricStrip

@@ -88,6 +88,7 @@ class TTSEngine:
         reference_audio: np.ndarray | None = None,
         reference_sr: int | None = None,
         controls: dict[str, Any] | None = None,
+        progress_callback: Callable[[np.ndarray, int], None] | None = None,
     ) -> SynthesisResult:
         """Synthesize text to speech."""
         if self._engine_impl is None:
@@ -104,14 +105,17 @@ class TTSEngine:
 
         inference_context = torch.inference_mode() if torch is not None else nullcontext()
         with inference_context:
-            audio, sample_rate = self._engine_impl.synthesize(
-                text=text,
-                speaker=speaker,
-                language=language,
-                reference_audio=reference_audio,
-                reference_sr=reference_sr,
-                controls=controls,
-            )
+            synthesis_arguments = {
+                "text": text,
+                "speaker": speaker,
+                "language": language,
+                "reference_audio": reference_audio,
+                "reference_sr": reference_sr,
+                "controls": controls,
+            }
+            if self._engine == "fish-speech":
+                synthesis_arguments["progress_callback"] = progress_callback
+            audio, sample_rate = self._engine_impl.synthesize(**synthesis_arguments)
 
         elapsed = time.monotonic() - start_time
         duration = len(audio) / sample_rate if sample_rate > 0 else 0.0

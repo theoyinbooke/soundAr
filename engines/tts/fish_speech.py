@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import queue
+import os
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -104,11 +105,12 @@ class FishSpeechEngine(BaseTTSEngine):
 
         device = self.get_device()
         precision = torch.bfloat16
+        compile_enabled = os.environ.get("SOUNDAR_FISH_COMPILE", "0").strip().lower() in {"1", "true", "yes"}
         semantic_model, decode_one_token = load_model(
             model_dir,
             device,
             precision,
-            compile=False,
+            compile=compile_enabled,
         )
         with torch.device(device):
             semantic_model.setup_caches(
@@ -155,7 +157,7 @@ class FishSpeechEngine(BaseTTSEngine):
             llama_queue=llama_queue,
             decoder_model=self._decoder_model,
             precision=precision,
-            compile=False,
+            compile=compile_enabled,
         )
         self._loaded = True
 
@@ -180,6 +182,7 @@ class FishSpeechEngine(BaseTTSEngine):
         reference_audio: np.ndarray | None = None,
         reference_sr: int | None = None,
         controls: dict[str, Any] | None = None,
+        progress_callback: Callable[[np.ndarray, int], None] | None = None,
     ) -> tuple[np.ndarray, int]:
         if self._runtime is None:
             raise RuntimeError("Fish Speech 1.5 is not loaded.")
@@ -200,12 +203,18 @@ class FishSpeechEngine(BaseTTSEngine):
             top_p=float(controls.get("top_p", 0.7)),
             repetition_penalty=float(controls.get("repetition_penalty", 1.2)),
             temperature=float(controls.get("temperature", 0.7)),
-            streaming=False,
+            streaming=progress_callback is not None,
             format="wav",
         )
         for result in self._runtime.inference(request):
             if result.code == "error":
                 raise RuntimeError("Fish Speech synthesis failed.") from result.error
+            if result.code == "segment" and result.audio is not None and progress_callback is not None:
+                sample_rate, audio = result.audio
+                progress_callback(
+                    np.asarray(audio, dtype=np.float32).reshape(-1),
+                    int(sample_rate),
+                )
             if result.code == "final" and result.audio is not None:
                 sample_rate, audio = result.audio
                 return np.asarray(audio, dtype=np.float32).reshape(-1), int(sample_rate)

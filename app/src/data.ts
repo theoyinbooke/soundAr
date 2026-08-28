@@ -327,6 +327,7 @@ export const fallbackBootstrap: BootstrapState = {
   scheduler: {
     active_workers: 0,
     max_workers: 4,
+    engine_limits: { "fish-speech": 1 },
     reserved_vram_mb: 0,
     available_vram_budget_mb: 11017,
     active_batches: 0,

@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AssistantLauncher, AssistantPane, selectAssistantArtifacts } from "./AssistantPane";
+import { AssistantLauncher, AssistantPane, selectAssistantArtifacts, selectAssistantJobs } from "./AssistantPane";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 afterEach(cleanup);
@@ -16,6 +16,17 @@ describe("AssistantPane", () => {
     ];
     expect(selectAssistantArtifacts(history, new Set(), "project").map((item) => item.id)).toEqual(["master"]);
     expect(selectAssistantArtifacts(history, new Set(), "single").map((item) => item.id)).toEqual(["chapter-2"]);
+  });
+
+  it("tracks only newly created active audio jobs for progressive feedback", () => {
+    const base = { kind: "synthesis", progress: 0.8, stage: "decoding" as const, attempt: 1, created_at: "2026-08-27T18:00:00Z", updated_at: "2026-08-27T18:00:01Z" };
+    const jobs = [
+      { ...base, id: "new-speech", status: "running" as const },
+      { ...base, id: "old-speech", status: "running" as const },
+      { ...base, id: "finished", status: "completed" as const },
+      { ...base, id: "model-load", kind: "model-load", status: "running" as const },
+    ];
+    expect(selectAssistantJobs(jobs, new Set(["old-speech"])).map((job) => job.id)).toEqual(["new-speech"]);
   });
 
   it("opens from a restrained floating action", async () => {

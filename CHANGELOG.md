@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.5.5 - 2026-08-27
+
+- Kept Fish Speech in one warm resident worker by default while preserving durable queued requests and the global scheduler capacity for independent engines.
+- Added progressive Fish audio previews with validated job-scoped storage, first-audio timing, atomic WAV updates, completion cleanup, and interrupted-session recovery.
+- Surfaced active local generation progress in the assistant, with playable progressive previews for single audio and one compact aggregate state for project renders.
+- Made the assistant a practical desktop split pane without automatically collapsing navigation, and reflowed dense generation, project, voice, model, compare, and live workspaces inside the remaining width.
+- Added repeatable cold/warm Fish benchmark tooling and retained compilation as an explicit experiment because its faster warm inference did not justify its measured first-run latency.
+
 ## 0.5.4 - 2026-08-27
 
 - Kept the populated Projects workspace within 320–390 px phone viewports and prevented controls inside a closed Production panel from overlapping mobile navigation.

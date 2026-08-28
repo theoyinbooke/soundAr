@@ -10,7 +10,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_VERSION: i64 = 32;
 const HISTORY_RESULT_LIMIT: i64 = 500;
 
 pub struct Store {
@@ -70,6 +70,7 @@ impl Store {
         backfill_voice_provenance(&connection)?;
         recover_incomplete_publications(&mut connection, &artifacts_root)?;
         cleanup_partial_artifacts(&artifacts_root)?;
+        cleanup_preview_artifacts(&artifacts_root)?;
 
         let recovered_at = now();
         connection.execute(
@@ -77,10 +78,14 @@ impl Store {
              SELECT lower(hex(randomblob(16))), id, 'failed', progress, 'Interrupted when soundAr last closed', ?1 FROM jobs WHERE status IN ('preparing', 'running')",
             [&recovered_at],
         ).map_err(|error| format!("Could not record interrupted job recovery: {error}"))?;
-        connection.execute(
-            "UPDATE jobs SET status = 'failed', error = 'Interrupted when soundAr last closed', updated_at = ?1 WHERE status IN ('preparing', 'running')",
-            [&recovered_at],
-        ).map_err(|error| format!("Could not recover interrupted jobs: {error}"))?;
+        connection
+            .execute(
+                "UPDATE jobs SET status = 'failed', error = 'Interrupted when soundAr last closed',
+                preview_audio_path = NULL, preview_duration_seconds = NULL, updated_at = ?1
+             WHERE status IN ('preparing', 'running')",
+                [&recovered_at],
+            )
+            .map_err(|error| format!("Could not recover interrupted jobs: {error}"))?;
         connection
             .execute(
                 "UPDATE batch_items SET status = 'failed', error = 'Interrupted when soundAr last closed', updated_at = ?1 WHERE status = 'running'",
@@ -386,6 +391,95 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_job_preview(
+        &self,
+        id: &str,
+        raw_path: &str,
+        duration_seconds: f64,
+        first_audio_seconds: f64,
+        progress: f64,
+    ) -> Result<(), String> {
+        let path = self.validate_artifact_path(raw_path)?;
+        let expected_name = format!(".preview-{id}.wav");
+        if path.file_name().and_then(|value| value.to_str()) != Some(&expected_name) {
+            return Err("The runtime returned an invalid job preview path".to_string());
+        }
+        validate_audio_file(&path)?;
+        let timestamp = now();
+        let progress = progress.clamp(0.2, 0.94);
+        let connection = self.lock()?;
+        let changed = connection
+            .execute(
+                "UPDATE jobs SET preview_audio_path = ?2, preview_duration_seconds = ?3,
+                    first_audio_seconds = CASE WHEN first_audio_seconds IS NULL THEN ?4 ELSE first_audio_seconds END,
+                    progress = MAX(progress, ?5), updated_at = ?6
+                 WHERE id = ?1 AND status = 'running'",
+                params![id, path.to_string_lossy(), duration_seconds.max(0.0), first_audio_seconds.max(0.0), progress, timestamp],
+            )
+            .map_err(|error| format!("Could not update the job audio preview: {error}"))?;
+        if changed == 0 {
+            return Err("The active generation job was not found".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn job_preview_audio(&self, id: &str) -> Result<Vec<u8>, String> {
+        let raw_path: String = {
+            let connection = self.lock()?;
+            connection
+                .query_row(
+                    "SELECT preview_audio_path FROM jobs WHERE id = ?1 AND preview_audio_path IS NOT NULL AND status IN ('preparing', 'running')",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("Could not locate the job audio preview: {error}"))?
+                .ok_or("This job has no active audio preview")?
+        };
+        let path = self.validate_artifact_path(&raw_path)?;
+        let expected_name = format!(".preview-{id}.wav");
+        if path.file_name().and_then(|value| value.to_str()) != Some(&expected_name) {
+            return Err("The stored job preview path is invalid".to_string());
+        }
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("Could not inspect the job audio preview: {error}"))?;
+        if metadata.len() > 128 * 1024 * 1024 {
+            return Err("The job audio preview is too large to play safely".to_string());
+        }
+        fs::read(path).map_err(|error| format!("Could not read the job audio preview: {error}"))
+    }
+
+    fn clear_job_preview(&self, id: &str) -> Result<(), String> {
+        let raw_path: Option<String> = {
+            let connection = self.lock()?;
+            let path = connection
+                .query_row(
+                    "SELECT preview_audio_path FROM jobs WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("Could not locate the job audio preview: {error}"))?
+                .flatten();
+            connection
+                .execute(
+                    "UPDATE jobs SET preview_audio_path = NULL, preview_duration_seconds = NULL WHERE id = ?1",
+                    [id],
+                )
+                .map_err(|error| format!("Could not clear the job audio preview: {error}"))?;
+            path
+        };
+        if let Some(raw_path) = raw_path {
+            let path = self.validate_artifact_path_allow_missing(&raw_path)?;
+            if path.file_name().and_then(|value| value.to_str())
+                == Some(&format!(".preview-{id}.wav"))
+            {
+                fs::remove_file(path).ok();
+            }
+        }
+        Ok(())
+    }
+
     pub fn start_job(&self, id: &str) -> Result<String, String> {
         let timestamp = now();
         let mut connection = self.lock()?;
@@ -460,6 +554,8 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| format!("Could not commit the failed job: {error}"))?;
+        drop(connection);
+        self.clear_job_preview(id)?;
         Ok(())
     }
 
@@ -491,6 +587,8 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| format!("Could not commit job completion: {error}"))?;
+        drop(connection);
+        self.clear_job_preview(id)?;
         Ok(changed > 0)
     }
 
@@ -516,6 +614,8 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| format!("Could not commit cancellation: {error}"))?;
+        drop(connection);
+        self.clear_job_preview(id)?;
         Ok(changed > 0)
     }
 
@@ -748,6 +848,8 @@ impl Store {
             }
             format!("Could not commit the generation: {error}")
         })?;
+        drop(connection);
+        self.clear_job_preview(job_id)?;
         Ok(history_value(
             &history_id,
             job_id,
@@ -1935,7 +2037,9 @@ impl Store {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT id, kind, status, progress, attempt, error, created_at, updated_at, request_json, priority FROM jobs WHERE dismissed = 0 ORDER BY created_at DESC LIMIT 100",
+                "SELECT id, kind, status, progress, attempt, error, created_at, updated_at, request_json, priority,
+                        preview_audio_path, preview_duration_seconds, first_audio_seconds
+                 FROM jobs WHERE dismissed = 0 ORDER BY created_at DESC LIMIT 100",
             )
             .map_err(|error| format!("Could not prepare the job list: {error}"))?;
         let rows = statement
@@ -1972,6 +2076,9 @@ impl Store {
                     "title": request.get("title").and_then(Value::as_str).or_else(|| request.get("text").and_then(Value::as_str)).or_else(|| request.get("prompt").and_then(Value::as_str)).unwrap_or("Untitled task"),
                     "model_id": request.get("model_id").and_then(Value::as_str),
                     "priority": priority_name(row.get::<_, i64>(9)?),
+                    "preview_audio_path": row.get::<_, Option<String>>(10)?,
+                    "preview_duration_seconds": row.get::<_, Option<f64>>(11)?,
+                    "first_audio_seconds": row.get::<_, Option<f64>>(12)?,
                 }))
             })
             .map_err(|error| format!("Could not list jobs: {error}"))?;
@@ -1984,7 +2091,8 @@ impl Store {
         connection
             .query_row(
                 "SELECT j.id, j.kind, j.status, j.progress, j.attempt, j.error, j.created_at, j.updated_at, j.request_json,
-                        a.format, a.size_bytes, a.sha256, h.id, j.priority
+                        a.format, a.size_bytes, a.sha256, h.id, j.priority,
+                        j.preview_audio_path, j.preview_duration_seconds, j.first_audio_seconds
                  FROM jobs j
                  LEFT JOIN artifacts a ON a.id = j.output_artifact_id
                  LEFT JOIN history h ON h.job_id = j.id
@@ -2010,6 +2118,9 @@ impl Store {
                         "title": request.get("title").and_then(Value::as_str).or_else(|| request.get("text").and_then(Value::as_str)).or_else(|| request.get("prompt").and_then(Value::as_str)).unwrap_or("Untitled task"),
                         "model_id": request.get("model_id").and_then(Value::as_str),
                         "priority": priority_name(row.get::<_, i64>(13)?),
+                        "preview_audio_path": row.get::<_, Option<String>>(14)?,
+                        "preview_duration_seconds": row.get::<_, Option<f64>>(15)?,
+                        "first_audio_seconds": row.get::<_, Option<f64>>(16)?,
                         "result": format.map(|format| json!({
                             "format": format,
                             "size_bytes": size_bytes.unwrap_or_default(),
@@ -4762,6 +4873,33 @@ fn migrate(connection: &mut Connection, from_version: i64) -> Result<(), String>
             )
             .map_err(|error| format!("Could not index durable generation kinds: {error}"))?;
     }
+    if from_version < 32 {
+        for (name, definition) in [
+            ("preview_audio_path", "TEXT"),
+            ("preview_duration_seconds", "REAL"),
+            ("first_audio_seconds", "REAL"),
+        ] {
+            let exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('jobs') WHERE name = ?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    format!("Could not inspect progressive audio previews: {error}")
+                })?;
+            if !exists {
+                transaction
+                    .execute(
+                        &format!("ALTER TABLE jobs ADD COLUMN {name} {definition}"),
+                        [],
+                    )
+                    .map_err(|error| {
+                        format!("Could not add progressive audio previews: {error}")
+                    })?;
+            }
+        }
+    }
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|error| format!("Could not record database schema version: {error}"))?;
@@ -5376,6 +5514,30 @@ fn cleanup_partial_artifacts(root: &Path) -> Result<(), String> {
             fs::remove_file(&path).map_err(|error| {
                 format!(
                     "Could not remove incomplete artifact {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_preview_artifacts(root: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(root)
+        .map_err(|error| format!("Could not inspect preview artifacts: {error}"))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Could not inspect a preview artifact: {error}"))?;
+        let path = entry.path();
+        let is_preview = path.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".preview-") && name.ends_with(".wav"));
+        if is_preview {
+            fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "Could not remove interrupted preview {}: {error}",
                     path.display()
                 )
             })?;
@@ -6341,6 +6503,39 @@ mod tests {
     }
 
     #[test]
+    fn progressive_preview_is_scoped_to_its_active_job_and_removed_on_completion() {
+        let (store, root) = test_store();
+        let id = store
+            .create_job("synthesis", &json!({"text": "Progressive preview"}))
+            .expect("create preview job");
+        store.start_job(&id).expect("start preview job");
+        let preview = root.join("artifacts").join(format!(".preview-{id}.wav"));
+        fs::write(&preview, b"RIFF\x10\x00\x00\x00WAVEprogressive").expect("write preview");
+        store
+            .update_job_preview(
+                &id,
+                preview.to_str().expect("preview path"),
+                0.5,
+                0.25,
+                0.82,
+            )
+            .expect("record preview");
+        let jobs = store.list_jobs().expect("list preview job");
+        assert_eq!(jobs[0]["preview_duration_seconds"], 0.5);
+        assert_eq!(jobs[0]["first_audio_seconds"], 0.25);
+        assert!(store
+            .job_preview_audio(&id)
+            .expect("read preview")
+            .starts_with(b"RIFF"));
+
+        store.complete_job(&id).expect("complete preview job");
+        assert!(!preview.exists());
+        assert!(store.job_preview_audio(&id).is_err());
+        drop(store);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn generic_job_completion_and_failure_never_revive_cancellation() {
         let (store, root) = test_store();
         let id = store
@@ -6439,11 +6634,14 @@ mod tests {
         fs::create_dir_all(&artifacts).expect("create artifact fixture");
         let partial = artifacts.join("interrupted.wav.partial");
         let finished = artifacts.join("finished.wav");
+        let preview = artifacts.join(".preview-interrupted.wav");
         fs::write(&partial, b"incomplete").expect("write partial");
         fs::write(&finished, b"complete").expect("write finished");
+        fs::write(&preview, b"preview").expect("write preview");
 
         let store = Store::open(root.join("data"), artifacts).expect("open store");
         assert!(!partial.exists());
+        assert!(!preview.exists());
         assert_eq!(fs::read(&finished).expect("read finished"), b"complete");
 
         drop(store);

@@ -92,6 +92,7 @@ export interface SchedulerStatus {
   available_vram_budget_mb?: number | null;
   active_batches: number;
   waiting_jobs?: number;
+  engine_limits?: Record<string, number>;
 }
 
 export interface VoiceProfile {
@@ -208,6 +209,9 @@ export interface JobRecord {
   title?: string;
   model_id?: string | null;
   priority?: QueuePriority;
+  preview_audio_path?: string | null;
+  preview_duration_seconds?: number | null;
+  first_audio_seconds?: number | null;
   created_at: string;
   updated_at: string;
 }

@@ -93,6 +93,37 @@ describe("Generation batch import", () => {
     expect(screen.getByRole("option", { name: "fishaudio/fish-speech-1.5" })).toBeVisible();
   });
 
+  it("keeps accepting durable work when all execution slots are busy", async () => {
+    const user = userEvent.setup();
+    const activeJobs = Array.from({ length: 4 }, (_, index) => ({
+      id: `active-${index}`,
+      kind: "synthesis",
+      status: "running" as const,
+      progress: 0.5,
+      attempt: 1,
+      priority: "normal" as const,
+      title: `Active render ${index + 1}`,
+      model_id: "hexgrad/Kokoro-82M",
+      created_at: "2026-08-27T00:00:00Z",
+      updated_at: "2026-08-27T00:00:01Z",
+    }));
+    const bootstrap = { ...fallbackBootstrap, runtime: "tauri" as const, jobs: activeJobs };
+    bridge.listJobs.mockResolvedValue(activeJobs);
+    bridge.listHistory.mockResolvedValue([]);
+    bridge.listBatchRuns.mockResolvedValue([]);
+    bridge.getSchedulerStatus.mockResolvedValue(bootstrap.scheduler);
+    bridge.queueSynthesis.mockResolvedValue({
+      ...activeJobs[0], id: "durably-queued", status: "preparing", progress: 0.05, title: "Queued after busy slots",
+    });
+
+    render(<GenerateView bootstrap={bootstrap} voices={bootstrap.voices} onVoicesChange={vi.fn()} onGenerated={vi.fn()} />);
+    const generate = screen.getByRole("button", { name: "Generate audio" });
+    expect(generate).toBeEnabled();
+    await user.click(generate);
+
+    await waitFor(() => expect(bridge.queueSynthesis).toHaveBeenCalledTimes(1));
+  });
+
   it("queues separate music direction and lyric conditions without voice-cloning fields", async () => {
     const user = userEvent.setup();
     const bootstrap = { ...fallbackBootstrap, runtime: "tauri" as const };

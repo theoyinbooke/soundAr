@@ -612,21 +612,32 @@ impl RuntimeState {
         self.request_internal(request, Some(job_id))
     }
 
-    fn request_internal(&self, request: Value, job_id: Option<&str>) -> Result<Value, String> {
+    fn request_internal(&self, mut request: Value, job_id: Option<&str>) -> Result<Value, String> {
         let runtime_started = Instant::now();
         let requested_engine = self.request_engine(&request)?;
         let priority = priority_value(request.get("priority"))?;
-        let benchmark_token = request.get("benchmark_token").and_then(Value::as_str);
+        let benchmark_token = request
+            .get("benchmark_token")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let operation = request
             .get("operation")
             .and_then(Value::as_str)
-            .unwrap_or("synthesize");
+            .unwrap_or("synthesize")
+            .to_string();
+        if let (Some(job_id), Some(object)) = (job_id, request.as_object_mut()) {
+            object.insert("_job_id".to_string(), json!(job_id));
+        }
         let request_payload = request.to_string();
         if request_payload.len() > MAX_RPC_REQUEST_BYTES {
             return Err("The inference request exceeds the 1 MB local RPC limit".to_string());
         }
-        let (_lease, mut existing) =
-            self.acquire_scheduler_slot(&requested_engine, job_id, priority, benchmark_token)?;
+        let (_lease, mut existing) = self.acquire_scheduler_slot(
+            &requested_engine,
+            job_id,
+            priority,
+            benchmark_token.as_deref(),
+        )?;
         let mut worker_state = if existing.is_some() { "warm" } else { "cold" };
         if let Some(job_id) = job_id {
             let status = match self.store.start_job(job_id) {
@@ -731,7 +742,7 @@ impl RuntimeState {
             Self::stop_process(&mut process);
             return Err(format!("Could not send the inference request: {error}"));
         }
-        let timeout_seconds = match operation {
+        let timeout_seconds = match operation.as_str() {
             "health" | "capabilities" => 30,
             "analyze_audio"
             | "prepare_voice_reference"
@@ -743,29 +754,72 @@ impl RuntimeState {
             }
             _ => 300,
         };
-        let read_result = wait_for_worker_output(&mut process, timeout_seconds).and_then(|_| {
-            let mut bytes = Vec::new();
-            let count = process
-                .stdout
-                .by_ref()
-                .take(MAX_RPC_RESPONSE_BYTES + 1)
-                .read_until(b'\n', &mut bytes)
-                .map_err(|error| format!("Could not read the inference response: {error}"))?;
-            if count == 0 {
-                let status = process.child.try_wait().ok().flatten();
-                return Err(format!(
-                    "The {requested_engine} worker exited without a response{}",
-                    status
-                        .map(|value| format!(" ({value})"))
-                        .unwrap_or_default()
-                ));
+        let read_result = (|| {
+            let deadline = Instant::now() + Duration::from_secs(timeout_seconds as u64);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!(
+                        "The {requested_engine} worker exceeded its {timeout_seconds} second deadline"
+                    ));
+                }
+                wait_for_worker_output(
+                    &mut process,
+                    remaining.as_secs().max(1).min(i32::MAX as u64) as i32,
+                )?;
+                let mut bytes = Vec::new();
+                let count = process
+                    .stdout
+                    .by_ref()
+                    .take(MAX_RPC_RESPONSE_BYTES + 1)
+                    .read_until(b'\n', &mut bytes)
+                    .map_err(|error| format!("Could not read the inference response: {error}"))?;
+                if count == 0 {
+                    let status = process.child.try_wait().ok().flatten();
+                    return Err(format!(
+                        "The {requested_engine} worker exited without a response{}",
+                        status
+                            .map(|value| format!(" ({value})"))
+                            .unwrap_or_default()
+                    ));
+                }
+                if bytes.len() as u64 > MAX_RPC_RESPONSE_BYTES {
+                    return Err("The inference worker exceeded the 8 MB response limit".to_string());
+                }
+                let line = String::from_utf8(bytes)
+                    .map_err(|_| "The inference worker returned non-UTF-8 output".to_string())?;
+                let message: Value = serde_json::from_str(&line).map_err(|error| {
+                    format!("The inference worker stopped unexpectedly: {error}")
+                })?;
+                if let Some(event) = message.get("event") {
+                    if event.get("type").and_then(Value::as_str) == Some("audio-preview") {
+                        let job_id = job_id
+                            .ok_or("The worker sent an audio preview outside a durable job")?;
+                        self.store.update_job_preview(
+                            job_id,
+                            event
+                                .get("audio_path")
+                                .and_then(Value::as_str)
+                                .ok_or("The worker preview has no audio path")?,
+                            event
+                                .get("duration_seconds")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                            event
+                                .get("first_audio_seconds")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                            event
+                                .get("progress")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.78),
+                        )?;
+                    }
+                    continue;
+                }
+                return Ok(line);
             }
-            if bytes.len() as u64 > MAX_RPC_RESPONSE_BYTES {
-                return Err("The inference worker exceeded the 8 MB response limit".to_string());
-            }
-            String::from_utf8(bytes)
-                .map_err(|_| "The inference worker returned non-UTF-8 output".to_string())
-        });
+        })();
         if let Some(job_id) = job_id {
             if let Ok(mut active) = self.active_syntheses.lock() {
                 active.remove(job_id);
@@ -815,7 +869,7 @@ impl RuntimeState {
                     .map(str::to_string)
                     .collect();
             } else if matches!(
-                operation,
+                operation.as_str(),
                 "load"
                     | "synthesize"
                     | "generate_music"
@@ -828,7 +882,7 @@ impl RuntimeState {
                     process.loaded_models = vec![model_id.to_string()];
                 }
             }
-            if matches!(operation, "synthesize" | "generate_music") {
+            if matches!(operation.as_str(), "synthesize" | "generate_music") {
                 let elapsed = runtime_started.elapsed().as_secs_f64();
                 let inference = result
                     .get("inference_seconds")
@@ -913,6 +967,13 @@ impl RuntimeState {
             "active_batches": active_batches,
             "waiting_jobs": scheduler.waiters.len(),
             "benchmark_reserved": scheduler.benchmark_reservation.is_some(),
+            "engine_limits": {
+                "fish-speech": env::var("SOUNDAR_FISH_MAX_PARALLEL_JOBS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, scheduler.max_workers),
+            },
         }))
     }
 
@@ -999,7 +1060,18 @@ impl RuntimeState {
                 .unwrap_or(0);
             let available = total.saturating_sub(used);
             let budget = *scheduler.available_vram_budget_mb.get_or_insert(available);
-            let capacity = scheduler.active_workers < scheduler.max_workers;
+            let engine_limit = if engine == "fish-speech" {
+                env::var("SOUNDAR_FISH_MAX_PARALLEL_JOBS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, scheduler.max_workers)
+            } else {
+                scheduler.max_workers
+            };
+            let active_for_engine = scheduler.active_engines.get(engine).copied().unwrap_or(0);
+            let capacity = scheduler.active_workers < scheduler.max_workers
+                && active_for_engine < engine_limit;
             if cuda && reservation > 0 && total < reservation {
                 scheduler.waiters.retain(|waiter| waiter.ticket != ticket);
                 changed.notify_all();
@@ -3258,6 +3330,17 @@ fn read_generated_audio(
     state
         .store
         .generated_audio_bytes(&path)
+        .map(tauri::ipc::Response::new)
+}
+
+#[tauri::command]
+fn read_job_preview(
+    state: tauri::State<'_, RuntimeState>,
+    job_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    state
+        .store
+        .job_preview_audio(&job_id)
         .map(tauri::ipc::Response::new)
 }
 
@@ -5881,6 +5964,7 @@ pub fn run() {
             clear_finished_jobs,
             save_application_setting,
             read_generated_audio,
+            read_job_preview,
             read_transcription_audio,
             read_voice_audio,
             list_audio_input_devices,
@@ -6902,6 +6986,91 @@ for line in sys.stdin:
             benchmark_token: None,
         };
         assert!(scheduler_rank(&earlier_high, now) > scheduler_rank(&later_high, now));
+    }
+
+    #[test]
+    fn fish_jobs_share_one_resident_worker_and_accept_progress_events() {
+        let root = std::env::temp_dir().join(format!("soundar-fish-queue-{}", Uuid::new_v4()));
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(root.join("data")).expect("create Fish runtime data");
+        fs::create_dir_all(&artifacts).expect("create Fish artifacts");
+        let artifacts_json =
+            serde_json::to_string(&artifacts.to_string_lossy()).expect("artifact JSON");
+        fs::write(
+            root.join("bridge.py"),
+            format!(
+                r#"import json, pathlib, sys, time
+for line in sys.stdin:
+    request = json.loads(line)
+    time.sleep(0.22)
+    preview = pathlib.Path({artifacts_json}) / ('.preview-' + request['_job_id'] + '.wav')
+    preview.write_bytes(b'RIFF\x10\x00\x00\x00WAVEprogressive')
+    print(json.dumps({{"event": {{"type": "audio-preview", "audio_path": str(preview), "duration_seconds": 0.5, "first_audio_seconds": 0.22, "progress": 0.82}}}}), flush=True)
+    time.sleep(0.22)
+    print(json.dumps({{"ok": True, "result": {{"model_id": request["model_id"], "engine": "fish-speech", "inference_seconds": 0.44}}}}), flush=True)
+"#
+            ),
+        )
+        .expect("write Fish bridge");
+        fs::write(
+            root.join("data/engine_manifests.json"),
+            r#"{"engines":[{"id":"fish-speech","minimum_vram_mb":0}]}"#,
+        )
+        .expect("write Fish manifest");
+        let registry = root.join("models.json");
+        fs::write(
+            &registry,
+            r#"{"models":[{"model_id":"test/fish","engine":"fish-speech","task":"tts"}]}"#,
+        )
+        .expect("write Fish registry");
+        let store = Store::open(root.join("state"), artifacts).expect("Fish store");
+        let runtime = RuntimeState::new_with_store_and_registry(
+            root.clone(),
+            PathBuf::from("python3"),
+            registry,
+            store,
+        );
+        runtime.scheduler.0.lock().expect("scheduler").max_workers = 4;
+        let request = json!({"operation":"synthesize", "model_id":"test/fish"});
+        let jobs = [
+            runtime
+                .store
+                .create_job("synthesis", &request)
+                .expect("first Fish job"),
+            runtime
+                .store
+                .create_job("synthesis", &request)
+                .expect("second Fish job"),
+        ];
+        let started = Instant::now();
+        let handles = jobs
+            .iter()
+            .map(|job| {
+                let runtime = runtime.clone();
+                let request = request.clone();
+                let job = job.clone();
+                std::thread::spawn(move || runtime.request_for_job(request, &job))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("join Fish job").expect("run Fish job");
+        }
+        assert!(started.elapsed() >= Duration::from_millis(800));
+        assert_eq!(runtime.worker_pool.lock().expect("worker pool").len(), 1);
+        assert_eq!(
+            runtime.scheduler_status().expect("status")["engine_limits"]["fish-speech"],
+            1
+        );
+        let records = runtime.store.list_jobs().expect("Fish job previews");
+        assert!(records
+            .iter()
+            .all(|job| job["preview_duration_seconds"] == 0.5));
+        for job in &jobs {
+            runtime.store.cancel_job(job).expect("clear Fish preview");
+        }
+        runtime.stop_active_worker().expect("stop Fish worker");
+        drop(runtime);
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -142,8 +142,8 @@ reference = reference_path.read_bytes()
 connection = sqlite3.connect(database)
 connection.execute("PRAGMA foreign_keys=ON")
 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-if schema != 31:
-    raise SystemExit(f"candidate clean launch created schema {schema}, expected 31")
+if schema != 32:
+    raise SystemExit(f"candidate clean launch created schema {schema}, expected 32")
 timestamp = "2026-08-13T12:00:00Z"
 connection.execute(
     "INSERT INTO jobs (id, kind, status, request_json, progress, attempt, output_artifact_id, created_at, updated_at, dismissed, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -204,8 +204,8 @@ import sys
 database = pathlib.Path(sys.argv[1])
 state = pathlib.Path(sys.argv[2])
 connection = sqlite3.connect(database)
-if connection.execute("PRAGMA user_version").fetchone()[0] != 31:
-    raise SystemExit("the candidate did not migrate schema 30 to 31")
+if connection.execute("PRAGMA user_version").fetchone()[0] != 32:
+    raise SystemExit("the candidate did not migrate schema 30 to 32")
 if connection.execute("PRAGMA quick_check").fetchone()[0].lower() != "ok":
     raise SystemExit("the migrated database failed quick_check")
 if list(connection.execute("PRAGMA foreign_key_check")):
@@ -225,6 +225,10 @@ if connection.execute("SELECT value_json FROM settings WHERE key = 'theme'").fet
     raise SystemExit("upgrade did not preserve settings")
 if connection.execute("SELECT generation_kind FROM history WHERE id = 'journey-history'").fetchone()[0] != "speech":
     raise SystemExit("schema-31 generation kind was not created cleanly")
+job_columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+for column in ("preview_audio_path", "preview_duration_seconds", "first_audio_seconds"):
+    if column not in job_columns:
+        raise SystemExit(f"schema-32 progressive preview column is missing: {column}")
 connection.close()
 backups = list(state.glob("soundar.sqlite3.backup-*"))
 if not backups:
@@ -260,7 +264,7 @@ import sqlite3
 import sys
 
 connection = sqlite3.connect(sys.argv[1])
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 31
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
 assert connection.execute("PRAGMA quick_check").fetchone()[0].lower() == "ok"
 assert connection.execute("SELECT COUNT(*) FROM projects WHERE id = 'journey-project'").fetchone()[0] == 1
 assert connection.execute("SELECT COUNT(*) FROM history WHERE id = 'journey-history'").fetchone()[0] == 1
@@ -268,4 +272,4 @@ assert connection.execute("SELECT COUNT(*) FROM voices WHERE id = 'journey-voice
 connection.close()
 PY
 
-printf 'Verified offline previous-release launch, clean candidate launch, schema-30 upgrade, and Debian/AppImage profile preservation for soundAr %s.\n' "$VERSION"
+printf 'Verified offline previous-release launch, clean candidate launch, schema-30-to-32 upgrade, and Debian/AppImage profile preservation for soundAr %s.\n' "$VERSION"

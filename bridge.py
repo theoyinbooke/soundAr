@@ -10,6 +10,7 @@ import math
 import os
 import re
 import sys
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -62,6 +63,7 @@ class Runtime:
         self.speaker_verifier = SpeakerVerifier(self.gpu)
         self.forced_aligner = ForcedAligner(self.gpu)
         self.contracts = EngineContractRegistry(Path(self.settings.catalog_path).parent / "engine_manifests.json")
+        self.event_sink = None
 
     def dispatch(self, request: dict[str, object]) -> dict[str, object]:
         operation = str(request.get("operation", "synthesize"))
@@ -715,6 +717,32 @@ class Runtime:
 
         collector = BenchmarkCollector(self.gpu)
         collector.start()
+        preview_segments: list[np.ndarray] = []
+        preview_started = time.monotonic()
+        preview_path: Path | None = None
+        job_id = str(request.get("_job_id") or "").strip()
+        if engine_name == "fish-speech" and self.event_sink is not None and re.fullmatch(r"[A-Za-z0-9_-]{8,80}", job_id):
+            preview_path = Path.home() / ".soundAr" / "exports" / f".preview-{job_id}.wav"
+
+        def publish_preview(segment: np.ndarray, sample_rate: int) -> None:
+            if preview_path is None or self.event_sink is None or segment.size == 0:
+                return
+            preview_segments.append(np.asarray(segment, dtype=np.float32).reshape(-1))
+            combined = np.concatenate(preview_segments)
+            temporary = preview_path.with_suffix(".wav.partial")
+            save_audio(temporary, combined, sample_rate, "wav")
+            os.replace(temporary, preview_path)
+            sequence = len(preview_segments)
+            self.event_sink({
+                "type": "audio-preview",
+                "stage": "decoding",
+                "progress": min(0.92, 0.78 + sequence * 0.02),
+                "audio_path": str(preview_path),
+                "duration_seconds": round(combined.size / sample_rate, 4),
+                "first_audio_seconds": round(time.monotonic() - preview_started, 4),
+                "sequence": sequence,
+            })
+
         result = self.engine.synthesize(
             text=text,
             speaker=str(request.get("speaker") or "default"),
@@ -732,6 +760,7 @@ class Runtime:
                 "instruction": str(request.get("instruction") or "Speak clearly and naturally."),
                 "seed": int(request.get("seed", 0)),
             },
+            progress_callback=publish_preview if preview_path is not None else None,
         )
         metrics = collector.stop(model_id, engine_name, "tts", result.duration_seconds)
 
@@ -977,15 +1006,23 @@ def analyze_audio_path(path: Path) -> dict[str, object]:
 
 
 def serve(runtime: Runtime) -> int:
+    protocol_stdout = sys.stdout
     for line in sys.stdin:
         try:
             request = json.loads(line)
+            runtime.event_sink = lambda event: print(
+                json.dumps({"event": event}),
+                file=protocol_stdout,
+                flush=True,
+            )
             with contextlib.redirect_stdout(io.StringIO()):
                 result = runtime.dispatch(request)
             response = {"ok": True, "result": result}
         except Exception as error:
             response = {"ok": False, "error": str(error)}
-        print(json.dumps(response), flush=True)
+        finally:
+            runtime.event_sink = None
+        print(json.dumps(response), file=protocol_stdout, flush=True)
     return 0
 
 

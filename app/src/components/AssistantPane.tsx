@@ -2,8 +2,8 @@ import { ArrowUp, Bot, Check, ChevronDown, CircleAlert, CircleStop, Download, Ex
 import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { codexRequest, connectCodex, getCodexStatus, listenToCodex, loadCodexModels, respondToCodex, type AgentAccess, type CodexEvent, type CodexModel, type CodexStatus, type ReasoningEffort } from "../lib/codexBridge";
-import { exportHistoryItem, listHistory, loadGeneratedAudio } from "../lib/bridge";
-import type { HistoryItem } from "../types";
+import { exportHistoryItem, listHistory, listJobs, loadGeneratedAudio, loadJobPreview } from "../lib/bridge";
+import type { HistoryItem, JobRecord } from "../types";
 
 type Message = { id: string; role: "user" | "assistant" | "system"; text: string; pending?: boolean };
 type ToolRun = { id: string; title: string; detail: string; state: "running" | "complete" | "failed" };
@@ -34,9 +34,11 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [artifacts, setArtifacts] = useState<HistoryItem[]>([]);
+  const [activeJobs, setActiveJobs] = useState<JobRecord[]>([]);
   const [artifactMode, setArtifactMode] = useState<"single" | "project">("single");
   const scrollRef = useRef<HTMLDivElement>(null);
   const initialHistoryIds = useRef<Set<string> | undefined>(undefined);
+  const initialJobIds = useRef<Set<string> | undefined>(undefined);
   const artifactKey = useRef("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
@@ -78,9 +80,11 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
     let timer = 0;
     async function refreshArtifacts() {
       try {
-        const history = await listHistory();
+        const [history, jobs] = await Promise.all([listHistory(), listJobs()]);
         if (!active) return;
         if (!initialHistoryIds.current) initialHistoryIds.current = new Set(history.map((item) => item.id));
+        if (!initialJobIds.current) initialJobIds.current = new Set(jobs.map((item) => item.id));
+        setActiveJobs(selectAssistantJobs(jobs, initialJobIds.current));
         const created = selectAssistantArtifacts(history, initialHistoryIds.current, artifactMode);
         if (created.length) {
           const key = created.map((item) => item.id).join(":");
@@ -91,17 +95,17 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
           }
         }
       } finally {
-        if (active) timer = window.setTimeout(refreshArtifacts, sending ? 1800 : 4500);
+        if (active) timer = window.setTimeout(refreshArtifacts, sending || activeJobs.length ? 500 : 3000);
       }
     }
     void refreshArtifacts();
     return () => { active = false; window.clearTimeout(timer); };
-  }, [open, sending, onStudioChanged, artifactMode]);
+  }, [open, sending, activeJobs.length, onStudioChanged, artifactMode]);
 
   useEffect(() => {
     const element = scrollRef.current;
     if (element && typeof element.scrollTo === "function") element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
-  }, [messages, toolRuns, approval]);
+  }, [messages, toolRuns, activeJobs, artifacts, approval]);
 
   const selectedModel = useMemo(() => models.find((model) => model.id === modelId) ?? models[0], [modelId, models]);
   const efforts = selectedModel?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ?? ["low", "medium", "high"];
@@ -174,9 +178,14 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
     setPlanSteps([]);
     setToolRuns([]);
     setArtifacts([]);
+    setActiveJobs([]);
     setArtifactMode("single");
-    const currentHistory = await listHistory().catch(() => []);
+    const [currentHistory, currentJobs] = await Promise.all([
+      listHistory().catch(() => []),
+      listJobs().catch(() => []),
+    ]);
     initialHistoryIds.current = new Set(currentHistory.map((item) => item.id));
+    initialJobIds.current = new Set(currentJobs.map((item) => item.id));
     artifactKey.current = "";
     setMessages((items) => [...items, { id: `user-${Date.now()}`, role: "user", text }]);
     try {
@@ -244,6 +253,10 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       setToolRuns([]);
       setPlanSteps([]);
       setArtifacts([]);
+      setActiveJobs([]);
+      initialHistoryIds.current = undefined;
+      initialJobIds.current = undefined;
+      artifactKey.current = "";
     } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); }
   }
 
@@ -251,7 +264,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   return <aside className="assistant-pane" aria-label="soundAr assistant">
     <header className="assistant-header">
       <div><strong>Assistant</strong><span>{account ? "Powered by your Codex login" : "Codex connection"}</span></div>
-      <div className="assistant-header-actions"><button type="button" aria-label="New conversation" title="New conversation" onClick={() => { setThreadId(undefined); setMessages(defaultMessages); setToolRuns([]); setPlanSteps([]); setArtifacts([]); }}><Plus size={16} /></button><button type="button" aria-label="Conversation history" title="Conversation history" aria-expanded={threadMenuOpen} onClick={() => setThreadMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button><button type="button" aria-label="Close assistant" title="Close assistant" onClick={onClose}><PanelRightClose size={16} /></button></div>
+      <div className="assistant-header-actions"><button type="button" aria-label="New conversation" title="New conversation" onClick={() => { setThreadId(undefined); setMessages(defaultMessages); setToolRuns([]); setPlanSteps([]); setArtifacts([]); setActiveJobs([]); initialHistoryIds.current = undefined; initialJobIds.current = undefined; }}><Plus size={16} /></button><button type="button" aria-label="Conversation history" title="Conversation history" aria-expanded={threadMenuOpen} onClick={() => setThreadMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button><button type="button" aria-label="Close assistant" title="Close assistant" onClick={onClose}><PanelRightClose size={16} /></button></div>
       {threadMenuOpen ? <div className="assistant-thread-menu" role="menu" aria-label="Assistant conversations"><strong>Recent conversations</strong>{threads.length ? threads.map((thread) => <button role="menuitem" type="button" key={thread.id} onClick={() => void resumeThread(thread.id)}><span>{thread.name || thread.preview || "Untitled conversation"}</span><small>{thread.updatedAt ? new Date(thread.updatedAt * 1000).toLocaleDateString() : "Saved by Codex"}</small></button>) : <span>No saved conversations yet.</span>}</div> : null}
     </header>
     <div className="assistant-thread" ref={scrollRef}>
@@ -263,6 +276,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
         {messages.map((message) => <article className={`assistant-message is-${message.role}`} key={message.id}><span>{message.role === "assistant" ? "Assistant" : message.role === "user" ? "You" : "soundAr"}</span><p>{message.text}{message.pending ? <i className="assistant-caret" /> : null}</p></article>)}
         {planSteps.length ? <ol className="assistant-plan" aria-label="Current plan">{planSteps.map((step, index) => <li className={`is-${step.status}`} key={`${index}-${step.step}`}><span>{step.status === "completed" ? <Check size={12} /> : step.status === "inProgress" ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><strong>{step.step}</strong></li>)}</ol> : null}
         {toolRuns.length ? <ActivitySummary runs={toolRuns} /> : null}
+        {activeJobs.length ? <AssistantJobProgress jobs={activeJobs} mode={artifactMode} /> : null}
         {artifacts.map((item) => <AudioArtifact key={item.id} item={item} onRevise={() => {
           setDraft(`Revise “${item.title || (item.generation_kind === "music" ? "Generated music" : "Generated speech")}” (${item.id}): `);
           window.setTimeout(() => composerRef.current?.focus(), 0);
@@ -335,6 +349,52 @@ export function selectAssistantArtifacts(history: HistoryItem[], baseline: Set<s
     .filter((item) => item.audio_path && !baseline?.has(item.id))
     .filter((item) => mode === "project" ? item.model_id === "soundar/project-master" || item.engine === "finishing" : item.model_id !== "soundar/project-master")
     .slice(0, 1);
+}
+
+export function selectAssistantJobs(jobs: JobRecord[], baseline: Set<string> | undefined) {
+  return jobs
+    .filter((job) => !baseline?.has(job.id))
+    .filter((job) => ["queued", "preparing", "running"].includes(job.status))
+    .filter((job) => ["synthesis", "api-synthesis", "music-generation"].includes(job.kind));
+}
+
+function AssistantJobProgress({ jobs, mode }: { jobs: JobRecord[]; mode: "single" | "project" }) {
+  const job = jobs.find((item) => item.preview_audio_path) ?? jobs[0];
+  const [source, setSource] = useState<string>();
+  const [playing, setPlaying] = useState(false);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const progress = mode === "project"
+    ? jobs.reduce((total, item) => total + item.progress, 0) / Math.max(1, jobs.length)
+    : job.progress;
+  useEffect(() => {
+    if (mode === "project" || !job.preview_audio_path) {
+      setSource(undefined);
+      return;
+    }
+    let active = true;
+    let objectUrl: string | undefined;
+    loadJobPreview(job.id).then((url) => {
+      objectUrl = url;
+      if (active) setSource(url);
+      else if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+      if (objectUrl?.startsWith("blob:")) URL.revokeObjectURL(objectUrl);
+    };
+  }, [job.id, job.preview_audio_path, job.preview_duration_seconds, mode]);
+  return <article className="assistant-job-progress" aria-live="polite">
+    {source ? <audio ref={audioRef} src={source} onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} /> : null}
+    <div className="assistant-job-progress-heading">
+      <span>{mode === "project" ? "Project rendering" : job.stage === "decoding" ? "Preview ready" : "Generating locally"}</span>
+      <strong>{Math.round(progress * 100)}%</strong>
+    </div>
+    <div className="assistant-job-progress-track"><span style={{ width: `${Math.max(4, progress * 100)}%` }} /></div>
+    <div className="assistant-job-progress-meta">
+      <span>{mode === "project" ? `${jobs.length} ${jobs.length === 1 ? "chapter" : "chapters"} active` : job.title?.slice(0, 54) || "Audio generation"}</span>
+      {source ? <button type="button" aria-label={playing ? "Pause progressive preview" : "Play progressive preview"} onClick={() => { const audio = audioRef.current; if (!audio) return; if (audio.paused) void audio.play(); else audio.pause(); }}>{playing ? <Pause size={12} /> : <Play size={12} />}<span>{formatTime(job.preview_duration_seconds ?? 0)} preview</span></button> : <small>{humanize(job.stage ?? job.status)}</small>}
+    </div>
+  </article>;
 }
 
 function ActivitySummary({ runs }: { runs: ToolRun[] }) {
