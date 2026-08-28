@@ -758,6 +758,17 @@ def evaluate_thresholds(
             }
         )
 
+    def check_optional_measurement(name: str, actual: float | None, maximum: float) -> None:
+        checks.append(
+            {
+                "name": name,
+                "actual": actual,
+                "maximum": maximum,
+                "passed": actual is None or actual <= maximum,
+                "skipped": actual is None,
+            }
+        )
+
     check("end_to_end_wall_seconds", end_to_end_seconds, float(thresholds["max_end_to_end_wall_seconds"]))
     for stage_name, maximum in thresholds.get("max_stage_realtime_factor", {}).items():
         stage = by_name.get(stage_name)
@@ -769,7 +780,9 @@ def evaluate_thresholds(
     for stage_name, maximum in thresholds.get("max_stage_peak_delta_vram_mib", {}).items():
         stage = by_name.get(stage_name)
         actual = stage.get("gpu", {}).get("peak_delta_vram_mib") if stage else None
-        check(f"{stage_name}.peak_delta_vram_mib", actual, float(maximum))
+        check_optional_measurement(
+            f"{stage_name}.peak_delta_vram_mib", actual, float(maximum)
+        )
     for stage_name, maximum in thresholds.get("max_optional_stage_realtime_factor", {}).items():
         stage = by_name.get(stage_name)
         if stage and stage.get("status") != "skipped":
@@ -783,7 +796,7 @@ def evaluate_thresholds(
     ).items():
         stage = by_name.get(stage_name)
         if stage and stage.get("status") != "skipped":
-            check(
+            check_optional_measurement(
                 f"{stage_name}.peak_delta_vram_mib",
                 stage.get("gpu", {}).get("peak_delta_vram_mib"),
                 float(maximum),

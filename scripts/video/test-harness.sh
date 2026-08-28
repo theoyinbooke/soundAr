@@ -158,6 +158,34 @@ assert any(
     and not check["passed"]
     for check in gate["checks"]
 )
+
+portable_stages = [
+    {
+        "name": name,
+        "status": "passed",
+        "realtime_factor": 0.01,
+        "wall_seconds": 0.1,
+        "gpu": {"peak_delta_vram_mib": None},
+    }
+    for name in stage_names
+]
+portable_stages.append(
+    {"name": "proxy_render_cache_hit", "status": "passed", "wall_seconds": 0.05}
+)
+portable_gate = benchmark.evaluate_thresholds(
+    script_dir / "performance-thresholds.json",
+    portable_stages,
+    end_to_end_seconds=1.0,
+)
+assert portable_gate["passed"] is True
+assert {
+    check["name"]
+    for check in portable_gate["checks"]
+    if check.get("skipped") is True
+} == {
+    "portrait_final_render.peak_delta_vram_mib",
+    "animated_podcast_final_render.peak_delta_vram_mib",
+}
 PY
 
 printf 'Video Studio harness tests passed. Evidence retained at %s\n' "$test_root"

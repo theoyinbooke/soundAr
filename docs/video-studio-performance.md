@@ -81,7 +81,7 @@ The checked-in thresholds are deliberately wider than the observed baseline. The
 | Each final-render VRAM delta | 2,048 MiB |
 | faster-whisper VRAM delta when configured | 4,096 MiB |
 
-The benchmark exits nonzero and records the failed check in `benchmark.json` when any threshold is exceeded. A threshold change requires a new idle-machine baseline, a written explanation, and review; it is not an acceptable way to make a regression disappear.
+The benchmark exits nonzero and records the failed check in `benchmark.json` when any available threshold is exceeded. VRAM thresholds are enforced whenever `nvidia-smi` supplies samples; CPU-only CI records those measurements as explicitly skipped while still enforcing timing, cache, decode, and output checks. A threshold change requires a new idle-machine baseline, a written explanation, and review; it is not an acceptable way to make a regression disappear.
 
 For a CPU-only CI smoke:
 
