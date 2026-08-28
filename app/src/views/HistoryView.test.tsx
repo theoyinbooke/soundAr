@@ -1,7 +1,10 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HistoryItem } from "../types";
 import { HistoryView } from "./SecondaryViews";
+import { createBrowserPreviewVideoService } from "../lib/videoBridge";
+import { VideoIntegrationProvider } from "../components/video/VideoIntegrationContext";
 
 const bridge = vi.hoisted(() => ({
   listHistory: vi.fn(),
@@ -38,6 +41,21 @@ const damaged: HistoryItem = {
 };
 
 describe("History artifact integrity", () => {
+  it("keeps final video masters playable, downloadable, and linked to Video Studio", async () => {
+    const user = userEvent.setup();
+    const onOpenProject = vi.fn();
+    render(<VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={onOpenProject}>
+      <HistoryView history={[]} onChange={vi.fn()} />
+    </VideoIntegrationProvider>);
+
+    const player = await screen.findByLabelText("Play Creator update · Portrait master");
+    const card = player.closest("article");
+    expect(card).not.toBeNull();
+    expect(within(card!).getByRole("link", { name: "Download Creator update · Portrait master" })).toHaveAttribute("href", expect.stringContaining("data:video/mp4"));
+    await user.click(within(card!).getByRole("button", { name: "Open in Video Studio" }));
+    expect(onOpenProject).toHaveBeenCalledWith("creator-update-master");
+  });
+
   it("explains a modified artifact and disables playback and reveal", () => {
     bridge.listHistory.mockResolvedValue([damaged]);
     render(<HistoryView history={[damaged]} onChange={vi.fn()} />);

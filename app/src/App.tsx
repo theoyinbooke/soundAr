@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { AppShell } from "./components/AppShell";
 import { RuntimeSetupNotice } from "./components/RuntimeSetupNotice";
@@ -12,6 +12,10 @@ import { ModelsView } from "./views/ModelsView";
 import { AboutView, CompareView, HistoryView, SettingsView } from "./views/SecondaryViews";
 import { VoicesView } from "./views/VoicesView";
 import { ProjectsView } from "./views/ProjectsView";
+import { VideoStudioView } from "./views/VideoStudioView";
+import { createVideoStudioService } from "./lib/videoBridge";
+import { VideoIntegrationProvider } from "./components/video/VideoIntegrationContext";
+import type { VideoStudioService } from "./types/video";
 
 export default function App() {
   const [settings, setSettings] = useState<ApplicationSettings>({ theme: "light", dense_tables: true, reduced_motion: false });
@@ -29,6 +33,11 @@ export default function App() {
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckStatus>({ phase: "idle" });
   const [preferredVoiceId, setPreferredVoiceId] = useState<string>();
   const [assistantOpen, setAssistantOpen] = useState(false);
+  const [selectedVideoProjectId, setSelectedVideoProjectId] = useState<string>();
+  const [videoRevision, setVideoRevision] = useState(0);
+  const videoServiceRef = useRef<VideoStudioService | null>(null);
+  if (videoServiceRef.current === null) videoServiceRef.current = createVideoStudioService();
+  const videoService = videoServiceRef.current;
 
   const refreshStudioData = useCallback(async () => {
     try {
@@ -47,8 +56,22 @@ export default function App() {
 
   const navigate = useCallback((next: NavKey) => {
     setCurrent(next);
-    if (next === "projects") void refreshStudioData();
+    if (next === "projects" || next === "video") void refreshStudioData();
   }, [refreshStudioData]);
+
+  const openVideoProject = useCallback((projectId: string) => {
+    setSelectedVideoProjectId(projectId);
+    setCurrent("video");
+  }, []);
+
+  const markVideoChanged = useCallback(() => {
+    setVideoRevision((revision) => revision + 1);
+  }, []);
+
+  const handleAssistantStudioChanged = useCallback(() => {
+    markVideoChanged();
+    void refreshStudioData();
+  }, [markVideoChanged, refreshStudioData]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme;
@@ -106,6 +129,7 @@ export default function App() {
   function renderView(state: BootstrapState) {
     switch (current) {
       case "generate": return <GenerateView bootstrap={state} voices={voices} onVoicesChange={setVoices} preferredVoiceId={preferredVoiceId} onOpenModels={() => setCurrent("models")} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
+      case "video": return <VideoStudioView service={videoService} initialProjectId={selectedVideoProjectId} assistantOpen={assistantOpen} onProjectChanged={(project) => { setSelectedVideoProjectId(project.id); markVideoChanged(); }} onMasterPublished={() => { markVideoChanged(); void refreshStudioData(); }} />;
       case "projects": return <ProjectsView bootstrap={state} projects={projects} voices={voices} onChange={setProjects} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "voices": return <VoicesView bootstrap={state} voices={voices} onChange={setVoices} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} onUseVoice={(id) => { setPreferredVoiceId(id); setCurrent("generate"); }} />;
       case "models": return <ModelsView bootstrap={state} onChanged={refreshBootstrap} />;
@@ -159,11 +183,13 @@ export default function App() {
   }
 
   return (
-    <AppShell current={current} onNavigate={navigate} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId} assistantOpen={assistantOpen} onAssistantOpenChange={setAssistantOpen} onAssistantStudioChanged={refreshStudioData}>
-      {runtimeNotice ? <div className="runtime-warning">Local operation failed: {runtimeNotice}</div> : null}
-      {availableUpdate ? <UpdateNotice update={availableUpdate} installKind={bootstrap.install_kind} onDismiss={() => { void availableUpdate.close(); setAvailableUpdate(undefined); }} /> : null}
-      {bootstrap.runtime === "tauri" && !bootstrap.system.python_ready ? <RuntimeSetupNotice onReady={refreshBootstrap} /> : null}
-      {renderView(bootstrap)}
-    </AppShell>
+    <VideoIntegrationProvider service={videoService} revision={videoRevision} onOpenProject={openVideoProject}>
+      <AppShell current={current} onNavigate={navigate} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId} assistantOpen={assistantOpen} onAssistantOpenChange={setAssistantOpen} onAssistantStudioChanged={handleAssistantStudioChanged}>
+        {runtimeNotice ? <div className="runtime-warning">Local operation failed: {runtimeNotice}</div> : null}
+        {availableUpdate ? <UpdateNotice update={availableUpdate} installKind={bootstrap.install_kind} onDismiss={() => { void availableUpdate.close(); setAvailableUpdate(undefined); }} /> : null}
+        {bootstrap.runtime === "tauri" && !bootstrap.system.python_ready ? <RuntimeSetupNotice onReady={refreshBootstrap} /> : null}
+        {renderView(bootstrap)}
+      </AppShell>
+    </VideoIntegrationProvider>
   );
 }

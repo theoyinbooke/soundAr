@@ -114,6 +114,29 @@ function makeScenes(candidates: CandidateVideoClip[]): VideoScene[] {
   });
 }
 
+function makeMasterArtifact(projectId: string, versionId: string, durationMs: number, title = "Creator update · Portrait master"): VideoArtifact {
+  return {
+    id: `${projectId}-master`,
+    project_id: projectId,
+    version_id: versionId,
+    role: "master",
+    title,
+    mime_type: "video/mp4",
+    format: "mp4",
+    url: FIXTURE_VIDEO_URL,
+    download_name: `${projectId}-portrait-master.mp4`,
+    duration_ms: durationMs,
+    width: 1080,
+    height: 1920,
+    frame_rate: 30,
+    codec: "H.264",
+    file_size_bytes: 24_300_000,
+    checksum: "a1b2c3d4…9f0e",
+    playable: true,
+    created_at: FIXED_NOW,
+  };
+}
+
 function makeProject(id = "creator-update", name = "Creator update · Reel draft", status: VideoProject["status"] = "editing"): VideoProject {
   const candidates = clone(candidateSeed);
   const scenes = status === "review" || status === "analyzing" ? [] : makeScenes(candidates);
@@ -145,7 +168,13 @@ function makeProject(id = "creator-update", name = "Creator update · Reel draft
     revisions: [],
     settings: { aspect_ratio: "9:16", caption_style: "clean-white", captions_enabled: true, hardware_render: true },
   };
-  return { id, name, status, duration_ms: manifest.timeline.duration_ms, scene_count: scenes.length, created_at: FIXED_NOW, updated_at: FIXED_NOW, poster_url: undefined, manifest };
+  const project: VideoProject = { id, name, status, duration_ms: manifest.timeline.duration_ms, scene_count: scenes.length, created_at: FIXED_NOW, updated_at: FIXED_NOW, poster_url: undefined, manifest };
+  if (status === "exported") {
+    const master = makeMasterArtifact(id, manifest.version_id, project.duration_ms);
+    project.master = master;
+    project.manifest.artifacts.push(master);
+  }
+  return project;
 }
 
 function summary(project: VideoProject): VideoProjectSummary {
@@ -164,6 +193,7 @@ async function pause(milliseconds = 12): Promise<void> {
 export function createBrowserPreviewVideoService(): VideoStudioService {
   const projects = new Map<string, VideoProject>();
   [
+    makeProject("creator-update-master", "Creator update · Reel master", "exported"),
     makeProject(),
     makeProject("product-demo", "Product demo", "review"),
     makeProject("tutorial-outline", "Tutorial outline"),
@@ -306,7 +336,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
         if (cancelledJobs.delete(update.id)) throw new Error("Video export was cancelled.");
       }
       const exported = clone(current);
-      const master: VideoArtifact = { id: `${request.project_id}-master`, project_id: request.project_id, version_id: request.version_id, role: "master", title: "Creator update · Portrait master", mime_type: "video/mp4", format: "mp4", url: FIXTURE_VIDEO_URL, download_name: `${request.project_id}-portrait-master.mp4`, duration_ms: exported.duration_ms, width: 1080, height: 1920, frame_rate: 30, codec: "H.264", file_size_bytes: 24_300_000, checksum: "a1b2c3d4…9f0e", playable: true, created_at: FIXED_NOW };
+      const master = makeMasterArtifact(request.project_id, request.version_id, exported.duration_ms);
       exported.master = master;
       exported.status = "exported";
       exported.manifest.artifacts = [...exported.manifest.artifacts.filter((artifact) => artifact.role !== "master"), master];

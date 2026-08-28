@@ -1,19 +1,24 @@
-import { ArrowUp, Bot, Check, ChevronDown, CircleAlert, CircleStop, Download, ExternalLink, LoaderCircle, MessageCircle, MoreHorizontal, PanelRightClose, Pause, Play, Plus, ShieldCheck, X } from "lucide-react";
+import { ArrowUp, Bot, Check, ChevronDown, CircleAlert, CircleStop, Clapperboard, Download, ExternalLink, FileVideo2, LoaderCircle, MessageCircle, MoreHorizontal, PanelRightClose, Pause, Play, Plus, ShieldCheck, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { codexRequest, connectCodex, getCodexStatus, listenToCodex, loadCodexModels, respondToCodex, type AgentAccess, type CodexEvent, type CodexModel, type CodexStatus, type ReasoningEffort } from "../lib/codexBridge";
 import { exportHistoryItem, listHistory, listJobs, loadGeneratedAudio, loadJobPreview } from "../lib/bridge";
 import type { HistoryItem, JobRecord } from "../types";
+import type { VideoArtifact, VideoJobPhase, VideoProject } from "../types/video";
+import { useVideoIntegration, useVideoProjectSummaries } from "./video/VideoIntegrationContext";
 
 type Message = { id: string; role: "user" | "assistant" | "system"; text: string; pending?: boolean };
 type ToolRun = { id: string; title: string; detail: string; state: "running" | "complete" | "failed" };
 type Approval = { id: number; method: string; title: string; detail: string };
 type ThreadSummary = { id: string; preview?: string; name?: string; updatedAt?: number };
 type PlanStep = { step: string; status: "pending" | "inProgress" | "completed" };
+type VideoPhaseRun = { phase: VideoJobPhase; title: string; detail: string; state: "running" | "complete" | "failed" };
 
 const defaultMessages: Message[] = [{ id: "welcome", role: "assistant", text: "Tell me what you are building—even if the idea is unfinished. I can research and plan it, write the content, create speech or music, assemble projects and batches, and revise the result with you." }];
 
 export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolean; onClose: () => void; onStudioChanged?: () => void }) {
+  const { onOpenProject: onOpenVideoProject, service: videoService } = useVideoIntegration();
+  const { refresh: refreshVideoProjects } = useVideoProjectSummaries(open);
   const [status, setStatus] = useState<CodexStatus>({ available: true, connected: false });
   const [account, setAccount] = useState<Record<string, unknown>>();
   const [models, setModels] = useState<CodexModel[]>([]);
@@ -36,6 +41,8 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   const [artifacts, setArtifacts] = useState<HistoryItem[]>([]);
   const [activeJobs, setActiveJobs] = useState<JobRecord[]>([]);
   const [artifactMode, setArtifactMode] = useState<"single" | "project">("single");
+  const [videoPhases, setVideoPhases] = useState<VideoPhaseRun[]>([]);
+  const [videoProject, setVideoProject] = useState<VideoProject>();
   const scrollRef = useRef<HTMLDivElement>(null);
   const initialHistoryIds = useRef<Set<string> | undefined>(undefined);
   const initialJobIds = useRef<Set<string> | undefined>(undefined);
@@ -105,10 +112,29 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   useEffect(() => {
     const element = scrollRef.current;
     if (element && typeof element.scrollTo === "function") element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
-  }, [messages, toolRuns, activeJobs, artifacts, approval]);
+  }, [messages, toolRuns, activeJobs, artifacts, approval, videoPhases, videoProject]);
 
   const selectedModel = useMemo(() => models.find((model) => model.id === modelId) ?? models[0], [modelId, models]);
   const efforts = selectedModel?.supportedReasoningEfforts?.map((option) => option.reasoningEffort) ?? ["low", "medium", "high"];
+
+  async function resolveVideoResult(item: Record<string, unknown>, tool: string) {
+    if (!videoService) return;
+    const embedded = videoProjectFromToolResult(item);
+    const projectId = videoProjectIdFromToolResult(item) ?? embedded?.id;
+    const summaries = await refreshVideoProjects();
+    const summary = projectId
+      ? summaries.find((project) => project.id === projectId)
+      : videoPhaseForTool(tool) === "export"
+        ? summaries.find((project) => project.master)
+        : summaries[0];
+    try {
+      const resolved = projectId || summary?.id ? await videoService.getVideoProject(projectId ?? summary!.id) : embedded;
+      if (resolved) setVideoProject(resolved);
+    } catch {
+      if (embedded) setVideoProject(embedded);
+    }
+    onStudioChanged?.();
+  }
 
   function handleEvent(event: CodexEvent) {
     const params = event.params ?? {};
@@ -138,10 +164,22 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       const item = params.item as Record<string, unknown> | undefined;
       if (item?.type === "dynamicToolCall") {
         const id = String(item.id);
-        const title = humanize(String(item.tool ?? "soundAr tool"));
-        if (item.tool === "save_project" || item.tool === "export_project_master") setArtifactMode("project");
-        setToolRuns((runs) => [...runs.filter((run) => run.id !== id), { id, title, detail: event.method === "item/completed" ? "Finished in soundAr" : "Working in soundAr", state: event.method === "item/completed" ? "complete" : "running" }]);
-        if (event.method === "item/completed") onStudioChanged?.();
+        const tool = String(item.tool ?? "soundAr tool");
+        const phase = videoPhaseForTool(tool);
+        const completed = event.method === "item/completed";
+        const failed = completed && (item.status === "failed" || Boolean(item.error));
+        if (phase) {
+          const run: VideoPhaseRun = { phase, title: videoPhaseTitle(phase), detail: failed ? String((item.error as Record<string, unknown> | undefined)?.message ?? item.error ?? "Needs attention") : completed ? "Finished in soundAr" : "Working in soundAr", state: failed ? "failed" : completed ? "complete" : "running" };
+          setVideoPhases((runs) => upsertVideoPhase(runs, run));
+          if (completed && !failed) void resolveVideoResult(item, tool);
+        } else if (isVideoTool(tool)) {
+          if (completed && !failed) void resolveVideoResult(item, tool);
+        } else {
+          const title = humanize(tool);
+          if (item.tool === "save_project" || item.tool === "export_project_master") setArtifactMode("project");
+          setToolRuns((runs) => [...runs.filter((run) => run.id !== id), { id, title, detail: completed ? "Finished in soundAr" : "Working in soundAr", state: completed ? "complete" : "running" }]);
+          if (completed) onStudioChanged?.();
+        }
       } else if (event.method === "item/completed" && item?.type === "agentMessage" && item.phase === "final_answer") {
         setSending(false);
         setMessages((items) => items.map((message) => ({ ...message, pending: false })));
@@ -180,6 +218,8 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
     setArtifacts([]);
     setActiveJobs([]);
     setArtifactMode("single");
+    setVideoPhases([]);
+    setVideoProject(undefined);
     const [currentHistory, currentJobs] = await Promise.all([
       listHistory().catch(() => []),
       listJobs().catch(() => []),
@@ -222,6 +262,16 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
           setMessages((items) => [...items, { id: `assistant-${Date.now()}`, role: "assistant", text: preview.message }]);
           setPlanSteps(preview.plan);
           setToolRuns(preview.tools);
+          if (preview.video) {
+            setVideoPhases([
+              { phase: "source", title: "Source", detail: "Confirmed in soundAr", state: "complete" },
+              { phase: "analyze", title: "Analyze", detail: "Source clock preserved", state: "complete" },
+              { phase: "review", title: "Plan & revise", detail: "Scenes approved", state: "complete" },
+              { phase: "preview", title: "Preview", detail: "Playable locally", state: "complete" },
+              { phase: "export", title: "Export", detail: "Final master ready", state: "complete" },
+            ]);
+            void resolveVideoResult({ output: { project_id: "creator-update-master" } }, "export_video");
+          }
           setSending(false);
         }, 650);
       }
@@ -254,6 +304,8 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       setPlanSteps([]);
       setArtifacts([]);
       setActiveJobs([]);
+      setVideoPhases([]);
+      setVideoProject(undefined);
       initialHistoryIds.current = undefined;
       initialJobIds.current = undefined;
       artifactKey.current = "";
@@ -264,7 +316,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   return <aside className="assistant-pane" aria-label="soundAr assistant">
     <header className="assistant-header">
       <div><strong>Assistant</strong><span>{account ? "Powered by your Codex login" : "Codex connection"}</span></div>
-      <div className="assistant-header-actions"><button type="button" aria-label="New conversation" title="New conversation" onClick={() => { setThreadId(undefined); setMessages(defaultMessages); setToolRuns([]); setPlanSteps([]); setArtifacts([]); setActiveJobs([]); initialHistoryIds.current = undefined; initialJobIds.current = undefined; }}><Plus size={16} /></button><button type="button" aria-label="Conversation history" title="Conversation history" aria-expanded={threadMenuOpen} onClick={() => setThreadMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button><button type="button" aria-label="Close assistant" title="Close assistant" onClick={onClose}><PanelRightClose size={16} /></button></div>
+      <div className="assistant-header-actions"><button type="button" aria-label="New conversation" title="New conversation" onClick={() => { setThreadId(undefined); setMessages(defaultMessages); setToolRuns([]); setPlanSteps([]); setArtifacts([]); setActiveJobs([]); setVideoPhases([]); setVideoProject(undefined); initialHistoryIds.current = undefined; initialJobIds.current = undefined; }}><Plus size={16} /></button><button type="button" aria-label="Conversation history" title="Conversation history" aria-expanded={threadMenuOpen} onClick={() => setThreadMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button><button type="button" aria-label="Close assistant" title="Close assistant" onClick={onClose}><PanelRightClose size={16} /></button></div>
       {threadMenuOpen ? <div className="assistant-thread-menu" role="menu" aria-label="Assistant conversations"><strong>Recent conversations</strong>{threads.length ? threads.map((thread) => <button role="menuitem" type="button" key={thread.id} onClick={() => void resumeThread(thread.id)}><span>{thread.name || thread.preview || "Untitled conversation"}</span><small>{thread.updatedAt ? new Date(thread.updatedAt * 1000).toLocaleDateString() : "Saved by Codex"}</small></button>) : <span>No saved conversations yet.</span>}</div> : null}
     </header>
     <div className="assistant-thread" ref={scrollRef}>
@@ -275,6 +327,8 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       {account ? <>
         {messages.map((message) => <article className={`assistant-message is-${message.role}`} key={message.id}><span>{message.role === "assistant" ? "Assistant" : message.role === "user" ? "You" : "soundAr"}</span><p>{message.text}{message.pending ? <i className="assistant-caret" /> : null}</p></article>)}
         {planSteps.length ? <ol className="assistant-plan" aria-label="Current plan">{planSteps.map((step, index) => <li className={`is-${step.status}`} key={`${index}-${step.step}`}><span>{step.status === "completed" ? <Check size={12} /> : step.status === "inProgress" ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><strong>{step.step}</strong></li>)}</ol> : null}
+        {videoPhases.length ? <AssistantVideoPhaseSummary phases={videoPhases} /> : null}
+        {videoProject?.master ? <AssistantVideoMaster project={videoProject} onOpen={() => onOpenVideoProject?.(videoProject.id)} /> : null}
         {toolRuns.length ? <ActivitySummary runs={toolRuns} /> : null}
         {activeJobs.length ? <AssistantJobProgress jobs={activeJobs} mode={artifactMode} /> : null}
         {artifacts.map((item) => <AudioArtifact key={item.id} item={item} onRevise={() => {
@@ -315,6 +369,30 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
 
 export function AssistantLauncher({ onClick }: { onClick: () => void }) {
   return <button className="assistant-launcher" type="button" aria-label="Open soundAr assistant" title="Open assistant" onClick={onClick}><MessageCircle size={19} /></button>;
+}
+
+function AssistantVideoPhaseSummary({ phases }: { phases: VideoPhaseRun[] }) {
+  const failed = phases.some((phase) => phase.state === "failed");
+  const running = phases.some((phase) => phase.state === "running");
+  return <section className={`assistant-video-phases${failed ? " is-failed" : ""}`} aria-label="Video production progress" aria-live="polite">
+    <div className="assistant-video-phases-heading"><span>{running ? <LoaderCircle className="spin" size={13} /> : failed ? <CircleAlert size={13} /> : <Check size={13} />}</span><strong>{failed ? "Video production needs attention" : running ? "Producing video locally" : "Video production complete"}</strong></div>
+    <ol>{phases.map((phase) => <li className={`is-${phase.state}`} key={phase.phase}><span>{phase.state === "running" ? <LoaderCircle className="spin" size={11} /> : phase.state === "failed" ? <CircleAlert size={11} /> : <Check size={11} />}</span><strong>{phase.title}</strong><small>{phase.detail}</small></li>)}</ol>
+  </section>;
+}
+
+function AssistantVideoMaster({ project, onOpen }: { project: VideoProject; onOpen: () => void }) {
+  const master = project.master!;
+  const secondary = project.manifest.artifacts.filter((artifact) => artifact.id !== master.id && artifact.role !== "source");
+  return <article className="assistant-video-master" aria-label={`Final video master: ${master.title}`}>
+    <div className="assistant-video-master-media">{master.url ? <video aria-label={`Play ${master.title}`} controls playsInline preload="metadata" poster={master.poster_url ?? project.poster_url} src={master.url} /> : <div><FileVideo2 aria-hidden="true" size={22} /><span>Master stored locally</span></div>}</div>
+    <div className="assistant-video-master-copy"><span className="section-label">Final video master</span><strong>{master.title}</strong><small>{formatVideoDuration(master.duration_ms ?? project.duration_ms)} · {master.width && master.height ? `${master.width}×${master.height}` : "MP4"} · {master.codec ?? "Local render"}</small><div><button type="button" onClick={onOpen}><Clapperboard aria-hidden="true" size={12} />Open project</button>{master.url ? <a aria-label={`Download ${master.title}`} download={master.download_name ?? `${project.id}-master.mp4`} href={master.url}><Download aria-hidden="true" size={12} />Download</a> : null}</div></div>
+    {secondary.length ? <details className="assistant-video-secondary"><summary><span>Project assets</span><small>{secondary.length} secondary</small><ChevronDown aria-hidden="true" size={12} /></summary><div>{secondary.slice(-6).map((artifact) => <AssistantVideoArtifactRow artifact={artifact} key={artifact.id} />)}</div></details> : null}
+  </article>;
+}
+
+function AssistantVideoArtifactRow({ artifact }: { artifact: VideoArtifact }) {
+  const label = artifact.role.replaceAll("-", " ");
+  return <div className="assistant-video-secondary-row"><span><FileVideo2 aria-hidden="true" size={11} /></span><strong>{artifact.title}</strong><small>{label}</small>{artifact.url ? <a href={artifact.url} download={artifact.download_name} aria-label={`Download secondary asset ${artifact.title}`}><Download aria-hidden="true" size={11} /></a> : null}</div>;
 }
 
 function AudioArtifact({ item, onRevise }: { item: HistoryItem; onRevise: () => void }) {
@@ -407,10 +485,112 @@ function ActivitySummary({ runs }: { runs: ToolRun[] }) {
     <div>{recent.map((run) => <div className={`assistant-activity-row is-${run.state}`} key={run.id}><span>{run.state === "running" ? <LoaderCircle className="spin" size={12} /> : run.state === "failed" ? <CircleAlert size={12} /> : <Check size={12} />}</span><strong>{run.title}</strong><small>{run.detail}</small></div>)}</div>
   </details>;
 }
-function previewCreativeResponse(prompt: string): { message: string; plan: PlanStep[]; tools: ToolRun[] } {
+
+const videoToolPhases: Record<string, VideoJobPhase> = {
+  preview_link: "source",
+  preview_video_link: "source",
+  import_link: "source",
+  import_video_link: "source",
+  import_video_file: "source",
+  create_video_project: "review",
+  analyze_video: "analyze",
+  plan_video: "review",
+  revise_video: "review",
+  render_video_preview: "preview",
+  export_video: "export",
+  export_publish_package: "export",
+};
+
+const readOnlyVideoTools = new Set(["list_video_projects", "get_video_project", "video_runtime_status", "cancel_video_job", "resume_video_job"]);
+const videoPhaseOrder: VideoJobPhase[] = ["source", "analyze", "review", "preview", "export"];
+
+function normalizeToolName(tool: string) {
+  const normalized = tool.toLowerCase();
+  const known = [...Object.keys(videoToolPhases), ...readOnlyVideoTools];
+  return known.find((name) => normalized === name || normalized.endsWith(`__${name}`) || normalized.endsWith(`/${name}`) || normalized.endsWith(`:${name}`) || normalized.endsWith(`.${name}`))
+    ?? normalized.split(/[.:/]/).at(-1)
+    ?? normalized;
+}
+
+export function videoPhaseForTool(tool: string): VideoJobPhase | undefined {
+  return videoToolPhases[normalizeToolName(tool)];
+}
+
+export function isVideoTool(tool: string) {
+  const normalized = normalizeToolName(tool);
+  return normalized in videoToolPhases || readOnlyVideoTools.has(normalized);
+}
+
+function videoPhaseTitle(phase: VideoJobPhase) {
+  return ({ source: "Source", analyze: "Analyze", review: "Plan & revise", preview: "Preview", export: "Export" } satisfies Record<VideoJobPhase, string>)[phase];
+}
+
+function upsertVideoPhase(phases: VideoPhaseRun[], next: VideoPhaseRun) {
+  return [...phases.filter((phase) => phase.phase !== next.phase), next].sort((left, right) => videoPhaseOrder.indexOf(left.phase) - videoPhaseOrder.indexOf(right.phase));
+}
+
+function parseStructuredValue(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return value;
+  try { return JSON.parse(trimmed); } catch { return value; }
+}
+
+function findStructuredValue<T>(root: unknown, predicate: (value: Record<string, unknown>) => T | undefined, depth = 0, visited = new WeakSet<object>()): T | undefined {
+  const parsed = parseStructuredValue(root);
+  if (depth > 6 || !parsed || typeof parsed !== "object") return undefined;
+  if (visited.has(parsed)) return undefined;
+  visited.add(parsed);
+  if (Array.isArray(parsed)) {
+    for (const value of parsed) {
+      const found = findStructuredValue(value, predicate, depth + 1, visited);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  const direct = predicate(record);
+  if (direct !== undefined) return direct;
+  for (const value of Object.values(record)) {
+    const found = findStructuredValue(value, predicate, depth + 1, visited);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+export function videoProjectIdFromToolResult(item: Record<string, unknown>): string | undefined {
+  return findStructuredValue(item, (value) => {
+    if (typeof value.project_id === "string") return value.project_id;
+    if (typeof value.projectId === "string") return value.projectId;
+    if (typeof value.id === "string" && typeof value.name === "string" && value.manifest && typeof value.manifest === "object") return value.id;
+    return undefined;
+  });
+}
+
+export function videoProjectFromToolResult(item: Record<string, unknown>): VideoProject | undefined {
+  return findStructuredValue(item, (value) => typeof value.id === "string" && typeof value.name === "string" && value.manifest && typeof value.manifest === "object" ? value as unknown as VideoProject : undefined);
+}
+
+function formatVideoDuration(milliseconds: number) {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function previewCreativeResponse(prompt: string): { message: string; plan: PlanStep[]; tools: ToolRun[]; video?: boolean } {
   const normalized = prompt.toLowerCase();
+  const isVideo = /video|reel|clip|caption|youtube|animated podcast/.test(normalized);
   const isSpeech = /speech|voice|podcast|narrat|audiobook|opening|spoken/.test(normalized);
   const isProject = /project|episode|chapter|course|campaign|series|audiobook/.test(normalized);
+  if (isVideo) return {
+    video: true,
+    message: "I’ve shaped that into a local video production, kept the source timing intact, reviewed the scene plan, and prepared a playable portrait master. The assembled result is below; tell me what to shorten, restyle, or rerender and I’ll update only the affected stages.",
+    plan: [
+      { step: "Confirm the source and production brief", status: "completed" },
+      { step: "Analyze, plan, and review the scenes", status: "completed" },
+      { step: "Render the preview and final master", status: "completed" },
+    ],
+    tools: [],
+  };
   const output = isSpeech ? "opening audio" : "music draft";
   return {
     message: `I’ve turned that into a working brief. I’ll research the context that affects the creative direction, draft the ${isSpeech ? "spoken content" : "music direction"}, ${isProject ? "organize it as a reusable project, " : ""}choose an installed local setup, and create a first ${output}. When it appears here, play it and tell me what to change—I’ll revise the same idea rather than make you start over.`,

@@ -1,12 +1,41 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AssistantLauncher, AssistantPane, selectAssistantArtifacts, selectAssistantJobs } from "./AssistantPane";
+import { AssistantLauncher, AssistantPane, selectAssistantArtifacts, selectAssistantJobs, videoPhaseForTool, videoProjectIdFromToolResult } from "./AssistantPane";
+import { VideoIntegrationProvider } from "./video/VideoIntegrationContext";
+import { createBrowserPreviewVideoService } from "../lib/videoBridge";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 afterEach(cleanup);
 
 describe("AssistantPane", () => {
+  it("groups shared video tools into high-level phases and resolves structured project results", () => {
+    expect(videoPhaseForTool("analyze_video")).toBe("analyze");
+    expect(videoPhaseForTool("soundar/export_video")).toBe("export");
+    expect(videoPhaseForTool("mcp__soundar__render_video_preview")).toBe("preview");
+    expect(videoProjectIdFromToolResult({ output: [{ type: "text", text: JSON.stringify({ artifact: { role: "master", project_id: "video-project-7" } }) }] })).toBe("video-project-7");
+  });
+
+  it("renders the assembled video master prominently and keeps project assets secondary", async () => {
+    const onOpenProject = vi.fn();
+    render(<VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={onOpenProject}>
+      <AssistantPane open onClose={vi.fn()} />
+    </VideoIntegrationProvider>);
+
+    const composer = await screen.findByRole("textbox", { name: "Message soundAr assistant" });
+    await userEvent.type(composer, "Render a short portrait reel with calm captions{enter}");
+    const progress = await screen.findByRole("region", { name: "Video production progress" }, { timeout: 2_000 });
+    expect(within(progress).getByText("Video production complete")).toBeVisible();
+    expect(within(progress).getByText("Export")).toBeVisible();
+    const master = await screen.findByRole("article", { name: "Final video master: Creator update · Portrait master" });
+    expect(within(master).getByLabelText("Play Creator update · Portrait master")).toBeInstanceOf(HTMLVideoElement);
+    expect(within(master).getByRole("link", { name: "Download Creator update · Portrait master" })).toHaveAttribute("download", "creator-update-master-portrait-master.mp4");
+    const secondaryAssets = within(master).getByText("Project assets").closest("details");
+    expect(secondaryAssets).not.toHaveAttribute("open");
+    await userEvent.click(within(master).getByRole("button", { name: "Open project" }));
+    expect(onOpenProject).toHaveBeenCalledWith("creator-update-master");
+  });
+
   it("shows only the final master for project workflows and one clip for single requests", () => {
     const base = { voice: "Default", text: "", generation_kind: "speech" as const, audio_path: "/managed/audio.wav", sample_rate: 24000, duration_seconds: 1, inference_seconds: 0, rtf: 0, vram_peak_mb: 0, waveform: [], created_at: "2026-08-27T18:00:00Z", preview: false };
     const history = [

@@ -1,9 +1,11 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fallbackBootstrap } from "../data";
 import type { BatchRunRecord, ProjectRecord, ProjectRenderBatch } from "../types";
 import { ProjectsView, reconcileProjectBatchChapters } from "./ProjectsView";
+import { createBrowserPreviewVideoService } from "../lib/videoBridge";
+import { VideoIntegrationProvider } from "../components/video/VideoIntegrationContext";
 
 const bridge = vi.hoisted(() => ({
   cancelBatchRun: vi.fn(),
@@ -68,6 +70,24 @@ function batch(status: BatchRunRecord["status"] = "queued"): BatchRunRecord {
 }
 
 describe("Projects batch rendering", () => {
+  it("surfaces a playable primary video master and opens its shared Video Studio project", async () => {
+    const user = userEvent.setup();
+    const onOpenProject = vi.fn();
+    const service = createBrowserPreviewVideoService();
+
+    render(<VideoIntegrationProvider service={service} onOpenProject={onOpenProject}>
+      <ProjectsView bootstrap={fallbackBootstrap} projects={[project]} voices={fallbackBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />
+    </VideoIntegrationProvider>);
+
+    const player = await screen.findByLabelText("Play Creator update · Portrait master");
+    expect(player).toBeInstanceOf(HTMLVideoElement);
+    const masterCard = player.closest("article");
+    expect(masterCard).not.toBeNull();
+    expect(within(masterCard!).getByRole("link", { name: "Download Creator update · Portrait master" })).toHaveAttribute("download", "creator-update-master-portrait-master.mp4");
+    await user.click(within(masterCard!).getByRole("button", { name: "Open in Video Studio" }));
+    expect(onOpenProject).toHaveBeenCalledWith("creator-update-master");
+  });
+
   it("never links an older batch result to a chapter edited after submission", () => {
     const linkage: ProjectRenderBatch = {
       batch_id: "batch-1",

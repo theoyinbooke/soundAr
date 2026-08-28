@@ -5,6 +5,8 @@ import type { ApplicationSettings, AudioInputDevice, AudioOutputDevice, AudioPla
 import { CompactAudioPlayer, CompactField, EmptyState, MetricStrip, PageHeader, Panel, RowActionMenu, Segmented, SelectField, StatusText } from "../components/ui";
 import { cancelComparison, createComparison, deleteHistoryItem, duplicateHistoryItem, exportHistoryItem, generateMusic, getAudioPlaybackStatus, getAudioRecordingStatus, getComparison, getDeveloperApiStatus, getHistoryRequest, listAudioInputDevices, listAudioOutputDevices, listHistory, loadGeneratedAudio, loadTranscriptionAudio, startAudioPlayback, startAudioRecording, startDeveloperApi, stopAudioPlayback, stopAudioRecording, stopDeveloperApi, synthesizeSpeech, transcribeAudio, updateComparisonReview, updateHistoryMetadata } from "../lib/bridge";
 import { canSynthesizeWithoutReference, qualifiedModels } from "../lib/capabilities";
+import { useVideoIntegration, useVideoProjectSummaries } from "../components/video/VideoIntegrationContext";
+import { sortVideoProjectsForLibrary, VideoMasterCard } from "../components/video/VideoMasterCard";
 
 export function reconcileAudioDeviceSelection<T extends { id: string; is_default: boolean }>(current: string, devices: T[]) {
   if (devices.some((device) => device.id === current)) return current;
@@ -290,6 +292,8 @@ export function CompareView({ bootstrap, onGenerated }: { bootstrap: BootstrapSt
 }
 
 export function HistoryView({ history, onChange, selectedId }: { history: HistoryItem[]; onChange: (history: HistoryItem[]) => void; selectedId?: string }) {
+  const { onOpenProject: onOpenVideoProject, service: videoService } = useVideoIntegration();
+  const { projects: videoProjects, loading: videoProjectsLoading, error: videoProjectsError } = useVideoProjectSummaries();
   const [activeId, setActiveId] = useState<string>();
   const [loadingId, setLoadingId] = useState<string>();
   const [isPlaying, setIsPlaying] = useState(false);
@@ -447,10 +451,15 @@ export function HistoryView({ history, onChange, selectedId }: { history: Histor
   const selectedArtifactMessage = selected?.artifact_state === "modified"
     ? "Audio file changed on disk"
     : selectedUnavailable ? "Audio file is missing" : undefined;
+  const videoMasters = sortVideoProjectsForLibrary(videoProjects).filter((project) => project.master);
 
   return (
     <div className="page history-page">
-      <PageHeader title="History" subtitle="Reopen, audition, and export generations made on this machine." />
+      <PageHeader title="History" subtitle="Reopen, audition, and export audio generations and final video masters." />
+      {videoService ? <section className="video-history-library" aria-labelledby="video-history-library-title">
+        <div className="video-library-heading"><div><h2 id="video-history-library-title">Video masters</h2><p>Completed MP4 exports remain playable and downloadable from their project record.</p></div>{videoMasters.length ? <span>{videoMasters.length} master{videoMasters.length === 1 ? "" : "s"}</span> : null}</div>
+        {videoProjectsLoading && !videoMasters.length ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Loading video masters</div> : videoMasters.length ? <div className="video-history-card-grid">{videoMasters.map((project) => <VideoMasterCard key={project.id} project={project} variant="history" onOpen={onOpenVideoProject} />)}</div> : <div className="video-library-empty"><span>{videoProjectsError ?? "Final Video Studio exports will appear here."}</span></div>}
+      </section> : null}
       <Panel className={`history-workspace history-detail-only${selected ? "" : " is-empty"}`} ariaLabel="Generation history">
         <section className="history-detail" aria-label="Generation details">
           {selected ? <>

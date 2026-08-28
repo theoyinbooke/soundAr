@@ -4,6 +4,8 @@ import type { BatchInputRow, BatchRunRecord, BootstrapState, HistoryItem, Projec
 import { cancelBatchRun, deleteProject, exportHistoryItem, exportProjectMaster, getBatchRun, importProjectScript, listHistory, loadGeneratedAudio, pauseBatchRun, pickProjectScript, queueBatchRun, resumeBatchRun, saveProject, synthesizeSpeech } from "../lib/bridge";
 import { capabilityForModel, compatibleVoicesForModel, qualifiedModels } from "../lib/capabilities";
 import { EmptyState, PageHeader, Panel, SelectField, StatusText } from "../components/ui";
+import { useVideoIntegration, useVideoProjectSummaries } from "../components/video/VideoIntegrationContext";
+import { sortVideoProjectsForLibrary, VideoMasterCard } from "../components/video/VideoMasterCard";
 
 function newChapter(position: number): ProjectChapter {
   return { id: crypto.randomUUID(), title: `Chapter ${position + 1}`, text: "", language: "en" };
@@ -108,6 +110,8 @@ export function ProjectsView({
   onChange: (projects: ProjectRecord[]) => void;
   onGenerated: (item: HistoryItem) => void;
 }) {
+  const { onOpenProject: onOpenVideoProject, service: videoService } = useVideoIntegration();
+  const { projects: videoProjects, loading: videoProjectsLoading, error: videoProjectsError } = useVideoProjectSummaries();
   const ttsModels = useMemo(() => qualifiedModels(bootstrap, "tts"), [bootstrap]);
   const [selectedId, setSelectedId] = useState(projects[0]?.id ?? "");
   const [name, setName] = useState(projects[0]?.name ?? "Untitled project");
@@ -480,10 +484,15 @@ export function ProjectsView({
   const canMaster = Boolean(selectedId) && writtenChapters.length > 0 && writtenChapters.every((chapter) => chapter.history_id);
 
   const workspaceOpen = Boolean(selected || chapters.length || state === "New draft");
+  const visibleVideoProjects = sortVideoProjectsForLibrary(videoProjects).slice(0, 3);
 
   return <>
     <div className="page projects-page">
-      <PageHeader title="Projects" subtitle="Build long-form voice work in focused, chapter-based workspaces." actions={<button className="button button-primary" type="button" onClick={() => setProjectDialogMode("create")}><FolderPlus aria-hidden="true" size={14} />New project</button>} />
+      <PageHeader title="Projects" subtitle="Build long-form voice work and continue local video productions." actions={<button className="button button-primary" type="button" onClick={() => setProjectDialogMode("create")}><FolderPlus aria-hidden="true" size={14} />New project</button>} />
+      {videoService ? <section className="video-project-library" aria-labelledby="video-project-library-title">
+        <div className="video-library-heading"><div><h2 id="video-project-library-title">Video projects</h2><p>Final masters stay playable here; drafts reopen in the full timeline workspace.</p></div>{videoProjects.length ? <span>{videoProjects.length} project{videoProjects.length === 1 ? "" : "s"}</span> : null}</div>
+        {videoProjectsLoading && !visibleVideoProjects.length ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Loading video projects</div> : visibleVideoProjects.length ? <div className="video-project-card-grid">{visibleVideoProjects.map((project) => <VideoMasterCard key={project.id} project={project} onOpen={onOpenVideoProject} />)}</div> : <div className="video-library-empty"><span>{videoProjectsError ?? "Video projects created in Video Studio will appear here."}</span></div>}
+      </section> : null}
       <div className="projects-layout">
         <Panel className="project-list table-panel" ariaLabel="Project library">
           <div className="project-list-heading"><span><strong>Library</strong><small>{projects.length + (!selectedId && chapters.length ? 1 : 0)} project{projects.length + (!selectedId && chapters.length ? 1 : 0) === 1 ? "" : "s"}</small></span></div>
