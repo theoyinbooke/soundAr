@@ -409,10 +409,16 @@ fn discover_tool(kind: MediaToolKind, context: &DiscoveryContext) -> MediaToolSt
         }
 
         let roots = match kind {
-            MediaToolKind::Node | MediaToolKind::YtDlp => vec![
+            MediaToolKind::Node => vec![
                 home.join(".nvm/versions/node"),
                 home.join(".local/share/fnm/node-versions"),
                 home.join(".asdf/installs/nodejs"),
+            ],
+            MediaToolKind::YtDlp => vec![
+                home.join(".local/share/soundar/runtimes"),
+                home.join(".local/share/soundAr/runtimes"),
+                home.join(".soundAr/runtimes"),
+                home.join(".virtualenvs"),
             ],
             MediaToolKind::Deno => vec![home.join(".deno/bin"), home.join(".asdf/installs/deno")],
             MediaToolKind::FasterWhisper => vec![
@@ -2691,6 +2697,34 @@ mod tests {
         assert!(status.available, "{status:?}");
         assert!(status.configured);
         assert_eq!(status.version.as_deref(), Some("v99.2.1"));
+        assert_eq!(status.path, Some(fs::canonicalize(candidate).unwrap()));
+    }
+
+    #[test]
+    fn managed_soundar_runtime_is_discovered_without_desktop_path_inheritance() {
+        let home = TestDirectory::new("managed-yt-dlp");
+        let candidate = home
+            .0
+            .join(".local/share/soundar/runtimes/yt-dlp-test/bin/yt-dlp");
+        fs::create_dir_all(candidate.parent().expect("runtime bin directory"))
+            .expect("create managed runtime");
+        let mut file = fs::File::create(&candidate).expect("create managed yt-dlp");
+        file.write_all(b"#!/bin/sh\necho '2026.06.09'\n")
+            .expect("write managed yt-dlp");
+        let mut permissions = file.metadata().expect("metadata").permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&candidate, permissions).expect("make managed yt-dlp executable");
+        drop(file);
+
+        let context = DiscoveryContext {
+            path: Some(OsString::new()),
+            home: Some(home.0.clone()),
+            overrides: BTreeMap::new(),
+            run_nvenc_smoke: false,
+        };
+        let status = discover_tool(MediaToolKind::YtDlp, &context);
+        assert!(status.available, "{status:?}");
+        assert_eq!(status.version.as_deref(), Some("2026.06.09"));
         assert_eq!(status.path, Some(fs::canonicalize(candidate).unwrap()));
     }
 
