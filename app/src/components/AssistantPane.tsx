@@ -1,7 +1,7 @@
 import { ArrowUp, Bot, Check, ChevronDown, CircleAlert, CircleStop, Clapperboard, Download, ExternalLink, FileVideo2, LoaderCircle, MessageCircle, MoreHorizontal, PanelRightClose, Pause, Play, Plus, ShieldCheck, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { codexRequest, connectCodex, getCodexStatus, listenToCodex, loadAssistantVideoThreadLink, loadCodexModels, respondToCodex, type AgentAccess, type CodexEvent, type CodexModel, type CodexStatus, type ReasoningEffort } from "../lib/codexBridge";
+import { codexRequest, listenToCodex, loadAssistantVideoThreadLink, loadCodexModels, refreshCodexConnection, respondToCodex, type AgentAccess, type CodexEvent, type CodexModel, type CodexStatus, type ReasoningEffort } from "../lib/codexBridge";
 import { exportHistoryItem, listHistory, listJobs, loadGeneratedAudio, loadJobPreview } from "../lib/bridge";
 import type { HistoryItem, JobRecord } from "../types";
 import type { VideoArtifact, VideoJobPhase, VideoProject } from "../types/video";
@@ -33,7 +33,8 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   const [approval, setApproval] = useState<Approval>();
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string>();
-  const [connecting, setConnecting] = useState(false);
+  const [connecting, setConnecting] = useState(true);
+  const [connectionRefresh, setConnectionRefresh] = useState(0);
   const [sending, setSending] = useState(false);
   const [menu, setMenu] = useState<"model" | "effort" | "access">();
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
@@ -50,17 +51,26 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   const artifactKey = useRef("");
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
+  useLayoutEffect(() => {
+    // Reset the transient phase while hidden so a previously unavailable result cannot paint for
+    // one frame when the persistent pane is opened again.
+    if (!open) {
+      setConnecting(true);
+      return;
+    }
     let active = true;
     let unlisten: () => void = () => undefined;
     setConnecting(true);
-    getCodexStatus()
-      .then(async (current) => current.connected ? current : current.available ? connectCodex() : current)
+    setError(undefined);
+    refreshCodexConnection()
       .then(async (current) => {
         if (!active) return;
         setStatus(current);
-        if (!current.connected) return;
+        if (!current.connected) {
+          setAccount(undefined);
+          setModels([]);
+          return;
+        }
         const [accountResponse, loadedModels] = await Promise.all([
           codexRequest<{ account?: Record<string, unknown>; requiresOpenaiAuth: boolean }>("account/read", { refreshToken: false }),
           loadCodexModels(),
@@ -80,7 +90,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       .catch((caught) => active && setError(caught instanceof Error ? caught.message : String(caught)))
       .finally(() => active && setConnecting(false));
     return () => { active = false; unlisten(); };
-  }, [open]);
+  }, [open, connectionRefresh]);
 
   useEffect(() => {
     if (!open) return;
@@ -212,6 +222,12 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       const url = login.authUrl ?? login.verificationUrl;
       if (url) await openUrl(url);
     } catch (caught) { setError(caught instanceof Error ? caught.message : String(caught)); }
+  }
+
+  function retryCodexConnection() {
+    setConnecting(true);
+    setError(undefined);
+    setConnectionRefresh((value) => value + 1);
   }
 
   async function send() {
@@ -349,8 +365,8 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
       {threadMenuOpen ? <div className="assistant-thread-menu" role="menu" aria-label="Assistant conversations"><strong>Recent conversations</strong>{threads.length ? threads.map((thread) => <button role="menuitem" type="button" key={thread.id} onClick={() => void resumeThread(thread.id)}><span>{thread.name || thread.preview || "Untitled conversation"}</span><small>{thread.updatedAt ? new Date(thread.updatedAt * 1000).toLocaleDateString() : "Saved by Codex"}</small></button>) : <span>No saved conversations yet.</span>}</div> : null}
     </header>
     <div className="assistant-thread" ref={scrollRef}>
-      {!status.available ? <div className="assistant-banner is-warning"><CircleAlert size={17} /><div><strong>Codex CLI not detected</strong><p>{status.message}</p><button type="button" onClick={() => location.reload()}>Scan again</button></div></div> : null}
-      {status.available && !status.connected && !connecting ? <div className="assistant-banner is-warning"><CircleAlert size={17} /><div><strong>Could not connect to Codex</strong><p>{error ?? "The detected Codex installation did not start."}</p><button type="button" onClick={() => location.reload()}>Reconnect</button></div></div> : null}
+      {!connecting && !status.available ? <div className="assistant-banner is-warning"><CircleAlert size={17} /><div><strong>Codex CLI not detected</strong><p>{status.message}</p><button type="button" onClick={retryCodexConnection}>Scan again</button></div></div> : null}
+      {status.available && !status.connected && !connecting ? <div className="assistant-banner is-warning"><CircleAlert size={17} /><div><strong>Could not connect to Codex</strong><p>{error ?? "The detected Codex installation did not start."}</p><button type="button" onClick={retryCodexConnection}>Reconnect</button></div></div> : null}
       {connecting ? <div className="assistant-loading"><LoaderCircle className="spin" size={18} /><span>Connecting to Codex…</span></div> : null}
       {status.connected && !account && !connecting ? <div className="assistant-signin"><Bot size={25} /><strong>Connect your ChatGPT account</strong><p>soundAr uses the login managed by your existing Codex installation. Your credentials stay with Codex.</p><button className="primary-button" type="button" onClick={() => void startLogin()}>Sign in with ChatGPT <ExternalLink size={13} /></button></div> : null}
       {account ? <>
@@ -370,7 +386,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
     </div>
     <footer className="assistant-composer-wrap">
       <div className="assistant-composer">
-        <textarea ref={composerRef} aria-label="Message soundAr assistant" placeholder={account ? "Ask soundAr to create anything" : "Connect Codex to begin"} value={draft} disabled={!account || sending} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
+        <textarea ref={composerRef} aria-label="Message soundAr assistant" placeholder={account ? "Ask soundAr to create anything" : "Connect Codex to begin"} value={draft} disabled={!status.connected || !account || sending} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
         <div className="assistant-composer-bar">
           <div className="assistant-control-cluster is-context">
             <div className="assistant-control-slot is-model">
@@ -387,7 +403,7 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
               <button type="button" className="assistant-control" aria-haspopup="menu" aria-expanded={menu === "effort"} disabled={!selectedModel} onClick={() => setMenu(menu === "effort" ? undefined : "effort")}><span>{humanize(effort)}</span><ChevronDown size={12} /></button>
               {menu === "effort" ? <div className="assistant-picker picker-effort" role="menu" aria-label="Reasoning effort">{efforts.map((value) => <button type="button" role="menuitemradio" aria-checked={value === effort} key={value} onClick={() => { setEffort(value); setMenu(undefined); }}><span><strong>{humanize(value)}</strong><small>{effortDescription(value)}</small></span>{value === effort ? <Check size={14} /> : null}</button>)}</div> : null}
             </div>
-            <button className="assistant-send" type="button" aria-label={sending ? "Stop response" : "Send message"} disabled={!sending && (!draft.trim() || !account)} onClick={() => sending ? void interrupt() : void send()}>{sending ? <CircleStop size={16} /> : <ArrowUp size={16} />}</button>
+            <button className="assistant-send" type="button" aria-label={sending ? "Stop response" : "Send message"} disabled={!sending && (!draft.trim() || !status.connected || !account)} onClick={() => sending ? void interrupt() : void send()}>{sending ? <CircleStop size={16} /> : <ArrowUp size={16} />}</button>
           </div>
         </div>
       </div>

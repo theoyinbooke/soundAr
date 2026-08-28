@@ -1,11 +1,31 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CodexStatus } from "../lib/codexBridge";
 import { AssistantLauncher, AssistantPane, selectAssistantArtifacts, selectAssistantJobs, videoPhaseForTool, videoProjectIdFromToolResult } from "./AssistantPane";
 import { VideoIntegrationProvider } from "./video/VideoIntegrationContext";
 import { createBrowserPreviewVideoService } from "../lib/videoBridge";
 
+const codexConnection = vi.hoisted(() => ({ refresh: vi.fn() }));
+
+vi.mock("../lib/codexBridge", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../lib/codexBridge")>(),
+  refreshCodexConnection: codexConnection.refresh,
+}));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
+
+const connectedCodex: CodexStatus = {
+  available: true,
+  connected: true,
+  path: "/usr/local/bin/codex",
+  version: "codex-cli test",
+  studio_root: "/home/studio/.soundAr",
+};
+
+beforeEach(() => {
+  codexConnection.refresh.mockReset();
+  codexConnection.refresh.mockResolvedValue(connectedCodex);
+});
 afterEach(cleanup);
 
 describe("AssistantPane", () => {
@@ -118,6 +138,35 @@ describe("AssistantPane", () => {
     render(<AssistantLauncher onClick={onClick} />);
     await userEvent.click(screen.getByRole("button", { name: "Open soundAr assistant" }));
     expect(onClick).toHaveBeenCalledOnce();
+  });
+
+  it("automatically resolves Codex on the first open without showing a detection warning", async () => {
+    render(<AssistantPane open onClose={vi.fn()} />);
+
+    expect(screen.getByText("Connecting to Codex…")).toBeVisible();
+    expect(screen.queryByText("Codex CLI not detected")).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /GPT-5.6-Sol/i })).toBeInTheDocument();
+    expect(codexConnection.refresh).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes a stale unavailable result before painting a reopened pane", async () => {
+    let resolveReopen!: (status: CodexStatus) => void;
+    const reopened = new Promise<CodexStatus>((resolve) => { resolveReopen = resolve; });
+    codexConnection.refresh
+      .mockResolvedValueOnce({ available: false, connected: false, message: "Codex CLI was not found." })
+      .mockImplementationOnce(() => reopened);
+    const onClose = vi.fn();
+    const view = render(<AssistantPane open onClose={onClose} />);
+    expect(await screen.findByText("Codex CLI not detected")).toBeVisible();
+
+    view.rerender(<AssistantPane open={false} onClose={onClose} />);
+    view.rerender(<AssistantPane open onClose={onClose} />);
+
+    expect(screen.queryByText("Codex CLI not detected")).not.toBeInTheDocument();
+    expect(screen.getByText("Connecting to Codex…")).toBeVisible();
+    await act(async () => resolveReopen(connectedCodex));
+    expect(await screen.findByRole("button", { name: /GPT-5.6-Sol/i })).toBeInTheDocument();
+    expect(codexConnection.refresh).toHaveBeenCalledTimes(2);
   });
 
   it("loads Codex controls and completes the preview conversation flow", async () => {

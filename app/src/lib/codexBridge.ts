@@ -49,6 +49,9 @@ const previewModels: CodexModel[] = [
   { id: "gpt-5.5", model: "gpt-5.5", displayName: "GPT-5.5", description: "Frontier model for complex work", isDefault: false, hidden: false, defaultReasoningEffort: "medium", supportedReasoningEfforts: ["low", "medium", "high", "xhigh"].map((reasoningEffort) => ({ reasoningEffort: reasoningEffort as ReasoningEffort })) },
 ];
 
+const CODEX_DISCOVERY_RETRY_DELAY_MS = 200;
+let codexConnectionRefresh: Promise<CodexStatus> | undefined;
+
 export async function getCodexStatus(): Promise<CodexStatus> {
   if (import.meta.env.DEV && !hasTauriRuntime()) return { available: true, connected: true, path: "/usr/local/bin/codex", version: "codex-cli preview", studio_root: "/home/studio/.soundAr" };
   return invoke("codex_agent_status");
@@ -57,6 +60,34 @@ export async function getCodexStatus(): Promise<CodexStatus> {
 export async function connectCodex(): Promise<CodexStatus> {
   if (import.meta.env.DEV && !hasTauriRuntime()) return getCodexStatus();
   return invoke("codex_agent_connect");
+}
+
+/**
+ * Refreshes discovery and establishes the app-server session as one deduplicated operation.
+ *
+ * Desktop startup can briefly race installation paths becoming visible to the WebView-owned
+ * request. One bounded retry replaces the old full-page "Scan again" workaround. Concurrent
+ * callers (including React Strict Mode's development probe) share the same attempt, so opening
+ * the Assistant never fans out duplicate filesystem scans or app-server launches.
+ */
+export function refreshCodexConnection(): Promise<CodexStatus> {
+  if (codexConnectionRefresh) return codexConnectionRefresh;
+
+  const attempt = (async () => {
+    let current = await getCodexStatus();
+    if (!current.available) {
+      await new Promise((resolve) => window.setTimeout(resolve, CODEX_DISCOVERY_RETRY_DELAY_MS));
+      current = await getCodexStatus();
+    }
+    if (current.connected || !current.available) return current;
+    return connectCodex();
+  })();
+  codexConnectionRefresh = attempt;
+  const clear = () => {
+    if (codexConnectionRefresh === attempt) codexConnectionRefresh = undefined;
+  };
+  void attempt.then(clear, clear);
+  return attempt;
 }
 
 export async function disconnectCodex(): Promise<boolean> {
