@@ -1,8 +1,9 @@
-import { Check, FileAudio2, LoaderCircle, Pause, Play, Plus, RefreshCw, RotateCcw, Save, Scissors, Search, ShieldCheck, Trash2, UserRound, X } from "lucide-react";
+import { Check, FileAudio2, LoaderCircle, Pause, Play, Plus, RefreshCw, RotateCcw, Save, Scissors, Search, Trash2, UserRound, X } from "lucide-react";
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { BootstrapState, HistoryItem, VoiceEvaluation, VoiceProfile } from "../types";
 import { CompactAudioPlayer, Dropdown, PageHeader, Panel, RowActionMenu, Segmented, StatusText } from "../components/ui";
-import { addVoiceReference, deleteVoiceProfile, importVoiceProfile, listHistory, loadGeneratedAudio, loadVoiceAudio, measureVoiceSimilarity, pickAudioFile, processVoiceReference, saveVoiceEvaluation, synthesizeSpeech, transcribeAudio, updateVoiceReferenceTranscript } from "../lib/bridge";
+import { VoiceProfileDialog } from "../components/VoiceProfileDialog";
+import { addVoiceReference, deleteVoiceProfile, listHistory, loadGeneratedAudio, loadVoiceAudio, measureVoiceSimilarity, pickAudioFile, processVoiceReference, saveVoiceEvaluation, synthesizeSpeech, transcribeAudio, updateVoiceReferenceTranscript } from "../lib/bridge";
 import { compatibleVoicesForModel, qualifiedModels } from "../lib/capabilities";
 
 type VoiceFilter = "all" | "verified" | "draft";
@@ -34,15 +35,6 @@ export function VoicesView({
   const [filter, setFilter] = useState<VoiceFilter>("all");
   const [selectedId, setSelectedId] = useState(voices[0]?.id ?? "");
   const [showAdd, setShowAdd] = useState(false);
-  const [newName, setNewName] = useState("");
-  const [newStyle, setNewStyle] = useState("");
-  const [samplePath, setSamplePath] = useState("");
-  const [relationship, setRelationship] = useState("self");
-  const [consentBasis, setConsentBasis] = useState("");
-  const [permittedUses, setPermittedUses] = useState("Personal and commercial speech generation");
-  const [sourceDate, setSourceDate] = useState(() => new Date().toISOString().slice(0, 10));
-  const [acknowledged, setAcknowledged] = useState(false);
-  const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string>();
   const [referenceBusy, setReferenceBusy] = useState(false);
   const [selectedReferenceId, setSelectedReferenceId] = useState("");
@@ -244,36 +236,6 @@ export function VoicesView({
     }
   }
 
-  async function addVoice() {
-    if (!newName.trim() || !samplePath || !acknowledged || !consentBasis.trim() || !permittedUses.trim()) return;
-    setSaving(true);
-    setFormError(undefined);
-    try {
-      const voice = await importVoiceProfile({
-        name: newName.trim(),
-        style: newStyle.trim() || "Custom voice",
-        source_path: samplePath,
-        consent_confirmed: acknowledged,
-        consent_basis: consentBasis.trim(),
-        speaker_relationship: relationship,
-        permitted_uses: permittedUses.trim(),
-        source_date: sourceDate,
-      });
-      onChange([...voices, voice]);
-      setSelectedId(voice.id);
-      setShowAdd(false);
-      setNewName("");
-      setNewStyle("");
-      setSamplePath("");
-      setConsentBasis("");
-      setAcknowledged(false);
-    } catch (caught) {
-      setFormError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setSaving(false);
-    }
-  }
-
   async function removeVoice(voice: VoiceProfile) {
     if (voice.state === "preset") return;
     if (!window.confirm(`Delete ${voice.name} and its managed reference audio? Existing generation records will remain.`)) return;
@@ -439,35 +401,7 @@ export function VoicesView({
         ) : null}
       </div>
 
-      {showAdd ? (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowAdd(false)}>
-          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="add-voice-title" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="modal-header">
-              <div><h2 id="add-voice-title">Add voice profile</h2><p>Reference audio and consent metadata remain on this machine.</p></div>
-              <button className="icon-button" type="button" title="Close" onClick={() => setShowAdd(false)}><X aria-hidden="true" size={15} /></button>
-            </div>
-            <div className="modal-body">
-              <label className="form-field"><span>Name</span><input autoFocus value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="Voice name" /></label>
-              <label className="form-field"><span>Style</span><input value={newStyle} onChange={(event) => setNewStyle(event.target.value)} placeholder="Warm documentary" /></label>
-              <button className="sample-dropzone" type="button" onClick={async () => setSamplePath(await pickAudioFile() ?? samplePath)}>
-                <FileAudio2 aria-hidden="true" size={20} />
-                <strong>{samplePath.split("/").at(-1) || "Choose a clean voice sample"}</strong>
-                <span>WAV, FLAC, MP3, M4A, or OGG / original copied into soundAr</span>
-              </button>
-              <label className="form-field"><span>Speaker relationship</span><Dropdown ariaLabel="Speaker relationship" value={relationship} onChange={setRelationship} options={[{ value: "self", label: "My own voice" }, { value: "authorized-person", label: "Authorized speaker" }, { value: "licensed-source", label: "Licensed source" }]} /></label>
-              <label className="form-field"><span>Consent basis</span><input value={consentBasis} onChange={(event) => setConsentBasis(event.target.value)} placeholder="Recorded by me, or written permission details" /></label>
-              <label className="form-field"><span>Permitted uses</span><input value={permittedUses} onChange={(event) => setPermittedUses(event.target.value)} /></label>
-              <label className="form-field"><span>Source date</span><input type="date" value={sourceDate} onChange={(event) => setSourceDate(event.target.value)} /></label>
-              <label className="consent-note consent-check"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} /><ShieldCheck aria-hidden="true" size={16} /><span>I confirm I own this voice or have explicit permission to create and use its synthetic likeness.</span></label>
-              {formError ? <StatusText tone="danger">{formError}</StatusText> : null}
-            </div>
-            <div className="modal-actions">
-              <button className="button button-secondary" type="button" onClick={() => setShowAdd(false)}>Cancel</button>
-              <button className="button button-primary" type="button" disabled={saving || !newName.trim() || !samplePath || !acknowledged || !consentBasis.trim() || !permittedUses.trim()} onClick={() => void addVoice()}>{saving ? "Importing and analyzing..." : "Create profile"}</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      {showAdd ? <VoiceProfileDialog onClose={() => setShowAdd(false)} onCreated={(voice) => { onChange([...voices, voice]); setSelectedId(voice.id); setShowAdd(false); }} /> : null}
     </div>
   );
 }

@@ -30,9 +30,10 @@ required_resources=(
   runtime/requirements-engines/transformers.txt runtime/requirements-engines/speaker-verification.txt
   runtime/requirements-engines/alignment.txt runtime/requirements-engines/speecht5.txt
   runtime/requirements-engines/chatterbox.txt runtime/requirements-engines/coqui.txt
-  runtime/requirements-engines/nemo.txt runtime/core/speaker_verifier.py
+  runtime/requirements-engines/nemo.txt runtime/requirements-engines/musicgen.txt runtime/requirements-engines/acestep.txt runtime/requirements-engines/breeze.txt runtime/requirements-engines/fish-speech.txt runtime/core/speaker_verifier.py
   runtime/core/speaker_diarizer.py runtime/core/forced_aligner.py
-  runtime/data/engine_manifests.json runtime/engines/tts/chatterbox_turbo_tts.py
+  runtime/core/music_engine.py runtime/engines/base_music.py runtime/engines/music/__init__.py runtime/engines/music/musicgen.py runtime/engines/music/acestep.py
+  runtime/data/engine_manifests.json runtime/engines/tts/chatterbox_turbo_tts.py runtime/engines/tts/breeze_tts.py runtime/engines/tts/fish_speech.py
   runtime/engines/stt/nemo_stt.py
 )
 

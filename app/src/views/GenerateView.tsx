@@ -1,10 +1,12 @@
-import { ChevronDown, ChevronRight, FileInput, FolderOpen, MoreHorizontal, Pause, Play, RotateCcw, Save, Sparkles, X } from "lucide-react";
+import { ChevronDown, ChevronRight, FileInput, FolderOpen, MoreHorizontal, Pause, Play, Plus, RotateCcw, Save, Sparkles, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { cancelBatchRun, cancelJob, clearFinishedJobs, createBatchRun, getSchedulerStatus, importBatchInput, listBatchRuns, listHistory, listJobs, loadGeneratedAudio, pauseBatchRun, pickBatchInputFile, queueBatchRun, queueSynthesis, resumeBatchRun, retryJob, saveGenerationPreset, synthesizeSpeech, updateBatchItem } from "../lib/bridge";
 import { capabilityForModel, compatibleVoicesForModel, qualifiedModels, recommendModel } from "../lib/capabilities";
 import type { BatchImportResult, BatchInputRow, BatchRunRecord, BootstrapState, HistoryItem, JobRecord, QueuePriority, RouteIntent, SynthesisRequest, SynthesisResult, VoiceProfile } from "../types";
 import { CompactField, Dropdown, MetricStrip, PageHeader, Panel, Segmented, SelectField, StatusText } from "../components/ui";
+import { VoiceProfileDialog } from "../components/VoiceProfileDialog";
+import { MusicGeneratePanel } from "./MusicGeneratePanel";
 
 const idleWaveform = Array.from({ length: 64 }, (_, index) => 0.12 + Math.abs(Math.sin(index * 0.31)) * 0.13);
 
@@ -14,18 +16,28 @@ function formatPlaybackTime(seconds: number) {
   return `${minutes}:${(seconds % 60).toFixed(1).padStart(4, "0")}`;
 }
 
+function jobFailureSummary(error?: string | null) {
+  if (!error) return undefined;
+  const normalized = error.toLowerCase();
+  if (normalized.includes("out of memory") || normalized.includes("cuda oom")) return "Not enough free GPU memory";
+  return error.split(/\r?\n/)[0].slice(0, 96);
+}
+
 export function GenerateView({
   bootstrap,
   voices,
+  onVoicesChange,
   onGenerated,
   preferredVoiceId,
 }: {
   bootstrap: BootstrapState;
   voices: VoiceProfile[];
+  onVoicesChange: (voices: VoiceProfile[]) => void;
   onGenerated: (item: HistoryItem) => void;
   preferredVoiceId?: string;
 }) {
   const ttsModels = useMemo(() => qualifiedModels(bootstrap, "tts"), [bootstrap]);
+  const [generationKind, setGenerationKind] = useState<"speech" | "music">("speech");
   const [mode, setMode] = useState<"text" | "ssml" | "batch">("text");
   const [text, setText] = useState("The best voices feel present before they sound perfect.\nStart with clarity, then shape pace, warmth, and intent.");
   const [modelId, setModelId] = useState(ttsModels.find((model) => model.engine === "kokoro")?.model_id ?? ttsModels[0]?.model_id ?? "");
@@ -61,10 +73,12 @@ export function GenerateView({
   const [expandedBatchId, setExpandedBatchId] = useState<string>();
   const [jobs, setJobs] = useState<JobRecord[]>(bootstrap.jobs);
   const [scheduler, setScheduler] = useState(bootstrap.scheduler);
+  const [showAddVoice, setShowAddVoice] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const cancelRequested = useRef(false);
   const submittedJobIds = useRef(new Set<string>());
   const deliveredHistoryIds = useRef(new Set<string>());
+  const pendingCreatedVoiceId = useRef<string | undefined>(undefined);
   const selectedModel = ttsModels.find((model) => model.model_id === modelId);
   const capability = capabilityForModel(bootstrap, selectedModel);
   const libraryVoices = compatibleVoicesForModel(bootstrap, selectedModel, voices);
@@ -75,6 +89,20 @@ export function GenerateView({
   const selectedVoice = compatibleVoices.find((voice) => voice.id === voiceId);
   const referenceRequired = capability?.voice_modes.length === 1 && capability.voice_modes[0] === "reference";
   const voiceReady = !referenceRequired || Boolean(selectedVoice?.local_path);
+
+  function useCreatedVoice(voice: VoiceProfile) {
+    pendingCreatedVoiceId.current = voice.id;
+    onVoicesChange([...voices, voice]);
+    const currentModelSupportsVoice = selectedModel
+      ? compatibleVoicesForModel(bootstrap, selectedModel, [voice]).length > 0
+      : false;
+    const compatibleModel = currentModelSupportsVoice
+      ? selectedModel
+      : ttsModels.find((model) => compatibleVoicesForModel(bootstrap, model, [voice]).length > 0);
+    if (compatibleModel) setModelId(compatibleModel.model_id);
+    setVoiceId(voice.id);
+    setShowAddVoice(false);
+  }
 
   function applyRoute(intent: RouteIntent) {
     setRouteIntent(intent);
@@ -108,7 +136,12 @@ export function GenerateView({
     const nextVoices = nextCapability?.voice_modes.includes("default")
       ? ["__engine_default__", ...nextLibraryVoices.map((voice) => voice.id)]
       : nextLibraryVoices.map((voice) => voice.id);
-    if (!nextVoices.includes(voiceId)) setVoiceId(nextVoices[0] ?? "");
+    if (pendingCreatedVoiceId.current && nextVoices.includes(pendingCreatedVoiceId.current)) {
+      setVoiceId(pendingCreatedVoiceId.current);
+      pendingCreatedVoiceId.current = undefined;
+    } else if (!nextVoices.includes(voiceId)) {
+      setVoiceId(nextVoices[0] ?? "");
+    }
   }, [bootstrap, modelId, voices, voiceId]);
 
   useEffect(() => {
@@ -140,7 +173,7 @@ export function GenerateView({
   }, [result?.audio_path]);
 
   useEffect(() => {
-    if (bootstrap.runtime !== "tauri") return;
+    if (generationKind !== "speech" || bootstrap.runtime !== "tauri") return;
     let active = true;
     async function refreshQueue() {
       try {
@@ -168,9 +201,10 @@ export function GenerateView({
     void refreshQueue();
     const timer = window.setInterval(() => void refreshQueue(), 500);
     return () => { active = false; window.clearInterval(timer); };
-  }, [bootstrap.runtime]);
+  }, [bootstrap.runtime, generationKind]);
 
   useEffect(() => {
+    if (generationKind !== "speech") return;
     function handleShortcut(event: KeyboardEvent) {
       if (!(event.ctrlKey || event.metaKey)) return;
       if (event.key === "Enter") {
@@ -184,7 +218,7 @@ export function GenerateView({
     }
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [audioUrl, isGenerating, isPlaying, modelId, mode, outputFormat, seed, speed, text, voiceId]);
+  }, [audioUrl, generationKind, isGenerating, isPlaying, modelId, mode, outputFormat, seed, speed, text, voiceId]);
   const runtimeReady = bootstrap.runtime === "browser" || bootstrap.system.python_ready;
   const estimatedSeconds = Math.max(2, Math.round(text.length / 13));
 
@@ -295,7 +329,7 @@ export function GenerateView({
   async function clearFinishedQueue() {
     try {
       await clearFinishedJobs();
-      setJobs((items) => items.filter((job) => !["completed", "cancelled"].includes(job.status)));
+      setJobs((items) => items.filter((job) => !["completed", "failed", "cancelled"].includes(job.status)));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
@@ -489,10 +523,28 @@ export function GenerateView({
 
   const waveform = result?.waveform?.length ? result.waveform : idleWaveform;
   const playbackProgress = playbackDuration > 0 ? playbackTime / playbackDuration : 0;
+  const generationTypeControl = <Segmented
+    label="Generation type"
+    value={generationKind}
+    onChange={setGenerationKind}
+    options={[
+      { value: "speech", label: "Voice" },
+      { value: "music", label: "Music" },
+    ]}
+  />;
+
+  if (generationKind === "music") {
+    return (
+      <div className="page generate-page">
+        <PageHeader title="Generate music" subtitle="Create short, local lyric-conditioned or instrumental drafts with a bounded text-to-music workflow." actions={generationTypeControl} />
+        <MusicGeneratePanel bootstrap={bootstrap} onGenerated={onGenerated} />
+      </div>
+    );
+  }
 
   return (
     <div className="page generate-page">
-      <PageHeader title="Generate" subtitle="Create, queue, preview, and export speech from local open-source engines." />
+      <PageHeader title="Generate" subtitle="Create, queue, preview, and export speech from local open-source engines." actions={generationTypeControl} />
 
       <div className="generate-layout">
         <Panel className="composer-panel" ariaLabel="Generation composer">
@@ -526,7 +578,12 @@ export function GenerateView({
 
           <div className="selector-grid">
             <SelectField label="Model" value={modelId} onChange={setModelId} status={selectedModel ? "Ready" : undefined} options={ttsModels.map((model) => ({ value: model.model_id, label: model.model_id }))} />
-            <SelectField label="Voice" value={voiceId} onChange={setVoiceId} status={selectedVoice ? `${selectedVoice.sample_seconds || "Preset"}` : undefined} options={compatibleVoices.map((voice) => ({ value: voice.id, label: `${voice.name} - ${voice.style}` }))} />
+            <div className="voice-select-with-action">
+              <SelectField label="Voice" value={voiceId} onChange={setVoiceId} status={selectedVoice ? `${selectedVoice.sample_seconds || "Preset"}` : undefined} options={compatibleVoices.map((voice) => ({ value: voice.id, label: `${voice.name} - ${voice.style}` }))} />
+              <button className="icon-button" type="button" title="Add voice profile" aria-label="Add voice profile from Generate" onClick={() => setShowAddVoice(true)}>
+                <Plus aria-hidden="true" size={14} />
+              </button>
+            </div>
           </div>
 
           <div className="route-control">
@@ -621,7 +678,7 @@ export function GenerateView({
             ]}
           />
 
-          <div className="queue-heading"><span className="section-label rail-section">Queue</span>{jobs.some((job) => ["completed", "cancelled"].includes(job.status)) ? <button className="text-button" type="button" onClick={() => void clearFinishedQueue()}>Clear finished</button> : null}</div>
+          <div className="queue-heading"><span className="section-label rail-section">Queue</span>{jobs.some((job) => ["completed", "failed", "cancelled"].includes(job.status)) ? <button className="text-button" type="button" onClick={() => void clearFinishedQueue()}>{jobs.some((job) => job.status === "failed") ? "Clear failed" : "Clear finished"}</button> : null}</div>
           <div className="queue-list">
             {jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).slice(0, 5).map((job) => (
               <div className="queue-row" key={job.id}>
@@ -630,7 +687,7 @@ export function GenerateView({
               </div>
             ))}
             {jobs.filter((job) => ["failed", "cancelled"].includes(job.status) && ["synthesis", "api-synthesis"].includes(job.kind)).slice(0, 3).map((job) => (
-              <div className="queue-row" key={job.id}><div><strong>{job.title?.slice(0, 28) || job.kind}</strong><StatusText tone={job.status === "failed" ? "danger" : "muted"}>{job.status}{job.attempt > 1 ? ` / attempt ${job.attempt}` : ""}</StatusText></div><button className="text-button queue-resume" type="button" onClick={() => void retryQueuedJob(job)}><RotateCcw aria-hidden="true" size={12} />Retry</button></div>
+              <div className="queue-row" key={job.id}><div><strong>{job.title?.slice(0, 28) || job.kind}</strong><StatusText tone={job.status === "failed" ? "danger" : "muted"}>{job.status}{job.attempt > 1 ? ` / attempt ${job.attempt}` : ""}</StatusText>{job.status === "failed" && jobFailureSummary(job.error) ? <small className="queue-error" title={job.error ?? undefined}>{jobFailureSummary(job.error)}</small> : null}</div><button className="text-button queue-resume" type="button" onClick={() => void retryQueuedJob(job)}><RotateCcw aria-hidden="true" size={12} />Retry</button></div>
             ))}
             {!jobs.some((job) => ["queued", "preparing", "running"].includes(job.status)) ? <div className="queue-row"><div><strong>{text.split(/[.!?]/)[0].slice(0, 28) || "Current script"}</strong><StatusText tone={result ? "success" : "muted"}>{result ? "Ready" : "Draft"}</StatusText></div><MoreHorizontal aria-hidden="true" size={16} /></div> : null}
             {batches.slice(0, 4).map((batch) => {
@@ -675,6 +732,7 @@ export function GenerateView({
           </div>
         </Panel>
       </div>
+      {showAddVoice ? <VoiceProfileDialog onClose={() => setShowAddVoice(false)} onCreated={useCreatedVoice} /> : null}
     </div>
   );
 }

@@ -42,6 +42,8 @@ the retained logs. A skipped required item blocks publication.
 - [x] `SOUNDAR_SOAK_DURATION_SECONDS=1800 ./scripts/run-packaged-gpu-soak.sh` completes against the exact candidate without leaked workers or scheduler reservations; its JSON report passes validation.
 - [x] Peak VRAM, RTF, startup overhead, driver, runtime, and model revisions are retained as machine-readable evidence.
 - [ ] Already-installed models complete the offline GPU smoke.
+- [ ] `./scripts/run-packaged-musicgen-acceptance.sh` passes against the exact candidate, isolated MusicGen runtime, and pinned `facebook/musicgen-small` checkpoint; cold/warm 32 kHz artifacts, durable Music history, unload, and scheduler quiescence are retained.
+- [ ] `./scripts/run-packaged-acestep-acceptance.sh` passes against the exact candidate, isolated ACE-Step runtime, and pinned `ACE-Step/acestep-v15-xl-turbo-diffusers` checkpoint; cold/warm 48 kHz stereo lyric renders, separate prompt/lyrics History fields, unload, and scheduler quiescence are retained.
 
 ## Physical Audio And Quality
 
@@ -51,6 +53,8 @@ the retained logs. A skipped required item blocks publication.
 - [ ] The 30-minute Live capture/routing soak passes; the two-hour release soak passes when Live changed materially.
 - [ ] Consent-safe listening corpus is reviewed for clarity, pronunciation, numbers, names, pacing, and long-form continuity.
 - [ ] New or changed cloning models have retained consent, human preference, and comparative similarity evidence.
+- [ ] MusicGen has a retained listening review covering ambient, rhythmic, acoustic, electronic, and negative-vocal prompts; unacceptable artifacts, prompt limits, and the CC BY-NC 4.0 non-commercial restriction are disclosed.
+- [ ] ACE-Step has a retained lyric listening review covering sectioned lyrics, language selection, intelligibility, music-direction adherence, 48 kHz stereo delivery, and the documented text-to-music-only boundary.
 - [ ] `MODEL_LICENSES.md` and in-app disclosures match every qualified model and pinned revision.
 
 ## Publication And Rollback

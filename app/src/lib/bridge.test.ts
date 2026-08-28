@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createBatchRun, getHistoryRequest, listHistory, pauseBatchRun, resumeBatchRun, saveApplicationSetting, synthesizeSpeech, updateBatchItem, updateHistoryMetadata, verifyModel } from "./bridge";
+import { createBatchRun, generateMusic, getHistoryRequest, listHistory, pauseBatchRun, resumeBatchRun, saveApplicationSetting, synthesizeSpeech, updateBatchItem, updateHistoryMetadata, verifyModel } from "./bridge";
 
 describe("browser preview bridge", () => {
   afterEach(() => vi.useRealTimers());
@@ -27,7 +27,58 @@ describe("browser preview bridge", () => {
     expect(await listHistory("Preview only", { artifact_state: "available" })).toEqual([]);
     expect((await updateHistoryMetadata(result.id, { favorite: true })).favorite).toBe(true);
     expect(await listHistory("Preview only", { favorite: true })).toHaveLength(1);
-    expect((await getHistoryRequest(result.id)).text).toBe("Preview only");
+    const storedRequest = await getHistoryRequest(result.id);
+    expect("text" in storedRequest && storedRequest.text).toBe("Preview only");
+  });
+
+  it("keeps browser music previews explicitly non-rendered and distinct from speech", async () => {
+    vi.useFakeTimers();
+    const generation = generateMusic({
+      model_id: "facebook/musicgen-small",
+      prompt: "Warm ambient synth pads",
+      duration_seconds: 10,
+      guidance_scale: 3,
+      temperature: 1,
+      top_k: 250,
+      top_p: 0,
+      seed: 9,
+      output_format: "wav",
+    });
+    await vi.runAllTimersAsync();
+    const result = await generation;
+    expect(result.preview).toBe(true);
+    expect(result.audio_path).toBeNull();
+    expect(result.generation_kind).toBe("music");
+    expect(result.voice).toBe("Not applicable");
+    const request = await getHistoryRequest(result.id);
+    expect("prompt" in request && request.prompt).toBe("Warm ambient synth pads");
+  });
+
+  it("preserves separate ACE-Step direction and lyric conditions in a non-rendered preview", async () => {
+    vi.useFakeTimers();
+    const generation = generateMusic({
+      model_id: "ACE-Step/acestep-v15-xl-turbo-diffusers",
+      prompt: "Warm indie-pop, brushed drums, close-mic lead vocal",
+      lyrics: "[Verse]\nHold the light until morning comes",
+      vocal_language: "en",
+      duration_seconds: 20,
+      inference_steps: 8,
+      shift: 3,
+      bpm: 96,
+      seed: 42,
+      output_format: "wav",
+    });
+    await vi.runAllTimersAsync();
+    const result = await generation;
+
+    expect(result.preview).toBe(true);
+    expect(result.audio_path).toBeNull();
+    expect(result.engine).toBe("acestep");
+    expect(result.sample_rate).toBe(48_000);
+    const request = await getHistoryRequest(result.id);
+    expect("prompt" in request && request.prompt).toBe("Warm indie-pop, brushed drums, close-mic lead vocal");
+    expect("lyrics" in request && request.lyrics).toBe("[Verse]\nHold the light until morning comes");
+    expect("vocal_language" in request && request.vocal_language).toBe("en");
   });
 
   it("reports preview model integrity without pretending to inspect native files", async () => {

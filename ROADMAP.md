@@ -864,8 +864,11 @@ Release channels should be:
 - Merge major dependency upgrades because compilation alone passes.
 - Build collaboration accounts or cloud sync before the single-user local project
   model is dependable.
-- Add video avatars, music generation, or sound-effects generation before the
-  speech production core is excellent.
+- Expand text-to-music beyond its bounded local beta, or add video avatars and
+  sound-effects generation, before each has dedicated hardware qualification,
+  listening evidence, and license review. The current ACE-Step path accepts
+  direction plus optional lyrics, while the MusicGen path is instrumental-only;
+  neither is a general audio-editing or melody-conditioning surface.
 - Train professional voice models before reference ingestion, consent, dataset
   quality, evaluation, and isolated training runtimes are complete.
 - Call a feature complete because its screen exists.

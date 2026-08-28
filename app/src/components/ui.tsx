@@ -1,7 +1,8 @@
 import { AlertTriangle, Check, ChevronDown, Ellipsis, LoaderCircle, Pause, Play, RefreshCw } from "lucide-react";
-import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode } from "react";
+import { useContext, useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { BrandMark } from "./Brand";
+import { PageToolbarTargetContext } from "./PageToolbarContext";
 
 export interface DropdownOption {
   value: string;
@@ -17,15 +18,19 @@ export function PageHeader({
   subtitle: string;
   actions?: ReactNode;
 }) {
-  return (
-    <header className="page-header">
+  const toolbarTarget = useContext(PageToolbarTargetContext);
+  const content = (
+    <div className="page-header-content">
       <div className="page-heading">
         <h1>{title}</h1>
         <p>{subtitle}</p>
       </div>
       {actions ? <div className="page-actions">{actions}</div> : null}
-    </header>
+    </div>
   );
+  return toolbarTarget
+    ? createPortal(content, toolbarTarget)
+    : <header className="page-header">{content}</header>;
 }
 
 export function Panel({

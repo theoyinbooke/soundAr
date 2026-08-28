@@ -1,10 +1,10 @@
 import { Activity, Check, CircleStop, Copy, Download, Eye, FolderOpen, Gauge, KeyRound, LoaderCircle, Mic, NotebookPen, Pause, Play, RefreshCw, Search, Server, SlidersHorizontal, Star, Trophy, Trash2, Volume2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { ApplicationSettings, AudioInputDevice, AudioOutputDevice, AudioPlaybackState, AudioRecordingState, BootstrapState, ComparisonRecord, DeveloperApiState, HistoryFilters, HistoryItem } from "../types";
+import type { ApplicationSettings, AudioInputDevice, AudioOutputDevice, AudioPlaybackState, AudioRecordingState, BootstrapState, ComparisonRecord, DeveloperApiState, HistoryFilters, HistoryItem, UpdateCheckStatus } from "../types";
 import { CompactAudioPlayer, CompactField, EmptyState, MetricStrip, PageHeader, Panel, RowActionMenu, Segmented, SelectField, StatusText } from "../components/ui";
 import { BrandLockup, BrandMark } from "../components/Brand";
-import { cancelComparison, createComparison, deleteHistoryItem, duplicateHistoryItem, exportHistoryItem, getAudioPlaybackStatus, getAudioRecordingStatus, getComparison, getDeveloperApiStatus, getHistoryRequest, listAudioInputDevices, listAudioOutputDevices, listHistory, loadGeneratedAudio, loadTranscriptionAudio, startAudioPlayback, startAudioRecording, startDeveloperApi, stopAudioPlayback, stopAudioRecording, stopDeveloperApi, synthesizeSpeech, transcribeAudio, updateComparisonReview, updateHistoryMetadata } from "../lib/bridge";
+import { cancelComparison, createComparison, deleteHistoryItem, duplicateHistoryItem, exportHistoryItem, generateMusic, getAudioPlaybackStatus, getAudioRecordingStatus, getComparison, getDeveloperApiStatus, getHistoryRequest, listAudioInputDevices, listAudioOutputDevices, listHistory, loadGeneratedAudio, loadTranscriptionAudio, startAudioPlayback, startAudioRecording, startDeveloperApi, stopAudioPlayback, stopAudioRecording, stopDeveloperApi, synthesizeSpeech, transcribeAudio, updateComparisonReview, updateHistoryMetadata } from "../lib/bridge";
 import { canSynthesizeWithoutReference, qualifiedModels } from "../lib/capabilities";
 
 const idleWaveform = [22, 34, 18, 48, 28, 62, 42, 71, 38, 54, 31, 66, 45, 57];
@@ -388,9 +388,19 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
 
   async function copyText(item: HistoryItem) {
     try {
-      await navigator.clipboard.writeText(item.text);
+      if (item.generation_kind === "music") {
+        const request = await getHistoryRequest(item.id);
+        if (!("prompt" in request)) throw new Error("The stored music request is invalid.");
+        const lyrics = request.lyrics?.trim();
+        await navigator.clipboard.writeText([
+          `Music direction:\n${request.prompt}`,
+          lyrics ? `Lyrics or text to sing:\n${lyrics}` : "",
+        ].filter(Boolean).join("\n\n"));
+      } else {
+        await navigator.clipboard.writeText(item.text);
+      }
     } catch {
-      setPlaybackError({ id: item.id, message: "Could not copy text to the clipboard" });
+      setPlaybackError({ id: item.id, message: "Could not copy generation text to the clipboard" });
     }
   }
 
@@ -418,7 +428,13 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
     setLoadingId(item.id);
     try {
       const request = await getHistoryRequest(item.id);
-      await synthesizeSpeech({ ...request, title: `${item.title} rerun` });
+      if (item.generation_kind === "music") {
+        if (!("prompt" in request)) throw new Error("The stored music request is invalid.");
+        await generateMusic({ ...request, title: `${item.title} rerun` });
+      } else {
+        if (!("text" in request)) throw new Error("The stored speech request is invalid.");
+        await synthesizeSpeech({ ...request, title: `${item.title} rerun` });
+      }
       await refreshHistory();
     } catch (caught) {
       setPlaybackError({ id: item.id, message: caught instanceof Error ? caught.message : String(caught) });
@@ -458,7 +474,7 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
         {history.length ? (
           <div className="table-scroll">
             <table className="data-table history-table">
-              <thead><tr><th>Generation</th><th>Voice</th><th>Model</th><th>Duration</th><th>RTF</th><th aria-label="Actions" /></tr></thead>
+              <thead><tr><th>Generation</th><th>Source</th><th>Model</th><th>Duration</th><th>RTF</th><th aria-label="Actions" /></tr></thead>
               <tbody>{history.map((item) => {
                 const playing = activeId === item.id && isPlaying;
                 const loading = loadingId === item.id;
@@ -472,7 +488,7 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
                       <strong>{item.favorite ? <Star aria-label="Favorite" fill="currentColor" size={11} /> : null}{item.title}</strong>
                       <small className={playbackError?.id === item.id || artifactMessage ? "history-playback-error" : rowNotice?.id === item.id ? "history-row-notice" : undefined}>{playbackError?.id === item.id ? playbackError.message : rowNotice?.id === item.id ? rowNotice.message : (artifactMessage ?? item.notes) || new Date(item.created_at).toLocaleString()}</small>
                     </td>
-                    <td>{item.voice}</td>
+                    <td>{item.generation_kind === "music" ? "Music" : item.voice}</td>
                     <td className="muted-cell">{item.model_id.split("/").at(-1)}</td>
                     <td className="mono-cell">{item.duration_seconds.toFixed(1)} s</td>
                     <td className="mono-cell">{item.rtf.toFixed(2)}x</td>
@@ -486,7 +502,7 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
                         { label: "Duplicate artifact", icon: <Copy size={12} />, disabled: loading || artifactUnavailable, onSelect: () => duplicate(item) },
                         { label: "Export copy", icon: <Download size={12} />, disabled: artifactUnavailable, onSelect: () => exportCopy(item) },
                         { label: "Reveal in folder", icon: <FolderOpen size={12} />, disabled: !item.audio_path || artifactUnavailable, onSelect: () => { if (item.audio_path) void revealItemInDir(item.audio_path); } },
-                        { label: "Copy script", icon: <Copy size={12} />, onSelect: () => copyText(item) },
+                        { label: item.generation_kind === "music" ? "Copy direction and lyrics" : "Copy script", icon: <Copy size={12} />, onSelect: () => copyText(item) },
                         { label: "Delete", icon: <Trash2 size={12} />, danger: true, onSelect: () => remove(item) },
                       ]} /></div>
                     </td>
@@ -502,7 +518,28 @@ export function HistoryView({ history, onChange }: { history: HistoryItem[]; onC
   );
 }
 
-export function SettingsView({ bootstrap, settings, onSetting }: { bootstrap: BootstrapState; settings: ApplicationSettings; onSetting: <K extends keyof ApplicationSettings>(key: K, value: ApplicationSettings[K]) => void }) {
+function UpdateCheckButton({ status, onCheck }: { status: UpdateCheckStatus; onCheck: () => void }) {
+  return (
+    <button className="button button-secondary" type="button" disabled={status.phase === "checking"} onClick={onCheck}>
+      {status.phase === "checking" ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <RefreshCw aria-hidden="true" size={13} />}
+      {status.phase === "checking" ? "Checking..." : "Check for updates"}
+    </button>
+  );
+}
+
+function UpdateCheckFeedback({ status }: { status: UpdateCheckStatus }) {
+  if (!status.message || status.phase === "idle") return null;
+  const tone = status.phase === "current"
+    ? "success"
+    : status.phase === "available" || status.phase === "checking"
+      ? "warning"
+      : status.phase === "error"
+        ? "danger"
+        : "muted";
+  return <div className="update-check-feedback" role="status" aria-live="polite"><StatusText tone={tone}>{status.message}</StatusText></div>;
+}
+
+export function SettingsView({ bootstrap, settings, onSetting, updateCheck, onCheckForUpdates }: { bootstrap: BootstrapState; settings: ApplicationSettings; onSetting: <K extends keyof ApplicationSettings>(key: K, value: ApplicationSettings[K]) => void; updateCheck: UpdateCheckStatus; onCheckForUpdates: () => void }) {
   const [api, setApi] = useState<DeveloperApiState>({ running: false });
   const [apiBusy, setApiBusy] = useState(false);
   const [apiError, setApiError] = useState<string>();
@@ -520,7 +557,8 @@ export function SettingsView({ bootstrap, settings, onSetting }: { bootstrap: Bo
 
   return (
     <div className="page settings-page">
-      <PageHeader title="Settings" subtitle="Tune the desktop runtime, storage, and visual appearance." />
+      <PageHeader title="Settings" subtitle="Tune the desktop runtime, storage, and visual appearance." actions={<UpdateCheckButton status={updateCheck} onCheck={onCheckForUpdates} />} />
+      <UpdateCheckFeedback status={updateCheck} />
       <div className="settings-columns">
         <Panel className="settings-section">
           <div className="settings-title"><SlidersHorizontal size={15} /><div><h2>Appearance</h2><p>Compact in both themes, with no blue or purple.</p></div></div>
@@ -550,17 +588,18 @@ export function SettingsView({ bootstrap, settings, onSetting }: { bootstrap: Bo
   );
 }
 
-export function AboutView({ bootstrap }: { bootstrap: BootstrapState }) {
+export function AboutView({ bootstrap, updateCheck, onCheckForUpdates }: { bootstrap: BootstrapState; updateCheck: UpdateCheckStatus; onCheckForUpdates: () => void }) {
   return (
     <div className="page about-page">
-      <PageHeader title="About" subtitle="Application identity and local runtime details." />
+      <PageHeader title="About" subtitle="Application identity and local runtime details." actions={<UpdateCheckButton status={updateCheck} onCheck={onCheckForUpdates} />} />
+      <UpdateCheckFeedback status={updateCheck} />
       <section className="about-identity" aria-labelledby="about-product-name">
         <BrandMark className="about-mark" />
         <div>
           <BrandLockup className="about-lockup" />
           <p id="about-product-name">Open-source local voice studio</p>
         </div>
-        <span className="about-version">Version 0.3.0</span>
+        <span className="about-version">Version {__APP_VERSION__}</span>
       </section>
       <div className="about-details">
         <Panel className="about-section" ariaLabel="Application details">

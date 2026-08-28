@@ -431,6 +431,152 @@
         "https://huggingface.co/ResembleAI/chatterbox-turbo",
         "https://github.com/resemble-ai/chatterbox"
       ]
+    },
+    {
+      "model_id": "BreezeBlue/Breeze-TTS-2",
+      "task": "tts",
+      "engine": "breeze",
+      "install_status": "ready",
+      "revision": "c1c8ca18b70b30822735633991d9ebf4898e47d4",
+      "license": "BreezeBlue Research and Non-Commercial License 1.0",
+      "tier": "advanced",
+      "recommended_for_12gb": true,
+      "languages": ["en", "zh"],
+      "summary": "Bilingual 3.47B speech model with natural-language voice design, expressive events, and 24 kHz output.",
+      "known_limitations": [
+        "The model weights and self-hosted outputs are restricted to research and non-commercial use; commercial use requires written authorization from BreezeBlue.",
+        "Linux, CUDA, and a 12 GB NVIDIA GPU are required by the qualified eager path.",
+        "The upstream fast CUDA-graph path needs approximately 14.4 GiB and is disabled on the 12 GB target.",
+        "This first soundAr adapter exposes reference-free voice design. Upstream voice cloning and voice direction require an exact reference transcript and are not yet exposed."
+      ],
+      "test_status": "required",
+      "qualification": {
+        "device": "NVIDIA GeForce RTX 4080 Laptop GPU",
+        "runtime": "isolated Breeze eager CUDA runtime",
+        "sample_rate": 24000,
+        "duration_seconds": 3.92,
+        "inference_seconds": 5.5021,
+        "rtf": 1.4036,
+        "peak_vram_mb": 8792.9,
+        "tested_at": "2026-08-26"
+      },
+      "default_chunk_seconds": null,
+      "default_sample_rate": 24000,
+      "runtime_notes": [
+        "Uses the official eager streaming implementation pinned to source revision ca632ce6c4d05f7985da4eab29b1a5d445b43f7b.",
+        "The checkpoint contains 3,466,363,713 parameters and approximately 6.97 GB of model weights.",
+        "Supports English and Chinese plus inline vocal events such as (laugh), (cough), and (sigh).",
+        "Model weights are downloaded only after explicit user approval and are never bundled."
+      ],
+      "source_urls": [
+        "https://huggingface.co/BreezeBlue/Breeze-TTS-2",
+        "https://github.com/breezeblue-ai/breeze-tts",
+        "https://breezeblue.ai/breeze-tts-2"
+      ]
+    },
+    {
+      "model_id": "fishaudio/fish-speech-1.5",
+      "task": "tts",
+      "engine": "fish-speech",
+      "install_status": "ready",
+      "revision": "275a984d33c33659e39eed41ff5bcd6e67517f4c",
+      "license": "CC-BY-NC-SA-4.0",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": ["en", "zh", "ja", "de", "fr", "es", "ko", "ar", "ru", "nl", "it", "pl", "pt"],
+      "summary": "Fish Audio's stable multilingual Fish Speech 1.5 checkpoint with reference-free generation and 44.1 kHz output.",
+      "known_limitations": [
+        "The model weights are restricted to non-commercial use and derivatives must remain under CC-BY-NC-SA-4.0.",
+        "The official checkpoint uses PyTorch .pth files; soundAr loads them locally with weights_only=True.",
+        "This first soundAr adapter exposes reference-free generation. Voice cloning requires an exact reference transcript and is not yet exposed.",
+        "Fish Audio S2 Pro is newer, but its official runtime requires at least 24 GB VRAM and is not marked ready on this 12 GB target."
+      ],
+      "test_status": "required",
+      "qualification": {
+        "device": "NVIDIA GeForce RTX 4080 Laptop GPU",
+        "runtime": "isolated Fish Speech v1.5.1 CUDA runtime",
+        "sample_rate": 44100,
+        "duration_seconds": 2.9257,
+        "inference_seconds": 1.9254,
+        "rtf": 0.6581,
+        "peak_vram_mb": 1657.4,
+        "tested_at": "2026-08-26"
+      },
+      "default_chunk_seconds": null,
+      "default_sample_rate": 44100,
+      "runtime_notes": [
+        "Uses Fish Audio's Apache-2.0 inference source pinned to v1.5.1 commit 58046eaa1a4cefb0c8cc3a3a667b34186ea02dde.",
+        "The public checkpoint is approximately 1.47 GB and was trained on more than one million hours across 13 languages.",
+        "The official v1.5.1 inference path loads checkpoint tensors with PyTorch weights_only=True and performs no cloud inference.",
+        "Model weights are downloaded only after explicit user approval and are never bundled."
+      ],
+      "source_urls": [
+        "https://huggingface.co/fishaudio/fish-speech-1.5",
+        "https://github.com/fishaudio/fish-speech/tree/v1.5.1",
+        "https://arxiv.org/abs/2411.01156"
+      ]
+    },
+    {
+      "model_id": "facebook/musicgen-small",
+      "task": "music",
+      "engine": "musicgen",
+      "install_status": "ready",
+      "revision": "47e682ccac550edc80b042ca977074aee86306e7",
+      "license": "CC-BY-NC-4.0",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": [],
+      "summary": "Local 300M MusicGen model for short text-conditioned music drafts at 32 kHz.",
+      "known_limitations": [
+        "This is an instrumental direction model in soundAr; it cannot condition on lyrics or reliably sing supplied text.",
+        "The model is text-to-music only in this release; melody conditioning and audio continuation are not exposed.",
+        "Generation is stochastic and can contain vocal-like artifacts even when an instrumental prompt is used.",
+        "MusicGen weights are licensed CC BY-NC 4.0 and must not be used commercially without separate permission.",
+        "Longer clips increase latency and VRAM use; this local path is bounded to 30 seconds."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 32000,
+      "runtime_notes": [
+        "Uses the built-in Transformers MusicgenForConditionalGeneration implementation with local files only and no remote model code.",
+        "The engine emits a complete, atomically published WAV or FLAC artifact; streaming is intentionally not advertised.",
+        "Model weights are downloaded only after explicit user approval."
+      ],
+      "source_urls": [
+        "https://huggingface.co/facebook/musicgen-small",
+        "https://github.com/facebookresearch/audiocraft"
+      ]
+    },
+    {
+      "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+      "task": "music",
+      "engine": "acestep",
+      "install_status": "ready",
+      "revision": "200ba991ae448051e14b0183157e35c2d27c9fb0",
+      "license": "MIT (ACE-Step); Apache-2.0 (Qwen3 text encoder)",
+      "tier": "recommended",
+      "recommended_for_12gb": true,
+      "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "ru"],
+      "summary": "ACE-Step 1.5 XL Turbo lyric-conditioned music at 48 kHz stereo, using separate direction and lyric inputs.",
+      "known_limitations": [
+        "The local checkpoint is approximately 11.1 GB; soundAr uses model CPU offload on 12 GB NVIDIA GPUs, which increases render time.",
+        "Lyrics are a generation condition, not a transcript guarantee; review the audible words before use.",
+        "soundAr exposes only text-to-music here: no source-audio cover, remix, repaint, or voice-reference upload is enabled.",
+        "The local workflow is bounded to 10–30 seconds and requires a CUDA GPU in this release."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": 48000,
+      "runtime_notes": [
+        "Uses the official local Diffusers pipeline with no remote code execution or cloud fallback.",
+        "A caption directs genre, instruments, mood, and production; optional lyrics use [Verse] and [Chorus] structure.",
+        "Model weights are downloaded only after explicit user approval and pinned to the qualified revision.",
+        "The ACE-Step weights are MIT; the bundled Qwen3 text encoder is Apache-2.0."
+      ],
+      "source_urls": [
+        "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
+        "https://huggingface.co/docs/diffusers/api/pipelines/ace_step"
+      ]
     }
   ]
 }

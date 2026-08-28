@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: soundAr Local API
-  version: 0.3.0
+  version: 0.3.1
   description: Loopback-only API started explicitly from the soundAr desktop Settings screen.
 servers:
   - url: http://127.0.0.1:17843

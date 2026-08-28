@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-08-26
+
+- Added Breeze TTS 2 and Fish Speech 1.5 as pinned, isolated local synthesis engines with real RTX 4080 qualification evidence.
+- Added local text-to-music foundations and expanded packaged engine resources.
+- Reworked the desktop shell into one compact, useful page toolbar and reclaimed the duplicate header row across the application.
+- Added manual update checks to Settings and About and synchronized the displayed application version with package metadata.
+
 ## 0.3.0 - 2026-08-13
 
 - Replaced vulnerable Transformers and Diffusers pins with qualified patched releases, migrated XTTS to maintained `coqui-tts`, isolated optional engine dependencies, and disabled model-supplied Python execution.

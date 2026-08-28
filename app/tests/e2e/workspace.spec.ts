@@ -30,6 +30,46 @@ test("workspace is explicit about preview and native capability boundaries", asy
   await expect(page.locator("body")).not.toHaveCSS("overflow-x", "scroll");
 });
 
+test("Settings and About expose manual update checks with explicit feedback", async ({ page }) => {
+  await page.goto("/");
+  await openRoute(page, "Settings");
+  await page.getByRole("button", { name: "Check for updates" }).click();
+  await expect(page.getByRole("status")).toContainText("available in the installed desktop app");
+
+  await openRoute(page, "About");
+  await expect(page.getByRole("button", { name: "Check for updates" })).toBeVisible();
+  await expect(page.getByText("Version 0.3.1", { exact: true })).toBeVisible();
+});
+
+test("text-to-music stays bounded and never fabricates browser audio", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Music", exact: true }).click();
+
+  await expect(page.getByRole("heading", { name: "Generate music" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Music direction" })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Lyrics or text to sing" })).toBeVisible();
+  await expect(page.getByText("Text-to-music / local only")).toBeVisible();
+  await expect(page.getByText(/Direction and lyrics stay separate/i)).toBeVisible();
+  await expect(page.getByText(/source audio, and batch generation are intentionally outside this release/i)).toBeVisible();
+  await expect(page.getByText("Stereo / 48 kHz")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Preview music flow" })).toBeEnabled();
+
+  await page.getByRole("button", { name: "Preview music flow" }).click();
+  await expect(page.getByText("Browser preview has no rendered audio")).toBeVisible();
+  await expect(page.locator("audio")).toHaveCount(0);
+
+  const bounds = await page.locator(".generate-layout").evaluate((layout) => ({
+    clientWidth: layout.clientWidth,
+    scrollWidth: layout.scrollWidth,
+    left: layout.getBoundingClientRect().left,
+    right: layout.getBoundingClientRect().right,
+    viewportWidth: window.innerWidth,
+  }));
+  expect(bounds.scrollWidth).toBeLessThanOrEqual(bounds.clientWidth + 1);
+  expect(bounds.left).toBeGreaterThanOrEqual(-1);
+  expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth + 1);
+});
+
 test("implemented routes remain usable at the target viewport", async ({ page }) => {
   await page.goto("/");
   for (const route of ["Projects", "Transcribe", "Voices", "Models", "Live", "Compare", "Benchmarks", "History"]) {
@@ -334,7 +374,7 @@ test("every route keeps controls inside its layout in both themes", async ({ pag
       expect(overflow, `${theme} ${route} overflow`).toEqual([]);
 
       if (route === "About") {
-        await expect(page.getByText("Version 0.3.0", { exact: true })).toBeVisible();
+        await expect(page.getByText("Version 0.3.1", { exact: true })).toBeVisible();
         const runtimeDetails = page.getByLabel("Runtime details");
         await expect(runtimeDetails.getByText(/NVIDIA GeForce|No compatible GPU/)).toBeVisible();
       }

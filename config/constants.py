@@ -47,4 +47,6 @@ ENGINE_LABELS = {
     "cohere": "Cohere",
     "voxtral": "Voxtral",
     "chatterbox": "Chatterbox",
+    "breeze": "Breeze TTS 2",
+    "fish-speech": "Fish Speech 1.5",
 }

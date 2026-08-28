@@ -5,7 +5,7 @@ import { RuntimeSetupNotice } from "./components/RuntimeSetupNotice";
 import { UpdateNotice } from "./components/UpdateNotice";
 import { LoadingView, RuntimeFailureView } from "./components/ui";
 import { listHistory, loadBootstrapState, saveApplicationSetting } from "./lib/bridge";
-import type { ApplicationSettings, BootstrapState, HistoryItem, NavKey, ProjectRecord, Theme, TranscriptionRecord } from "./types";
+import type { ApplicationSettings, BootstrapState, HistoryItem, NavKey, ProjectRecord, Theme, TranscriptionRecord, UpdateCheckStatus } from "./types";
 import { BenchmarksView } from "./views/BenchmarksView";
 import { GenerateView } from "./views/GenerateView";
 import { ModelsView } from "./views/ModelsView";
@@ -27,6 +27,7 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [transcriptions, setTranscriptions] = useState<TranscriptionRecord[]>([]);
   const [availableUpdate, setAvailableUpdate] = useState<Update>();
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckStatus>({ phase: "idle" });
   const [preferredVoiceId, setPreferredVoiceId] = useState<string>();
 
   useEffect(() => {
@@ -84,7 +85,7 @@ export default function App() {
 
   function renderView(state: BootstrapState) {
     switch (current) {
-      case "generate": return <GenerateView bootstrap={state} voices={voices} preferredVoiceId={preferredVoiceId} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
+      case "generate": return <GenerateView bootstrap={state} voices={voices} onVoicesChange={setVoices} preferredVoiceId={preferredVoiceId} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "projects": return <ProjectsView bootstrap={state} projects={projects} voices={voices} onChange={setProjects} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "transcribe": return <TranscribeView bootstrap={state} records={transcriptions} onChange={setTranscriptions} />;
       case "voices": return <VoicesView bootstrap={state} voices={voices} onChange={setVoices} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} onUseVoice={(id) => { setPreferredVoiceId(id); setCurrent("generate"); }} />;
@@ -93,8 +94,8 @@ export default function App() {
       case "compare": return <CompareView bootstrap={state} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "benchmarks": return <BenchmarksView bootstrap={state} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "history": return <HistoryView history={history} onChange={setHistory} />;
-      case "settings": return <SettingsView bootstrap={state} settings={settings} onSetting={updateSetting} />;
-      case "about": return <AboutView bootstrap={state} />;
+      case "settings": return <SettingsView bootstrap={state} settings={settings} onSetting={updateSetting} updateCheck={updateCheck} onCheckForUpdates={checkForUpdatesNow} />;
+      case "about": return <AboutView bootstrap={state} updateCheck={updateCheck} onCheckForUpdates={checkForUpdatesNow} />;
     }
   }
 
@@ -121,6 +122,28 @@ export default function App() {
       setSettings(saved);
     } catch (caught) {
       setRuntimeNotice(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  async function checkForUpdatesNow() {
+    if (bootstrap?.runtime !== "tauri") {
+      setUpdateCheck({ phase: "unavailable", message: "Update checks are available in the installed desktop app." });
+      return;
+    }
+    setUpdateCheck({ phase: "checking", message: "Checking the signed release feed..." });
+    try {
+      const update = await check({ timeout: 15_000 });
+      if (update) {
+        setAvailableUpdate(update);
+        setUpdateCheck({ phase: "available", message: `soundAr ${update.version} is available.` });
+      } else {
+        setUpdateCheck({ phase: "current", message: `soundAr ${__APP_VERSION__} is up to date.` });
+      }
+    } catch (caught) {
+      setUpdateCheck({
+        phase: "error",
+        message: caught instanceof Error ? `Update check failed: ${caught.message}` : `Update check failed: ${String(caught)}`,
+      });
     }
   }
 

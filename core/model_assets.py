@@ -61,6 +61,47 @@ def _required_model_files(path: Path, engine: str) -> tuple[list[str], list[list
             "model.safetensors.index.json",
             "pytorch_model.bin.index.json",
         ]]
+    if engine == "musicgen":
+        return [
+            "config.json",
+            "preprocessor_config.json",
+            "tokenizer_config.json",
+            "tokenizer.json",
+        ], [[
+            "pytorch_model.bin",
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        ]]
+    if engine == "acestep":
+        return [
+            "model_index.json",
+            "transformer/config.json",
+            "condition_encoder/config.json",
+            "vae/config.json",
+            "text_encoder/config.json",
+            "tokenizer/tokenizer.json",
+            "scheduler/scheduler_config.json",
+        ], [
+            [
+                "transformer/diffusion_pytorch_model.safetensors",
+                "transformer/diffusion_pytorch_model.safetensors.index.json",
+            ],
+            [
+                "condition_encoder/diffusion_pytorch_model.safetensors",
+                "condition_encoder/diffusion_pytorch_model.safetensors.index.json",
+            ],
+            [
+                "vae/diffusion_pytorch_model.safetensors",
+                "vae/diffusion_pytorch_model.safetensors.index.json",
+            ],
+            [
+                "text_encoder/model.safetensors",
+                "text_encoder/pytorch_model.bin",
+                "text_encoder/model.safetensors.index.json",
+                "text_encoder/pytorch_model.bin.index.json",
+            ],
+        ]
     if engine in {"speaker-verification", "alignment"}:
         required = ["config.json", "preprocessor_config.json"]
         if engine == "alignment":
@@ -96,6 +137,27 @@ def _required_model_files(path: Path, engine: str) -> tuple[list[str], list[list
         return ["ve.safetensors", "t3_cfg.safetensors", "s3gen.safetensors", "tokenizer.json"], []
     if engine == "chatterbox-turbo":
         return ["ve.safetensors", "t3_turbo_v1.safetensors", "s3gen_meanflow.safetensors", "tokenizer_config.json", "vocab.json"], []
+    if engine == "breeze":
+        return [
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "audio_tokenizer/config.json",
+            "audio_tokenizer/preprocessor_config.json",
+            "audio_tokenizer/model.safetensors",
+        ], [[
+            "model.safetensors",
+            "model.safetensors.index.json",
+        ]]
+    if engine == "fish-speech":
+        return [
+            "config.json",
+            "model.pth",
+            "firefly-gan-vq-fsq-8x1024-21hz-generator.pth",
+            "special_tokens.json",
+            "tokenizer.tiktoken",
+        ], []
     return [], [[]]
 
 
@@ -180,8 +242,9 @@ def model_integrity_report(
                 shards = payload.get("weight_map")
                 if not isinstance(shards, dict) or not shards:
                     raise ValueError("weight map is missing")
+                index_parent = Path(relative).parent
                 for shard in sorted({str(value) for value in shards.values()}):
-                    check_file(shard)
+                    check_file(str(index_parent / shard))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             invalid.append(relative)
 
