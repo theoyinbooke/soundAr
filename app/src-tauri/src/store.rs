@@ -2247,6 +2247,65 @@ impl Store {
         Ok((job, request))
     }
 
+    /// Atomically re-arms a durable Video Studio job and returns its original request.
+    ///
+    /// Callers provide the exact workflow kinds they know how to reconstruct. This keeps the
+    /// generic job store from silently retrying a task through the wrong runner while preserving
+    /// the original id, attempt history, and durable event stream.
+    pub fn resume_video_job(
+        &self,
+        id: &str,
+        allowed_kinds: &[&str],
+    ) -> Result<(Value, Value), String> {
+        if allowed_kinds.is_empty() {
+            return Err("No resumable video workflow kinds were provided".to_string());
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Could not resume the video task: {error}"))?;
+        let job: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT kind, status, request_json FROM jobs WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Could not inspect the video task: {error}"))?;
+        let Some((kind, status, request_json)) = job else {
+            return Err("The selected video task was not found".to_string());
+        };
+        if !allowed_kinds.iter().any(|allowed| *allowed == kind) {
+            return Err("This task must be resumed from its owning workflow".to_string());
+        }
+        if !matches!(status.as_str(), "failed" | "cancelled") {
+            return Err("Only failed, interrupted, or cancelled video tasks can be resumed".into());
+        }
+        let request = serde_json::from_str::<Value>(&request_json)
+            .map_err(|error| format!("The stored video task request is invalid: {error}"))?;
+        let timestamp = now();
+        transaction
+            .execute(
+                "UPDATE jobs
+                 SET status = 'preparing', progress = 0.05, attempt = attempt + 1,
+                     error = NULL, output_artifact_id = NULL, dismissed = 0, updated_at = ?2
+                 WHERE id = ?1 AND status IN ('failed', 'cancelled')",
+                params![id, timestamp],
+            )
+            .map_err(|error| format!("Could not prepare the video task resume: {error}"))?;
+        insert_job_event(&transaction, id, "preparing", 0.05, None, &timestamp)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("Could not commit the video task resume: {error}"))?;
+        drop(connection);
+        let job = self
+            .list_jobs()?
+            .into_iter()
+            .find(|job| job.get("id").and_then(Value::as_str) == Some(id))
+            .ok_or_else(|| "The resumed video task disappeared".to_string())?;
+        Ok((job, request))
+    }
+
     pub fn clear_finished_jobs(&self) -> Result<usize, String> {
         let connection = self.lock()?;
         connection
@@ -7899,6 +7958,51 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["queued", "preparing", "cancelled"]
         );
+        drop(store);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn video_job_resume_is_atomic_scoped_and_preserves_the_durable_request() {
+        let (store, root) = test_store();
+        let request = json!({
+            "project_id": "project-1",
+            "expected_revision": 3,
+            "profile": "preview",
+            "title": "Render preview",
+        });
+        let id = store
+            .create_job("video_timeline_render", &request)
+            .expect("create video job");
+        store.start_job(&id).expect("start video job");
+        store
+            .fail_job(&id, "application restarted")
+            .expect("interrupt video job");
+
+        assert!(store
+            .resume_video_job(&id, &["video_import_local"])
+            .expect_err("reject wrong owner")
+            .contains("owning workflow"));
+        let (resumed, stored_request) = store
+            .resume_video_job(&id, &["video_timeline_render"])
+            .expect("resume video job");
+        assert_eq!(resumed["status"], "preparing");
+        assert_eq!(resumed["attempt"], 2);
+        assert_eq!(stored_request, request);
+        assert!(store
+            .resume_video_job(&id, &["video_timeline_render"])
+            .expect_err("reject active job")
+            .contains("failed, interrupted, or cancelled"));
+
+        let audio = store
+            .create_job("synthesis", &json!({"text": "not video"}))
+            .expect("create audio job");
+        store.fail_job(&audio, "expected").expect("fail audio job");
+        assert!(store
+            .resume_video_job(&audio, &["video_timeline_render"])
+            .expect_err("reject audio job")
+            .contains("owning workflow"));
+
         drop(store);
         fs::remove_dir_all(root).ok();
     }
