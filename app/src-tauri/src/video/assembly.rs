@@ -11,6 +11,7 @@ use super::contracts::{
     RationalRate, RenderArtifact, SourceAsset, TimeRange, TimelineClip, TimelineTrack, TrackKind,
     VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
 };
+use super::media::local_media_input_args;
 use super::renderer::{
     PortraitLayout, RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass,
     VideoEncoder,
@@ -176,9 +177,16 @@ pub fn build_timeline_render_plan(
                 OsString::from(ffmpeg_time(clip.source_range.start_us)),
                 OsString::from("-t"),
                 OsString::from(ffmpeg_time(clip.source_range.duration()?)),
-                OsString::from("-i"),
-                path.as_os_str().to_os_string(),
             ]);
+            args.extend(local_media_input_args(&path).map_err(|error| {
+                VideoError::new(
+                    VideoErrorCode::InvalidAsset,
+                    format!(
+                        "timeline media {media_id} failed local-input policy: {}",
+                        error.message
+                    ),
+                )
+            })?);
         }
     }
     args.extend([

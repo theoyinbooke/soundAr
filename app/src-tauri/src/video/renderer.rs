@@ -1,4 +1,4 @@
-use super::media::{is_executable_file, MediaError};
+use super::media::{is_executable_file, local_media_input_args, MediaError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -174,7 +174,7 @@ pub fn build_proxy_command(
         "scale=w={width}:h={height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1,fps={}",
         profile.frame_rate()
     );
-    let mut common = base_video_arguments(&paths.input, &paths.output);
+    let mut common = base_video_arguments(&paths.input)?;
     common.extend([
         OsString::from("-map"),
         OsString::from("0:v:0"),
@@ -199,7 +199,7 @@ pub fn build_thumbnail_command(
         ));
     }
     let paths = validate_plan_paths(ffmpeg, input, output)?;
-    let args = vec![
+    let mut args = vec![
         OsString::from("-hide_banner"),
         OsString::from("-loglevel"),
         OsString::from("error"),
@@ -207,8 +207,9 @@ pub fn build_thumbnail_command(
         OsString::from("-n"),
         OsString::from("-ss"),
         OsString::from(format_timestamp_us(at_us)),
-        OsString::from("-i"),
-        paths.input.as_os_str().to_os_string(),
+    ];
+    args.extend(local_media_input_args(&paths.input)?);
+    args.extend([
         OsString::from("-map"),
         OsString::from("0:v:0"),
         OsString::from("-frames:v"),
@@ -222,7 +223,7 @@ pub fn build_thumbnail_command(
         OsString::from("-f"),
         OsString::from("image2"),
         paths.output.as_os_str().to_os_string(),
-    ];
+    ]);
     Ok(RenderCommandPlan {
         profile: RenderProfile::Proxy,
         workload_class: RenderWorkloadClass::Light,
@@ -254,14 +255,15 @@ pub fn build_waveform_command(
     let filter = format!(
         "[0:a:0]aformat=channel_layouts=mono,showwavespic=s={width}x{height}:colors=0x6b7280[wave]"
     );
-    let args = vec![
+    let mut args = vec![
         OsString::from("-hide_banner"),
         OsString::from("-loglevel"),
         OsString::from("error"),
         OsString::from("-nostdin"),
         OsString::from("-n"),
-        OsString::from("-i"),
-        paths.input.as_os_str().to_os_string(),
+    ];
+    args.extend(local_media_input_args(&paths.input)?);
+    args.extend([
         OsString::from("-filter_complex"),
         OsString::from(filter),
         OsString::from("-map"),
@@ -271,7 +273,7 @@ pub fn build_waveform_command(
         OsString::from("-f"),
         OsString::from("image2"),
         paths.output.as_os_str().to_os_string(),
-    ];
+    ]);
     Ok(RenderCommandPlan {
         profile: RenderProfile::Proxy,
         workload_class: RenderWorkloadClass::Light,
@@ -314,7 +316,7 @@ pub fn build_portrait_command_with_layout(
     let paths = validate_plan_paths(ffmpeg, input, output)?;
     let (width, height) = profile.portrait_dimensions();
     let fps = profile.frame_rate();
-    let mut common = base_video_arguments(&paths.input, &paths.output);
+    let mut common = base_video_arguments(&paths.input)?;
     match layout {
         PortraitLayout::CenterCrop => {
             common.extend([
@@ -435,8 +437,8 @@ fn validate_plan_paths(
     })
 }
 
-fn base_video_arguments(input: &Path, _output: &Path) -> Vec<OsString> {
-    vec![
+fn base_video_arguments(input: &Path) -> Result<Vec<OsString>, MediaError> {
+    let mut args = vec![
         OsString::from("-hide_banner"),
         OsString::from("-loglevel"),
         OsString::from("error"),
@@ -446,13 +448,15 @@ fn base_video_arguments(input: &Path, _output: &Path) -> Vec<OsString> {
         OsString::from("pipe:2"),
         OsString::from("-stats_period"),
         OsString::from("0.25"),
-        OsString::from("-i"),
-        input.as_os_str().to_os_string(),
+    ];
+    args.extend(local_media_input_args(input)?);
+    args.extend([
         OsString::from("-map_metadata"),
         OsString::from("-1"),
         OsString::from("-map_chapters"),
         OsString::from("-1"),
-    ]
+    ]);
+    Ok(args)
 }
 
 fn build_h264_plan(
