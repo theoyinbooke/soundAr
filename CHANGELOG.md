@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Added a first-class Linux Video Studio for authorized link/local ingest and prompt/audio starts, with internal timestamped transcription, candidate review, scene planning, a source-clock timeline, fast portrait previews, and local MP4/package export.
+- Added versioned manifests, project locks, durable cancellable/resumable media jobs, atomic publication, crash recovery, content-addressed scene caches, and Projects/History/Assistant master surfacing.
+- Added shared Video Studio tools to the existing authenticated Codex assistant so conversational research, planning, creation, revision, monitoring, preview, export, and publish-package workflows use the same native services as the UI.
+- Added captions, title and speaker cards, animated podcast waveforms, crop/layout control, speech and music mixing, NVENC final rendering with verified software fallback, and targeted invalidation for incremental revisions.
+- Hardened link and local-media intake with per-URL rights evidence, single-source defaults, public-only HTTPS proxy confinement, bounded tools and outputs, ordinary-media protocol/demuxer allowlists, private managed storage, disk reservations, checksum validation, and atomic publish packages.
+- Added managed yt-dlp/EJS/Node and faster-whisper discovery, CUDA word-timestamp transcription with preserved gaps, exact-machine FFmpeg/NVENC benchmarks, and a three-run qualified Whisper-tiny plus single-NVENC overlap envelope for the RTX 4080 Laptop GPU.
+- Added a compact, responsive Video Studio surface and coherent final-master presentation across Video Studio, Projects, History, and the Assistant without reintroducing automatic navigation collapse or decorative UI accents.
+
 ## 0.5.5 - 2026-08-27
 
 - Kept Fish Speech in one warm resident worker by default while preserving durable queued requests and the global scheduler capacity for independent engines.

@@ -45,6 +45,19 @@ the retained logs. A skipped required item blocks publication.
 - [ ] `./scripts/run-packaged-musicgen-acceptance.sh` passes against the exact candidate, isolated MusicGen runtime, and pinned `facebook/musicgen-small` checkpoint; cold/warm 32 kHz artifacts, durable Music history, unload, and scheduler quiescence are retained.
 - [x] `./scripts/run-packaged-acestep-acceptance.sh` passes against the exact candidate, isolated ACE-Step runtime, and pinned `ACE-Step/Ace-Step1.5` Studio checkpoint; consecutive cold/warm 48 kHz stereo lyric renders, separate prompt/lyrics History fields, unload, and scheduler quiescence are retained.
 
+## Video Studio
+
+- [ ] `scripts/video/test-harness.sh` passes with real FFmpeg/FFprobe fixture generation, proxy cache reuse, preview/final decode, atomic publication, and regression-gate self-test.
+- [ ] The full-resolution benchmark passes on the release machine with CUDA transcription configured; every stage is measured, no stage is skipped, and `benchmark.json` plus its SHA-256 are retained.
+- [ ] `scripts/video/qualify_gpu_overlap.py` passes three consecutive repetitions for any enabled inference/render overlap; every unqualified model or workload remains serialized.
+- [ ] One rights-clear local imported-source reel and one prompt/audio animated podcast render to playable final MP4 masters and publish packages through production services.
+- [ ] Exact-URL rights confirmation, local-media validation, public-network confinement, source/output quotas, private storage, and publish-package redaction/integrity tests pass.
+- [ ] Source-clock transcript gaps, candidate review protection, captions, scene/timeline math, audio mix, crop/layout, cancellation, resume after restart, cache reuse, and revision without full rerender are verified.
+- [ ] “Change the voice” creates one durable idempotent speech replacement and invalidates only speech/render/package work; “render three variations” publishes one primary master plus variants from one frozen editorial version.
+- [ ] Video Studio, Projects, History, and the Assistant all play and download the registered assembled master; scene artifacts remain secondary and no result is only an opaque local path.
+- [ ] Responsive and accessibility checks pass with the Assistant open and closed at 800, 1024, 1180, and 1440 px, with no unintended overflow or automatic sidebar collapse.
+- [ ] Packaged Debian/AppImage runtime discovery reports the same managed FFmpeg, yt-dlp/EJS/Node, and faster-whisper readiness as the verified source candidate.
+
 ## Playback And Quality
 
 - [ ] Real output selection and routed playback complete without persistent underruns.
