@@ -4,12 +4,17 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-$(node -p "require('$ROOT/app/package.json').version")}"
 PREVIOUS_DEB="${2:-${SOUNDAR_PREVIOUS_DEB:-}}"
+EXPECTED_SCHEMA="$(sed -n 's/^const SCHEMA_VERSION: i64 = \([0-9][0-9]*\);/\1/p' "$ROOT/app/src-tauri/src/store.rs" | head -1)"
 BUNDLE_ROOT="$ROOT/app/src-tauri/target/release/bundle"
 CANDIDATE_DEB="$BUNDLE_ROOT/deb/soundAr_${VERSION}_amd64.deb"
 CANDIDATE_APPIMAGE="$BUNDLE_ROOT/appimage/soundAr_${VERSION}_amd64.AppImage"
 
 [[ -n "$PREVIOUS_DEB" && -s "$PREVIOUS_DEB" ]] || {
   printf 'Usage: %s [version] <previous-stable.deb>\n' "$0" >&2
+  exit 1
+}
+[[ "$EXPECTED_SCHEMA" =~ ^[0-9]+$ ]] || {
+  printf 'Could not resolve the candidate database schema version.\n' >&2
   exit 1
 }
 for command in dpkg-deb python3 sha256sum timeout unshare; do
@@ -129,21 +134,24 @@ printf 'journey-model-weight-sentinel' > "$models/weights.safetensors"
 printf '{"models":[{"model_id":"journey/model","revision":"1111111111111111111111111111111111111111"}]}' \
   > "$home/.soundAr/state/models.json"
 
-python3 - "$database" "$exports/journey.wav" "$voices/reference.wav" <<'PY'
+python3 - "$database" "$exports/journey.wav" "$voices/reference.wav" "$EXPECTED_SCHEMA" <<'PY'
 import hashlib
 import json
 import pathlib
 import sqlite3
 import sys
 
-database, artifact_path, reference_path = map(pathlib.Path, sys.argv[1:])
+database, artifact_path, reference_path = map(pathlib.Path, sys.argv[1:4])
+expected_schema = int(sys.argv[4])
 artifact = artifact_path.read_bytes()
 reference = reference_path.read_bytes()
 connection = sqlite3.connect(database)
 connection.execute("PRAGMA foreign_keys=ON")
 schema = connection.execute("PRAGMA user_version").fetchone()[0]
-if schema != 32:
-    raise SystemExit(f"candidate clean launch created schema {schema}, expected 32")
+if schema != expected_schema:
+    raise SystemExit(
+        f"candidate clean launch created schema {schema}, expected {expected_schema}"
+    )
 timestamp = "2026-08-13T12:00:00Z"
 connection.execute(
     "INSERT INTO jobs (id, kind, status, request_json, progress, attempt, output_artifact_id, created_at, updated_at, dismissed, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -196,16 +204,20 @@ sha256sum "${sentinels[@]}" > "$journey_root/sentinels.sha256"
 
 launch_offline candidate-upgrade-deb "$candidate_runtime" "$candidate_binary"
 
-python3 - "$database" "$home/.soundAr/state" <<'PY'
+python3 - "$database" "$home/.soundAr/state" "$EXPECTED_SCHEMA" <<'PY'
 import pathlib
 import sqlite3
 import sys
 
 database = pathlib.Path(sys.argv[1])
 state = pathlib.Path(sys.argv[2])
+expected_schema = int(sys.argv[3])
 connection = sqlite3.connect(database)
-if connection.execute("PRAGMA user_version").fetchone()[0] != 32:
-    raise SystemExit("the candidate did not migrate schema 30 to 32")
+actual_schema = connection.execute("PRAGMA user_version").fetchone()[0]
+if actual_schema != expected_schema:
+    raise SystemExit(
+        f"the candidate did not migrate schema 30 to {expected_schema} (got {actual_schema})"
+    )
 if connection.execute("PRAGMA quick_check").fetchone()[0].lower() != "ok":
     raise SystemExit("the migrated database failed quick_check")
 if list(connection.execute("PRAGMA foreign_key_check")):
@@ -259,12 +271,13 @@ sha256sum --check --status "$journey_root/sentinels.sha256" || {
   printf 'The AppImage launch changed a user model, voice reference, export, or registry.\n' >&2
   exit 1
 }
-python3 - "$database" <<'PY'
+python3 - "$database" "$EXPECTED_SCHEMA" <<'PY'
 import sqlite3
 import sys
 
 connection = sqlite3.connect(sys.argv[1])
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 32
+expected_schema = int(sys.argv[2])
+assert connection.execute("PRAGMA user_version").fetchone()[0] == expected_schema
 assert connection.execute("PRAGMA quick_check").fetchone()[0].lower() == "ok"
 assert connection.execute("SELECT COUNT(*) FROM projects WHERE id = 'journey-project'").fetchone()[0] == 1
 assert connection.execute("SELECT COUNT(*) FROM history WHERE id = 'journey-history'").fetchone()[0] == 1
@@ -272,4 +285,4 @@ assert connection.execute("SELECT COUNT(*) FROM voices WHERE id = 'journey-voice
 connection.close()
 PY
 
-printf 'Verified offline previous-release launch, clean candidate launch, schema-30-to-32 upgrade, and Debian/AppImage profile preservation for soundAr %s.\n' "$VERSION"
+printf 'Verified offline previous-release launch, clean candidate launch, schema-30-to-%s upgrade, and Debian/AppImage profile preservation for soundAr %s.\n' "$EXPECTED_SCHEMA" "$VERSION"
