@@ -86,6 +86,7 @@
       "../../engines/base_stt.py": "runtime/engines/base_stt.py",
       "../../engines/stt/__init__.py": "runtime/engines/stt/__init__.py",
       "../../engines/stt/transformers_stt.py": "runtime/engines/stt/transformers_stt.py",
+      "../../engines/stt/faster_whisper_stt.py": "runtime/engines/stt/faster_whisper_stt.py",
       "../../engines/stt/nemo_stt.py": "runtime/engines/stt/nemo_stt.py",
       "../../engines/stt/cohere_stt.py": "runtime/engines/stt/cohere_stt.py",
       "../../engines/stt/voxtral_stt.py": "runtime/engines/stt/voxtral_stt.py",

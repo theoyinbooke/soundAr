@@ -34,7 +34,7 @@ required_resources=(
   runtime/core/speaker_diarizer.py runtime/core/forced_aligner.py
   runtime/core/music_engine.py runtime/engines/base_music.py runtime/engines/music/__init__.py runtime/engines/music/musicgen.py runtime/engines/music/acestep.py
   runtime/data/engine_manifests.json runtime/engines/tts/chatterbox_turbo_tts.py runtime/engines/tts/breeze_tts.py runtime/engines/tts/fish_speech.py
-  runtime/engines/stt/nemo_stt.py
+  runtime/engines/stt/faster_whisper_stt.py runtime/engines/stt/nemo_stt.py
 )
 
 for resource in "${required_resources[@]}"; do
