@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.1 - 2026-08-28
+
+- Rebuilt Video Studio as a compact, resizable composition workspace with a larger centered portrait canvas, title-only scene rail, collapsible five-lane timeline, top-level export actions, responsive layouts, and exact project/history reopening.
+- Added eight rendered caption treatments, deterministic source-word paging, per-scene caption selection, and direct canvas drag/resize placement that stays synchronized with the source clock from preview through final export.
+- Added durable split, trim, reorder, merge, and visual-layer timeline edits with version checks, idempotent operations, preserved gaps, targeted cache invalidation, and revision-bound undo/redo behavior.
+- Added first-class PNG, JPEG, and WebP illustration layers with crop, fit, fades, pan-and-zoom motion, FFmpeg image-sequence rendering, generated-image provenance, and playable animated-podcast masters.
+- Added app-closed `soundar-desktop agent` video tools so authenticated Codex workflows can register generated visuals, edit timelines, render, export, and retrieve durable projects through the same services as the desktop UI.
+- Bound every visual import to a short-lived, one-use exact-file receipt from the native picker or an authenticated, pinned Codex generation result, including hostile PATH/environment, symlink, hardlink, replacement, replay, and schema-migration defenses.
+- Fixed automatic Codex detection when opening or reopening the Assistant and removed the false “CLI not detected” state that previously required a manual rescan.
+
 ## 0.6.0 - 2026-08-28
 
 - Added a first-class Linux Video Studio for authorized link/local ingest and prompt/audio starts, with internal timestamped transcription, candidate review, scene planning, a source-clock timeline, fast portrait previews, and local MP4/package export.
