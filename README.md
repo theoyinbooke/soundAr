@@ -51,7 +51,7 @@ The installer adds the Debian package and prepares soundAr's managed Python runt
 To install a package built locally:
 
 ```bash
-./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.5.5_amd64.deb
+./install-linux.sh app/src-tauri/target/release/bundle/deb/soundAr_0.6.0_amd64.deb
 ```
 
 ### Storage and updates

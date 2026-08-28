@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-08-28
 
 - Added a first-class Linux Video Studio for authorized link/local ingest and prompt/audio starts, with internal timestamped transcription, candidate review, scene planning, a source-clock timeline, fast portrait previews, and local MP4/package export.
 - Added versioned manifests, project locks, durable cancellable/resumable media jobs, atomic publication, crash recovery, content-addressed scene caches, and Projects/History/Assistant master surfacing.

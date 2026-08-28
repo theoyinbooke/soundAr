@@ -25,7 +25,7 @@ RTF is wall time divided by source duration. Values below 1.0 are faster than re
 
 ## Exact-machine baseline
 
-Release-qualified reference run: `20260828T051916Z-1130289` on 2026-08-28 UTC at benchmark commit `d74a266`. The immutable report SHA-256 is `db2bc22978f84a145c253506bd7c0fbfa19b27c32c932dfa92d9da0e4d5eb2a7`.
+Release-qualified reference run: `20260828T083242Z-1410755` on 2026-08-28 UTC at benchmark commit `766f912`. The immutable report SHA-256 is `0c9b95f57c235ecc45546f6083e4830897ca09c0d2a905ff368002054487c777`.
 
 | Component | Baseline |
 |---|---|
@@ -42,16 +42,16 @@ The benchmark used one 6.000 s moving imported-source fixture and one 7.320 s an
 
 | Stage | Wall time | RTF | Encoder | Peak VRAM | Peak delta |
 |---|---:|---:|---|---:|---:|
-| Imported-source probe | 0.074 s | 0.0124 | n/a | 1,264 MiB | 0 MiB |
-| Podcast-source probe | 0.072 s | 0.0098 | n/a | 1,264 MiB | 0 MiB |
-| 640×360 proxy, cache miss | 0.249 s | 0.0415 | libx264 ultrafast | 1,264 MiB | 0 MiB |
-| 640×360 proxy, validated cache hit | 0.135 s | 0.0225 | no render | n/a | n/a |
-| 540×960 portrait preview | 0.291 s | 0.0485 | libx264 ultrafast | 1,264 MiB | 0 MiB |
-| 1080×1920 imported reel final | 0.857 s | 0.1428 | H.264 NVENC | 1,603 MiB | 339 MiB |
-| 1080×1920 animated podcast final | 0.906 s | 0.1238 | H.264 NVENC | 1,603 MiB | 339 MiB |
-| faster-whisper transcription | 1.905 s | 0.2603 | CUDA FP16 | 1,604 MiB | 340 MiB |
+| Imported-source probe | 0.065 s | 0.0109 | n/a | 1,264 MiB | 0 MiB |
+| Podcast-source probe | 0.080 s | 0.0109 | n/a | 1,264 MiB | 0 MiB |
+| 640×360 proxy, cache miss | 0.231 s | 0.0385 | libx264 ultrafast | 1,264 MiB | 0 MiB |
+| 640×360 proxy, validated cache hit | 0.145 s | 0.0241 | no render | n/a | n/a |
+| 540×960 portrait preview | 0.302 s | 0.0503 | libx264 ultrafast | 1,264 MiB | 0 MiB |
+| 1080×1920 imported reel final | 0.870 s | 0.1450 | H.264 NVENC | 1,603 MiB | 339 MiB |
+| 1080×1920 animated podcast final | 0.895 s | 0.1223 | H.264 NVENC | 1,603 MiB | 339 MiB |
+| faster-whisper transcription | 1.877 s | 0.2564 | CUDA FP16 | 1,636 MiB | 372 MiB |
 
-End-to-end wall time was 7.817 s, including rights-clear fixture generation, all probes, proxy miss/hit, preview, two final renders, CUDA transcription, checksums, FFprobe validation, and first-frame decode checks. All twelve regression checks passed. The test cache hit ratio is intentionally 0.5 because it issues one miss followed by one hit for the same canonical key.
+End-to-end wall time was 7.752 s, including rights-clear fixture generation, all probes, proxy miss/hit, preview, two final renders, CUDA transcription, checksums, FFprobe validation, and first-frame decode checks. All twelve regression checks passed. The test cache hit ratio is intentionally 0.5 because it issues one miss followed by one hit for the same canonical key.
 
 Output validation evidence:
 
@@ -61,7 +61,7 @@ Output validation evidence:
 | Portrait preview | 946,455 | `20c8aa2864cc628339d5bad5aa38f832e34e39eb15ca4aa3d65c229442ce7176` |
 | Imported reel final | 5,189,244 | `2a54d590571ebe73b493c43dd2def6ff84310ad173a9d213f38aa890e59488ac` |
 | Animated podcast final | 828,113 | `a9c92aea3f97dd2fc84d1c8e4877e4da9658c578c80bc42ca24db5aaf6fa1ec9` |
-| Timestamped transcript | 3,140 | `a55909792c42d373f2d7d7ab12701576b33073c4e7b4b8bfe6f3fa0e31d8eae9` |
+| Timestamped transcript | 3,140 | `c49c2a2e74c4273a5caa1a928b4f61f92f5f8ee38d4b57817ab3628d741e47f3` |
 
 These hashes identify this reference run, not universal golden video bytes. FFmpeg, encoder, driver, and muxer updates can legitimately change encoded bytes. The invariant is that a cache hit within one toolchain key exactly matches its miss, and every published output probes and decodes successfully.
 
@@ -98,7 +98,7 @@ scripts/video/run-smoke-benchmark.sh \
 
 The release-qualified run uses the managed transformers environment with faster-whisper 1.2.1, CTranslate2 4.6.0, CUDA FP16, and a content-addressed local conversion of the already installed `openai/whisper-tiny` smoke model. It performs no model lookup or download. The model content fingerprint recorded in the transcript is `fc48c04033b8db32ec42171b709f60d84525472d9fc3fe627fd931ee63976583`.
 
-The result contains two segments and twelve words on the original microsecond clock. With VAD explicitly disabled, it retains a measured 2,320,000 µs gap between the two synthesized phrases. The full child-process wall time is 1.905 s for 7.320 s of audio (RTF 0.2603), with a measured 340 MiB peak VRAM delta. Reproduce it without a model download:
+The result contains two segments and twelve words on the original microsecond clock. With VAD explicitly disabled, it retains a measured 2,320,000 µs gap between the two synthesized phrases. The full child-process wall time is 1.877 s for 7.320 s of audio (RTF 0.2564), with a measured 372 MiB peak VRAM delta. Reproduce it without a model download:
 
 ```bash
 scripts/video/run-smoke-benchmark.sh \
@@ -111,15 +111,15 @@ The gate fails if the transcription is empty, word timing is missing, the source
 
 ## Qualified Whisper/NVENC overlap
 
-Release-qualified overlap run: `20260828T054049Z-1146496`. The immutable `gpu-overlap.json` SHA-256 is `2456adc1bf5c26c16db6e2f3371e73adae397b2afbb812964d5a0904e71b5026`.
+Release-qualified overlap run: `20260828T083304Z-1411913`. The immutable `gpu-overlap.json` SHA-256 is `b65263647d83439539af87072094f64e11309e14681f1a40ec4cb2a2d964c903`.
 
 The overlap gate starts a repeated 60-second 1080×1920 H.264 NVENC final render, waits until the encoder is active, then runs the exact managed `openai/whisper-tiny` CTranslate2 model on CUDA FP16. It continuously samples total VRAM, validates the rendered A/V through FFprobe and first-frame decode, and validates the timestamped transcript and its preserved source-clock gap. Three consecutive repetitions are mandatory.
 
 | Repetition | Process overlap | Render RTF | Transcription RTF | Peak total VRAM | Peak delta |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 2.169 s | 0.0861 | 0.2964 | 1,940 MiB | 676 MiB |
-| 2 | 2.069 s | 0.0868 | 0.2826 | 1,974 MiB | 710 MiB |
-| 3 | 2.019 s | 0.0854 | 0.2758 | 1,974 MiB | 710 MiB |
+| 1 | 2.069 s | 0.0869 | 0.2826 | 1,936 MiB | 672 MiB |
+| 2 | 2.069 s | 0.0856 | 0.2826 | 1,942 MiB | 678 MiB |
+| 3 | 2.122 s | 0.0863 | 0.2899 | 1,938 MiB | 674 MiB |
 
 All repetitions stayed far below the 11,514 MiB usable scheduler budget (12,282 MiB physical minus 768 MiB headroom), retained twelve timestamped words and the intentional gap, and observed 50% peak encoder utilization. Reproduce without network access:
 
