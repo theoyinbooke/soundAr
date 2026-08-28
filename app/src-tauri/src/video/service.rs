@@ -7062,7 +7062,141 @@ mod tests {
             "current-output identity adoption must not duplicate the batch"
         );
 
-        let crash_base = project_expectation(&replay.project).expect("crash batch base");
+        // Variations 1 and 4 intentionally select the same effective layout;
+        // with captions and cards disabled their FFmpeg commands produce
+        // byte-identical media. They are still distinct semantic outputs and
+        // every response/checkpoint must retain the exact stable Store ID.
+        let identical_base =
+            project_expectation(&replay.project).expect("identical-byte batch base");
+        let published_progress = Arc::new(Mutex::new(Vec::<VideoServiceProgress>::new()));
+        let progress_sink = Arc::clone(&published_progress);
+        let progress_callback: ProgressCallback = Arc::new(move |progress| {
+            if progress.phase == "published" {
+                progress_sink
+                    .lock()
+                    .expect("published progress sink")
+                    .push(progress);
+            }
+        });
+        let identical_batch = workspace
+            .service
+            .queue_timeline_render_batch(
+                TimelineRenderBatchRequest {
+                    base: TimelineRenderRequest {
+                        project_id: video_project.clone(),
+                        expected_revision: identical_base.revision,
+                        expected_version_id: identical_base.version_id,
+                        profile: TimelineRenderProfile::Preview,
+                        caption_theme: CaptionTheme::Calm,
+                        portrait_layout: PortraitSourceLayout::CenterCrop,
+                        actor: "service-test".to_string(),
+                        variation: 0,
+                        include_title_cards: false,
+                        include_speaker_cards: false,
+                        burn_captions: false,
+                    },
+                    variations: vec![1, 4],
+                },
+                Some(progress_callback),
+            )
+            .expect("queue identical-byte semantic variations");
+        let identical_result = workspace
+            .service
+            .wait_for_job(
+                &identical_batch.job_id,
+                &video_project,
+                Duration::from_secs(180),
+            )
+            .expect("identical-byte semantic variations complete");
+        let identical_expectation =
+            project_expectation(&identical_result.project).expect("identical batch expectation");
+        let identical_outputs = identical_result
+            .project
+            .get("outputs")
+            .and_then(Value::as_array)
+            .expect("identical batch outputs")
+            .iter()
+            .filter(|output| {
+                output.get("version_id").and_then(Value::as_str)
+                    == Some(identical_expectation.version_id.as_str())
+                    && output.get("job_id").and_then(Value::as_str)
+                        == Some(identical_batch.job_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(identical_outputs.len(), 2);
+        assert_eq!(
+            identical_outputs
+                .iter()
+                .filter_map(|output| output.get("sha256").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "the regression requires byte-identical encoded media"
+        );
+        let identical_ids = identical_outputs
+            .iter()
+            .map(|output| {
+                let provenance = output.get("provenance").expect("variation provenance");
+                let variation = provenance
+                    .get("variation")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                    .expect("variation discriminator");
+                let render_key = provenance
+                    .get("render_cache_key")
+                    .and_then(Value::as_str)
+                    .expect("render cache key");
+                let expected_id =
+                    stable_output_id(&video_project, "timeline-preview", render_key, variation);
+                assert_eq!(
+                    output.get("id").and_then(Value::as_str),
+                    Some(expected_id.as_str())
+                );
+                expected_id
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(identical_ids.len(), 2);
+        let stages = workspace
+            .service
+            .store
+            .list_video_stages(&video_project)
+            .expect("identical batch stages");
+        let checkpoint_ids = stages
+            .iter()
+            .filter(|stage| {
+                stage.get("job_id").and_then(Value::as_str) == Some(identical_batch.job_id.as_str())
+                    && stage.get("stage_key").and_then(Value::as_str) == Some("preview_render")
+                    && stage.get("status").and_then(Value::as_str) == Some("completed")
+            })
+            .filter_map(|stage| {
+                stage
+                    .get("checkpoint")
+                    .and_then(|checkpoint| checkpoint.get("output_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(checkpoint_ids, identical_ids);
+        let progress = published_progress
+            .lock()
+            .expect("published progress")
+            .last()
+            .cloned()
+            .expect("batch published progress");
+        assert_eq!(progress.job_id, identical_batch.job_id);
+        let progress_ids = progress
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.get("outputs"))
+            .and_then(Value::as_array)
+            .expect("published progress outputs")
+            .iter()
+            .filter_map(|output| output.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(progress_ids, identical_ids);
+
+        let crash_base = project_expectation(&identical_result.project).expect("crash batch base");
         let crash_request = TimelineRenderBatchRequest {
             base: TimelineRenderRequest {
                 project_id: video_project.clone(),
@@ -11938,22 +12072,50 @@ impl VideoStudioService {
                     } else {
                         "preview"
                     };
-                    saved
+                    let semantic_role = match render.request.profile {
+                        TimelineRenderProfile::Preview => "timeline-preview",
+                        TimelineRenderProfile::Final => "timeline-final",
+                    };
+                    let expected_id = stable_output_id(
+                        &render.request.project_id,
+                        semantic_role,
+                        &render.render_key,
+                        render.request.variation,
+                    );
+                    let output = saved
                         .iter()
                         .find(|output| {
-                            output.get("version_id").and_then(Value::as_str)
-                                == Some(committed_expectation.version_id.as_str())
-                                && output.get("kind").and_then(Value::as_str) == Some(kind)
-                                && output.get("sha256").and_then(Value::as_str)
-                                    == Some(render.output_sha.as_str())
+                            output.get("id").and_then(Value::as_str)
+                                == Some(expected_id.as_str())
                         })
-                        .cloned()
                         .ok_or_else(|| {
                             VideoServiceError::new(
                                 "video.store_contract_failed",
-                                "An atomically published batch output could not be reloaded",
+                                "An atomically published semantic batch output could not be reloaded",
                             )
-                        })
+                            .details(json!({
+                                "expected_output_id": expected_id,
+                                "variation": render.request.variation,
+                            }))
+                        })?;
+                    if output.get("version_id").and_then(Value::as_str)
+                        != Some(committed_expectation.version_id.as_str())
+                        || output.get("kind").and_then(Value::as_str) != Some(kind)
+                        || output.get("sha256").and_then(Value::as_str)
+                            != Some(render.output_sha.as_str())
+                    {
+                        return Err(VideoServiceError::new(
+                            "video.store_contract_failed",
+                            "An atomically published semantic batch output did not match its prepared artifact",
+                        )
+                        .details(json!({
+                            "expected_output_id": expected_id,
+                            "expected_version_id": committed_expectation.version_id,
+                            "expected_kind": kind,
+                            "expected_sha256": render.output_sha,
+                        })));
+                    }
+                    Ok(output.clone())
                 })
                 .collect::<ServiceResult<Vec<_>>>()?;
             (committed, outputs)
