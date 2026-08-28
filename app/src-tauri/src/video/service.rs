@@ -64,7 +64,7 @@ pub struct VideoServiceError {
 }
 
 impl VideoServiceError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -73,12 +73,12 @@ impl VideoServiceError {
         }
     }
 
-    fn retryable(mut self, value: bool) -> Self {
+    pub fn retryable(mut self, value: bool) -> Self {
         self.retryable = value;
         self
     }
 
-    fn details(mut self, value: Value) -> Self {
+    pub fn details(mut self, value: Value) -> Self {
         self.details = Some(value);
         self
     }
@@ -107,6 +107,69 @@ impl VideoServiceError {
     pub fn stable_message(&self) -> String {
         format!("{}: {}", self.code, self.message)
     }
+}
+
+/// Application-wide GPU admission request. The Video Studio keeps CPU, I/O,
+/// and NVENC accounting in its deterministic local scheduler; RuntimeState can
+/// inject one global gate so resident inference models and video workloads also
+/// share the physical VRAM envelope.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SharedGpuAdmissionRequest {
+    pub job_id: String,
+    pub project_id: String,
+    pub resource_class: ResourceClass,
+    pub requested_vram_mb: u32,
+    pub requested_nvenc_sessions: u8,
+    pub exclusive: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SharedGpuAdmissionWait {
+    pub reason: String,
+    #[serde(default = "default_gpu_retry_after_ms")]
+    pub retry_after_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+fn default_gpu_retry_after_ms() -> u64 {
+    RESOURCE_POLL_INTERVAL.as_millis() as u64
+}
+
+/// Marker for an application-owned GPU lease. Dropping the boxed value must
+/// release its global reservation and wake waiters; the service guarantees the
+/// lease is dropped on success, error, cancellation, and panic unwinding.
+pub trait SharedGpuAdmissionLease: Send {}
+
+pub enum SharedGpuAdmissionOutcome {
+    Admitted(Box<dyn SharedGpuAdmissionLease>),
+    Waiting(SharedGpuAdmissionWait),
+}
+
+impl SharedGpuAdmissionOutcome {
+    pub fn admitted(lease: impl SharedGpuAdmissionLease + 'static) -> Self {
+        Self::Admitted(Box::new(lease))
+    }
+
+    pub fn waiting(reason: impl Into<String>) -> Self {
+        Self::Waiting(SharedGpuAdmissionWait {
+            reason: reason.into(),
+            retry_after_ms: default_gpu_retry_after_ms(),
+            details: None,
+        })
+    }
+}
+
+/// Non-blocking global admission boundary. Implementations must atomically
+/// return either a lease or normal backpressure. The service owns polling,
+/// cancellation, and progress so no RuntimeState lock is held across a sleep.
+pub trait SharedGpuAdmissionGate: Send + Sync {
+    fn try_acquire(
+        &self,
+        request: &SharedGpuAdmissionRequest,
+    ) -> ServiceResult<SharedGpuAdmissionOutcome>;
 }
 
 impl std::fmt::Display for VideoServiceError {
@@ -366,6 +429,7 @@ pub struct VideoStudioService {
     store: Arc<Store>,
     video_root: PathBuf,
     scheduler: Mutex<ResourceScheduler>,
+    gpu_admission_gate: Option<Arc<dyn SharedGpuAdmissionGate>>,
     cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     runtime_cache: Mutex<Option<(Instant, MediaRuntimeStatus)>>,
 }
@@ -816,10 +880,15 @@ impl Drop for ProjectLock<'_> {
 struct SchedulerLease<'a> {
     scheduler: &'a Mutex<ResourceScheduler>,
     job_id: String,
+    shared_gpu_lease: Option<Box<dyn SharedGpuAdmissionLease>>,
 }
 
 impl Drop for SchedulerLease<'_> {
     fn drop(&mut self) {
+        // Release the application-wide GPU reservation before returning local
+        // capacity. This prevents another video worker from observing free
+        // local VRAM while the global reservation is still live.
+        self.shared_gpu_lease.take();
         let _ = self
             .scheduler
             .lock()
@@ -3517,6 +3586,77 @@ mod tests {
         NormalizedRect, ReviewState, ReviewedScene, TimelineGap,
     };
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct RecordingGpuState {
+        active: AtomicUsize,
+        maximum_active: AtomicUsize,
+        attempts: AtomicUsize,
+        releases: AtomicUsize,
+        blocked: AtomicBool,
+        requests: Mutex<Vec<Value>>,
+    }
+
+    struct RecordingGpuGate {
+        state: Arc<RecordingGpuState>,
+    }
+
+    struct RecordingGpuLease {
+        state: Arc<RecordingGpuState>,
+    }
+
+    impl SharedGpuAdmissionLease for RecordingGpuLease {}
+
+    impl Drop for RecordingGpuLease {
+        fn drop(&mut self) {
+            self.state.active.fetch_sub(1, Ordering::AcqRel);
+            self.state.releases.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl SharedGpuAdmissionGate for RecordingGpuGate {
+        fn try_acquire(
+            &self,
+            request: &SharedGpuAdmissionRequest,
+        ) -> ServiceResult<SharedGpuAdmissionOutcome> {
+            self.state.attempts.fetch_add(1, Ordering::AcqRel);
+            self.state
+                .requests
+                .lock()
+                .expect("recording gate requests")
+                .push(serde_json::to_value(request).expect("serializable GPU request"));
+            if self.state.blocked.load(Ordering::Acquire)
+                || self
+                    .state
+                    .active
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                return Ok(SharedGpuAdmissionOutcome::Waiting(SharedGpuAdmissionWait {
+                    reason: "another GPU workload is active".to_string(),
+                    retry_after_ms: 10,
+                    details: Some(json!({ "fake": true })),
+                }));
+            }
+            let active = self.state.active.load(Ordering::Acquire);
+            let mut maximum = self.state.maximum_active.load(Ordering::Acquire);
+            while active > maximum {
+                match self.state.maximum_active.compare_exchange_weak(
+                    maximum,
+                    active,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => maximum = observed,
+                }
+            }
+            Ok(SharedGpuAdmissionOutcome::admitted(RecordingGpuLease {
+                state: Arc::clone(&self.state),
+            }))
+        }
+    }
 
     struct TestWorkspace {
         root: PathBuf,
@@ -3531,6 +3671,19 @@ mod tests {
                 Store::open(root.join("data"), root.join("artifacts")).expect("test store"),
             );
             let service = Arc::new(VideoStudioService::new(store).expect("video service"));
+            Self { root, service }
+        }
+
+        fn with_gpu_gate(gate: Arc<dyn SharedGpuAdmissionGate>) -> Self {
+            let root = std::env::temp_dir().join(format!("soundar-video-service-{}", new_id()));
+            fs::create_dir_all(&root).expect("test workspace");
+            let store = Arc::new(
+                Store::open(root.join("data"), root.join("artifacts")).expect("test store"),
+            );
+            let service = Arc::new(
+                VideoStudioService::new_with_gpu_admission_gate(store, gate)
+                    .expect("video service with shared GPU gate"),
+            );
             Self { root, service }
         }
 
@@ -3725,6 +3878,152 @@ mod tests {
             validate_safe_component(value, "video.invalid_project_id")
                 .expect("ordinary safe component");
         }
+    }
+
+    #[test]
+    fn shared_gpu_gate_serializes_video_work_and_releases_every_lease() {
+        let state = Arc::new(RecordingGpuState::default());
+        let gate = Arc::new(RecordingGpuGate {
+            state: Arc::clone(&state),
+        });
+        let shared_gate: Arc<dyn SharedGpuAdmissionGate> = gate;
+        let workspace = TestWorkspace::with_gpu_gate(shared_gate);
+        let first_cancel = AtomicBool::new(false);
+        let first = workspace
+            .service
+            .acquire_resources(
+                "gpu-video-one",
+                "project-gpu-gate",
+                ResourceRequest::medium_nvenc(),
+                &first_cancel,
+                None,
+            )
+            .expect("first shared GPU lease");
+        assert_eq!(state.active.load(Ordering::Acquire), 1);
+
+        let (acquired_sender, acquired_receiver) = mpsc::channel();
+        let second_service = Arc::clone(&workspace.service);
+        let second = thread::spawn(move || -> ServiceResult<()> {
+            let cancel = AtomicBool::new(false);
+            let lease = second_service.acquire_resources(
+                "gpu-video-two",
+                "project-gpu-gate",
+                ResourceRequest::medium_nvenc(),
+                &cancel,
+                None,
+            )?;
+            acquired_sender.send(()).expect("announce second admission");
+            drop(lease);
+            Ok(())
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.attempts.load(Ordering::Acquire) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "second request did not reach gate"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            acquired_receiver
+                .recv_timeout(Duration::from_millis(75))
+                .is_err(),
+            "the fake global gate must serialize overlapping GPU work"
+        );
+        drop(first);
+        acquired_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second request admitted after RAII release");
+        second
+            .join()
+            .expect("second GPU worker joins")
+            .expect("second GPU work");
+        assert_eq!(state.active.load(Ordering::Acquire), 0);
+        assert_eq!(state.maximum_active.load(Ordering::Acquire), 1);
+        assert_eq!(state.releases.load(Ordering::Acquire), 2);
+
+        let requests = state.requests.lock().expect("recorded requests");
+        let first_request = requests
+            .iter()
+            .find(|request| request.get("job_id").and_then(Value::as_str) == Some("gpu-video-one"))
+            .expect("serialized first request");
+        assert_eq!(first_request.get("resource_class"), Some(&json!("medium")));
+        assert_eq!(first_request.get("requested_vram_mb"), Some(&json!(1_024)));
+        assert_eq!(
+            first_request.get("requested_nvenc_sessions"),
+            Some(&json!(1))
+        );
+        assert_eq!(first_request.get("exclusive"), Some(&json!(false)));
+        drop(requests);
+
+        let attempts_before_cpu = state.attempts.load(Ordering::Acquire);
+        let cpu_cancel = AtomicBool::new(false);
+        let cpu_lease = workspace
+            .service
+            .acquire_resources(
+                "cpu-video-only",
+                "project-gpu-gate",
+                ResourceRequest::light(),
+                &cpu_cancel,
+                None,
+            )
+            .expect("CPU-only work keeps local admission");
+        drop(cpu_lease);
+        assert_eq!(
+            state.attempts.load(Ordering::Acquire),
+            attempts_before_cpu,
+            "CPU-only work must not enter the shared GPU gate"
+        );
+    }
+
+    #[test]
+    fn shared_gpu_wait_is_cancellable_without_leaking_local_capacity() {
+        let state = Arc::new(RecordingGpuState::default());
+        state.blocked.store(true, Ordering::Release);
+        let gate = Arc::new(RecordingGpuGate {
+            state: Arc::clone(&state),
+        });
+        let shared_gate: Arc<dyn SharedGpuAdmissionGate> = gate;
+        let workspace = TestWorkspace::with_gpu_gate(shared_gate);
+        let service = Arc::clone(&workspace.service);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = thread::spawn(move || {
+            service
+                .acquire_resources(
+                    "gpu-video-cancel",
+                    "project-gpu-cancel",
+                    ResourceRequest::medium_nvenc(),
+                    &worker_cancel,
+                    None,
+                )
+                .map(drop)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.attempts.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "blocked request did not reach gate"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        cancel.store(true, Ordering::Release);
+        let error = worker
+            .join()
+            .expect("cancelled GPU worker joins")
+            .expect_err("waiting GPU admission must observe cancellation");
+        assert_eq!(error.code, "video.cancelled");
+        assert_eq!(state.active.load(Ordering::Acquire), 0);
+        assert_eq!(state.releases.load(Ordering::Acquire), 0);
+        let local_usage = workspace
+            .service
+            .scheduler
+            .lock()
+            .expect("local scheduler")
+            .usage();
+        assert_eq!(local_usage.total_jobs(), 0);
+        assert_eq!(local_usage.vram_mb, 0);
+        assert_eq!(local_usage.nvenc_sessions, 0);
     }
 
     #[test]
@@ -4741,6 +5040,17 @@ impl VideoStudioService {
         cancel: &AtomicBool,
         callback: Option<&ProgressCallback>,
     ) -> ServiceResult<SchedulerLease<'a>> {
+        let requires_shared_gpu = request.vram_mb > 0
+            || request.nvenc_sessions > 0
+            || matches!(request.class, ResourceClass::Exclusive);
+        let shared_request = SharedGpuAdmissionRequest {
+            job_id: job_id.to_string(),
+            project_id: project_id.to_string(),
+            resource_class: request.class,
+            requested_vram_mb: request.vram_mb,
+            requested_nvenc_sessions: request.nvenc_sessions,
+            exclusive: matches!(request.class, ResourceClass::Exclusive),
+        };
         let mut last_notice = Instant::now()
             .checked_sub(Duration::from_secs(2))
             .unwrap_or_else(Instant::now);
@@ -4753,10 +5063,52 @@ impl VideoStudioService {
                 .try_acquire(job_id.to_string(), request)?;
             match outcome {
                 AdmissionOutcome::Admitted(_) => {
-                    return Ok(SchedulerLease {
+                    let mut lease = SchedulerLease {
                         scheduler: &self.scheduler,
                         job_id: job_id.to_string(),
-                    });
+                        shared_gpu_lease: None,
+                    };
+                    let Some(gate) = self
+                        .gpu_admission_gate
+                        .as_ref()
+                        .filter(|_| requires_shared_gpu)
+                    else {
+                        return Ok(lease);
+                    };
+                    // No local scheduler mutex is held across this external
+                    // call. Normal backpressure releases the local lease before
+                    // sleeping, preventing lock inversion and capacity hoarding.
+                    self.ensure_not_cancelled(cancel)?;
+                    match gate.try_acquire(&shared_request)? {
+                        SharedGpuAdmissionOutcome::Admitted(shared) => {
+                            lease.shared_gpu_lease = Some(shared);
+                            return Ok(lease);
+                        }
+                        SharedGpuAdmissionOutcome::Waiting(wait) => {
+                            drop(lease);
+                            if last_notice.elapsed() >= Duration::from_secs(1) {
+                                emit_progress(
+                                    callback,
+                                    job_id,
+                                    project_id,
+                                    "waiting_for_gpu",
+                                    0.01,
+                                    "Waiting for shared GPU capacity",
+                                    None,
+                                    Some(json!({
+                                        "request": shared_request,
+                                        "reason": wait.reason,
+                                        "details": wait.details,
+                                    })),
+                                );
+                                last_notice = Instant::now();
+                            }
+                            self.wait_for_resource_retry(
+                                cancel,
+                                Duration::from_millis(wait.retry_after_ms.clamp(10, 250)),
+                            )?;
+                        }
+                    }
                 }
                 AdmissionOutcome::Waiting { blocks } => {
                     if last_notice.elapsed() >= Duration::from_secs(1) {
@@ -4772,9 +5124,25 @@ impl VideoStudioService {
                         );
                         last_notice = Instant::now();
                     }
-                    thread::sleep(RESOURCE_POLL_INTERVAL);
+                    self.wait_for_resource_retry(cancel, RESOURCE_POLL_INTERVAL)?;
                 }
             }
+        }
+    }
+
+    fn wait_for_resource_retry(
+        &self,
+        cancel: &AtomicBool,
+        duration: Duration,
+    ) -> ServiceResult<()> {
+        let deadline = Instant::now() + duration;
+        loop {
+            self.ensure_not_cancelled(cancel)?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(25)));
         }
     }
 
@@ -5196,6 +5564,20 @@ impl VideoStudioService {
 
 impl VideoStudioService {
     pub fn new(store: Arc<Store>) -> ServiceResult<Self> {
+        Self::new_with_optional_gpu_admission_gate(store, None)
+    }
+
+    pub fn new_with_gpu_admission_gate(
+        store: Arc<Store>,
+        gpu_admission_gate: Arc<dyn SharedGpuAdmissionGate>,
+    ) -> ServiceResult<Self> {
+        Self::new_with_optional_gpu_admission_gate(store, Some(gpu_admission_gate))
+    }
+
+    fn new_with_optional_gpu_admission_gate(
+        store: Arc<Store>,
+        gpu_admission_gate: Option<Arc<dyn SharedGpuAdmissionGate>>,
+    ) -> ServiceResult<Self> {
         let video_root = store.video_artifacts_root();
         fs::create_dir_all(&video_root).map_err(|error| {
             VideoServiceError::io(
@@ -5208,6 +5590,7 @@ impl VideoStudioService {
             store,
             video_root,
             scheduler: Mutex::new(ResourceScheduler::for_rtx_4080_laptop()),
+            gpu_admission_gate,
             cancellations: Mutex::new(HashMap::new()),
             runtime_cache: Mutex::new(None),
         })
