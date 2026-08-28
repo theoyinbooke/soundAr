@@ -15,5 +15,11 @@
   "max_stage_peak_delta_vram_mib": {
     "portrait_final_render": 2048,
     "animated_podcast_final_render": 2048
+  },
+  "max_optional_stage_realtime_factor": {
+    "transcription_faster_whisper": 0.8
+  },
+  "max_optional_stage_peak_delta_vram_mib": {
+    "transcription_faster_whisper": 4096
   }
 }

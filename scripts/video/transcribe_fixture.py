@@ -5,9 +5,23 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import sys
 from pathlib import Path
+
+
+def model_fingerprint(model_path: Path) -> str:
+    digest = hashlib.sha256()
+    for name in ("config.json", "model.bin", "tokenizer.json"):
+        path = model_path / name
+        if not path.is_file():
+            raise ValueError(f"local CTranslate2 model is missing {name}")
+        digest.update(name.encode("utf-8"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def main() -> int:
@@ -38,7 +52,13 @@ def main() -> int:
     if device == "auto":
         device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
-    model = WhisperModel(str(model_path), device=device, compute_type=compute_type)
+    model_sha256 = model_fingerprint(model_path)
+    model = WhisperModel(
+        str(model_path),
+        device=device,
+        compute_type=compute_type,
+        local_files_only=True,
+    )
     segments_iter, info = model.transcribe(
         str(audio_path),
         beam_size=5,
@@ -84,8 +104,11 @@ def main() -> int:
         "runtime": {
             "name": "faster-whisper",
             "model": str(model_path),
+            "model_sha256": model_sha256,
             "device": device,
             "compute_type": compute_type,
+            "word_timestamps": True,
+            "vad_filter": False,
         },
         "language": info.language,
         "language_probability": info.language_probability,

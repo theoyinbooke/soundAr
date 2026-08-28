@@ -109,14 +109,14 @@ fi
 stage_dir="$(mktemp -d "$output_dir/.fixture-stage.XXXXXX")"
 speech_mode='flite'
 speech_provenance='Generated locally with FFmpeg lavfi and Flite; no third-party source media'
-if "$ffmpeg_path" -hide_banner -filters 2>/dev/null | grep -Eq '^[[:space:]]*\.\.[[:space:]]+flite[[:space:]]'; then
+if "$ffmpeg_path" -hide_banner -filters 2>/dev/null | grep -E '^[[:space:]]*\.\.[[:space:]]+flite[[:space:]]' >/dev/null; then
   "$ffmpeg_path" \
     -hide_banner -loglevel error -nostdin -n \
-    -f lavfi -i "flite=text='Welcome to sound A R Video Studio.':voice=slt" \
-    -f lavfi -i "anullsrc=r=48000:cl=mono:d=0.80" \
-    -f lavfi -i "flite=text='Your local story stays on your machine.':voice=slt" \
+    -f lavfi -i "flite=text='Welcome to sound A R Video Studio.':voice=kal16" \
+    -f lavfi -i "anullsrc=r=48000:cl=mono:d=2.00" \
+    -f lavfi -i "flite=text='Your local story stays on your machine.':voice=kal16" \
     -filter_complex \
-      '[0:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=mono[a0];[1:a]aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=mono[silence];[2:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=mono[a1];[a0][silence][a1]concat=n=3:v=0:a=1[outa]' \
+      '[0:a]volume=5dB,aresample=48000,aformat=sample_fmts=s16:channel_layouts=mono[a0];[1:a]aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=mono[silence];[2:a]volume=5dB,aresample=48000,aformat=sample_fmts=s16:channel_layouts=mono[a1];[a0][silence][a1]concat=n=3:v=0:a=1[outa]' \
     -map '[outa]' \
     -c:a pcm_s16le \
     "$stage_dir/speech-source.wav"
@@ -126,7 +126,7 @@ else
   "$ffmpeg_path" \
     -hide_banner -loglevel error -nostdin -n \
     -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=2.20' \
-    -f lavfi -i 'anullsrc=r=48000:cl=mono:d=0.80' \
+    -f lavfi -i 'anullsrc=r=48000:cl=mono:d=2.00' \
     -f lavfi -i 'sine=frequency=554.37:sample_rate=48000:duration=2.20' \
     -filter_complex \
       '[0:a]aformat=sample_fmts=s16:channel_layouts=mono[a0];[1:a]aformat=sample_fmts=s16:channel_layouts=mono[silence];[2:a]aformat=sample_fmts=s16:channel_layouts=mono[a1];[a0][silence][a1]concat=n=3:v=0:a=1[outa]' \
@@ -250,7 +250,7 @@ manifest = {
     "timing_contract": {
         "clock": "original_source",
         "unit": "microseconds",
-        "intentional_silence_seconds": 0.8,
+        "intentional_silence_seconds": 2.0,
         "caption_gaps_preserved": True,
     },
     "artifacts": artifacts,

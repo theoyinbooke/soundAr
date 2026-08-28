@@ -201,22 +201,34 @@ def discover_python_runtimes(home: Path) -> list[Path]:
             paths.append(Path(found))
     paths.extend(
         [
+            home / ".local/share/soundar/runtime/.venv/bin/python",
+            home / ".local/share/soundar/runtime/engines/transformers/.venv/bin/python",
             home / ".local/share/soundar/runtimes/faster-whisper/bin/python",
             home / ".local/share/soundAr/runtimes/faster-whisper/bin/python",
             home / ".soundAr/runtimes/faster-whisper/bin/python",
         ]
     )
+    paths.extend(
+        Path(value)
+        for pattern in (
+            home / ".local/share/soundar/runtimes/*/bin/python",
+            home / ".local/share/soundAr/runtimes/*/bin/python",
+            home / ".soundAr/runtimes/*/bin/python",
+        )
+        for value in glob.glob(str(pattern))
+    )
     unique: list[Path] = []
     seen: set[str] = set()
     for path in paths:
         try:
-            resolved = path.resolve(strict=True)
+            candidate = Path(os.path.abspath(path.expanduser()))
+            resolved = candidate.resolve(strict=True)
         except (OSError, RuntimeError):
             continue
-        key = str(resolved)
-        if key not in seen and resolved.is_file() and os.access(resolved, os.X_OK):
+        key = str(candidate)
+        if key not in seen and resolved.is_file() and os.access(candidate, os.X_OK):
             seen.add(key)
-            unique.append(resolved)
+            unique.append(candidate)
     return unique
 
 
@@ -316,6 +328,15 @@ def collect(run_nvenc_smoke: bool) -> dict[str, Any]:
     home = Path.home()
     node_paths = [Path(value) for value in glob.glob(str(home / ".nvm/versions/node/*/bin/node"))]
     node_paths.extend([home / ".local/share/mise/shims/node", home / ".asdf/shims/node"])
+    yt_dlp_paths = [
+        Path(value)
+        for pattern in (
+            home / ".local/share/soundar/runtimes/*/bin/yt-dlp",
+            home / ".local/share/soundAr/runtimes/*/bin/yt-dlp",
+            home / ".soundAr/runtimes/*/bin/yt-dlp",
+        )
+        for value in glob.glob(str(pattern))
+    ]
     deno_paths = [home / ".deno/bin/deno", home / ".local/bin/deno"]
     whisper_paths = [
         home / ".local/bin/whisper-cli",
@@ -330,7 +351,7 @@ def collect(run_nvenc_smoke: bool) -> dict[str, Any]:
         "SOUNDAR_YT_DLP_PATH",
         ["yt-dlp", "yt-dlp_linux"],
         ["--version"],
-        [home / ".local/bin/yt-dlp", Path("/snap/bin/yt-dlp")],
+        [home / ".local/bin/yt-dlp", Path("/snap/bin/yt-dlp"), *yt_dlp_paths],
     )
     node = basic_tool("SOUNDAR_NODE_PATH", ["node"], ["--version"], node_paths)
     deno = basic_tool("SOUNDAR_DENO_PATH", ["deno"], ["--version"], deno_paths)

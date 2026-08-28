@@ -42,7 +42,7 @@ assert second["cache_hit"] is True
 manifest = json.loads((root / "fixture-manifest.json").read_text(encoding="utf-8"))
 assert manifest["rights"]["authorized"] is True
 assert manifest["rights"]["third_party_source_media"] is False
-assert manifest["timing_contract"]["intentional_silence_seconds"] == 0.8
+assert manifest["timing_contract"]["intentional_silence_seconds"] == 2.0
 for artifact in manifest["artifacts"]:
     actual = hashlib.sha256((root / artifact["file"]).read_bytes()).hexdigest()
     assert actual == artifact["sha256"]
@@ -129,11 +129,25 @@ stages = [
     for name in stage_names
 ]
 stages.append({"name": "proxy_render_cache_hit", "wall_seconds": 9.0})
+stages.append(
+    {
+        "name": "transcription_faster_whisper",
+        "status": "passed",
+        "realtime_factor": 9.0,
+        "wall_seconds": 9.0,
+        "gpu": {"peak_delta_vram_mib": 9000},
+    }
+)
 gate = benchmark.evaluate_thresholds(
     script_dir / "performance-thresholds.json", stages, end_to_end_seconds=99.0
 )
 assert gate["passed"] is False
 assert any(not check["passed"] for check in gate["checks"])
+assert any(
+    check["name"] == "transcription_faster_whisper.realtime_factor"
+    and not check["passed"]
+    for check in gate["checks"]
+)
 PY
 
 printf 'Video Studio harness tests passed. Evidence retained at %s\n' "$test_root"

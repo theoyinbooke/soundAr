@@ -601,10 +601,11 @@ def optional_transcription(
         return
     try:
         model = configured_model.expanduser().resolve(strict=True)
-        interpreter = python_path.expanduser().resolve(strict=True)
+        interpreter = python_path.expanduser().absolute()
+        interpreter_target = interpreter.resolve(strict=True)
     except OSError as error:
         raise BenchmarkFailure(f"configured transcription path is invalid: {error}") from error
-    if not model.is_dir() or not interpreter.is_file():
+    if not model.is_dir() or not interpreter_target.is_file():
         raise BenchmarkFailure("transcription model must be a directory and Python must be a file")
     staging = run_dir / "staging" / f".transcript.{uuid.uuid4().hex}.json"
     staging.parent.mkdir(exist_ok=True)
@@ -630,13 +631,29 @@ def optional_transcription(
     transcript = json.loads(staging.read_text(encoding="utf-8"))
     if transcript.get("source_clock", {}).get("unit") != "microseconds":
         raise BenchmarkFailure("transcript did not preserve the source-clock contract")
+    if transcript.get("runtime", {}).get("vad_filter") is not False:
+        raise BenchmarkFailure("transcription did not record VAD-disabled source-clock timing")
+    segments = transcript.get("segments", [])
+    words = [word for segment in segments for word in segment.get("words", [])]
+    if not segments or not words:
+        raise BenchmarkFailure("transcription returned no timestamped speech for the fixture")
+    word_gaps = [
+        max(0, int(current["start_us"]) - int(previous["end_us"]))
+        for previous, current in zip(words, words[1:])
+    ]
+    max_word_gap_us = max(word_gaps, default=0)
+    if max_word_gap_us < 500_000:
+        raise BenchmarkFailure("transcription collapsed the fixture's intentional source-clock gap")
     final = run_dir / "artifacts" / "speech-source.transcript.json"
     os.replace(staging, final)
     record["output"] = {
         "path": str(final),
         "bytes": final.stat().st_size,
         "sha256": sha256_file(final),
-        "segments": len(transcript.get("segments", [])),
+        "segments": len(segments),
+        "words": len(words),
+        "max_word_gap_us": max_word_gap_us,
+        "model_sha256": transcript["runtime"].get("model_sha256"),
         "source_clock": transcript["source_clock"],
     }
     stages.append(record)
@@ -709,6 +726,24 @@ def evaluate_thresholds(
         stage = by_name.get(stage_name)
         actual = stage.get("gpu", {}).get("peak_delta_vram_mib") if stage else None
         check(f"{stage_name}.peak_delta_vram_mib", actual, float(maximum))
+    for stage_name, maximum in thresholds.get("max_optional_stage_realtime_factor", {}).items():
+        stage = by_name.get(stage_name)
+        if stage and stage.get("status") != "skipped":
+            check(
+                f"{stage_name}.realtime_factor",
+                stage.get("realtime_factor"),
+                float(maximum),
+            )
+    for stage_name, maximum in thresholds.get(
+        "max_optional_stage_peak_delta_vram_mib", {}
+    ).items():
+        stage = by_name.get(stage_name)
+        if stage and stage.get("status") != "skipped":
+            check(
+                f"{stage_name}.peak_delta_vram_mib",
+                stage.get("gpu", {}).get("peak_delta_vram_mib"),
+                float(maximum),
+            )
 
     miss = by_name.get("proxy_render_cache_miss", {}).get("wall_seconds")
     hit = by_name.get("proxy_render_cache_hit", {}).get("wall_seconds")
