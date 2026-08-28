@@ -107,7 +107,7 @@ The selected primary runtime is [faster-whisper](https://github.com/SYSTRAN/fast
 
 The current faster-whisper GPU runtime requires CUDA 12 cuBLAS and CUDA 12 cuDNN 9. Keep these libraries inside the managed environment. Do not add global library symlinks.
 
-The following is another explicit networked setup step:
+The following is another explicit networked setup step. These exact CUDA wheel versions match the qualified RTX 4080 runtime:
 
 ```bash
 soundar_whisper_runtime="${XDG_DATA_HOME:-$HOME/.local/share}/soundar/runtimes/faster-whisper-1.2.1"
@@ -117,18 +117,18 @@ mkdir -p "$soundar_whisper_wheels"
 "$soundar_whisper_runtime/bin/python" -m pip download \
   --dest "$soundar_whisper_wheels" \
   'faster-whisper==1.2.1' \
-  'nvidia-cublas-cu12' \
-  'nvidia-cudnn-cu12==9.*'
+  'nvidia-cublas-cu12==12.4.5.8' \
+  'nvidia-cudnn-cu12==9.1.0.70'
 "$soundar_whisper_runtime/bin/python" -m pip install \
   --no-index --find-links "$soundar_whisper_wheels" \
   'faster-whisper==1.2.1' \
-  'nvidia-cublas-cu12' \
-  'nvidia-cudnn-cu12==9.*'
+  'nvidia-cublas-cu12==12.4.5.8' \
+  'nvidia-cudnn-cu12==9.1.0.70'
 sha256sum "$soundar_whisper_wheels"/* >"$soundar_whisper_runtime/wheelhouse.sha256"
 "$soundar_whisper_runtime/bin/python" -m pip freeze --all >"$soundar_whisper_runtime/runtime.lock"
 ```
 
-Before release, replace the two NVIDIA wildcard resolutions with exact versions from `runtime.lock`, rebuild the wheelhouse from those pins, and re-record hashes. The wildcard is shown only for initial compatibility discovery because it is the upstream-supported CUDA 12/cuDNN 9 constraint.
+Keep `runtime.lock` and the wheelhouse hashes with the release evidence. Re-qualification is required before changing CTranslate2, cuBLAS, cuDNN, the driver, or the selected model.
 
 Materialize an audited CTranslate2 model into a local directory using the soundAr model manager or a reviewed offline transfer. Record its upstream revision, license, total bytes, and file hashes. Never pass a Hub model name to the background service: a name can trigger an implicit download. For this 12 GiB GPU, `distil-large-v3` is the throughput-oriented starting profile and `large-v3` is the quality profile; qualify both before changing the default.
 
@@ -175,4 +175,4 @@ scripts/video/test-harness.sh
 scripts/video/run-smoke-benchmark.sh --output-dir evidence/video-studio-performance
 ```
 
-The harness synthesizes all media locally with FFmpeg lavfi, includes an 800 ms speech gap, validates every output through FFprobe and a first-frame decode, measures GPU/VRAM, verifies content-addressed cache reuse, and atomically publishes an immutable JSON report. See [video-studio-performance.md](video-studio-performance.md) for the exact-machine baseline and regression thresholds.
+The harness synthesizes all media locally with FFmpeg lavfi, includes a two-second speech gap, validates every output through FFprobe and a first-frame decode, measures GPU/VRAM, verifies content-addressed cache reuse, and atomically publishes an immutable JSON report. See [video-studio-performance.md](video-studio-performance.md) for the exact-machine baseline and regression thresholds.

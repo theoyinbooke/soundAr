@@ -25,7 +25,7 @@ RTF is wall time divided by source duration. Values below 1.0 are faster than re
 
 ## Exact-machine baseline
 
-Reference run: `20260828T030608Z-946269` on 2026-08-28 UTC at harness commit `45ca914b697c648ab9cf83e99f77e4974aa3d981`. The immutable report SHA-256 is `0bff485d6c684d16d4f43c8f971326001e866873b68e18ec9d87772da8c0b396`.
+Release-qualified reference run: `20260828T051916Z-1130289` on 2026-08-28 UTC at benchmark commit `d74a266`. The immutable report SHA-256 is `db2bc22978f84a145c253506bd7c0fbfa19b27c32c932dfa92d9da0e4d5eb2a7`.
 
 | Component | Baseline |
 |---|---|
@@ -36,21 +36,22 @@ Reference run: `20260828T030608Z-946269` on 2026-08-28 UTC at harness commit `45
 | Driver / VRAM | 595.84 / 12,282 MiB |
 | FFmpeg | 8.0.1-3ubuntu2 |
 | Final encoder | H.264 NVENC (`h264_nvenc`, runtime-smoke verified) |
-| Tool readiness | FFmpeg/FFprobe/NVENC ready; Node 22.23.2 ready; yt-dlp/EJS and transcription runtime not yet installed |
+| Tool readiness | FFmpeg/FFprobe/NVENC ready; Node 22.23.2 ready; faster-whisper 1.2.1/CTranslate2 4.6.0 CUDA ready; yt-dlp 2026.6.9/yt-dlp-ejs 0.8.0 ready |
 
-The benchmark used one 6.000 s moving imported-source fixture and one 5.205 s animated-podcast fixture. Both contain AAC audio; the imported source carries three caption cues with visible source-clock gaps. Final output is 1080×1920.
+The benchmark used one 6.000 s moving imported-source fixture and one 7.320 s animated-podcast fixture. Both contain AAC audio; the imported source carries three caption cues with visible source-clock gaps. The locally synthesized podcast speech contains an explicit two-second silence. Final output is 1080×1920.
 
 | Stage | Wall time | RTF | Encoder | Peak VRAM | Peak delta |
 |---|---:|---:|---|---:|---:|
-| Imported-source probe | 0.074 s | 0.0123 | n/a | 1,264 MiB | 0 MiB |
-| Podcast-source probe | 0.065 s | 0.0125 | n/a | 1,264 MiB | 0 MiB |
-| 640×360 proxy, cache miss | 0.237 s | 0.0394 | libx264 ultrafast | 1,264 MiB | 0 MiB |
-| 640×360 proxy, validated cache hit | 0.139 s | 0.0232 | no render | n/a | n/a |
-| 540×960 portrait preview | 0.300 s | 0.0500 | libx264 ultrafast | 1,264 MiB | 0 MiB |
-| 1080×1920 imported reel final | 0.863 s | 0.1439 | H.264 NVENC | 1,603 MiB | 339 MiB |
-| 1080×1920 animated podcast final | 0.724 s | 0.1393 | H.264 NVENC | 1,603 MiB | 339 MiB |
+| Imported-source probe | 0.074 s | 0.0124 | n/a | 1,264 MiB | 0 MiB |
+| Podcast-source probe | 0.072 s | 0.0098 | n/a | 1,264 MiB | 0 MiB |
+| 640×360 proxy, cache miss | 0.249 s | 0.0415 | libx264 ultrafast | 1,264 MiB | 0 MiB |
+| 640×360 proxy, validated cache hit | 0.135 s | 0.0225 | no render | n/a | n/a |
+| 540×960 portrait preview | 0.291 s | 0.0485 | libx264 ultrafast | 1,264 MiB | 0 MiB |
+| 1080×1920 imported reel final | 0.857 s | 0.1428 | H.264 NVENC | 1,603 MiB | 339 MiB |
+| 1080×1920 animated podcast final | 0.906 s | 0.1238 | H.264 NVENC | 1,603 MiB | 339 MiB |
+| faster-whisper transcription | 1.905 s | 0.2603 | CUDA FP16 | 1,604 MiB | 340 MiB |
 
-End-to-end wall time was 5.058 s, including 1.480 s of rights-clear fixture generation, all probes, proxy miss/hit, preview, two final renders, checksums, FFprobe validation, and first-frame decode checks. All ten regression checks passed. The test cache hit ratio is intentionally 0.5 because it issues one miss followed by one hit for the same canonical key.
+End-to-end wall time was 7.817 s, including rights-clear fixture generation, all probes, proxy miss/hit, preview, two final renders, CUDA transcription, checksums, FFprobe validation, and first-frame decode checks. All twelve regression checks passed. The test cache hit ratio is intentionally 0.5 because it issues one miss followed by one hit for the same canonical key.
 
 Output validation evidence:
 
@@ -59,7 +60,8 @@ Output validation evidence:
 | Proxy / cache-hit payload | 818,731 | `49d9a0e160f5b750b5c4889f9edf865d1914dc9bd20695bac1157841aad7c626` |
 | Portrait preview | 946,455 | `20c8aa2864cc628339d5bad5aa38f832e34e39eb15ca4aa3d65c229442ce7176` |
 | Imported reel final | 5,189,244 | `2a54d590571ebe73b493c43dd2def6ff84310ad173a9d213f38aa890e59488ac` |
-| Animated podcast final | 427,521 | `200c20fc60e9c81d282d48eb853d99e428c71733aad427228bdc6fceaafe86a9` |
+| Animated podcast final | 828,113 | `a9c92aea3f97dd2fc84d1c8e4877e4da9658c578c80bc42ca24db5aaf6fa1ec9` |
+| Timestamped transcript | 3,140 | `a55909792c42d373f2d7d7ab12701576b33073c4e7b4b8bfe6f3fa0e31d8eae9` |
 
 These hashes identify this reference run, not universal golden video bytes. FFmpeg, encoder, driver, and muxer updates can legitimately change encoded bytes. The invariant is that a cache hit within one toolchain key exactly matches its miss, and every published output probes and decodes successfully.
 
@@ -74,8 +76,10 @@ The checked-in thresholds are deliberately wider than the observed baseline. The
 | Proxy cache-miss RTF | 0.15 |
 | Preview RTF | 0.25 |
 | Each final-render RTF | 0.65 |
+| faster-whisper RTF when configured | 0.80 |
 | Cache-hit wall / miss wall | 0.90 |
 | Each final-render VRAM delta | 2,048 MiB |
+| faster-whisper VRAM delta when configured | 4,096 MiB |
 
 The benchmark exits nonzero and records the failed check in `benchmark.json` when any threshold is exceeded. A threshold change requires a new idle-machine baseline, a written explanation, and review; it is not an acceptable way to make a regression disappear.
 
@@ -92,7 +96,9 @@ scripts/video/run-smoke-benchmark.sh \
 
 ## Transcription qualification
 
-The reference run explicitly records `transcription_faster_whisper` as skipped because no managed faster-whisper runtime or local CTranslate2 model was installed. This is visible evidence, not a passing transcription result. The release gate remains incomplete until setup is finished and this succeeds without a model download:
+The release-qualified run uses the managed transformers environment with faster-whisper 1.2.1, CTranslate2 4.6.0, CUDA FP16, and a content-addressed local conversion of the already installed `openai/whisper-tiny` smoke model. It performs no model lookup or download. The model content fingerprint recorded in the transcript is `fc48c04033b8db32ec42171b709f60d84525472d9fc3fe627fd931ee63976583`.
+
+The result contains two segments and twelve words on the original microsecond clock. With VAD explicitly disabled, it retains a measured 2,320,000 µs gap between the two synthesized phrases. The full child-process wall time is 1.905 s for 7.320 s of audio (RTF 0.2603), with a measured 340 MiB peak VRAM delta. Reproduce it without a model download:
 
 ```bash
 scripts/video/run-smoke-benchmark.sh \
@@ -101,7 +107,7 @@ scripts/video/run-smoke-benchmark.sh \
   --faster-whisper-python "$SOUNDAR_FASTER_WHISPER_PYTHON"
 ```
 
-The transcription artifact must use integer microseconds, preserve gaps, include word timing, and run with VAD disabled. Record model revision/hash, device, precision, wall time, RTF, and VRAM. Qualify inference on an otherwise idle GPU before measuring overlap.
+The gate fails if the transcription is empty, word timing is missing, the source-clock gap is collapsed, or VAD-disabled timing is not recorded. It also records model hash, device, precision, wall time, RTF, and VRAM.
 
 Do not infer that NVENC’s 339 MiB render delta makes arbitrary concurrent inference safe. Until measured with the installed model, Whisper remains a heavy/exclusive workload and must not overlap music, image generation, tracking, or another heavy render. A safe-overlap result requires three clean repetitions with no OOM, stable output contracts, peak total VRAM below the scheduler budget, and no stage exceeding its RTF gate.
 
