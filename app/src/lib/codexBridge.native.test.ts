@@ -47,4 +47,25 @@ describe("native Codex bridge discovery", () => {
       "codex_agent_connect",
     ]);
   });
+
+  it("makes one final native connection attempt before reporting a cold install as unavailable", async () => {
+    const unavailable = { available: false, connected: false, message: "Codex CLI was not found." };
+    for (let attempt = 0; attempt < 7; attempt += 1) tauri.invoke.mockResolvedValueOnce(unavailable);
+    tauri.invoke.mockResolvedValueOnce({ connected: true, path: "/opt/codex/bin/codex", version: "codex-cli 0.151.0" });
+
+    const refresh = refreshCodexConnection();
+    await vi.runAllTimersAsync();
+
+    await expect(refresh).resolves.toMatchObject({ available: true, connected: true });
+    expect(tauri.invoke.mock.calls.map(([command]) => command)).toEqual([
+      "codex_agent_status",
+      "codex_agent_status",
+      "codex_agent_status",
+      "codex_agent_status",
+      "codex_agent_status",
+      "codex_agent_status",
+      "codex_agent_status",
+      "codex_agent_connect",
+    ]);
+  });
 });

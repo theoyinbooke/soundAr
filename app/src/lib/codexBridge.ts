@@ -84,8 +84,20 @@ export function refreshCodexConnection(): Promise<CodexStatus> {
       await new Promise((resolve) => window.setTimeout(resolve, delay));
       current = await getCodexStatus();
     }
-    if (current.connected || !current.available) return current;
-    return connectCodex();
+    if (current.connected) return current;
+    try {
+      const connected = await connectCodex();
+      return { ...current, ...connected, available: connected.connected || current.available };
+    } catch (error) {
+      // A final direct connection attempt deliberately repeats native discovery. On a cold
+      // desktop launch the first bounded status scans can miss a shell-managed installation,
+      // while the immediately following native launch sees it (the same sequence the old
+      // manual "Scan again" button performed). Keep genuine connection failures visible once
+      // an installation was found, but preserve the truthful unavailable result when every
+      // native scan still fails.
+      if (current.available) throw error;
+      return current;
+    }
   })();
   codexConnectionRefresh = attempt;
   const clear = () => {
