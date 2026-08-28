@@ -47,7 +47,15 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
     let outputs = record
         .get("outputs")
         .and_then(Value::as_array)
-        .cloned()
+        .map(|outputs| {
+            outputs
+                .iter()
+                .filter(|output| {
+                    output.get("version_id").and_then(Value::as_str) == Some(version_id.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let local_by_id = store_assets
         .iter()
@@ -59,14 +67,17 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
         })
         .collect::<BTreeMap<_, _>>();
 
+    let deliverables = outputs
+        .iter()
+        .map(|output| present_output(output, &project_id, &version_id))
+        .collect::<VideoResult<Vec<_>>>()?;
     let mut artifacts = Vec::new();
     let mut artifact_ids = BTreeSet::new();
-    for output in &outputs {
-        let artifact = present_output(output, &project_id, &version_id)?;
+    for artifact in &deliverables {
         if let Some(id) = artifact.get("id").and_then(Value::as_str) {
             artifact_ids.insert(id.to_string());
         }
-        artifacts.push(artifact);
+        artifacts.push(artifact.clone());
     }
     for artifact in &manifest.render_artifacts {
         if artifact_ids.insert(artifact.id.clone()) {
@@ -93,11 +104,10 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
         }
     }
 
-    let master = outputs
+    let master = deliverables
         .iter()
-        .find(|output| output.get("is_primary").and_then(Value::as_bool) == Some(true))
-        .map(|output| present_output(output, &project_id, &version_id))
-        .transpose()?;
+        .find(|artifact| artifact.get("role").and_then(Value::as_str) == Some("master"))
+        .cloned();
     let source = present_source(
         manifest.source_assets.first(),
         &manifest,
@@ -157,11 +167,17 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
 
     let caption_style = current_caption_style(&manifest);
     let layout = canvas_mode(&manifest);
+    let narration_by_scene = manifest
+        .narration_bindings
+        .iter()
+        .filter_map(|binding| Some((binding.scene_id.as_deref()?, binding)))
+        .collect::<BTreeMap<_, _>>();
     let scenes = manifest
         .reviewed_scenes
         .iter()
         .enumerate()
         .map(|(index, scene)| {
+            let narration = narration_by_scene.get(scene.id.as_str()).copied();
             let source_range = scene.source_range;
             let timeline_end = scene
                 .timeline_start_us
@@ -179,10 +195,36 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "transcript": scene.script,
                 "layout": layout,
                 "crop_mode": scene_crop_mode(&manifest, &scene.id),
+                "crop_rect": scene_crop_rect(&manifest, &scene.id),
                 "captions_enabled": manifest.captions.iter().any(|caption| caption.scene_id.as_deref() == Some(scene.id.as_str())),
                 "caption_style": caption_style,
                 "voice_gain_db": gain_for_track(&manifest, "audio-main"),
                 "music_gain_db": gain_for_track(&manifest, "music-main"),
+                "narration_binding_id": narration.map(|binding| binding.id.as_str()),
+                "narration_history_id": narration.map(|binding| binding.history_id.as_str()),
+                "voice_id": narration.map(|binding| binding.voice_id.as_str()),
+                "model_id": narration.map(|binding| binding.model_id.as_str()),
+                "speaker": narration.map(|binding| binding.speaker.as_str()),
+                "language": narration.map(|binding| binding.language.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let narration_bindings = manifest
+        .narration_bindings
+        .iter()
+        .map(|binding| {
+            json!({
+                "id": binding.id,
+                "scene_id": binding.scene_id,
+                "render_artifact_id": binding.render_artifact_id,
+                "history_id": binding.history_id,
+                "generation_job_id": binding.generation_job_id,
+                "voice_id": binding.voice_id,
+                "model_id": binding.model_id,
+                "speaker": binding.speaker,
+                "language": binding.language,
+                "script_sha256": binding.script_sha256,
+                "created_at": binding.created_at,
             })
         })
         .collect::<Vec<_>>();
@@ -213,11 +255,13 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
         "id": project_id,
         "name": name,
         "status": status,
+        "revision": record.get("revision").and_then(Value::as_i64).unwrap_or_else(|| i64::try_from(manifest.revision).unwrap_or(i64::MAX)),
         "duration_ms": duration_ms,
         "scene_count": manifest.reviewed_scenes.len(),
         "updated_at": updated_at,
         "poster_url": poster_url,
         "master": master,
+        "deliverables": deliverables,
         "created_at": created_at,
         "manifest": {
             "schema_version": 1,
@@ -227,6 +271,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "transcript": transcript_segments,
             "candidates": candidates,
             "scenes": scenes,
+            "narration_bindings": narration_bindings,
             "timeline": timeline,
             "artifacts": artifacts,
             "revisions": revisions,
@@ -382,6 +427,17 @@ fn present_output(
         "playable": mime.starts_with("video/") || mime.starts_with("audio/"),
         "created_at": output.get("created_at").and_then(Value::as_str).unwrap_or("1970-01-01T00:00:00Z"),
     }))
+}
+
+/// Project an already-persisted output through the same playable/downloadable contract used by
+/// full project presentation. Command and assistant adapters use this for publish-package results
+/// without exposing a raw managed filesystem path as their final answer.
+pub fn present_video_output(
+    output: &Value,
+    project_id: &str,
+    default_version_id: &str,
+) -> VideoResult<Value> {
+    present_output(output, project_id, default_version_id)
 }
 
 fn present_manifest_artifact(
@@ -623,6 +679,24 @@ fn scene_crop_mode(manifest: &VideoProjectManifest, scene_id: &str) -> &'static 
     }
 }
 
+fn scene_crop_rect(
+    manifest: &VideoProjectManifest,
+    scene_id: &str,
+) -> Option<super::contracts::NormalizedRect> {
+    manifest
+        .tracks
+        .iter()
+        .filter(|track| {
+            matches!(
+                track.kind,
+                super::contracts::TrackKind::Video | super::contracts::TrackKind::Overlay
+            )
+        })
+        .flat_map(|track| &track.clips)
+        .find(|clip| clip.scene_id.as_deref() == Some(scene_id) && clip.crop.is_some())
+        .and_then(|clip| clip.crop)
+}
+
 fn gain_for_track(manifest: &VideoProjectManifest, track_id: &str) -> f64 {
     manifest
         .audio_mix
@@ -848,13 +922,28 @@ mod tests {
             "version": {"id": "version-1"},
             "manifest": manifest(),
             "assets": [],
-            "outputs": [{
-                "id": "master-1", "version_id": "version-1", "kind": "final_master",
-                "label": "Portrait master", "artifact_path": "/tmp/video-root/master.mp4",
-                "mime_type": "video/mp4", "size_bytes": 42, "sha256": "a".repeat(64),
-                "duration_us": 5_000_000, "width": 1080, "height": 1920,
-                "is_primary": true, "created_at": "2026-08-27T20:01:00Z"
-            }],
+            "outputs": [
+                {
+                    "id": "master-1", "version_id": "version-1", "kind": "final_master",
+                    "label": "Portrait master", "artifact_path": "/tmp/video-root/master.mp4",
+                    "mime_type": "video/mp4", "size_bytes": 42, "sha256": "a".repeat(64),
+                    "duration_us": 5_000_000, "width": 1080, "height": 1920,
+                    "is_primary": true, "created_at": "2026-08-27T20:01:00Z"
+                },
+                {
+                    "id": "variation-2", "version_id": "version-1", "kind": "variation",
+                    "label": "Variation 2", "artifact_path": "/tmp/video-root/variation-2.mp4",
+                    "mime_type": "video/mp4", "size_bytes": 40, "sha256": "b".repeat(64),
+                    "duration_us": 5_000_000, "width": 1080, "height": 1920,
+                    "is_primary": false, "created_at": "2026-08-27T20:01:01Z"
+                },
+                {
+                    "id": "publish-1", "version_id": "version-1", "kind": "publish_package",
+                    "label": "Publish package", "artifact_path": "/tmp/video-root/publish.zip",
+                    "mime_type": "application/zip", "size_bytes": 84, "sha256": "c".repeat(64),
+                    "is_primary": false, "created_at": "2026-08-27T20:01:02Z"
+                }
+            ],
         });
         let presented = present_video_project(&record, Path::new("/tmp/video-root")).unwrap();
         assert_eq!(presented["master"]["role"], "master");
@@ -864,5 +953,39 @@ mod tests {
             "/tmp/video-root/master.mp4"
         );
         assert_eq!(presented["manifest"]["artifacts"][0]["role"], "master");
+        assert_eq!(presented["deliverables"].as_array().unwrap().len(), 3);
+        assert_eq!(presented["deliverables"][1]["role"], "variation");
+        assert_eq!(presented["deliverables"][2]["role"], "publish-package");
+        let summary = present_video_project_summary(&record, Path::new("/tmp/video-root")).unwrap();
+        assert_eq!(summary["deliverables"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_master_from_an_older_version_is_not_presented_as_current() {
+        let record = json!({
+            "id": "video-project",
+            "name": "Thoughtful reel",
+            "revision": 2,
+            "status": "ready",
+            "created_at": "2026-08-27T20:00:00Z",
+            "updated_at": "2026-08-27T20:02:00Z",
+            "version": {"id": "version-2"},
+            "manifest": manifest(),
+            "assets": [],
+            "outputs": [{
+                "id": "master-old", "version_id": "version-1", "kind": "master",
+                "label": "Stale master", "artifact_path": "/tmp/video-root/old.mp4",
+                "mime_type": "video/mp4", "size_bytes": 42, "sha256": "a".repeat(64),
+                "duration_us": 5_000_000, "width": 1080, "height": 1920,
+                "is_primary": true, "created_at": "2026-08-27T20:01:00Z"
+            }],
+        });
+        let presented = present_video_project(&record, Path::new("/tmp/video-root")).unwrap();
+        assert!(presented["master"].is_null());
+        assert!(presented["deliverables"].as_array().unwrap().is_empty());
+        assert!(presented["manifest"]["artifacts"]
+            .as_array()
+            .expect("artifact list")
+            .is_empty());
     }
 }

@@ -33,10 +33,6 @@ impl VideoAgentDispatcher {
         Self { callback }
     }
 
-    pub(crate) fn unavailable() -> Self {
-        Self::new(unavailable_dispatch)
-    }
-
     pub(crate) fn dispatch(
         self,
         runtime: &RuntimeState,
@@ -45,17 +41,6 @@ impl VideoAgentDispatcher {
     ) -> Result<VideoAgentResult, VideoAgentToolError> {
         (self.callback)(runtime, operation, progress)
     }
-}
-
-fn unavailable_dispatch(
-    _runtime: &RuntimeState,
-    _operation: VideoAgentOperation,
-    _progress: Option<video::ProgressCallback>,
-) -> Result<VideoAgentResult, VideoAgentToolError> {
-    Err(VideoAgentToolError::new(
-        "video.agent_dispatch_unavailable",
-        "Video Studio is not connected to the shared native operation dispatcher",
-    ))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -78,6 +63,7 @@ pub(crate) enum VideoAgentOperationKind {
 }
 
 impl VideoAgentOperationKind {
+    #[cfg(test)]
     pub(crate) fn tool_name(self) -> &'static str {
         match self {
             Self::VideoRuntimeStatus => "video_runtime_status",
@@ -442,6 +428,8 @@ pub(crate) struct ScenePatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crop_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop_rect: Option<video::NormalizedRect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captions_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption_style: Option<String>,
@@ -449,6 +437,14 @@ pub(crate) struct ScenePatch {
     pub voice_gain_db: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music_gain_db: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 impl ScenePatch {
@@ -461,6 +457,37 @@ impl ScenePatch {
             return Err(VideoAgentToolError::invalid_field(
                 "scene_patch.layout",
                 "Layout must be portrait, landscape, or square",
+            ));
+        }
+        if self.crop_mode.as_deref() == Some("manual") && self.crop_rect.is_none() {
+            return Err(VideoAgentToolError::invalid_field(
+                "scene_patch.crop_rect",
+                "Manual crop mode requires an explicit normalized crop rectangle",
+            ));
+        }
+        if self.crop_mode.as_deref() != Some("manual") && self.crop_rect.is_some() {
+            return Err(VideoAgentToolError::invalid_field(
+                "scene_patch.crop_rect",
+                "A crop rectangle is valid only with manual crop mode",
+            ));
+        }
+        if self.crop_rect.is_some_and(|rect| {
+            rect.x_bp < 0
+                || rect.y_bp < 0
+                || rect.width_bp <= 0
+                || rect.height_bp <= 0
+                || rect
+                    .x_bp
+                    .checked_add(rect.width_bp)
+                    .is_none_or(|right| right > 10_000)
+                || rect
+                    .y_bp
+                    .checked_add(rect.height_bp)
+                    .is_none_or(|bottom| bottom > 10_000)
+        }) {
+            return Err(VideoAgentToolError::invalid_field(
+                "scene_patch.crop_rect",
+                "The normalized crop rectangle must stay within 0..10000 basis points",
             ));
         }
         if self
@@ -493,6 +520,42 @@ impl ScenePatch {
                     "Audio gain must be between -60 dB and +12 dB",
                 ));
             }
+        }
+        let voice_route = [
+            ("scene_patch.voice_id", self.voice_id.as_deref(), 128_usize),
+            ("scene_patch.model_id", self.model_id.as_deref(), 256),
+            ("scene_patch.speaker", self.speaker.as_deref(), 128),
+            ("scene_patch.language", self.language.as_deref(), 64),
+        ];
+        let supplied = voice_route
+            .iter()
+            .filter(|(_, value, _)| value.is_some())
+            .count();
+        if supplied != 0 && supplied != voice_route.len() {
+            return Err(VideoAgentToolError::invalid_field(
+                "scene_patch.voice_id",
+                "A voice revision must provide voice_id, model_id, speaker, and language together",
+            ));
+        }
+        for (field, value, maximum) in voice_route {
+            if value.is_some_and(|value| value.trim().is_empty() || value.len() > maximum) {
+                return Err(VideoAgentToolError::invalid_field(
+                    field,
+                    "Voice route values must be non-empty and bounded",
+                ));
+            }
+        }
+        if self.language.as_deref().is_some_and(|language| {
+            !language.split('-').all(|part| {
+                !part.is_empty()
+                    && part.len() <= 8
+                    && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        }) {
+            return Err(VideoAgentToolError::invalid_field(
+                "scene_patch.language",
+                "Language must be a BCP-47-style tag",
+            ));
         }
         Ok(())
     }
@@ -710,6 +773,7 @@ impl VideoAgentResult {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn job(
         operation: VideoAgentOperationKind,
         summary: impl Into<String>,
@@ -788,7 +852,7 @@ impl VideoAgentToolError {
     }
 
     fn invalid_field(field: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::new("video.agent_invalid_arguments", message).field(field)
+        Self::new("video.agent_invalid_field", message).field(field)
     }
 
     fn approval(code: impl Into<String>, message: impl Into<String>, field: &str) -> Self {
@@ -1164,10 +1228,25 @@ fn revise_schema() -> Value {
                     "properties": {
                         "layout": {"type":["string","null"],"enum":["portrait","landscape","square",null]},
                         "crop_mode": {"type":["string","null"],"enum":["auto-center","fit","manual",null]},
+                        "crop_rect": {
+                            "type":["object","null"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "x_bp": {"type":"integer","minimum":0,"maximum":9999},
+                                "y_bp": {"type":"integer","minimum":0,"maximum":9999},
+                                "width_bp": {"type":"integer","minimum":1,"maximum":10000},
+                                "height_bp": {"type":"integer","minimum":1,"maximum":10000}
+                            },
+                            "required":["x_bp","y_bp","width_bp","height_bp"]
+                        },
                         "captions_enabled": {"type":["boolean","null"]},
                         "caption_style": {"type":["string","null"],"enum":["clean-white","calm","kinetic",null]},
                         "voice_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12},
-                        "music_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12}
+                        "music_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12},
+                        "voice_id": {"type":["string","null"],"minLength":1,"maxLength":128,"description":"Stable soundAr Voice library id"},
+                        "model_id": {"type":["string","null"],"minLength":1,"maxLength":256,"description":"Installed local TTS model id"},
+                        "speaker": {"type":["string","null"],"minLength":1,"maxLength":128,"description":"Engine speaker selected for this voice"},
+                        "language": {"type":["string","null"],"minLength":1,"maxLength":64,"description":"BCP-47 narration language"}
                     }
                 }),
             ),
@@ -1377,6 +1456,93 @@ mod tests {
         )
         .expect_err("unknown fields must fail closed");
         assert_eq!(error.code, "video.agent_invalid_arguments");
+    }
+
+    #[test]
+    fn voice_revision_route_is_complete_and_exposed_by_the_schema() {
+        let operation = VideoAgentOperation::parse(
+            "revise_video",
+            json!({
+                "project_id": "project-7",
+                "instruction": "Change the voice",
+                "base_version_id": "version-2",
+                "scene_id": "scene-opening",
+                "scene_patch": {
+                    "voice_id": "af_heart",
+                    "model_id": "hexgrad/Kokoro-82M",
+                    "speaker": "af_heart",
+                    "language": "en-US"
+                }
+            }),
+        )
+        .expect("complete voice route");
+        assert_eq!(operation.kind(), VideoAgentOperationKind::ReviseVideo);
+
+        let error = VideoAgentOperation::parse(
+            "revise_video",
+            json!({
+                "project_id": "project-7",
+                "instruction": "Change the voice",
+                "base_version_id": "version-2",
+                "scene_patch": {"voice_id": "af_heart"}
+            }),
+        )
+        .expect_err("partial voice route");
+        assert_eq!(error.code, "video.agent_invalid_field");
+
+        let schema = revise_schema();
+        for field in ["voice_id", "model_id", "speaker", "language"] {
+            assert!(
+                schema
+                    .pointer(&format!("/properties/scene_patch/properties/{field}"))
+                    .is_some(),
+                "missing voice revision schema field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_framing_requires_and_preserves_an_exact_normalized_rectangle() {
+        let missing = VideoAgentOperation::parse(
+            "revise_video",
+            json!({
+                "project_id": "project-7",
+                "instruction": "Frame the speaker manually",
+                "base_version_id": "version-2",
+                "scene_id": "scene-opening",
+                "scene_patch": {"crop_mode": "manual"}
+            }),
+        )
+        .expect_err("manual framing without coordinates must fail closed");
+        assert_eq!(missing.code, "video.agent_invalid_field");
+        assert_eq!(missing.field.as_deref(), Some("scene_patch.crop_rect"));
+
+        let parsed = VideoAgentOperation::parse(
+            "revise_video",
+            json!({
+                "project_id": "project-7",
+                "instruction": "Frame the speaker manually",
+                "base_version_id": "version-2",
+                "scene_id": "scene-opening",
+                "scene_patch": {
+                    "crop_mode": "manual",
+                    "crop_rect": {"x_bp": 1750, "y_bp": 500, "width_bp": 5625, "height_bp": 9000}
+                }
+            }),
+        )
+        .expect("valid manual frame");
+        let VideoAgentOperation::ReviseVideo(request) = parsed else {
+            panic!("expected revise operation");
+        };
+        assert_eq!(
+            request.scene_patch.expect("scene patch").crop_rect,
+            Some(video::NormalizedRect {
+                x_bp: 1_750,
+                y_bp: 500,
+                width_bp: 5_625,
+                height_bp: 9_000,
+            })
+        );
     }
 
     #[test]

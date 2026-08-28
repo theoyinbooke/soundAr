@@ -19,8 +19,8 @@ use std::{
 use tauri::{AppHandle, Emitter};
 
 pub(crate) use video_tools::{
-    VideoAgentDispatcher, VideoAgentOperation, VideoAgentOperationKind, VideoAgentResult,
-    VideoAgentResultStatus, VideoAgentToolError, VideoDispatchCallback,
+    VideoAgentDispatcher, VideoAgentOperation, VideoAgentResult, VideoAgentResultStatus,
+    VideoAgentToolError, VideoDispatchCallback,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -63,13 +63,6 @@ impl AgentAccess {
 }
 
 impl CodexAgentState {
-    pub fn new() -> Self {
-        Self {
-            session: Mutex::new(None),
-            video_dispatcher: VideoAgentDispatcher::unavailable(),
-        }
-    }
-
     /// Connects Codex dynamic tools to the exact dispatcher used by the native Video Studio
     /// commands. Keeping this a function pointer prevents either transport from owning workflow
     /// state or creating a second renderer.
@@ -244,6 +237,24 @@ impl CodexAgentState {
             .map_err(|_| "Codex access lock failed")?
             .insert(thread_id.to_string(), access);
         Ok(())
+    }
+
+    /// Returns true only after this connected app-server session successfully started, resumed,
+    /// or used the exact thread. Native recovery commands use this to avoid exposing saved
+    /// conversation relationships through an arbitrary caller-supplied thread id.
+    pub fn has_registered_thread(&self, thread_id: &str) -> Result<bool, String> {
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| "Codex session lock failed")?
+            .clone()
+            .ok_or("Codex is not connected")?;
+        let registered = session
+            .thread_access
+            .lock()
+            .map_err(|_| "Codex access lock failed")?
+            .contains_key(thread_id);
+        Ok(registered)
     }
 }
 
@@ -469,6 +480,31 @@ fn execute_dynamic_tool(
         .cloned()
         .unwrap_or_else(|| json!({}));
     if video_tools::is_video_tool(tool) {
+        // These identities come from the authenticated app-server envelope. Never accept a
+        // model/tool argument as conversation provenance: that would let a tool call attach its
+        // result to another saved conversation.
+        let turn_id = params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .ok_or_else(|| {
+                VideoAgentToolError::new(
+                    "soundar.tool_turn_missing",
+                    "Dynamic video tool turn identity is missing or invalid",
+                )
+            })?;
+        let call_id = params
+            .get("callId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+            .ok_or_else(|| {
+                VideoAgentToolError::new(
+                    "soundar.tool_call_missing",
+                    "Dynamic video tool call identity is missing or invalid",
+                )
+            })?;
         let operation = VideoAgentOperation::parse(tool, arguments)?;
         let fallback_phase = operation.kind().phase();
         let result = video_dispatcher.dispatch(
@@ -479,6 +515,43 @@ fn execute_dynamic_tool(
                 fallback_phase,
             )),
         )?;
+        if let Some(project_id) = result.project_id.as_deref() {
+            let prominent = result
+                .output
+                .final_master
+                .as_ref()
+                .or(result.output.artifact.as_ref());
+            let output_id = prominent
+                .and_then(|artifact| artifact.get("id"))
+                .and_then(Value::as_str);
+            let relationship = prominent
+                .and_then(|artifact| artifact.get("role"))
+                .and_then(Value::as_str)
+                .filter(|role| {
+                    matches!(
+                        *role,
+                        "preview" | "master" | "variation" | "publish-package"
+                    )
+                })
+                .unwrap_or("project");
+            runtime
+                .store
+                .link_assistant_video_artifact(&json!({
+                    "thread_id": thread_id,
+                    "turn_id": turn_id,
+                    "item_id": call_id,
+                    "project_id": project_id,
+                    "output_id": output_id,
+                    "relationship": relationship,
+                }))
+                .map_err(|error| {
+                    VideoAgentToolError::new(
+                        "video.assistant_link_failed",
+                        "The Video Studio result completed but could not be attached to this saved conversation",
+                    )
+                    .details(json!({ "diagnostic": error }))
+                })?;
+        }
         return serde_json::to_value(result).map_err(|error| {
             VideoAgentToolError::new(
                 "video.agent_result_encode_failed",

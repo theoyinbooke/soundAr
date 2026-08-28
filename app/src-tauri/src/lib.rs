@@ -1,5 +1,7 @@
 mod codex_agent;
 mod store;
+pub mod video;
+mod video_commands;
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -30,6 +32,13 @@ const MAX_RPC_REQUEST_BYTES: usize = 1_048_576;
 const MAX_RPC_RESPONSE_BYTES: u64 = 8_388_608;
 const MAX_BATCH_IMPORT_BYTES: u64 = 8_388_608;
 const GPU_COLD_LOAD_HEADROOM_MB: u64 = 512;
+const SHARED_GPU_HEADROOM_MB: u64 = 768;
+const SHARED_NVENC_SESSION_LIMIT: u8 = 2;
+// The checked-in qualification gate proves only this exact pairing. Keep every
+// larger speech, music, image, tracking, and exclusive workload serialized.
+const QUALIFIED_VIDEO_OVERLAP_ENGINE: &str = "transformers";
+const QUALIFIED_VIDEO_OVERLAP_MODEL: &str = "openai/whisper-tiny";
+const QUALIFIED_VIDEO_OVERLAP_MAX_VIDEO_VRAM_MB: u64 = 2_048;
 
 fn cold_load_needs_idle_reclamation(available_mb: u64, required_mb: u64) -> bool {
     required_mb > 0 && available_mb < required_mb.saturating_add(GPU_COLD_LOAD_HEADROOM_MB)
@@ -60,6 +69,7 @@ struct RuntimeState {
     python_path: PathBuf,
     model_registry_path: PathBuf,
     store: Arc<Store>,
+    video: Arc<video::VideoStudioService>,
     worker_probe_after: Duration,
     codex_agent: Arc<codex_agent::CodexAgentState>,
 }
@@ -76,8 +86,14 @@ struct ActiveSynthesis {
 
 struct InferenceScheduler {
     active_workers: usize,
+    active_gpu_workers: usize,
+    active_qualified_video_overlap_workers: usize,
     active_engines: HashMap<String, usize>,
     reserved_vram_mb: u64,
+    video_reserved_vram_mb: u64,
+    video_nvenc_sessions: u8,
+    active_video_gpu_jobs: HashMap<String, VideoGpuReservation>,
+    exclusive_video_job: Option<String>,
     available_vram_budget_mb: Option<u64>,
     max_workers: usize,
     next_ticket: u64,
@@ -90,7 +106,16 @@ struct SchedulerWaiter {
     priority: i64,
     enqueued_at: Instant,
     reserved_vram_mb: u64,
+    uses_gpu: bool,
+    qualified_video_overlap: bool,
     benchmark_token: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct VideoGpuReservation {
+    vram_mb: u64,
+    nvenc_sessions: u8,
+    exclusive: bool,
 }
 
 struct BenchmarkReservation {
@@ -98,6 +123,25 @@ struct BenchmarkReservation {
     engine: String,
     remaining_admissions: usize,
     expires_at: Instant,
+}
+
+fn new_inference_scheduler(max_workers: usize) -> InferenceScheduler {
+    InferenceScheduler {
+        active_workers: 0,
+        active_gpu_workers: 0,
+        active_qualified_video_overlap_workers: 0,
+        active_engines: HashMap::new(),
+        reserved_vram_mb: 0,
+        video_reserved_vram_mb: 0,
+        video_nvenc_sessions: 0,
+        active_video_gpu_jobs: HashMap::new(),
+        exclusive_video_job: None,
+        available_vram_budget_mb: None,
+        max_workers,
+        next_ticket: 0,
+        waiters: Vec::new(),
+        benchmark_reservation: None,
+    }
 }
 
 fn scheduler_rank(waiter: &SchedulerWaiter, now: Instant) -> (i64, std::cmp::Reverse<u64>) {
@@ -112,7 +156,28 @@ struct SchedulerLease {
     scheduler: Arc<(Mutex<InferenceScheduler>, Condvar)>,
     engine: String,
     reserved_vram_mb: u64,
+    uses_gpu: bool,
+    qualified_video_overlap: bool,
     benchmark_token: Option<String>,
+}
+
+struct GlobalVideoGpuGate {
+    scheduler: Arc<(Mutex<InferenceScheduler>, Condvar)>,
+    python_path: PathBuf,
+    observation: Mutex<Option<GpuObservation>>,
+}
+
+#[derive(Clone, Copy)]
+struct GpuObservation {
+    observed_at: Instant,
+    cuda: bool,
+    total_mb: u64,
+    available_mb: u64,
+}
+
+struct GlobalVideoGpuLease {
+    scheduler: Arc<(Mutex<InferenceScheduler>, Condvar)>,
+    job_id: String,
 }
 
 struct BatchCoordinatorLease {
@@ -133,6 +198,14 @@ impl Drop for SchedulerLease {
         let (lock, changed) = &*self.scheduler;
         if let Ok(mut scheduler) = lock.lock() {
             scheduler.active_workers = scheduler.active_workers.saturating_sub(1);
+            if self.uses_gpu {
+                scheduler.active_gpu_workers = scheduler.active_gpu_workers.saturating_sub(1);
+            }
+            if self.qualified_video_overlap {
+                scheduler.active_qualified_video_overlap_workers = scheduler
+                    .active_qualified_video_overlap_workers
+                    .saturating_sub(1);
+            }
             if let Some(active) = scheduler.active_engines.get_mut(&self.engine) {
                 *active = active.saturating_sub(1);
                 if *active == 0 {
@@ -155,6 +228,223 @@ impl Drop for SchedulerLease {
                     if benchmark.remaining_admissions == 0 {
                         scheduler.benchmark_reservation = None;
                     }
+                }
+            }
+            changed.notify_all();
+        }
+    }
+}
+
+impl GlobalVideoGpuGate {
+    fn new(scheduler: Arc<(Mutex<InferenceScheduler>, Condvar)>, python_path: PathBuf) -> Self {
+        Self {
+            scheduler,
+            python_path,
+            observation: Mutex::new(None),
+        }
+    }
+
+    fn gpu_observation(&self) -> GpuObservation {
+        let mut cached = self
+            .observation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(observation) = *cached {
+            if observation.observed_at.elapsed() < Duration::from_millis(500) {
+                return observation;
+            }
+        }
+        let status = gpu_status(&self.python_path);
+        let total_mb = status
+            .get("vram_total_mb")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let used_mb = status
+            .get("vram_used_mb")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let observation = GpuObservation {
+            observed_at: Instant::now(),
+            cuda: status.get("cuda_available").and_then(Value::as_bool) == Some(true),
+            total_mb,
+            available_mb: total_mb.saturating_sub(used_mb),
+        };
+        *cached = Some(observation);
+        observation
+    }
+}
+
+fn video_request_supports_qualified_whisper_overlap(
+    request: &video::SharedGpuAdmissionRequest,
+) -> bool {
+    !request.exclusive
+        && request.requested_nvenc_sessions == 1
+        && u64::from(request.requested_vram_mb) <= QUALIFIED_VIDEO_OVERLAP_MAX_VIDEO_VRAM_MB
+        && matches!(
+            request.resource_class,
+            video::ResourceClass::Medium | video::ResourceClass::Heavy
+        )
+}
+
+fn active_video_jobs_support_qualified_whisper_overlap(scheduler: &InferenceScheduler) -> bool {
+    scheduler.active_video_gpu_jobs.len() == 1
+        && scheduler.video_nvenc_sessions == 1
+        && scheduler.active_video_gpu_jobs.values().all(|reservation| {
+            !reservation.exclusive
+                && reservation.nvenc_sessions == 1
+                && reservation.vram_mb <= QUALIFIED_VIDEO_OVERLAP_MAX_VIDEO_VRAM_MB
+        })
+}
+
+fn request_supports_qualified_video_overlap(
+    operation: &str,
+    engine: &str,
+    model_id: Option<&str>,
+) -> bool {
+    operation == "transcribe"
+        && engine == QUALIFIED_VIDEO_OVERLAP_ENGINE
+        && model_id == Some(QUALIFIED_VIDEO_OVERLAP_MODEL)
+}
+
+impl video::SharedGpuAdmissionGate for GlobalVideoGpuGate {
+    fn try_acquire(
+        &self,
+        request: &video::SharedGpuAdmissionRequest,
+    ) -> video::ServiceResult<video::SharedGpuAdmissionOutcome> {
+        let observation = self.gpu_observation();
+        let (lock, _) = &*self.scheduler;
+        let mut scheduler = lock.lock().map_err(|_| {
+            video::VideoServiceError::new(
+                "video.gpu_scheduler_unavailable",
+                "The shared GPU scheduler lock failed",
+            )
+            .retryable(true)
+        })?;
+        if scheduler
+            .active_video_gpu_jobs
+            .contains_key(&request.job_id)
+        {
+            return Err(video::VideoServiceError::new(
+                "video.gpu_duplicate_lease",
+                "The Video Studio task already owns shared GPU capacity",
+            ));
+        }
+
+        let waiting = |reason: &str, details: Value| {
+            video::SharedGpuAdmissionOutcome::Waiting(video::SharedGpuAdmissionWait {
+                reason: reason.to_string(),
+                retry_after_ms: 100,
+                details: Some(details),
+            })
+        };
+        if scheduler.exclusive_video_job.is_some() {
+            return Ok(waiting(
+                "another exclusive video workload is active",
+                json!({ "exclusive_job": scheduler.exclusive_video_job }),
+            ));
+        }
+        let qualified_active_inference = scheduler.active_gpu_workers == 1
+            && scheduler.active_qualified_video_overlap_workers == 1
+            && video_request_supports_qualified_whisper_overlap(request);
+        if scheduler.active_gpu_workers > 0 && !qualified_active_inference {
+            return Ok(waiting(
+                "GPU inference is active outside the measured Whisper/NVENC overlap envelope",
+                json!({
+                    "active_gpu_inference_jobs": scheduler.active_gpu_workers,
+                    "qualified_overlap_jobs": scheduler.active_qualified_video_overlap_workers,
+                }),
+            ));
+        }
+        if !scheduler.waiters.is_empty() {
+            return Ok(waiting(
+                "an earlier inference task is waiting for GPU capacity",
+                json!({ "waiting_inference_jobs": scheduler.waiters.len() }),
+            ));
+        }
+        if request.exclusive && !scheduler.active_video_gpu_jobs.is_empty() {
+            return Ok(waiting(
+                "exclusive GPU work requires all video workloads to finish",
+                json!({ "active_video_jobs": scheduler.active_video_gpu_jobs.len() }),
+            ));
+        }
+        let requested_vram_mb = u64::from(request.requested_vram_mb);
+        let combined_vram_mb = scheduler
+            .reserved_vram_mb
+            .saturating_add(scheduler.video_reserved_vram_mb)
+            .saturating_add(requested_vram_mb);
+        if observation.cuda
+            && (combined_vram_mb.saturating_add(SHARED_GPU_HEADROOM_MB) > observation.total_mb
+                || requested_vram_mb.saturating_add(SHARED_GPU_HEADROOM_MB)
+                    > observation.available_mb)
+        {
+            return Ok(waiting(
+                "insufficient safe free VRAM",
+                json!({
+                    "requested_vram_mb": requested_vram_mb,
+                    "reserved_vram_mb": scheduler.reserved_vram_mb + scheduler.video_reserved_vram_mb,
+                    "available_vram_mb": observation.available_mb,
+                    "headroom_mb": SHARED_GPU_HEADROOM_MB,
+                }),
+            ));
+        }
+        if scheduler
+            .video_nvenc_sessions
+            .saturating_add(request.requested_nvenc_sessions)
+            > SHARED_NVENC_SESSION_LIMIT
+        {
+            return Ok(waiting(
+                "the safe NVENC session envelope is full",
+                json!({
+                    "active_nvenc_sessions": scheduler.video_nvenc_sessions,
+                    "limit": SHARED_NVENC_SESSION_LIMIT,
+                }),
+            ));
+        }
+
+        let reservation = VideoGpuReservation {
+            vram_mb: requested_vram_mb,
+            nvenc_sessions: request.requested_nvenc_sessions,
+            exclusive: request.exclusive,
+        };
+        scheduler
+            .active_video_gpu_jobs
+            .insert(request.job_id.clone(), reservation);
+        scheduler.video_reserved_vram_mb = scheduler
+            .video_reserved_vram_mb
+            .saturating_add(reservation.vram_mb);
+        scheduler.video_nvenc_sessions = scheduler
+            .video_nvenc_sessions
+            .saturating_add(reservation.nvenc_sessions);
+        if reservation.exclusive {
+            scheduler.exclusive_video_job = Some(request.job_id.clone());
+        }
+        Ok(video::SharedGpuAdmissionOutcome::admitted(
+            GlobalVideoGpuLease {
+                scheduler: Arc::clone(&self.scheduler),
+                job_id: request.job_id.clone(),
+            },
+        ))
+    }
+}
+
+impl video::SharedGpuAdmissionLease for GlobalVideoGpuLease {}
+
+impl Drop for GlobalVideoGpuLease {
+    fn drop(&mut self) {
+        let (lock, changed) = &*self.scheduler;
+        if let Ok(mut scheduler) = lock.lock() {
+            if let Some(reservation) = scheduler.active_video_gpu_jobs.remove(&self.job_id) {
+                scheduler.video_reserved_vram_mb = scheduler
+                    .video_reserved_vram_mb
+                    .saturating_sub(reservation.vram_mb);
+                scheduler.video_nvenc_sessions = scheduler
+                    .video_nvenc_sessions
+                    .saturating_sub(reservation.nvenc_sessions);
+                if scheduler.exclusive_video_job.as_deref() == Some(self.job_id.as_str()) {
+                    scheduler.exclusive_video_job = None;
+                }
+                if scheduler.active_workers == 0 && scheduler.active_video_gpu_jobs.is_empty() {
+                    scheduler.available_vram_budget_mb = None;
                 }
             }
             changed.notify_all();
@@ -331,21 +621,24 @@ impl RuntimeState {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4)
             .clamp(1, 8);
+        let store = Arc::new(store);
+        let scheduler = Arc::new((
+            Mutex::new(new_inference_scheduler(max_workers)),
+            Condvar::new(),
+        ));
+        let shared_gpu_gate: Arc<dyn video::SharedGpuAdmissionGate> = Arc::new(
+            GlobalVideoGpuGate::new(Arc::clone(&scheduler), python_path.clone()),
+        );
+        let video = Arc::new(
+            video::VideoStudioService::new_with_gpu_admission_gate(
+                Arc::clone(&store),
+                shared_gpu_gate,
+            )
+            .expect("Store initialization guarantees writable video artifact storage"),
+        );
         Self {
             worker_pool: Arc::new(Mutex::new(Vec::new())),
-            scheduler: Arc::new((
-                Mutex::new(InferenceScheduler {
-                    active_workers: 0,
-                    active_engines: HashMap::new(),
-                    reserved_vram_mb: 0,
-                    available_vram_budget_mb: None,
-                    max_workers,
-                    next_ticket: 0,
-                    waiters: Vec::new(),
-                    benchmark_reservation: None,
-                }),
-                Condvar::new(),
-            )),
+            scheduler,
             setup_lock: Arc::new(Mutex::new(())),
             model_operation_lock: Arc::new(Mutex::new(())),
             active_download: Arc::new(Mutex::new(None)),
@@ -357,13 +650,16 @@ impl RuntimeState {
             runtime_root,
             python_path,
             model_registry_path,
-            store: Arc::new(store),
+            store,
+            video,
             worker_probe_after: env::var("SOUNDAR_WORKER_PROBE_AFTER_MS")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(Duration::from_secs(30)),
-            codex_agent: Arc::new(codex_agent::CodexAgentState::new()),
+            codex_agent: Arc::new(codex_agent::CodexAgentState::with_video_dispatcher(
+                video_commands::dispatch_video_operation,
+            )),
         }
     }
 
@@ -535,7 +831,8 @@ impl RuntimeState {
 
     fn start_process(&self, engine: &str) -> Result<PythonProcess, String> {
         let (python_path, isolated) = self.engine_python_path(engine);
-        let mut child = Command::new(&python_path)
+        let mut command = Command::new(&python_path);
+        command
             .arg(self.runtime_root.join("bridge.py"))
             .arg("--serve")
             .current_dir(&self.runtime_root)
@@ -546,7 +843,13 @@ impl RuntimeState {
             .env(
                 "SOUNDAR_ENGINE_RUNTIME",
                 if isolated { "layered" } else { "legacy-shared" },
-            )
+            );
+        if engine == "transformers" {
+            if let Some(library_path) = managed_cuda_library_path(&app_data_dir())? {
+                command.env("LD_LIBRARY_PATH", library_path);
+            }
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -625,6 +928,11 @@ impl RuntimeState {
             .and_then(Value::as_str)
             .unwrap_or("synthesize")
             .to_string();
+        let qualified_video_overlap = request_supports_qualified_video_overlap(
+            &operation,
+            &requested_engine,
+            request.get("model_id").and_then(Value::as_str),
+        );
         if let (Some(job_id), Some(object)) = (job_id, request.as_object_mut()) {
             object.insert("_job_id".to_string(), json!(job_id));
         }
@@ -637,6 +945,7 @@ impl RuntimeState {
             job_id,
             priority,
             benchmark_token.as_deref(),
+            qualified_video_overlap,
         )?;
         let mut worker_state = if existing.is_some() { "warm" } else { "cold" };
         if let Some(job_id) = job_id {
@@ -961,8 +1270,15 @@ impl RuntimeState {
             .len();
         Ok(json!({
             "active_workers": scheduler.active_workers,
+            "active_gpu_workers": scheduler.active_gpu_workers,
+            "active_qualified_video_overlap_workers": scheduler.active_qualified_video_overlap_workers,
             "max_workers": scheduler.max_workers,
-            "reserved_vram_mb": scheduler.reserved_vram_mb,
+            "reserved_vram_mb": scheduler.reserved_vram_mb.saturating_add(scheduler.video_reserved_vram_mb),
+            "inference_reserved_vram_mb": scheduler.reserved_vram_mb,
+            "video_reserved_vram_mb": scheduler.video_reserved_vram_mb,
+            "active_video_gpu_jobs": scheduler.active_video_gpu_jobs.len(),
+            "video_nvenc_sessions": scheduler.video_nvenc_sessions,
+            "exclusive_video_job": scheduler.exclusive_video_job,
             "available_vram_budget_mb": scheduler.available_vram_budget_mb,
             "active_batches": active_batches,
             "waiting_jobs": scheduler.waiters.len(),
@@ -983,6 +1299,7 @@ impl RuntimeState {
         job_id: Option<&str>,
         priority: i64,
         benchmark_token: Option<&str>,
+        qualified_video_overlap: bool,
     ) -> Result<(SchedulerLease, Option<PythonProcess>), String> {
         let model_reservation = self.engine_minimum_vram(engine)?;
         let (lock, changed) = &*self.scheduler;
@@ -1009,6 +1326,8 @@ impl RuntimeState {
             priority,
             enqueued_at: Instant::now(),
             reserved_vram_mb: model_reservation,
+            uses_gpu: model_reservation > 0,
+            qualified_video_overlap,
             benchmark_token: benchmark_token.map(str::to_string),
         });
         loop {
@@ -1070,8 +1389,13 @@ impl RuntimeState {
                 scheduler.max_workers
             };
             let active_for_engine = scheduler.active_engines.get(engine).copied().unwrap_or(0);
+            let video_overlap_available = scheduler.active_video_gpu_jobs.is_empty()
+                || (qualified_video_overlap
+                    && scheduler.active_gpu_workers == 0
+                    && active_video_jobs_support_qualified_whisper_overlap(&scheduler));
             let capacity = scheduler.active_workers < scheduler.max_workers
-                && active_for_engine < engine_limit;
+                && active_for_engine < engine_limit
+                && (model_reservation == 0 || video_overlap_available);
             if cuda && reservation > 0 && total < reservation {
                 scheduler.waiters.retain(|waiter| waiter.ticket != ticket);
                 changed.notify_all();
@@ -1079,13 +1403,17 @@ impl RuntimeState {
                     "{engine} requires at least {reservation} MB VRAM, but this GPU reports {total} MB"
                 ));
             }
-            let can_reclaim_idle_memory = scheduler.active_workers == 0;
+            let can_reclaim_idle_memory =
+                scheduler.active_workers == 0 && scheduler.active_video_gpu_jobs.is_empty();
+            let total_reserved_vram = scheduler
+                .reserved_vram_mb
+                .saturating_add(scheduler.video_reserved_vram_mb);
             let memory = !cuda
                 || reservation == 0
                 || can_reclaim_idle_memory
-                || budget >= scheduler.reserved_vram_mb.saturating_add(reservation);
+                || budget >= total_reserved_vram.saturating_add(reservation);
             let now = Instant::now();
-            let available_memory = budget.saturating_sub(scheduler.reserved_vram_mb);
+            let available_memory = budget.saturating_sub(total_reserved_vram);
             let next_ticket = scheduler
                 .waiters
                 .iter()
@@ -1099,6 +1427,11 @@ impl RuntimeState {
                                     && engine == reservation.engine
                             });
                     reservation_match
+                        && (!waiter.uses_gpu
+                            || scheduler.active_video_gpu_jobs.is_empty()
+                            || (waiter.qualified_video_overlap
+                                && scheduler.active_gpu_workers == 0
+                                && active_video_jobs_support_qualified_whisper_overlap(&scheduler)))
                         && (!cuda
                             || waiter.reserved_vram_mb == 0
                             || can_reclaim_idle_memory
@@ -1109,6 +1442,12 @@ impl RuntimeState {
             if capacity && memory && next_ticket == Some(ticket) {
                 scheduler.waiters.retain(|waiter| waiter.ticket != ticket);
                 scheduler.active_workers += 1;
+                if model_reservation > 0 && cuda {
+                    scheduler.active_gpu_workers += 1;
+                }
+                if model_reservation > 0 && cuda && qualified_video_overlap {
+                    scheduler.active_qualified_video_overlap_workers += 1;
+                }
                 *scheduler
                     .active_engines
                     .entry(engine.to_string())
@@ -1122,6 +1461,10 @@ impl RuntimeState {
                         scheduler: Arc::clone(&self.scheduler),
                         engine: engine.to_string(),
                         reserved_vram_mb: reservation,
+                        uses_gpu: model_reservation > 0 && cuda,
+                        qualified_video_overlap: model_reservation > 0
+                            && cuda
+                            && qualified_video_overlap,
                         benchmark_token: benchmark_token.map(str::to_string),
                     },
                     process,
@@ -3266,6 +3609,65 @@ fn app_data_dir() -> PathBuf {
         .join("soundar/runtime")
 }
 
+fn managed_cuda_library_path(
+    runtime_data_root: &Path,
+) -> Result<Option<std::ffi::OsString>, String> {
+    let venv_lib = runtime_data_root.join(".venv/lib");
+    let entries = match fs::read_dir(&venv_lib) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect the managed CUDA runtime at {}: {error}",
+                venv_lib.display()
+            ))
+        }
+    };
+    let canonical_root = fs::canonicalize(runtime_data_root).map_err(|error| {
+        format!(
+            "Could not validate the managed runtime directory {}: {error}",
+            runtime_data_root.display()
+        )
+    })?;
+    let mut python_dirs = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("python"))
+        })
+        .collect::<Vec<_>>();
+    python_dirs.sort();
+
+    let mut library_dirs = Vec::new();
+    for python_dir in python_dirs {
+        for package in ["cublas", "cudnn"] {
+            let candidate = python_dir
+                .join("site-packages/nvidia")
+                .join(package)
+                .join("lib");
+            let Ok(canonical) = fs::canonicalize(&candidate) else {
+                continue;
+            };
+            if canonical.starts_with(&canonical_root) && canonical.is_dir() {
+                library_dirs.push(canonical);
+            }
+        }
+    }
+    if library_dirs.is_empty() {
+        return Ok(None);
+    }
+    library_dirs.extend(
+        env::var_os("LD_LIBRARY_PATH")
+            .iter()
+            .flat_map(env::split_paths),
+    );
+    env::join_paths(library_dirs)
+        .map(Some)
+        .map_err(|error| format!("Could not prepare the managed CUDA library path: {error}"))
+}
+
 fn product_state_dir() -> PathBuf {
     home_dir().join(".soundAr/state")
 }
@@ -3512,6 +3914,7 @@ fn bootstrap_state(state: tauri::State<'_, RuntimeState>) -> Result<Value, Strin
         "settings": settings,
         "features": {
             "generate": "stable",
+            "video": "stable",
             "projects": "beta",
             "models": "beta",
             "voices": "beta",
@@ -5856,6 +6259,20 @@ fn codex_agent_disconnect(state: tauri::State<'_, RuntimeState>) -> Result<bool,
 }
 
 #[tauri::command]
+fn assistant_video_thread_link(
+    state: tauri::State<'_, RuntimeState>,
+    thread_id: String,
+) -> Result<Option<Value>, String> {
+    if !state.codex_agent.has_registered_thread(&thread_id)? {
+        return Err(
+            "soundar.thread_not_registered: Resume the exact assistant task before restoring its Video Studio result"
+                .into(),
+        );
+    }
+    state.store.latest_assistant_video_artifact(&thread_id)
+}
+
+#[tauri::command]
 fn codex_agent_request(
     state: tauri::State<'_, RuntimeState>,
     method: String,
@@ -5887,13 +6304,13 @@ fn codex_agent_request(
             );
             object.insert("dynamicTools".into(), codex_agent::dynamic_tools());
             object.entry("developerInstructions").or_insert_with(|| json!(
-                "You are soundAr's creative producer, not merely a command parser. Help the user turn an incomplete goal into an executable brief; research outside the studio with Codex capabilities when the selected access permits it; draft the required scripts, lyrics, directions, and project structure; and use the provided soundAr tools to create speech, music, batches, projects, and revisions end to end. Inspect studio state before choosing model or voice identifiers. State a concise plan, execute it, monitor durable jobs, and report playable output artifacts. For a multi-part project, save the project with every completed chapter history_id, then call export_project_master and report completion only after that tool returns a registered playable master; never assemble project audio with shell commands or expose an unregistered raw path. Treat follow-up feedback as a revision request and preserve the user's intent across turns. Never install Codex or modify soundAr application code. Ask only for genuinely blocking choices and always ask before destructive actions."
+                "You are soundAr's creative producer, not merely a command parser. Help the user turn an incomplete goal into an executable brief; research outside the studio with Codex capabilities when the selected access permits it; draft the required scripts, lyrics, directions, and project structure; and use the provided soundAr tools to create speech, music, batches, projects, videos, and revisions end to end. Inspect studio state before choosing model or voice identifiers. State a concise plan, execute it, monitor durable jobs, and report registered playable output artifacts. For a multi-part audio project, save the project with every completed chapter history_id, then call export_project_master and report completion only after that tool returns a registered playable master. For Video Studio work, use the shared Video Studio tools rather than shell media commands. Call preview_link before import_link; never assert media rights or set any rights or approval confirmation unless the user explicitly authorized the exact canonical URL or action; keep link intake to one source by default. Present progress at Source, Analyze, Plan & revise, Preview, and Export level without flooding the conversation, poll durable jobs through their project/job tools, and after export call get_video_project so the registered playable final master is the prominent final result rather than a scene artifact or raw path. Treat follow-up video feedback as revise_video against the exact base version and rerender only invalidated stages. Never assemble project media with shell commands, expose an unregistered raw path, install Codex, or modify soundAr application code. Ask only for genuinely blocking choices and always ask before destructive actions."
             ));
         }
     } else if method == "thread/resume" {
         if let Some(object) = params.as_object_mut() {
             object.entry("developerInstructions").or_insert_with(|| json!(
-                "Continue as soundAr's creative producer. Research and plan when needed, use the soundAr tools already attached to this thread for every supported speech, music, batch, project, and revision workflow, and preserve prior creative intent. Complete multi-part projects with export_project_master so the final audio is registered and playable in soundAr; never substitute a raw filesystem path. Never install Codex or modify soundAr application code. Ask before destructive actions."
+                "Continue as soundAr's creative producer. Research and plan when needed, use the soundAr tools already attached to this thread for every supported speech, music, batch, project, and revision workflow, and preserve prior creative intent. Complete multi-part audio projects with export_project_master so the final audio is registered and playable in soundAr; never substitute a raw filesystem path. If this pre-upgrade thread does not already have the shared Video Studio tools, explain that Video Studio requires a fresh assistant task rather than attempting a shell-media fallback. When the tools are present, call preview_link before import_link, never assert exact-URL media rights or confirmation flags for the user, use one source by default, present Source through Export phases, poll durable jobs, revise the exact base version, and finish with get_video_project so the registered playable master is prominent. Never install Codex or modify soundAr application code. Ask before destructive actions."
             ));
         }
     }
@@ -6020,6 +6437,22 @@ pub fn run() {
             install_model,
             cancel_model_install,
             remove_model,
+            video_commands::video_runtime_status,
+            video_commands::preview_video_link,
+            video_commands::import_video_link,
+            video_commands::import_video_file,
+            video_commands::analyze_video,
+            video_commands::plan_video,
+            video_commands::create_video_project,
+            video_commands::list_video_projects,
+            video_commands::get_video_project,
+            video_commands::revise_video,
+            video_commands::render_video_preview,
+            video_commands::export_video,
+            video_commands::export_publish_package,
+            video_commands::cancel_video_job,
+            video_commands::resume_video_job,
+            assistant_video_thread_link,
             codex_agent_status,
             codex_agent_connect,
             codex_agent_disconnect,
@@ -6043,12 +6476,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_audio_thread, cold_load_needs_idle_reclamation,
-        foundation_runtime_ready_for_install, gpu_status, home_dir, parse_project_script,
-        read_batch_import, read_json, resample_mono, scheduler_rank, sha256_path,
-        validate_model_argument, validate_revision, write_json_atomically, ActivePlayback,
-        ActiveRecording, RuntimeState, SchedulerWaiter, VoiceActivityDetector,
-        GPU_COLD_LOAD_HEADROOM_MB, MAX_RPC_REQUEST_BYTES,
+        active_video_jobs_support_qualified_whisper_overlap, capture_audio_thread,
+        cold_load_needs_idle_reclamation, foundation_runtime_ready_for_install, gpu_status,
+        home_dir, managed_cuda_library_path, new_inference_scheduler, parse_project_script,
+        read_batch_import, read_json, request_supports_qualified_video_overlap, resample_mono,
+        scheduler_rank, sha256_path, validate_model_argument, validate_revision,
+        video_request_supports_qualified_whisper_overlap, write_json_atomically, ActivePlayback,
+        ActiveRecording, GlobalVideoGpuGate, RuntimeState, SchedulerWaiter, VideoGpuReservation,
+        VoiceActivityDetector, GPU_COLD_LOAD_HEADROOM_MB, MAX_RPC_REQUEST_BYTES,
     };
     use crate::store::Store;
     use cpal::traits::{DeviceTrait, HostTrait};
@@ -6056,7 +6491,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     };
     use std::{
         fs,
@@ -6094,6 +6529,31 @@ mod tests {
         fs::rename(root.join("runtime.json"), root.join(".venv/runtime.json"))
             .expect("move manifest to the formerly checked location");
         assert!(!foundation_runtime_ready_for_install(&python, false));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn managed_transformer_workers_prepend_private_cuda_wheel_libraries() {
+        let root = std::env::temp_dir().join(format!("soundar-cuda-libs-{}", Uuid::new_v4()));
+        let site_packages = root.join(".venv/lib/python3.11/site-packages/nvidia");
+        let cublas = site_packages.join("cublas/lib");
+        let cudnn = site_packages.join("cudnn/lib");
+        fs::create_dir_all(&cublas).expect("create cuBLAS fixture");
+        fs::create_dir_all(&cudnn).expect("create cuDNN fixture");
+
+        let joined = managed_cuda_library_path(&root)
+            .expect("discover managed CUDA libraries")
+            .expect("managed CUDA path");
+        let paths = std::env::split_paths(&joined).collect::<Vec<_>>();
+        assert_eq!(
+            paths.first(),
+            Some(&cublas.canonicalize().expect("cuBLAS path"))
+        );
+        assert_eq!(
+            paths.get(1),
+            Some(&cudnn.canonicalize().expect("cuDNN path"))
+        );
+
         fs::remove_dir_all(root).ok();
     }
 
@@ -6178,6 +6638,8 @@ mod tests {
     fn require_quiescent_scheduler(runtime: &RuntimeState) -> Result<Value, String> {
         let scheduler = runtime.scheduler_status()?;
         let quiescent = scheduler["active_workers"].as_u64() == Some(0)
+            && scheduler["active_gpu_workers"].as_u64() == Some(0)
+            && scheduler["active_video_gpu_jobs"].as_u64() == Some(0)
             && scheduler["reserved_vram_mb"].as_u64() == Some(0)
             && scheduler["active_batches"].as_u64() == Some(0)
             && scheduler["waiting_jobs"].as_u64() == Some(0)
@@ -6960,6 +7422,8 @@ for line in sys.stdin:
             priority: 0,
             enqueued_at: now - Duration::from_secs(91),
             reserved_vram_mb: 0,
+            uses_gpu: false,
+            qualified_video_overlap: false,
             benchmark_token: None,
         };
         let fresh_urgent = SchedulerWaiter {
@@ -6967,6 +7431,8 @@ for line in sys.stdin:
             priority: 3,
             enqueued_at: now,
             reserved_vram_mb: 0,
+            uses_gpu: false,
+            qualified_video_overlap: false,
             benchmark_token: None,
         };
         assert!(scheduler_rank(&old_low, now) > scheduler_rank(&fresh_urgent, now));
@@ -6976,6 +7442,8 @@ for line in sys.stdin:
             priority: 2,
             enqueued_at: now,
             reserved_vram_mb: 0,
+            uses_gpu: false,
+            qualified_video_overlap: false,
             benchmark_token: None,
         };
         let later_high = SchedulerWaiter {
@@ -6983,9 +7451,144 @@ for line in sys.stdin:
             priority: 2,
             enqueued_at: now,
             reserved_vram_mb: 0,
+            uses_gpu: false,
+            qualified_video_overlap: false,
             benchmark_token: None,
         };
         assert!(scheduler_rank(&earlier_high, now) > scheduler_rank(&later_high, now));
+    }
+
+    #[test]
+    fn video_and_inference_share_one_cancel_safe_gpu_envelope() {
+        use crate::video::SharedGpuAdmissionGate as _;
+
+        let scheduler = Arc::new((Mutex::new(new_inference_scheduler(4)), Condvar::new()));
+        let gate = GlobalVideoGpuGate::new(Arc::clone(&scheduler), PathBuf::from("python3"));
+        let request = crate::video::SharedGpuAdmissionRequest {
+            job_id: "video-render-one".into(),
+            project_id: "video-project-one".into(),
+            resource_class: crate::video::ResourceClass::Medium,
+            requested_vram_mb: 1_024,
+            requested_nvenc_sessions: 1,
+            exclusive: false,
+        };
+
+        scheduler.0.lock().expect("scheduler").active_gpu_workers = 1;
+        assert!(matches!(
+            gate.try_acquire(&request).expect("normal backpressure"),
+            crate::video::SharedGpuAdmissionOutcome::Waiting(_)
+        ));
+        scheduler
+            .0
+            .lock()
+            .expect("scheduler")
+            .active_qualified_video_overlap_workers = 1;
+        let overlap_lease = match gate
+            .try_acquire(&request)
+            .expect("qualified overlap admission")
+        {
+            crate::video::SharedGpuAdmissionOutcome::Admitted(lease) => lease,
+            crate::video::SharedGpuAdmissionOutcome::Waiting(wait) => {
+                panic!("unexpected qualified overlap backpressure: {}", wait.reason)
+            }
+        };
+        drop(overlap_lease);
+        {
+            let mut state = scheduler.0.lock().expect("scheduler");
+            state.active_gpu_workers = 0;
+            state.active_qualified_video_overlap_workers = 0;
+        }
+
+        let lease = match gate.try_acquire(&request).expect("admit video render") {
+            crate::video::SharedGpuAdmissionOutcome::Admitted(lease) => lease,
+            crate::video::SharedGpuAdmissionOutcome::Waiting(wait) => {
+                panic!("unexpected GPU backpressure: {}", wait.reason)
+            }
+        };
+        {
+            let state = scheduler.0.lock().expect("scheduler");
+            assert_eq!(state.active_video_gpu_jobs.len(), 1);
+            assert_eq!(state.video_reserved_vram_mb, 1_024);
+            assert_eq!(state.video_nvenc_sessions, 1);
+        }
+        let exclusive = crate::video::SharedGpuAdmissionRequest {
+            job_id: "video-exclusive".into(),
+            exclusive: true,
+            ..request.clone()
+        };
+        assert!(matches!(
+            gate.try_acquire(&exclusive)
+                .expect("exclusive backpressure"),
+            crate::video::SharedGpuAdmissionOutcome::Waiting(_)
+        ));
+
+        drop(lease);
+        let state = scheduler.0.lock().expect("scheduler");
+        assert!(state.active_video_gpu_jobs.is_empty());
+        assert_eq!(state.video_reserved_vram_mb, 0);
+        assert_eq!(state.video_nvenc_sessions, 0);
+    }
+
+    #[test]
+    fn only_qualified_whisper_tiny_transcription_can_overlap_nvenc() {
+        assert!(request_supports_qualified_video_overlap(
+            "transcribe",
+            "transformers",
+            Some("openai/whisper-tiny"),
+        ));
+        assert!(!request_supports_qualified_video_overlap(
+            "transcribe",
+            "transformers",
+            Some("openai/whisper-small"),
+        ));
+        assert!(!request_supports_qualified_video_overlap(
+            "generate_music",
+            "musicgen",
+            Some("facebook/musicgen-small"),
+        ));
+
+        let request = crate::video::SharedGpuAdmissionRequest {
+            job_id: "qualified-final".into(),
+            project_id: "project".into(),
+            resource_class: crate::video::ResourceClass::Heavy,
+            requested_vram_mb: 2_048,
+            requested_nvenc_sessions: 1,
+            exclusive: false,
+        };
+        assert!(video_request_supports_qualified_whisper_overlap(&request));
+        assert!(!video_request_supports_qualified_whisper_overlap(
+            &crate::video::SharedGpuAdmissionRequest {
+                requested_vram_mb: 2_049,
+                ..request.clone()
+            }
+        ));
+
+        let mut scheduler = new_inference_scheduler(4);
+        scheduler.active_video_gpu_jobs.insert(
+            "qualified-final".into(),
+            VideoGpuReservation {
+                vram_mb: 2_048,
+                nvenc_sessions: 1,
+                exclusive: false,
+            },
+        );
+        scheduler.video_reserved_vram_mb = 2_048;
+        scheduler.video_nvenc_sessions = 1;
+        assert!(active_video_jobs_support_qualified_whisper_overlap(
+            &scheduler
+        ));
+        scheduler.active_video_gpu_jobs.insert(
+            "second-render".into(),
+            VideoGpuReservation {
+                vram_mb: 1_024,
+                nvenc_sessions: 1,
+                exclusive: false,
+            },
+        );
+        scheduler.video_nvenc_sessions = 2;
+        assert!(!active_video_jobs_support_qualified_whisper_overlap(
+            &scheduler
+        ));
     }
 
     #[test]

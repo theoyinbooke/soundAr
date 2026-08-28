@@ -31,6 +31,7 @@ pub enum VideoErrorCode {
     InvalidCaption,
     InvalidLayout,
     InvalidAudioMix,
+    InvalidNarration,
     InvalidArtifact,
     InvalidRevision,
     DuplicateId,
@@ -63,6 +64,7 @@ impl VideoErrorCode {
             Self::InvalidCaption => "video.invalid_caption",
             Self::InvalidLayout => "video.invalid_layout",
             Self::InvalidAudioMix => "video.invalid_audio_mix",
+            Self::InvalidNarration => "video.invalid_narration",
             Self::InvalidArtifact => "video.invalid_artifact",
             Self::InvalidRevision => "video.invalid_revision",
             Self::DuplicateId => "video.duplicate_id",
@@ -1143,6 +1145,58 @@ impl Validate for RenderArtifact {
     }
 }
 
+/// Binds the active generated narration for a scene to both its soundAr History
+/// provenance and the immutable managed artifact used by the canonical timeline.
+///
+/// The generation route is stored explicitly so a later voice revision can be
+/// reproduced without guessing which model, speaker, or consent-backed voice was
+/// used. `script_sha256` prevents a narration take from silently surviving a
+/// script edit that changed the words it is meant to speak.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NarrationBinding {
+    pub id: String,
+    pub scene_id: Option<String>,
+    pub render_artifact_id: String,
+    pub history_id: String,
+    pub generation_job_id: String,
+    pub voice_id: String,
+    pub model_id: String,
+    pub speaker: String,
+    pub language: String,
+    pub script_sha256: String,
+    pub created_at: String,
+}
+
+impl Validate for NarrationBinding {
+    fn validate(&self) -> VideoResult<()> {
+        validate_identifier(&self.id, "narration_bindings.id")?;
+        if let Some(scene_id) = &self.scene_id {
+            validate_identifier(scene_id, "narration_bindings.scene_id")?;
+        }
+        validate_identifier(
+            &self.render_artifact_id,
+            "narration_bindings.render_artifact_id",
+        )?;
+        validate_identifier(&self.history_id, "narration_bindings.history_id")?;
+        validate_identifier(
+            &self.generation_job_id,
+            "narration_bindings.generation_job_id",
+        )?;
+        validate_identifier(&self.voice_id, "narration_bindings.voice_id")?;
+        validate_nonempty(&self.model_id, "narration_bindings.model_id", 256)?;
+        validate_nonempty(&self.speaker, "narration_bindings.speaker", 128)?;
+        validate_language_tag(&self.language, "narration_bindings.language")?;
+        validate_sha256(
+            &self.script_sha256,
+            "narration_bindings.script_sha256",
+            VideoErrorCode::InvalidNarration,
+        )?;
+        validate_timestamp_text(&self.created_at, "narration_bindings.created_at")?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RevisionStage {
@@ -1216,6 +1270,8 @@ pub struct VideoProjectManifest {
     pub captions: Vec<CaptionCue>,
     pub layout: LayoutPlan,
     pub audio_mix: AudioMix,
+    #[serde(default)]
+    pub narration_bindings: Vec<NarrationBinding>,
     pub render_artifacts: Vec<RenderArtifact>,
     pub revision_history: Vec<RevisionRecord>,
     pub created_at: String,
@@ -1251,6 +1307,7 @@ impl VideoProjectManifest {
             captions: Vec::new(),
             layout,
             audio_mix,
+            narration_bindings: Vec::new(),
             render_artifacts: Vec::new(),
             revision_history: Vec::new(),
             created_at: created_at.clone(),
@@ -1321,6 +1378,12 @@ impl Validate for VideoProjectManifest {
                 .iter()
                 .map(|artifact| artifact.id.as_str()),
             "render_artifacts",
+        )?;
+        validate_unique_ids(
+            self.narration_bindings
+                .iter()
+                .map(|binding| binding.id.as_str()),
+            "narration_bindings",
         )?;
         validate_unique_ids(
             self.revision_history
@@ -1486,6 +1549,55 @@ impl Validate for VideoProjectManifest {
                     VideoErrorCode::MissingReference,
                     "render artifact references a missing scene",
                 ));
+            }
+        }
+
+        let mut bound_scene_ids = BTreeSet::new();
+        for binding in &self.narration_bindings {
+            binding.validate()?;
+            if let Some(scene_id) = binding.scene_id.as_deref() {
+                let scene = scene_by_id.get(scene_id).ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::MissingReference,
+                        "narration binding references a missing scene",
+                    )
+                    .at("narration_bindings.scene_id")
+                })?;
+                if !bound_scene_ids.insert(scene_id) {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidNarration,
+                        "a scene may have only one active narration binding",
+                    )
+                    .at("narration_bindings.scene_id"));
+                }
+                let expected_script_sha256 =
+                    format!("{:x}", Sha256::digest(scene.script.as_bytes()));
+                if binding.script_sha256 != expected_script_sha256 {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidNarration,
+                        "narration script provenance does not match the current scene script",
+                    )
+                    .at("narration_bindings.script_sha256"));
+                }
+            }
+            let artifact = artifact_by_id
+                .get(binding.render_artifact_id.as_str())
+                .ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::MissingReference,
+                        "narration binding references a missing render artifact",
+                    )
+                    .at("narration_bindings.render_artifact_id")
+                })?;
+            if !artifact.mime_type.starts_with("audio/")
+                || artifact.duration_us.is_none()
+                || !matches!(artifact.publication_state, PublicationState::Published)
+            {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidNarration,
+                    "narration must reference a published audio artifact with a duration",
+                )
+                .at("narration_bindings.render_artifact_id"));
             }
         }
 
@@ -1800,6 +1912,24 @@ fn validate_nonempty(value: &str, field: &str, maximum_length: usize) -> VideoRe
     Ok(())
 }
 
+fn validate_language_tag(value: &str, field: &str) -> VideoResult<()> {
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && value.split('-').all(|part| {
+            !part.is_empty()
+                && part.len() <= 8
+                && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        });
+    if !valid {
+        return Err(VideoError::new(
+            VideoErrorCode::InvalidNarration,
+            "language must be a bounded BCP-47-style tag",
+        )
+        .at(field));
+    }
+    Ok(())
+}
+
 fn validate_timestamp_text(value: &str, field: &str) -> VideoResult<()> {
     if !value.ends_with('Z') || DateTime::parse_from_rfc3339(value).is_err() {
         return Err(VideoError::new(
@@ -2105,6 +2235,7 @@ mod tests {
                 true_peak_db_milli: -1_000,
                 tracks: vec![],
             },
+            narration_bindings: vec![],
             render_artifacts: vec![],
             revision_history: vec![],
             created_at: timestamp(),
@@ -2182,6 +2313,76 @@ mod tests {
             .unwrap()
             .insert("future_field".into(), Value::Bool(true));
         assert!(serde_json::from_value::<VideoProjectManifest>(value).is_err());
+    }
+
+    #[test]
+    fn legacy_manifests_default_to_no_narration_bindings() {
+        let mut value = serde_json::to_value(manifest()).unwrap();
+        value.as_object_mut().unwrap().remove("narration_bindings");
+        let decoded = serde_json::from_value::<VideoProjectManifest>(value).unwrap();
+        assert!(decoded.narration_bindings.is_empty());
+        decoded.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn narration_binding_is_audio_backed_and_bound_to_current_scene_script() {
+        let mut manifest = manifest();
+        let script = "This narration belongs to the reviewed scene.";
+        manifest.reviewed_scenes.push(ReviewedScene {
+            id: "scene-narration".into(),
+            candidate_id: None,
+            source_asset_id: Some("source-1".into()),
+            source_range: Some(TimeRange::new(0, 3_000_000).unwrap()),
+            timeline_start_us: Microseconds::ZERO,
+            timeline_duration_us: Microseconds(3_000_000),
+            title: "Narrated scene".into(),
+            script: script.into(),
+            review_state: ReviewState::Approved,
+            revision: 1,
+        });
+        manifest.render_artifacts.push(RenderArtifact {
+            id: "narration-audio".into(),
+            role: RenderArtifactRole::SceneSegment,
+            scene_id: Some("scene-narration".into()),
+            managed_path: "renders/narration-audio.wav".into(),
+            sha256: hash('b'),
+            cache_key: hash('c'),
+            mime_type: "audio/wav".into(),
+            duration_us: Some(Microseconds(3_000_000)),
+            width: None,
+            height: None,
+            publication_state: PublicationState::Published,
+            created_at: timestamp(),
+        });
+        manifest.narration_bindings.push(NarrationBinding {
+            id: "narration-binding".into(),
+            scene_id: Some("scene-narration".into()),
+            render_artifact_id: "narration-audio".into(),
+            history_id: "history-narration".into(),
+            generation_job_id: "job-narration".into(),
+            voice_id: "af-heart".into(),
+            model_id: "hexgrad/Kokoro-82M".into(),
+            speaker: "af_heart".into(),
+            language: "en-US".into(),
+            script_sha256: format!("{:x}", Sha256::digest(script.as_bytes())),
+            created_at: timestamp(),
+        });
+        manifest.validate_strict().unwrap();
+
+        manifest.reviewed_scenes[0].script = "The script changed.".into();
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidNarration);
+        assert_eq!(
+            error.field.as_deref(),
+            Some("narration_bindings.script_sha256")
+        );
+
+        manifest.reviewed_scenes[0].script = script.into();
+        manifest.render_artifacts[0].mime_type = "video/mp4".into();
+        manifest.render_artifacts[0].width = Some(1080);
+        manifest.render_artifacts[0].height = Some(1920);
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidNarration);
     }
 
     #[test]

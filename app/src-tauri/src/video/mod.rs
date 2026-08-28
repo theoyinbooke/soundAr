@@ -30,13 +30,16 @@ pub use intelligence::{
     TranscriptImportRequest,
 };
 pub use media::{
-    discover_media_runtime, probe_h264_nvenc_runtime, probe_media, validate_caption_cues,
-    validate_import_url, CaptionCueInput, CaptionValidation, ImportProvider, MediaChapterProbe,
-    MediaError, MediaProbe as RuntimeMediaProbe, MediaRuntimeStatus, MediaStreamProbe,
-    MediaToolKind, MediaToolStatus, ValidatedImportUrl,
+    discover_media_runtime, local_media_input_args, preflight_import_url_destination,
+    probe_h264_nvenc_runtime, probe_media, validate_caption_cues, validate_import_url,
+    validate_local_media_source, CaptionCueInput, CaptionValidation, ImportProvider,
+    MediaChapterProbe, MediaError, MediaProbe as RuntimeMediaProbe, MediaRuntimeStatus,
+    MediaStreamProbe, MediaToolKind, MediaToolStatus, PublicHttpsProxy, ValidatedImportUrl,
+    LOCAL_MEDIA_FORMAT_WHITELIST, LOCAL_MEDIA_PROTOCOL_WHITELIST,
 };
 pub use presentation::{
-    present_runtime_tools, present_video_project, present_video_project_summary,
+    present_runtime_tools, present_video_output, present_video_project,
+    present_video_project_summary,
 };
 pub use renderer::{
     build_portrait_command, build_portrait_command_with_layout, build_proxy_command,
@@ -51,12 +54,17 @@ pub use scheduler::{
 };
 pub use service::{
     CreateVideoProjectRequest as ServiceCreateVideoProjectRequest, LinkImportRequest, LinkPreview,
-    LinkRightsRequest, LocalImportRequest, PortraitRenderRequest, PortraitSourceLayout,
-    ProgressCallback, PublishPackageRequest, QueuedVideoJob, ReviseVideoManifestRequest,
-    ServiceResult, VideoJobResult, VideoServiceError, VideoServiceProgress, VideoStudioService,
+    LinkRightsRequest, LocalImportRequest, NarrationReplacement, PortraitRenderRequest,
+    PortraitSourceLayout, ProgressCallback, PublishPackageRequest, QueuedVideoJob,
+    ReplaceNarrationRequest, ReviseVideoManifestRequest, ServiceResult, SharedGpuAdmissionGate,
+    SharedGpuAdmissionLease, SharedGpuAdmissionOutcome, SharedGpuAdmissionRequest,
+    SharedGpuAdmissionWait, TimelineRenderBatchRequest, TimelineRenderProfile,
+    TimelineRenderRequest, VideoJobResult, VideoServiceError, VideoServiceProgress,
+    VideoStudioService,
 };
 pub use timeline::{
-    frame_index_at, frame_time_us, map_source_to_timeline, map_timeline_to_source, partition_track,
+    frame_index_at, frame_time_us, map_source_endpoint_to_timeline, map_source_to_timeline,
+    map_timeline_endpoint_to_source, map_timeline_to_source, partition_track,
     quantize_range_outward, quantize_to_frame, source_clock_partition, FramePoint, FrameRange,
     QuantizeMode, SourceClockSpan, SourceClockSpanKind, TimelineSpan, TimelineSpanKind,
 };
