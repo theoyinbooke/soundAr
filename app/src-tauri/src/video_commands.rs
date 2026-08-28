@@ -2443,6 +2443,26 @@ fn apply_instruction_revision(
         set_caption_style(manifest, requested_scene_id, "kinetic")?;
         changed_paths.insert("/captions".into());
         invalidate_caption_render(invalidated);
+    } else if normalized.contains("bold pop caption") || normalized.contains("bold-pop caption") {
+        set_caption_style(manifest, requested_scene_id, "bold-pop")?;
+        changed_paths.insert("/captions".into());
+        invalidate_caption_render(invalidated);
+    } else if normalized.contains("highlight caption") {
+        set_caption_style(manifest, requested_scene_id, "highlight")?;
+        changed_paths.insert("/captions".into());
+        invalidate_caption_render(invalidated);
+    } else if normalized.contains("karaoke caption") {
+        set_caption_style(manifest, requested_scene_id, "karaoke")?;
+        changed_paths.insert("/captions".into());
+        invalidate_caption_render(invalidated);
+    } else if normalized.contains("typewriter caption") {
+        set_caption_style(manifest, requested_scene_id, "typewriter")?;
+        changed_paths.insert("/captions".into());
+        invalidate_caption_render(invalidated);
+    } else if normalized.contains("podcast caption") {
+        set_caption_style(manifest, requested_scene_id, "podcast")?;
+        changed_paths.insert("/captions".into());
+        invalidate_caption_render(invalidated);
     } else if normalized.contains("clean caption") {
         set_caption_style(manifest, requested_scene_id, "clean-white")?;
         changed_paths.insert("/captions".into());
@@ -2633,15 +2653,14 @@ fn set_caption_style(
 }
 
 fn caption_style_id(style: &str) -> Result<String, String> {
-    match style.trim().to_ascii_lowercase().as_str() {
-        "clean-white" | "clean" | "caption-clean-white" => Ok("caption-clean-white".into()),
-        "calm" | "caption-calm" => Ok("caption-calm".into()),
-        "kinetic" | "caption-kinetic" => Ok("caption-kinetic".into()),
-        _ => Err(
-            "video.invalid_caption_style: Caption style must be clean-white, calm, or kinetic"
-                .into(),
-        ),
-    }
+    video::CaptionPresetId::parse(style)
+        .map(|preset| preset.manifest_id().to_string())
+        .map_err(|_| {
+            format!(
+                "video.invalid_caption_style: Caption style must be {}",
+                video::CaptionPresetId::PUBLIC_IDS.join(", ")
+            )
+        })
 }
 
 fn set_mix_gain(
@@ -6119,6 +6138,25 @@ mod tests {
                 .expect_err("manual framing needs exact normalized coordinates")
                 .starts_with("video.invalid_crop:")
         );
+    }
+
+    #[test]
+    fn native_caption_style_mapping_matches_the_shared_curated_contract() {
+        for preset in video::CaptionPresetId::ALL {
+            assert_eq!(
+                caption_style_id(preset.public_id()).unwrap(),
+                preset.manifest_id()
+            );
+            assert_eq!(
+                caption_style_id(preset.manifest_id()).unwrap(),
+                preset.manifest_id()
+            );
+        }
+        let error = caption_style_id("unknown-style").unwrap_err();
+        assert!(error.starts_with("video.invalid_caption_style:"));
+        for style in video::CaptionPresetId::PUBLIC_IDS {
+            assert!(error.contains(style));
+        }
     }
 
     #[test]

@@ -7,19 +7,21 @@
 //! deterministic.
 
 use super::contracts::{
-    AudioMixTrack, CanvasMode, CaptionCue, LayoutPlan, LayoutRole, Microseconds, NormalizedRect,
-    RationalRate, RenderArtifact, SourceAsset, TimeRange, TimelineClip, TimelineTrack, TrackKind,
-    VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
+    AudioMixTrack, CanvasMode, CaptionCue, CaptionPresetId, LayoutPlan, LayoutRole, Microseconds,
+    NormalizedRect, RationalRate, RenderArtifact, SourceAsset, TimeRange, TimelineClip,
+    TimelineTrack, TrackKind, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
 };
 use super::media::local_media_input_args;
 use super::renderer::{
     PortraitLayout, RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass,
     VideoEncoder,
 };
-use super::timeline::{partition_track, TimelineSpanKind};
+use super::timeline::{
+    map_source_endpoint_to_timeline, partition_track, QuantizeMode, TimelineSpanKind,
+};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, OpenOptions},
     io::Write,
@@ -35,6 +37,85 @@ pub enum CaptionTheme {
     Calm,
     Kinetic,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptionRevealMode {
+    Page,
+    ActiveWord,
+    Karaoke,
+    Typewriter,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CaptionPagingRules {
+    max_words: usize,
+    max_lines: usize,
+    max_chars_per_line: usize,
+    preferred_min_page_us: i64,
+    break_on_punctuation: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AssCaptionPreset {
+    id: CaptionPresetId,
+    ass_name: &'static str,
+    font_name: &'static str,
+    relative_size: f64,
+    primary_color: &'static str,
+    secondary_color: &'static str,
+    active_color: &'static str,
+    outline_color: &'static str,
+    back_color: &'static str,
+    bold: bool,
+    spacing: i8,
+    border_style: u8,
+    outline: u8,
+    shadow: u8,
+    alignment: u8,
+    margin_vertical_fraction: f64,
+    uppercase: bool,
+    lowercase: bool,
+    reveal: CaptionRevealMode,
+    paging: CaptionPagingRules,
+}
+
+#[derive(Clone, Debug)]
+struct TimedCaptionToken {
+    text: String,
+    space_before: bool,
+    start_us: Microseconds,
+    end_us: Microseconds,
+}
+
+#[derive(Clone, Debug)]
+struct CaptionPage {
+    tokens: Vec<TimedCaptionToken>,
+    start_us: Microseconds,
+    end_us: Microseconds,
+}
+
+/// Authoritative caption page projection for live preview. The UI must render these pages rather
+/// than repeat word-count paging: the same private plan feeds ASS preview and final export.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CaptionPreviewPage {
+    pub id: String,
+    pub cue_id: String,
+    pub scene_id: Option<String>,
+    pub start_us: Microseconds,
+    pub end_us: Microseconds,
+    pub text: String,
+    pub style_id: String,
+    pub words: Vec<CaptionPreviewWord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CaptionPreviewWord {
+    pub text: String,
+    pub start_us: Microseconds,
+    pub end_us: Microseconds,
+}
+
+const MIN_ASS_PAGE_DURATION_US: i64 = 20_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -369,28 +450,33 @@ pub fn build_ass_document(
 ) -> VideoResult<String> {
     manifest.validate_strict()?;
     let (width, height) = profile_dimensions(options.profile, &manifest.layout);
-    let font_size = match options.caption_theme {
-        CaptionTheme::CleanWhite => (height as f64 * 0.044).round() as u32,
-        CaptionTheme::Calm => (height as f64 * 0.036).round() as u32,
-        CaptionTheme::Kinetic => (height as f64 * 0.052).round() as u32,
-    }
-    .clamp(24, 88);
-    let margin_v = (height as f64 * 0.09).round() as u32;
+    // `caption_theme` remains serialized in render requests for backwards compatibility and
+    // variation provenance. A cue's validated style_id is now authoritative, which lets one
+    // timeline render different scene looks without a shadow global caption clock or theme.
+    let _legacy_theme = options.caption_theme;
     let mut document = format!(
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: {width}\nPlayResY: {height}\nScaledBorderAndShadow: yes\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Caption,Inter,{font_size},&H00FFFFFF,&H00FFFFFF,&H78000000,&H3C000000,-1,0,0,0,100,100,0,0,1,3,0,2,70,70,{margin_v},1\nStyle: Title,Inter,{},&H00FFFFFF,&H00FFFFFF,&H90000000,&H50000000,-1,0,0,0,100,100,0,0,1,3,0,8,90,90,{},1\nStyle: Speaker,Inter,{},&H00FFFFFF,&H00FFFFFF,&H80000000,&H50000000,-1,0,0,0,100,100,0,0,3,1,0,7,70,70,70,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
-        (font_size as f64 * 1.08).round() as u32,
-        (height as f64 * 0.07).round() as u32,
-        (font_size as f64 * 0.68).round() as u32,
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: {width}\nPlayResY: {height}\nScaledBorderAndShadow: yes\nWrapStyle: 0\n; CaptionTiming: canonical timeline clock; exact source words or bounded in-cue fallback\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
     );
-    for caption in &manifest.captions {
-        document.push_str(&ass_dialogue(
-            10,
-            caption.range.start_us,
-            caption.range.end_us,
-            "Caption",
-            caption.speaker_id.as_deref().unwrap_or_default(),
-            &caption_text(caption, options.caption_theme),
-        ));
+    for preset_id in CaptionPresetId::ALL {
+        document.push_str(&ass_caption_style(caption_preset(preset_id), width, height));
+    }
+    let clean_font_size = caption_font_size(caption_preset(CaptionPresetId::CleanWhite), height);
+    document.push_str(&format!(
+        "Style: Title,Inter,{},&H00FFFFFF,&H00FFFFFF,&H90000000,&H50000000,-1,0,0,0,100,100,0,0,1,3,0,8,90,90,{},1\nStyle: Speaker,Inter,{},&H00FFFFFF,&H00FFFFFF,&H80000000,&H50000000,-1,0,0,0,100,100,0,0,3,1,0,7,70,70,70,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+        (clean_font_size as f64 * 1.08).round() as u32,
+        (height as f64 * 0.07).round() as u32,
+        (clean_font_size as f64 * 0.68).round() as u32,
+    ));
+    let mut ordered_captions = manifest.captions.iter().collect::<Vec<_>>();
+    ordered_captions.sort_by(|left, right| {
+        (left.range.start_us, left.range.end_us, left.id.as_str()).cmp(&(
+            right.range.start_us,
+            right.range.end_us,
+            right.id.as_str(),
+        ))
+    });
+    for caption in ordered_captions {
+        append_caption_events(&mut document, manifest, caption)?;
     }
     if options.include_title_cards {
         for scene in &manifest.reviewed_scenes {
@@ -411,6 +497,57 @@ pub fn build_ass_document(
         append_speaker_cards(&mut document, &manifest.captions)?;
     }
     Ok(document)
+}
+
+pub fn plan_caption_preview_pages(
+    manifest: &VideoProjectManifest,
+) -> VideoResult<Vec<CaptionPreviewPage>> {
+    manifest.validate_strict()?;
+    let mut projected = Vec::new();
+    for caption in &manifest.captions {
+        let (preset, pages) = planned_caption_pages_for_cue(manifest, caption)?;
+        for (index, page) in pages.into_iter().enumerate() {
+            let id = format!("{}-page-{:03}", caption.id, index + 1);
+            let words = page
+                .tokens
+                .iter()
+                .filter_map(|token| {
+                    let start_us = token.start_us.max(page.start_us);
+                    let end_us = token.end_us.min(page.end_us);
+                    (end_us > start_us).then(|| CaptionPreviewWord {
+                        text: token.text.clone(),
+                        start_us,
+                        end_us,
+                    })
+                })
+                .collect();
+            projected.push(CaptionPreviewPage {
+                id,
+                cue_id: caption.id.clone(),
+                scene_id: caption.scene_id.clone(),
+                start_us: page.start_us,
+                end_us: page.end_us,
+                text: plain_caption_page_text(&page, preset),
+                style_id: preset.id.public_id().to_string(),
+                words,
+            });
+        }
+    }
+    projected.sort_by(|left, right| {
+        (
+            left.start_us,
+            left.end_us,
+            left.cue_id.as_str(),
+            left.id.as_str(),
+        )
+            .cmp(&(
+                right.start_us,
+                right.end_us,
+                right.cue_id.as_str(),
+                right.id.as_str(),
+            ))
+    });
+    Ok(projected)
 }
 
 pub fn write_ass_document_atomic(path: &Path, document: &str) -> VideoResult<PathBuf> {
@@ -817,7 +954,15 @@ fn render_output_arguments(
 
 fn append_speaker_cards(document: &mut String, captions: &[CaptionCue]) -> VideoResult<()> {
     let mut prior_speaker: Option<&str> = None;
-    for caption in captions {
+    let mut ordered = captions.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        (left.range.start_us, left.range.end_us, left.id.as_str()).cmp(&(
+            right.range.start_us,
+            right.range.end_us,
+            right.id.as_str(),
+        ))
+    });
+    for caption in ordered {
         let Some(speaker) = caption
             .speaker_id
             .as_deref()
@@ -847,12 +992,892 @@ fn append_speaker_cards(document: &mut String, captions: &[CaptionCue]) -> Video
     Ok(())
 }
 
-fn caption_text(caption: &CaptionCue, theme: CaptionTheme) -> String {
-    let text = escape_ass_text(&caption.text);
-    match theme {
-        CaptionTheme::CleanWhite => text,
-        CaptionTheme::Calm => format!("{{\\fad(120,160)}}{text}"),
-        CaptionTheme::Kinetic => format!("{{\\fad(60,90)\\fscx104\\fscy104}}{text}"),
+fn caption_preset(id: CaptionPresetId) -> AssCaptionPreset {
+    match id {
+        CaptionPresetId::CleanWhite => AssCaptionPreset {
+            id,
+            ass_name: "CaptionCleanWhite",
+            font_name: "Inter",
+            relative_size: 0.044,
+            primary_color: "&H00FFFFFF",
+            secondary_color: "&H00FFFFFF",
+            active_color: "&H00FFFFFF",
+            outline_color: "&H78000000",
+            back_color: "&H3C000000",
+            bold: true,
+            spacing: 0,
+            border_style: 1,
+            outline: 3,
+            shadow: 0,
+            alignment: 2,
+            margin_vertical_fraction: 0.09,
+            uppercase: false,
+            lowercase: false,
+            reveal: CaptionRevealMode::Page,
+            paging: CaptionPagingRules {
+                max_words: 8,
+                max_lines: 2,
+                max_chars_per_line: 30,
+                preferred_min_page_us: 500_000,
+                break_on_punctuation: true,
+            },
+        },
+        CaptionPresetId::Calm => AssCaptionPreset {
+            id,
+            ass_name: "CaptionCalm",
+            font_name: "Inter",
+            relative_size: 0.036,
+            primary_color: "&H00F7F3EE",
+            secondary_color: "&H00F7F3EE",
+            active_color: "&H00F7F3EE",
+            outline_color: "&H8A111111",
+            back_color: "&H50000000",
+            bold: true,
+            spacing: 0,
+            border_style: 1,
+            outline: 2,
+            shadow: 1,
+            alignment: 2,
+            margin_vertical_fraction: 0.105,
+            uppercase: false,
+            lowercase: false,
+            reveal: CaptionRevealMode::Page,
+            paging: CaptionPagingRules {
+                max_words: 10,
+                max_lines: 2,
+                max_chars_per_line: 34,
+                preferred_min_page_us: 650_000,
+                break_on_punctuation: true,
+            },
+        },
+        CaptionPresetId::Kinetic => AssCaptionPreset {
+            id,
+            ass_name: "CaptionKinetic",
+            font_name: "Inter",
+            relative_size: 0.052,
+            primary_color: "&H00FFFFFF",
+            secondary_color: "&H003DD9FF",
+            active_color: "&H003DD9FF",
+            outline_color: "&H00000000",
+            back_color: "&H50000000",
+            bold: true,
+            spacing: 1,
+            border_style: 1,
+            outline: 4,
+            shadow: 1,
+            alignment: 2,
+            margin_vertical_fraction: 0.18,
+            uppercase: false,
+            lowercase: false,
+            reveal: CaptionRevealMode::Page,
+            paging: CaptionPagingRules {
+                max_words: 4,
+                max_lines: 2,
+                max_chars_per_line: 20,
+                preferred_min_page_us: 350_000,
+                break_on_punctuation: true,
+            },
+        },
+        CaptionPresetId::BoldPop => AssCaptionPreset {
+            id,
+            ass_name: "CaptionBoldPop",
+            font_name: "Inter",
+            relative_size: 0.064,
+            primary_color: "&H00FFFFFF",
+            secondary_color: "&H003DD9FF",
+            active_color: "&H003DD9FF",
+            outline_color: "&H00000000",
+            back_color: "&H60000000",
+            bold: true,
+            spacing: 1,
+            border_style: 1,
+            outline: 5,
+            shadow: 2,
+            alignment: 2,
+            margin_vertical_fraction: 0.22,
+            uppercase: true,
+            lowercase: false,
+            reveal: CaptionRevealMode::ActiveWord,
+            paging: CaptionPagingRules {
+                max_words: 3,
+                max_lines: 2,
+                max_chars_per_line: 16,
+                preferred_min_page_us: 300_000,
+                break_on_punctuation: true,
+            },
+        },
+        CaptionPresetId::Highlight => AssCaptionPreset {
+            id,
+            ass_name: "CaptionHighlight",
+            font_name: "Inter",
+            relative_size: 0.048,
+            primary_color: "&H00FFFFFF",
+            secondary_color: "&H00F2764F",
+            active_color: "&H00F2764F",
+            outline_color: "&H70000000",
+            back_color: "&H58000000",
+            bold: true,
+            spacing: 0,
+            border_style: 1,
+            outline: 3,
+            shadow: 1,
+            alignment: 2,
+            margin_vertical_fraction: 0.13,
+            uppercase: false,
+            lowercase: false,
+            reveal: CaptionRevealMode::ActiveWord,
+            paging: CaptionPagingRules {
+                max_words: 5,
+                max_lines: 2,
+                max_chars_per_line: 24,
+                preferred_min_page_us: 400_000,
+                break_on_punctuation: true,
+            },
+        },
+        CaptionPresetId::Karaoke => AssCaptionPreset {
+            id,
+            ass_name: "CaptionKaraoke",
+            font_name: "Inter",
+            relative_size: 0.047,
+            primary_color: "&H008C8C8C",
+            secondary_color: "&H008C8C8C",
+            active_color: "&H00FFFFFF",
+            outline_color: "&H78000000",
+            back_color: "&H48000000",
+            bold: true,
+            spacing: 0,
+            border_style: 1,
+            outline: 3,
+            shadow: 0,
+            alignment: 2,
+            margin_vertical_fraction: 0.11,
+            uppercase: false,
+            lowercase: false,
+            reveal: CaptionRevealMode::Karaoke,
+            paging: CaptionPagingRules {
+                max_words: 6,
+                max_lines: 2,
+                max_chars_per_line: 28,
+                preferred_min_page_us: 450_000,
+                break_on_punctuation: true,
+            },
+        },
+        CaptionPresetId::Typewriter => AssCaptionPreset {
+            id,
+            ass_name: "CaptionTypewriter",
+            font_name: "DejaVu Sans Mono",
+            relative_size: 0.038,
+            primary_color: "&H006EE7A4",
+            secondary_color: "&H006EE7A4",
+            active_color: "&H006EE7A4",
+            outline_color: "&H50000000",
+            back_color: "&H70110D0A",
+            bold: false,
+            spacing: 1,
+            border_style: 3,
+            outline: 1,
+            shadow: 0,
+            alignment: 2,
+            margin_vertical_fraction: 0.12,
+            uppercase: false,
+            lowercase: true,
+            reveal: CaptionRevealMode::Typewriter,
+            paging: CaptionPagingRules {
+                max_words: 7,
+                max_lines: 2,
+                max_chars_per_line: 30,
+                preferred_min_page_us: 400_000,
+                break_on_punctuation: true,
+            },
+        },
+        CaptionPresetId::Podcast => AssCaptionPreset {
+            id,
+            ass_name: "CaptionPodcast",
+            font_name: "Inter",
+            relative_size: 0.039,
+            primary_color: "&H00F3EFE8",
+            secondary_color: "&H00F3EFE8",
+            active_color: "&H00F3EFE8",
+            outline_color: "&H50000000",
+            back_color: "&H701A1510",
+            bold: true,
+            spacing: 0,
+            border_style: 3,
+            outline: 1,
+            shadow: 0,
+            alignment: 2,
+            margin_vertical_fraction: 0.09,
+            uppercase: false,
+            lowercase: false,
+            reveal: CaptionRevealMode::Page,
+            paging: CaptionPagingRules {
+                max_words: 10,
+                max_lines: 2,
+                max_chars_per_line: 34,
+                preferred_min_page_us: 650_000,
+                break_on_punctuation: true,
+            },
+        },
+    }
+}
+
+fn caption_font_size(preset: AssCaptionPreset, height: u32) -> u32 {
+    ((height as f64 * preset.relative_size).round() as u32).clamp(22, 112)
+}
+
+fn ass_caption_style(preset: AssCaptionPreset, width: u32, height: u32) -> String {
+    let font_size = caption_font_size(preset, height);
+    let margin_horizontal = ((width as f64 * 0.065).round() as u32).max(36);
+    let margin_vertical =
+        ((height as f64 * preset.margin_vertical_fraction).round() as u32).max(36);
+    format!(
+        "Style: {},{},{},{},{},{},{},{},0,0,0,100,100,{},0,{},{},{},{},{},{},{},1\n",
+        preset.ass_name,
+        preset.font_name,
+        font_size,
+        preset.primary_color,
+        preset.secondary_color,
+        preset.outline_color,
+        preset.back_color,
+        if preset.bold { -1 } else { 0 },
+        preset.spacing,
+        preset.border_style,
+        preset.outline,
+        preset.shadow,
+        preset.alignment,
+        margin_horizontal,
+        margin_horizontal,
+        margin_vertical,
+    )
+}
+
+fn append_caption_events(
+    document: &mut String,
+    manifest: &VideoProjectManifest,
+    caption: &CaptionCue,
+) -> VideoResult<()> {
+    let (preset, pages) = planned_caption_pages_for_cue(manifest, caption)?;
+    let speaker = caption.speaker_id.as_deref().unwrap_or_default();
+
+    for page in pages {
+        match preset.reveal {
+            CaptionRevealMode::Page => {
+                let mut text = caption_page_text(&page, preset, None, None, None);
+                let animation = caption_page_animation(preset.id, page.start_us);
+                if !animation.is_empty() {
+                    text.insert_str(0, animation);
+                }
+                document.push_str(&ass_dialogue(
+                    10,
+                    page.start_us,
+                    page.end_us,
+                    preset.ass_name,
+                    speaker,
+                    &text,
+                ));
+            }
+            CaptionRevealMode::ActiveWord => {
+                append_stateful_caption_events(document, &page, preset, speaker, true, false)?;
+            }
+            CaptionRevealMode::Karaoke => {
+                append_stateful_caption_events(document, &page, preset, speaker, false, true)?;
+            }
+            CaptionRevealMode::Typewriter => {
+                append_typewriter_events(document, &page, preset, speaker)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn planned_caption_pages_for_cue(
+    manifest: &VideoProjectManifest,
+    caption: &CaptionCue,
+) -> VideoResult<(AssCaptionPreset, Vec<CaptionPage>)> {
+    let preset = caption_preset(CaptionPresetId::parse(&caption.style_id)?);
+    let tokens = timed_caption_tokens(manifest, caption, preset)?;
+    let pages = paginate_caption_tokens(tokens, caption.range, preset.paging)?;
+    Ok((preset, pages))
+}
+
+/// Prefer word ranges mapped through the same canonical source clip used by A/V assembly. When
+/// words cannot be matched safely (generated copy, corrections with changed token count, missing
+/// scene binding, or conflicting track mappings), pacing falls back deterministically across the
+/// existing cue range. The fallback never changes the cue's start or end.
+fn timed_caption_tokens(
+    manifest: &VideoProjectManifest,
+    caption: &CaptionCue,
+    preset: AssCaptionPreset,
+) -> VideoResult<Vec<TimedCaptionToken>> {
+    let raw_tokens = caption
+        .text
+        .split_whitespace()
+        .map(|token| apply_caption_casing(token, preset))
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if raw_tokens.is_empty() {
+        return Err(VideoError::new(
+            VideoErrorCode::InvalidCaption,
+            "caption contains no renderable words",
+        )
+        .at("captions.text"));
+    }
+
+    let exact_ranges = exact_caption_word_ranges(manifest, caption, raw_tokens.len());
+    let ranges = exact_ranges.unwrap_or(weighted_ranges(
+        caption.range,
+        &raw_tokens
+            .iter()
+            .map(|token| token.chars().count().max(1))
+            .collect::<Vec<_>>(),
+    )?);
+    let mut tokens = raw_tokens
+        .into_iter()
+        .zip(ranges)
+        .enumerate()
+        .map(|(index, (text, range))| TimedCaptionToken {
+            text,
+            space_before: index > 0,
+            start_us: range.start_us,
+            end_us: range.end_us,
+        })
+        .collect::<Vec<_>>();
+    tokens = split_oversize_caption_tokens(tokens, preset.paging.max_chars_per_line)?;
+    Ok(tokens)
+}
+
+fn apply_caption_casing(value: &str, preset: AssCaptionPreset) -> String {
+    if preset.uppercase {
+        value.to_uppercase()
+    } else if preset.lowercase {
+        value.to_lowercase()
+    } else {
+        value.to_string()
+    }
+}
+
+fn exact_caption_word_ranges(
+    manifest: &VideoProjectManifest,
+    caption: &CaptionCue,
+    display_token_count: usize,
+) -> Option<Vec<TimeRange>> {
+    let transcript = manifest.transcript.as_ref()?;
+    let segment_id = caption.transcript_segment_id.as_deref()?;
+    let scene_id = caption.scene_id.as_deref()?;
+    let segment = transcript
+        .segments
+        .iter()
+        .find(|segment| segment.id == segment_id)?;
+    if segment.word_ids.len() != display_token_count || segment.word_ids.is_empty() {
+        return None;
+    }
+    let word_by_id = transcript
+        .words
+        .iter()
+        .map(|word| (word.id.as_str(), word))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut ranges = Vec::with_capacity(segment.word_ids.len());
+    let mut previous_end = caption.range.start_us;
+    for word_id in &segment.word_ids {
+        let word = word_by_id.get(word_id.as_str())?;
+        let mut mapped_ranges = BTreeSet::new();
+        for track in &manifest.tracks {
+            if !matches!(track.kind, TrackKind::Audio | TrackKind::Video) {
+                continue;
+            }
+            for clip in &track.clips {
+                if clip.scene_id.as_deref() != Some(scene_id)
+                    || clip.media.source_asset_id.as_deref()
+                        != Some(transcript.source_asset_id.as_str())
+                    || !clip.source_range.contains_endpoint(word.range.start_us)
+                    || !clip.source_range.contains_endpoint(word.range.end_us)
+                {
+                    continue;
+                }
+                let start = map_source_endpoint_to_timeline(
+                    clip,
+                    word.range.start_us,
+                    QuantizeMode::Nearest,
+                )
+                .ok()?;
+                let end =
+                    map_source_endpoint_to_timeline(clip, word.range.end_us, QuantizeMode::Nearest)
+                        .ok()?;
+                let start = start.max(caption.range.start_us);
+                let end = end.min(caption.range.end_us);
+                if end > start {
+                    mapped_ranges.insert((start.0, end.0));
+                }
+            }
+        }
+        if mapped_ranges.len() != 1 {
+            return None;
+        }
+        let (start, end) = mapped_ranges.into_iter().next()?;
+        let range = TimeRange::new(start, end).ok()?;
+        // Overlapping or reordered word evidence is not safe for active-word effects. Keep the
+        // cue clock intact and use the documented bounded fallback instead.
+        if range.start_us < previous_end {
+            return None;
+        }
+        previous_end = range.end_us;
+        ranges.push(range);
+    }
+    Some(ranges)
+}
+
+fn weighted_ranges(range: TimeRange, weights: &[usize]) -> VideoResult<Vec<TimeRange>> {
+    if weights.is_empty() {
+        return Ok(Vec::new());
+    }
+    let duration = range.duration()?.0;
+    if duration < i64::try_from(weights.len()).unwrap_or(i64::MAX) {
+        return Err(VideoError::new(
+            VideoErrorCode::InvalidCaption,
+            "caption duration is too short for deterministic token pacing",
+        )
+        .at("captions.range"));
+    }
+    let total_weight = weights
+        .iter()
+        .try_fold(0_i128, |total, weight| total.checked_add(*weight as i128))
+        .ok_or_else(|| {
+            VideoError::new(
+                VideoErrorCode::ArithmeticOverflow,
+                "caption token weighting overflowed",
+            )
+        })?;
+    let mut cumulative = 0_i128;
+    let mut cursor = range.start_us.0;
+    let mut result = Vec::with_capacity(weights.len());
+    for (index, weight) in weights.iter().enumerate() {
+        cumulative = cumulative.checked_add(*weight as i128).ok_or_else(|| {
+            VideoError::new(
+                VideoErrorCode::ArithmeticOverflow,
+                "caption token weighting overflowed",
+            )
+        })?;
+        let end = if index + 1 == weights.len() {
+            range.end_us.0
+        } else {
+            let offset = (duration as i128).checked_mul(cumulative).ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorCode::ArithmeticOverflow,
+                    "caption token timing overflowed",
+                )
+            })? / total_weight;
+            range
+                .start_us
+                .0
+                .checked_add(i64::try_from(offset).map_err(|_| {
+                    VideoError::new(
+                        VideoErrorCode::ArithmeticOverflow,
+                        "caption token timing exceeded the timeline clock",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::ArithmeticOverflow,
+                        "caption token timing overflowed",
+                    )
+                })?
+        };
+        if end <= cursor {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidCaption,
+                "caption duration is too short for positive token timing",
+            )
+            .at("captions.range"));
+        }
+        result.push(TimeRange::new(cursor, end)?);
+        cursor = end;
+    }
+    Ok(result)
+}
+
+fn split_oversize_caption_tokens(
+    tokens: Vec<TimedCaptionToken>,
+    max_chars: usize,
+) -> VideoResult<Vec<TimedCaptionToken>> {
+    let mut result = Vec::new();
+    for token in tokens {
+        let characters = token.text.chars().collect::<Vec<_>>();
+        if characters.len() <= max_chars {
+            result.push(token);
+            continue;
+        }
+        let chunks = characters
+            .chunks(max_chars)
+            .map(|chunk| chunk.iter().collect::<String>())
+            .collect::<Vec<_>>();
+        let chunk_ranges = weighted_ranges(
+            TimeRange::new(token.start_us.0, token.end_us.0)?,
+            &chunks
+                .iter()
+                .map(|chunk| chunk.chars().count())
+                .collect::<Vec<_>>(),
+        )?;
+        for (index, (text, range)) in chunks.into_iter().zip(chunk_ranges).enumerate() {
+            result.push(TimedCaptionToken {
+                text,
+                space_before: index == 0 && token.space_before,
+                start_us: range.start_us,
+                end_us: range.end_us,
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn paginate_caption_tokens(
+    tokens: Vec<TimedCaptionToken>,
+    cue_range: TimeRange,
+    rules: CaptionPagingRules,
+) -> VideoResult<Vec<CaptionPage>> {
+    let mut grouped = Vec::<Vec<TimedCaptionToken>>::new();
+    let mut current = Vec::<TimedCaptionToken>::new();
+    for token in tokens {
+        if !current.is_empty() && !caption_page_accepts(&current, &token, rules) {
+            grouped.push(std::mem::take(&mut current));
+        }
+        current.push(token);
+        if rules.break_on_punctuation
+            && current.len() >= 2
+            && current
+                .last()
+                .is_some_and(|token| caption_token_ends_phrase(&token.text))
+        {
+            grouped.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        grouped.push(current);
+    }
+    if grouped.len() >= 2 && grouped.last().is_some_and(|page| page.len() == 1) {
+        let last = grouped.pop().expect("checked trailing caption page");
+        let candidate = last.first().expect("one-token trailing caption page");
+        let can_merge = grouped
+            .last()
+            .is_some_and(|prior| caption_page_accepts(prior, candidate, rules));
+        if can_merge {
+            grouped.last_mut().expect("prior caption page").extend(last);
+        } else {
+            grouped.push(last);
+        }
+    }
+    if grouped.is_empty() {
+        return Err(VideoError::new(
+            VideoErrorCode::InvalidCaption,
+            "caption paging produced no display pages",
+        ));
+    }
+
+    let duration = cue_range.duration()?.0;
+    let page_count = i64::try_from(grouped.len()).map_err(|_| {
+        VideoError::new(
+            VideoErrorCode::ArithmeticOverflow,
+            "caption page count exceeded the timeline clock",
+        )
+    })?;
+    let minimum_total = page_count
+        .checked_mul(MIN_ASS_PAGE_DURATION_US)
+        .ok_or_else(|| {
+            VideoError::new(
+                VideoErrorCode::ArithmeticOverflow,
+                "caption page duration overflowed",
+            )
+        })?;
+    if duration < minimum_total {
+        return Err(VideoError::new(
+            VideoErrorCode::InvalidCaption,
+            "caption text cannot be safely paged inside its cue duration",
+        )
+        .at("captions.range"));
+    }
+    let minimum_page_duration = rules
+        .preferred_min_page_us
+        .min(duration / page_count)
+        .max(MIN_ASS_PAGE_DURATION_US);
+    let mut boundaries = vec![cue_range.start_us];
+    for index in 1..grouped.len() {
+        let previous = *boundaries.last().expect("caption start boundary");
+        let remaining = i64::try_from(grouped.len() - index).map_err(|_| {
+            VideoError::new(
+                VideoErrorCode::ArithmeticOverflow,
+                "caption page count exceeded the timeline clock",
+            )
+        })?;
+        let lower = previous.checked_add(Microseconds(minimum_page_duration))?;
+        let reserved = remaining
+            .checked_mul(minimum_page_duration)
+            .ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorCode::ArithmeticOverflow,
+                    "caption page duration overflowed",
+                )
+            })?;
+        let upper = Microseconds(cue_range.end_us.0.checked_sub(reserved).ok_or_else(|| {
+            VideoError::new(
+                VideoErrorCode::ArithmeticOverflow,
+                "caption page boundary overflowed",
+            )
+        })?);
+        let desired = grouped[index]
+            .first()
+            .expect("non-empty caption page")
+            .start_us;
+        boundaries.push(desired.max(lower).min(upper));
+    }
+    boundaries.push(cue_range.end_us);
+
+    grouped
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut tokens)| {
+            let start_us = boundaries[index];
+            let end_us = boundaries[index + 1];
+            if end_us <= start_us {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidCaption,
+                    "caption pages must have positive, non-overlapping durations",
+                )
+                .at("captions.range"));
+            }
+            let safely_inside_page = tokens.iter().all(|token| {
+                token.start_us >= start_us
+                    && token.end_us <= end_us
+                    && token.end_us > token.start_us
+            }) && tokens
+                .windows(2)
+                .all(|pair| pair[0].end_us <= pair[1].start_us);
+            if !safely_inside_page {
+                // Minimum readable page spacing can conflict with unusually clustered source-word
+                // evidence. In that case the exact timing is no longer safe for this page; pace
+                // only its own words inside the already-authoritative page bounds.
+                let ranges = weighted_ranges(
+                    TimeRange::new(start_us.0, end_us.0)?,
+                    &tokens
+                        .iter()
+                        .map(|token| token.text.chars().count().max(1))
+                        .collect::<Vec<_>>(),
+                )?;
+                for (token, range) in tokens.iter_mut().zip(ranges) {
+                    token.start_us = range.start_us;
+                    token.end_us = range.end_us;
+                }
+            }
+            Ok(CaptionPage {
+                tokens,
+                start_us,
+                end_us,
+            })
+        })
+        .collect()
+}
+
+fn caption_page_accepts(
+    current: &[TimedCaptionToken],
+    candidate: &TimedCaptionToken,
+    rules: CaptionPagingRules,
+) -> bool {
+    if current.len() >= rules.max_words {
+        return false;
+    }
+    let mut proposed = current.to_vec();
+    proposed.push(candidate.clone());
+    caption_line_breaks(&proposed, rules).is_some()
+}
+
+fn caption_line_breaks(
+    tokens: &[TimedCaptionToken],
+    rules: CaptionPagingRules,
+) -> Option<Vec<bool>> {
+    let mut result = Vec::with_capacity(tokens.len());
+    let mut line = 1_usize;
+    let mut line_chars = 0_usize;
+    for (index, token) in tokens.iter().enumerate() {
+        let token_chars = token.text.chars().count();
+        if token_chars == 0 || token_chars > rules.max_chars_per_line {
+            return None;
+        }
+        let separator = usize::from(index > 0 && token.space_before);
+        if line_chars > 0 && line_chars + separator + token_chars > rules.max_chars_per_line {
+            line += 1;
+            line_chars = token_chars;
+            result.push(true);
+        } else {
+            line_chars += separator + token_chars;
+            result.push(false);
+        }
+        if line > rules.max_lines {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn caption_token_ends_phrase(value: &str) -> bool {
+    value
+        .chars()
+        .last()
+        .is_some_and(|character| matches!(character, '.' | '!' | '?' | '…' | ',' | ';' | ':' | '—'))
+}
+
+fn append_stateful_caption_events(
+    document: &mut String,
+    page: &CaptionPage,
+    preset: AssCaptionPreset,
+    speaker: &str,
+    active_word: bool,
+    progressive: bool,
+) -> VideoResult<()> {
+    let mut boundaries = BTreeSet::from([page.start_us, page.end_us]);
+    for token in &page.tokens {
+        boundaries.insert(token.start_us.max(page.start_us).min(page.end_us));
+        if active_word {
+            boundaries.insert(token.end_us.max(page.start_us).min(page.end_us));
+        }
+    }
+    let boundaries = boundaries.into_iter().collect::<Vec<_>>();
+    for pair in boundaries.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        if end <= start || ass_time(start) == ass_time(end) {
+            continue;
+        }
+        let midpoint = Microseconds(start.0 + (end.0 - start.0) / 2);
+        let active = active_word.then(|| {
+            page.tokens
+                .iter()
+                .position(|token| token.start_us <= midpoint && midpoint < token.end_us)
+        });
+        let active = active.flatten();
+        let spoken = progressive.then(|| {
+            page.tokens
+                .iter()
+                .take_while(|token| token.start_us <= midpoint)
+                .count()
+        });
+        let text = caption_page_text(page, preset, active, spoken, None);
+        document.push_str(&ass_dialogue(
+            10,
+            start,
+            end,
+            preset.ass_name,
+            speaker,
+            &text,
+        ));
+    }
+    Ok(())
+}
+
+fn append_typewriter_events(
+    document: &mut String,
+    page: &CaptionPage,
+    preset: AssCaptionPreset,
+    speaker: &str,
+) -> VideoResult<()> {
+    let mut boundaries = BTreeSet::from([page.start_us, page.end_us]);
+    boundaries.extend(
+        page.tokens
+            .iter()
+            .map(|token| token.start_us.max(page.start_us).min(page.end_us)),
+    );
+    let boundaries = boundaries.into_iter().collect::<Vec<_>>();
+    for pair in boundaries.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        if end <= start || ass_time(start) == ass_time(end) {
+            continue;
+        }
+        let midpoint = Microseconds(start.0 + (end.0 - start.0) / 2);
+        let visible = page
+            .tokens
+            .iter()
+            .take_while(|token| token.start_us <= midpoint)
+            .count();
+        if visible == 0 {
+            continue;
+        }
+        let text = caption_page_text(page, preset, None, None, Some(visible));
+        document.push_str(&ass_dialogue(
+            10,
+            start,
+            end,
+            preset.ass_name,
+            speaker,
+            &text,
+        ));
+    }
+    Ok(())
+}
+
+fn caption_page_text(
+    page: &CaptionPage,
+    preset: AssCaptionPreset,
+    active_token: Option<usize>,
+    spoken_token_count: Option<usize>,
+    visible_token_count: Option<usize>,
+) -> String {
+    let visible = visible_token_count
+        .unwrap_or(page.tokens.len())
+        .min(page.tokens.len());
+    let breaks = caption_line_breaks(&page.tokens, preset.paging)
+        .expect("caption pages are measured before rendering");
+    let mut result = String::new();
+    let mut current_color: Option<&str> = None;
+    for (index, token) in page.tokens.iter().take(visible).enumerate() {
+        if index > 0 {
+            if breaks[index] {
+                result.push_str(r"\N");
+            } else if token.space_before {
+                result.push(' ');
+            }
+        }
+        let color = if active_token == Some(index)
+            || spoken_token_count.is_some_and(|count| index < count)
+        {
+            preset.active_color
+        } else {
+            preset.primary_color
+        };
+        if current_color != Some(color) {
+            result.push_str(&format!("{{\\1c{color}}}"));
+            current_color = Some(color);
+        }
+        result.push_str(&escape_ass_text(&token.text));
+    }
+    result
+}
+
+fn plain_caption_page_text(page: &CaptionPage, preset: AssCaptionPreset) -> String {
+    let breaks = caption_line_breaks(&page.tokens, preset.paging)
+        .expect("caption pages are measured before projection");
+    let mut result = String::new();
+    for (index, token) in page.tokens.iter().enumerate() {
+        if index > 0 {
+            if breaks[index] {
+                result.push('\n');
+            } else if token.space_before {
+                result.push(' ');
+            }
+        }
+        result.push_str(&token.text);
+    }
+    result
+}
+
+fn caption_page_animation(id: CaptionPresetId, start: Microseconds) -> &'static str {
+    // Like Reelmify, a page visible on the first output frame is stable: it does not fade/pop in.
+    if start == Microseconds::ZERO {
+        return "";
+    }
+    match id {
+        CaptionPresetId::Calm => r"{\fad(120,160)}",
+        CaptionPresetId::Kinetic => r"{\fad(40,80)\fscx104\fscy104\t(0,140,\fscx100\fscy100)}",
+        CaptionPresetId::Podcast => r"{\fad(100,160)}",
+        _ => "",
     }
 }
 
@@ -978,7 +2003,8 @@ mod tests {
         AudioMix, AudioMixTrack, CanvasSpec, GapReason, LayoutPlan, MediaProbe, MediaReference,
         NormalizedRect, Provenance, ProvenanceKind, RationalFrameRate, RationalRate, ReviewState,
         ReviewedScene, SourceAsset, SourceAssetKind, TimeRange, TimelineClip, TimelineGap,
-        TimelineTrack, TrackKind,
+        TimelineTrack, TrackKind, TranscriptSegment, TranscriptTimingSource, TranscriptVersion,
+        TranscriptWord,
     };
     use super::*;
     use std::process::{Command, Stdio};
@@ -1361,6 +2387,190 @@ mod tests {
     }
 
     #[test]
+    fn every_curated_caption_preset_has_one_distinct_ass_style_and_round_trips() {
+        let root =
+            std::env::temp_dir().join(format!("soundar-presets-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        fs::write(&source, b"fixture").unwrap();
+        let mut manifest = fixture_manifest(&source);
+        let mut style_lines = BTreeSet::new();
+
+        for id in CaptionPresetId::ALL {
+            manifest.captions[0].style_id = id.manifest_id().into();
+            let document = build_ass_document(&manifest, &AssemblyOptions::default()).unwrap();
+            let preset = caption_preset(id);
+            assert_eq!(
+                document
+                    .lines()
+                    .filter(|line| line.starts_with(&format!("Style: {},", preset.ass_name)))
+                    .count(),
+                1,
+                "{} must be emitted exactly once",
+                id.public_id()
+            );
+            assert!(document.lines().any(|line| {
+                line.starts_with("Dialogue: 10,") && line.split(',').nth(3) == Some(preset.ass_name)
+            }));
+            style_lines.insert(
+                document
+                    .lines()
+                    .find(|line| line.starts_with(&format!("Style: {},", preset.ass_name)))
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(style_lines.len(), CaptionPresetId::ALL.len());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mixed_per_cue_styles_render_without_a_global_theme_override() {
+        let root =
+            std::env::temp_dir().join(format!("soundar-mixed-ass-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        fs::write(&source, b"fixture").unwrap();
+        let mut manifest = fixture_manifest(&source);
+        manifest.captions[0].range = TimeRange::new(100_000, 480_000).unwrap();
+        manifest.captions[0].text = "FIRST IDEA".into();
+        manifest.captions[0].style_id = "caption-bold-pop".into();
+        let mut second = manifest.captions[0].clone();
+        second.id = "caption-2".into();
+        second.range = TimeRange::new(480_000, 900_000).unwrap();
+        second.text = "a measured response".into();
+        second.style_id = "caption-podcast".into();
+        manifest.captions.push(second);
+        manifest.validate_strict().unwrap();
+
+        let document = build_ass_document(
+            &manifest,
+            &AssemblyOptions {
+                caption_theme: CaptionTheme::Kinetic,
+                ..AssemblyOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(document.contains(",CaptionBoldPop,Host,"));
+        assert!(document.contains(",CaptionPodcast,Host,"));
+        assert!(!document.contains("Style: Caption,"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn long_caption_text_pages_within_bounds_and_never_exceeds_line_limits() {
+        let root = std::env::temp_dir().join(format!("soundar-paging-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        fs::write(&source, b"fixture").unwrap();
+        let mut manifest = fixture_manifest(&source);
+        manifest.captions[0].range = TimeRange::new(20_000, 980_000).unwrap();
+        manifest.captions[0].style_id = "caption-podcast".into();
+        manifest.captions[0].text = "One thoughtful question can open a conversation, reveal an overlooked detail, connect an earlier idea, and leave the audience with a clear next step. extraordinarilylongunbrokenidentifierthatmustneverescape".into();
+        let caption = manifest.captions[0].clone();
+        let preset = caption_preset(CaptionPresetId::Podcast);
+        let tokens = timed_caption_tokens(&manifest, &caption, preset).unwrap();
+        let pages = paginate_caption_tokens(tokens, caption.range, preset.paging).unwrap();
+        assert!(pages.len() >= 3);
+        assert_eq!(pages.first().unwrap().start_us, caption.range.start_us);
+        assert_eq!(pages.last().unwrap().end_us, caption.range.end_us);
+        for pair in pages.windows(2) {
+            assert_eq!(pair[0].end_us, pair[1].start_us);
+            assert!(pair[0].end_us > pair[0].start_us);
+        }
+        for page in &pages {
+            let breaks = caption_line_breaks(&page.tokens, preset.paging).unwrap();
+            assert!(breaks.iter().filter(|value| **value).count() < 2);
+            let mut line_chars = 0;
+            for (index, token) in page.tokens.iter().enumerate() {
+                if breaks[index] {
+                    assert!(line_chars <= preset.paging.max_chars_per_line);
+                    line_chars = token.text.chars().count();
+                } else {
+                    line_chars +=
+                        usize::from(index > 0 && token.space_before) + token.text.chars().count();
+                }
+            }
+            assert!(line_chars <= preset.paging.max_chars_per_line);
+        }
+        let document = build_ass_document(&manifest, &AssemblyOptions::default()).unwrap();
+        assert!(document.matches(",CaptionPodcast,Host,").count() >= pages.len());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn exact_source_words_drive_active_timing_and_mismatch_uses_bounded_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("soundar-word-clock-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        fs::write(&source, b"fixture").unwrap();
+        let mut manifest = fixture_manifest(&source);
+        manifest.transcript = Some(TranscriptVersion {
+            id: "transcript-1".into(),
+            source_asset_id: "source-1".into(),
+            source_clock_duration_us: Microseconds(1_000_000),
+            language: Some("en".into()),
+            timing_source: TranscriptTimingSource::Manual,
+            preserved_source_gaps: true,
+            segments: vec![TranscriptSegment {
+                id: "segment-1".into(),
+                range: TimeRange::new(100_000, 900_000).unwrap(),
+                text: "Hello world".into(),
+                speaker_id: Some("Host".into()),
+                word_ids: vec!["word-1".into(), "word-2".into()],
+            }],
+            words: vec![
+                TranscriptWord {
+                    id: "word-1".into(),
+                    range: TimeRange::new(200_000, 320_000).unwrap(),
+                    text: "Hello".into(),
+                    speaker_id: Some("Host".into()),
+                    confidence_milli: Some(990),
+                },
+                TranscriptWord {
+                    id: "word-2".into(),
+                    range: TimeRange::new(500_000, 650_000).unwrap(),
+                    text: "world".into(),
+                    speaker_id: Some("Host".into()),
+                    confidence_milli: Some(980),
+                },
+            ],
+            content_sha256: "e".repeat(64),
+            created_at: timestamp(),
+        });
+        manifest.captions[0].range = TimeRange::new(100_000, 900_000).unwrap();
+        manifest.captions[0].text = "Hello world".into();
+        manifest.captions[0].style_id = "caption-highlight".into();
+        manifest.captions[0].transcript_segment_id = Some("segment-1".into());
+        manifest.validate_strict().unwrap();
+
+        let preset = caption_preset(CaptionPresetId::Highlight);
+        let exact = timed_caption_tokens(&manifest, &manifest.captions[0], preset).unwrap();
+        assert_eq!(exact[0].start_us, Microseconds(200_000));
+        assert_eq!(exact[0].end_us, Microseconds(320_000));
+        assert_eq!(exact[1].start_us, Microseconds(500_000));
+        assert_eq!(exact[1].end_us, Microseconds(650_000));
+        let document = build_ass_document(&manifest, &AssemblyOptions::default()).unwrap();
+        assert!(document.contains("0:00:00.20,0:00:00.32,CaptionHighlight"));
+        assert!(document.contains("0:00:00.50,0:00:00.65,CaptionHighlight"));
+
+        manifest.captions[0].text = "Hello brave world".into();
+        let fallback = timed_caption_tokens(&manifest, &manifest.captions[0], preset).unwrap();
+        assert_eq!(fallback.first().unwrap().start_us, Microseconds(100_000));
+        assert_eq!(fallback.last().unwrap().end_us, Microseconds(900_000));
+        assert!(fallback
+            .windows(2)
+            .all(|pair| pair[0].end_us == pair[1].start_us));
+        assert!(fallback.iter().all(|token| {
+            token.start_us >= manifest.captions[0].range.start_us
+                && token.end_us <= manifest.captions[0].range.end_us
+                && token.end_us > token.start_us
+        }));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn assembly_plan_is_shell_free_and_has_software_fallback() {
         if !Path::new("/usr/bin/ffmpeg").is_file() {
             return;
@@ -1509,7 +2719,8 @@ mod tests {
             .status()
             .unwrap();
         assert!(fixture_status.success());
-        let manifest = fixture_manifest(&source);
+        let mut manifest = fixture_manifest(&source);
+        manifest.captions[0].style_id = "caption-karaoke".into();
         let options = AssemblyOptions {
             profile: RenderProfile::Proxy,
             portrait_layout: PortraitLayout::Contain,

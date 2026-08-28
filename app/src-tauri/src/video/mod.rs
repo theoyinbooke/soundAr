@@ -16,7 +16,8 @@ pub mod service;
 pub mod timeline;
 
 pub use assembly::{
-    build_ass_document, build_timeline_render_plan, write_ass_document_atomic, AssemblyOptions,
+    build_ass_document, build_timeline_render_plan, plan_caption_preview_pages,
+    write_ass_document_atomic, AssemblyOptions, CaptionPreviewPage, CaptionPreviewWord,
     CaptionTheme,
 };
 pub use cache::{

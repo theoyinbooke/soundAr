@@ -903,12 +903,102 @@ pub struct CaptionCue {
     pub scene_id: Option<String>,
 }
 
+/// Stable, curated caption looks shared by manifests, native commands, agent tools, and the
+/// FFmpeg/ASS renderer. Public surfaces use [`Self::public_id`]; persisted cues use
+/// [`Self::manifest_id`]. Parsing accepts both forms so existing projects remain readable while
+/// unsupported identifiers fail closed instead of silently changing appearance.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CaptionPresetId {
+    CleanWhite,
+    Calm,
+    Kinetic,
+    BoldPop,
+    Highlight,
+    Karaoke,
+    Typewriter,
+    Podcast,
+}
+
+impl CaptionPresetId {
+    pub const ALL: [Self; 8] = [
+        Self::CleanWhite,
+        Self::Calm,
+        Self::Kinetic,
+        Self::BoldPop,
+        Self::Highlight,
+        Self::Karaoke,
+        Self::Typewriter,
+        Self::Podcast,
+    ];
+
+    pub const PUBLIC_IDS: [&'static str; 8] = [
+        "clean-white",
+        "calm",
+        "kinetic",
+        "bold-pop",
+        "highlight",
+        "karaoke",
+        "typewriter",
+        "podcast",
+    ];
+
+    pub fn parse(value: &str) -> VideoResult<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            // `clean` and unprefixed values were accepted before the curated catalog existed.
+            "clean" | "clean-white" | "caption-clean" | "caption-clean-white" => {
+                Ok(Self::CleanWhite)
+            }
+            "calm" | "caption-calm" => Ok(Self::Calm),
+            "kinetic" | "caption-kinetic" => Ok(Self::Kinetic),
+            "bold-pop" | "caption-bold-pop" => Ok(Self::BoldPop),
+            "highlight" | "caption-highlight" => Ok(Self::Highlight),
+            "karaoke" | "caption-karaoke" => Ok(Self::Karaoke),
+            "typewriter" | "caption-typewriter" => Ok(Self::Typewriter),
+            "podcast" | "caption-podcast" => Ok(Self::Podcast),
+            _ => Err(VideoError::new(
+                VideoErrorCode::InvalidCaption,
+                format!(
+                    "unsupported caption style; expected one of {}",
+                    Self::PUBLIC_IDS.join(", ")
+                ),
+            )
+            .at("captions.style_id")),
+        }
+    }
+
+    pub const fn public_id(self) -> &'static str {
+        match self {
+            Self::CleanWhite => "clean-white",
+            Self::Calm => "calm",
+            Self::Kinetic => "kinetic",
+            Self::BoldPop => "bold-pop",
+            Self::Highlight => "highlight",
+            Self::Karaoke => "karaoke",
+            Self::Typewriter => "typewriter",
+            Self::Podcast => "podcast",
+        }
+    }
+
+    pub const fn manifest_id(self) -> &'static str {
+        match self {
+            Self::CleanWhite => "caption-clean-white",
+            Self::Calm => "caption-calm",
+            Self::Kinetic => "caption-kinetic",
+            Self::BoldPop => "caption-bold-pop",
+            Self::Highlight => "caption-highlight",
+            Self::Karaoke => "caption-karaoke",
+            Self::Typewriter => "caption-typewriter",
+            Self::Podcast => "caption-podcast",
+        }
+    }
+}
+
 impl Validate for CaptionCue {
     fn validate(&self) -> VideoResult<()> {
         validate_identifier(&self.id, "captions.id")?;
         self.range.validate()?;
         validate_nonempty(&self.text, "captions.text", 2_000)?;
-        validate_identifier(&self.style_id, "captions.style_id")?;
+        CaptionPresetId::parse(&self.style_id)?;
         if let Some(scene_id) = &self.scene_id {
             validate_identifier(scene_id, "captions.scene_id")?;
         }
@@ -2246,6 +2336,35 @@ mod tests {
     #[test]
     fn valid_manifest_preserves_explicit_gap() {
         manifest().validate_strict().unwrap();
+    }
+
+    #[test]
+    fn curated_caption_ids_are_stable_and_unknown_styles_fail_closed() {
+        for preset in CaptionPresetId::ALL {
+            assert_eq!(CaptionPresetId::parse(preset.public_id()).unwrap(), preset);
+            assert_eq!(
+                CaptionPresetId::parse(preset.manifest_id()).unwrap(),
+                preset
+            );
+        }
+        assert_eq!(
+            CaptionPresetId::parse("clean").unwrap(),
+            CaptionPresetId::CleanWhite
+        );
+
+        let mut manifest = manifest();
+        manifest.captions.push(CaptionCue {
+            id: "caption-unsupported".into(),
+            range: TimeRange::new(0, 1_000_000).unwrap(),
+            text: "A caption must never silently change style.".into(),
+            style_id: "surprise-template".into(),
+            speaker_id: None,
+            transcript_segment_id: None,
+            scene_id: None,
+        });
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidCaption);
+        assert_eq!(error.field.as_deref(), Some("captions.style_id"));
     }
 
     #[test]

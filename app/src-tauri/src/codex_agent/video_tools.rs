@@ -500,15 +500,16 @@ impl ScenePatch {
                 "Crop mode must be auto-center, fit, or manual",
             ));
         }
-        if self
-            .caption_style
-            .as_deref()
-            .is_some_and(|value| !matches!(value, "clean-white" | "calm" | "kinetic"))
-        {
-            return Err(VideoAgentToolError::invalid_field(
-                "scene_patch.caption_style",
-                "Caption style must be clean-white, calm, or kinetic",
-            ));
+        if let Some(value) = self.caption_style.as_deref() {
+            video::CaptionPresetId::parse(value).map_err(|_| {
+                VideoAgentToolError::invalid_field(
+                    "scene_patch.caption_style",
+                    format!(
+                        "Caption style must be {}",
+                        video::CaptionPresetId::PUBLIC_IDS.join(", ")
+                    ),
+                )
+            })?;
         }
         for (field, gain) in [
             ("scene_patch.voice_gain_db", self.voice_gain_db),
@@ -1240,7 +1241,7 @@ fn revise_schema() -> Value {
                             "required":["x_bp","y_bp","width_bp","height_bp"]
                         },
                         "captions_enabled": {"type":["boolean","null"]},
-                        "caption_style": {"type":["string","null"],"enum":["clean-white","calm","kinetic",null]},
+                        "caption_style": {"type":["string","null"],"enum":["clean-white","calm","kinetic","bold-pop","highlight","karaoke","typewriter","podcast",null]},
                         "voice_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12},
                         "music_gain_db": {"type":["number","null"],"minimum":-60,"maximum":12},
                         "voice_id": {"type":["string","null"],"minLength":1,"maxLength":128,"description":"Stable soundAr Voice library id"},
@@ -1498,6 +1499,43 @@ mod tests {
                     .is_some(),
                 "missing voice revision schema field {field}"
             );
+        }
+    }
+
+    #[test]
+    fn curated_caption_presets_are_validated_and_exposed_by_the_agent_schema() {
+        for style in video::CaptionPresetId::PUBLIC_IDS {
+            VideoAgentOperation::parse(
+                "revise_video",
+                json!({
+                    "project_id": "project-7",
+                    "instruction": "Change the caption style",
+                    "base_version_id": "version-2",
+                    "scene_id": "scene-opening",
+                    "scene_patch": {"caption_style": style}
+                }),
+            )
+            .unwrap_or_else(|error| panic!("{style} should be accepted: {error:?}"));
+        }
+        let error = VideoAgentOperation::parse(
+            "revise_video",
+            json!({
+                "project_id": "project-7",
+                "instruction": "Use an unknown caption style",
+                "base_version_id": "version-2",
+                "scene_patch": {"caption_style": "untrusted-template"}
+            }),
+        )
+        .expect_err("unknown caption preset must fail closed");
+        assert_eq!(error.code, "video.agent_invalid_field");
+        assert_eq!(error.field.as_deref(), Some("scene_patch.caption_style"));
+
+        let schema = revise_schema();
+        let values = schema["properties"]["scene_patch"]["properties"]["caption_style"]["enum"]
+            .as_array()
+            .expect("caption enum");
+        for style in video::CaptionPresetId::PUBLIC_IDS {
+            assert!(values.iter().any(|value| value.as_str() == Some(style)));
         }
     }
 

@@ -6,11 +6,11 @@
 //! supported local faster-whisper adapters.
 
 use super::contracts::{
-    AudioMix, AudioMixTrack, CandidateStatus, CaptionCue, ClipCandidate, GapReason, MediaReference,
-    Microseconds, RationalRate, ReviewState, ReviewedScene, TimeRange, TimelineClip, TimelineGap,
-    TimelineTrack, TrackKind, TranscriptSegment, TranscriptTimingSource, TranscriptVersion,
-    TranscriptWord, Validate, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
-    MAX_SOURCE_DURATION_US,
+    AudioMix, AudioMixTrack, CandidateStatus, CaptionCue, CaptionPresetId, ClipCandidate,
+    GapReason, MediaReference, Microseconds, RationalRate, ReviewState, ReviewedScene, TimeRange,
+    TimelineClip, TimelineGap, TimelineTrack, TrackKind, TranscriptSegment, TranscriptTimingSource,
+    TranscriptVersion, TranscriptWord, Validate, VideoError, VideoErrorCode, VideoProjectManifest,
+    VideoResult, MAX_SOURCE_DURATION_US,
 };
 use super::timeline::quantize_range_outward;
 use serde::{Deserialize, Serialize};
@@ -305,13 +305,9 @@ pub fn plan_reviewed_timeline(
         )
         .at("selected_candidate_ids"));
     }
-    if request.caption_style_id.is_empty() || request.caption_style_id.len() > 128 {
-        return Err(VideoError::new(
-            VideoErrorCode::InvalidCaption,
-            "caption_style_id must be a bounded identifier",
-        )
-        .at("caption_style_id"));
-    }
+    let caption_style_id = CaptionPresetId::parse(&request.caption_style_id)?
+        .manifest_id()
+        .to_string();
     if request.inter_scene_gap_us.0 < 0 || request.inter_scene_gap_us.0 > 10_000_000 {
         return Err(VideoError::new(
             VideoErrorCode::InvalidGap,
@@ -490,7 +486,7 @@ pub fn plan_reviewed_timeline(
                 id: format!("caption-{:03}-{:06}", index + 1, captions.len() + 1),
                 range: TimeRange::new(timeline_start.0, timeline_end.0)?,
                 text: segment.text.clone(),
-                style_id: request.caption_style_id.clone(),
+                style_id: caption_style_id.clone(),
                 speaker_id: segment.speaker_id.clone(),
                 transcript_segment_id: Some(segment.id.clone()),
                 scene_id: Some(scene_id.clone()),

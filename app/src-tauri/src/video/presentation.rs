@@ -5,10 +5,11 @@
 //! artifact paths. Keeping this adapter pure prevents the UI, Tauri commands, and agent tools
 //! from growing separate workflow implementations.
 
+use super::assembly::CaptionPreviewPage;
 use super::contracts::{
-    CandidateStatus, CanvasMode, LayoutRole, Microseconds, PublicationState, RenderArtifact,
-    RenderArtifactRole, RevisionStage, SourceAsset, SourceAssetKind, TrackKind, VideoError,
-    VideoErrorCode, VideoProjectManifest, VideoResult,
+    CandidateStatus, CanvasMode, CaptionPresetId, LayoutRole, Microseconds, PublicationState,
+    RenderArtifact, RenderArtifactRole, RevisionStage, SourceAsset, SourceAssetKind, TrackKind,
+    VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
 };
 use super::media::{MediaRuntimeStatus, MediaToolStatus};
 use serde_json::{json, Value};
@@ -166,6 +167,11 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
         .collect::<Vec<_>>();
 
     let caption_style = current_caption_style(&manifest);
+    let caption_pages = super::assembly::plan_caption_preview_pages(&manifest)?;
+    let presented_caption_pages = caption_pages
+        .iter()
+        .map(present_caption_page)
+        .collect::<Vec<_>>();
     let layout = canvas_mode(&manifest);
     let narration_by_scene = manifest
         .narration_bindings
@@ -178,6 +184,8 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
         .enumerate()
         .map(|(index, scene)| {
             let narration = narration_by_scene.get(scene.id.as_str()).copied();
+            let scene_caption_style = caption_style_for_scene(&manifest, &scene.id)
+                .unwrap_or(caption_style);
             let source_range = scene.source_range;
             let timeline_end = scene
                 .timeline_start_us
@@ -197,7 +205,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "crop_mode": scene_crop_mode(&manifest, &scene.id),
                 "crop_rect": scene_crop_rect(&manifest, &scene.id),
                 "captions_enabled": manifest.captions.iter().any(|caption| caption.scene_id.as_deref() == Some(scene.id.as_str())),
-                "caption_style": caption_style,
+                "caption_style": scene_caption_style,
                 "voice_gain_db": gain_for_track(&manifest, "audio-main"),
                 "music_gain_db": gain_for_track(&manifest, "music-main"),
                 "narration_binding_id": narration.map(|binding| binding.id.as_str()),
@@ -228,7 +236,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             })
         })
         .collect::<Vec<_>>();
-    let timeline = present_timeline(&manifest);
+    let timeline = present_timeline(&manifest, &caption_pages);
     let revisions = present_revisions(&manifest, &version_id);
     let status = present_status(record.get("status").and_then(Value::as_str));
     let name = record
@@ -271,6 +279,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "transcript": transcript_segments,
             "candidates": candidates,
             "scenes": scenes,
+            "caption_pages": presented_caption_pages,
             "narration_bindings": narration_bindings,
             "timeline": timeline,
             "artifacts": artifacts,
@@ -509,7 +518,10 @@ fn present_media_asset(asset: &Value, project_id: &str, version_id: &str) -> Val
     })
 }
 
-fn present_timeline(manifest: &VideoProjectManifest) -> Value {
+fn present_timeline(
+    manifest: &VideoProjectManifest,
+    caption_pages: &[CaptionPreviewPage],
+) -> Value {
     let source_kind = manifest
         .source_assets
         .iter()
@@ -517,9 +529,15 @@ fn present_timeline(manifest: &VideoProjectManifest) -> Value {
         .collect::<BTreeMap<_, _>>();
     let mut tracks = Vec::new();
     for track in &manifest.tracks {
+        // Caption media tracks are an internal timeline contract. The authoritative preview lane
+        // is derived from the same paged cue plan as ASS below, so never expose a competing lane
+        // that could shadow it in clients using `find(kind == "captions")`.
+        if matches!(track.kind, TrackKind::Caption) {
+            continue;
+        }
         let frontend_kind = match track.kind {
             TrackKind::Video | TrackKind::Overlay => "video",
-            TrackKind::Caption => "captions",
+            TrackKind::Caption => unreachable!("caption tracks are projected from cue pages"),
             TrackKind::Audio => {
                 let music = track.clips.iter().any(|clip| {
                     clip.media
@@ -576,17 +594,19 @@ fn present_timeline(manifest: &VideoProjectManifest) -> Value {
         items.sort_by_key(|item| item.get("start_ms").and_then(Value::as_i64).unwrap_or(0));
         tracks.push(json!({"kind": frontend_kind, "items": items}));
     }
-    if !manifest.captions.is_empty() {
+    if !caption_pages.is_empty() {
         tracks.push(json!({
             "kind": "captions",
-            "items": manifest.captions.iter().map(|caption| json!({
-                "id": caption.id,
+            "items": caption_pages.iter().map(|page| json!({
+                "id": page.id,
+                "cue_id": page.cue_id,
                 "track": "captions",
                 "kind": "clip",
-                "start_ms": micros_to_millis(caption.range.start_us),
-                "end_ms": micros_to_millis(caption.range.end_us),
-                "label": caption.text,
-                "scene_id": caption.scene_id,
+                "start_ms": micros_to_millis(page.start_us),
+                "end_ms": micros_to_millis(page.end_us),
+                "label": page.text,
+                "scene_id": page.scene_id,
+                "caption_style": page.style_id,
             })).collect::<Vec<_>>(),
         }));
     }
@@ -600,6 +620,23 @@ fn present_timeline(manifest: &VideoProjectManifest) -> Value {
         "duration_ms": micros_to_millis(manifest.timeline_duration_us),
         "source_clock_duration_ms": micros_to_millis(source_duration),
         "tracks": tracks,
+    })
+}
+
+fn present_caption_page(page: &CaptionPreviewPage) -> Value {
+    json!({
+        "id": page.id,
+        "cue_id": page.cue_id,
+        "scene_id": page.scene_id,
+        "start_ms": micros_to_millis(page.start_us),
+        "end_ms": micros_to_millis(page.end_us),
+        "text": page.text,
+        "style_id": page.style_id,
+        "words": page.words.iter().map(|word| json!({
+            "text": word.text,
+            "start_ms": micros_to_millis(word.start_us),
+            "end_ms": micros_to_millis(word.end_us),
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -647,18 +684,29 @@ fn present_tool(id: &str, label: &str, tool: &MediaToolStatus, fallback_ready: b
 }
 
 fn current_caption_style(manifest: &VideoProjectManifest) -> &'static str {
-    let style = manifest
+    manifest
         .captions
         .first()
-        .map(|caption| caption.style_id.to_ascii_lowercase())
-        .unwrap_or_default();
-    if style.contains("kinetic") {
-        "kinetic"
-    } else if style.contains("calm") {
-        "calm"
-    } else {
-        "clean-white"
-    }
+        .map(caption_public_style)
+        .unwrap_or(CaptionPresetId::CleanWhite.public_id())
+}
+
+fn caption_style_for_scene(
+    manifest: &VideoProjectManifest,
+    scene_id: &str,
+) -> Option<&'static str> {
+    manifest
+        .captions
+        .iter()
+        .find(|caption| caption.scene_id.as_deref() == Some(scene_id))
+        .map(caption_public_style)
+}
+
+fn caption_public_style(caption: &super::contracts::CaptionCue) -> &'static str {
+    // The manifest has already passed strict validation before presentation.
+    CaptionPresetId::parse(&caption.style_id)
+        .expect("validated caption preset")
+        .public_id()
 }
 
 fn scene_crop_mode(manifest: &VideoProjectManifest, scene_id: &str) -> &'static str {
@@ -836,7 +884,8 @@ fn presentation_error(message: impl Into<String>) -> VideoError {
 #[cfg(test)]
 mod tests {
     use super::super::contracts::{
-        AudioMix, CanvasSpec, LayoutPlan, NormalizedRect, RationalFrameRate, RevisionRecord,
+        AudioMix, CanvasSpec, CaptionCue, LayoutPlan, NormalizedRect, RationalFrameRate,
+        ReviewState, ReviewedScene, RevisionRecord, TimeRange, TimelineTrack, TrackKind,
     };
     use super::*;
     use std::collections::BTreeSet;
@@ -908,6 +957,161 @@ mod tests {
         assert_eq!(presented["manifest"]["source"]["kind"], "prompt");
         let summary = present_video_project_summary(&record, Path::new("/tmp/video-root")).unwrap();
         assert!(summary.get("manifest").is_none());
+    }
+
+    #[test]
+    fn authoritative_caption_pages_round_trip_per_scene_and_match_ass_outer_ranges() {
+        let mut manifest = manifest();
+        manifest.reviewed_scenes = vec![
+            ReviewedScene {
+                id: "scene-opening".into(),
+                candidate_id: None,
+                source_asset_id: None,
+                source_range: None,
+                timeline_start_us: Microseconds::ZERO,
+                timeline_duration_us: Microseconds(2_500_000),
+                title: "Opening".into(),
+                script: "Opening script".into(),
+                review_state: ReviewState::Approved,
+                revision: 1,
+            },
+            ReviewedScene {
+                id: "scene-close".into(),
+                candidate_id: None,
+                source_asset_id: None,
+                source_range: None,
+                timeline_start_us: Microseconds(2_500_000),
+                timeline_duration_us: Microseconds(2_500_000),
+                title: "Close".into(),
+                script: "Closing script".into(),
+                review_state: ReviewState::Approved,
+                revision: 1,
+            },
+        ];
+        manifest.captions = vec![
+            CaptionCue {
+                id: "caption-opening".into(),
+                range: TimeRange::new(100_000, 2_300_000).unwrap(),
+                text: "A thoughtful podcast caption keeps the complete idea readable and calmly moves to its next measured page.".into(),
+                style_id: "caption-podcast".into(),
+                speaker_id: Some("Host".into()),
+                transcript_segment_id: None,
+                scene_id: Some("scene-opening".into()),
+            },
+            CaptionCue {
+                id: "caption-close".into(),
+                range: TimeRange::new(2_600_000, 4_800_000).unwrap(),
+                text: "Follow every closing word".into(),
+                style_id: "caption-karaoke".into(),
+                speaker_id: Some("Guest".into()),
+                transcript_segment_id: None,
+                scene_id: Some("scene-close".into()),
+            },
+        ];
+        // Persisted cue order is not a presentation clock, and an existing canonical caption
+        // track must not create a second UI lane that shadows authoritative pages.
+        manifest.captions.reverse();
+        manifest.tracks.push(TimelineTrack {
+            id: "caption-main".into(),
+            kind: TrackKind::Caption,
+            clips: vec![],
+            preserve_gaps: false,
+        });
+        manifest.validate_strict().unwrap();
+        let canonical_pages = super::super::assembly::plan_caption_preview_pages(&manifest)
+            .expect("canonical preview pages");
+        assert!(canonical_pages.len() >= 3);
+        assert!(canonical_pages
+            .windows(2)
+            .all(|pair| pair[0].start_us <= pair[1].start_us));
+        let ass = super::super::assembly::build_ass_document(
+            &manifest,
+            &super::super::assembly::AssemblyOptions::default(),
+        )
+        .expect("ASS document");
+
+        let record = json!({
+            "id": "video-project",
+            "name": "Thoughtful reel",
+            "revision": 1,
+            "status": "ready",
+            "created_at": "2026-08-27T20:00:00Z",
+            "updated_at": "2026-08-27T20:01:00Z",
+            "version": {"id": "version-1"},
+            "manifest": manifest,
+            "assets": [],
+            "outputs": [],
+        });
+        let presented = present_video_project(&record, Path::new("/tmp/video-root")).unwrap();
+        assert_eq!(
+            presented["manifest"]["scenes"][0]["caption_style"],
+            "podcast"
+        );
+        assert_eq!(
+            presented["manifest"]["scenes"][1]["caption_style"],
+            "karaoke"
+        );
+        let presented_pages = presented["manifest"]["caption_pages"]
+            .as_array()
+            .expect("presented caption pages");
+        assert_eq!(presented_pages.len(), canonical_pages.len());
+        let caption_tracks = presented["manifest"]["timeline"]["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|track| track["kind"] == "captions")
+            .collect::<Vec<_>>();
+        assert_eq!(caption_tracks.len(), 1);
+        let caption_track = caption_tracks[0];
+        assert_eq!(
+            caption_track["items"].as_array().unwrap().len(),
+            canonical_pages.len()
+        );
+
+        for (canonical, page) in canonical_pages.iter().zip(presented_pages) {
+            assert_eq!(page["id"], canonical.id);
+            assert_eq!(page["cue_id"], canonical.cue_id);
+            assert_eq!(page["style_id"], canonical.style_id);
+            assert_eq!(page["start_ms"], canonical.start_us.0 / 1_000);
+            assert_eq!(page["end_ms"], canonical.end_us.0 / 1_000);
+            assert_eq!(page["text"], canonical.text);
+            if canonical.style_id == "podcast" {
+                let start = ass_time_for_test(canonical.start_us);
+                let end = ass_time_for_test(canonical.end_us);
+                let event = ass.lines().find(|line| {
+                    line.starts_with(&format!("Dialogue: 10,{start},{end},CaptionPodcast,"))
+                });
+                assert!(event.is_some(), "missing ASS page {start}..{end}");
+                let event_text = event.unwrap().splitn(10, ',').nth(9).unwrap();
+                assert_eq!(
+                    strip_ass_overrides(event_text).replace(r"\N", "\n"),
+                    canonical.text
+                );
+            }
+        }
+    }
+
+    fn strip_ass_overrides(value: &str) -> String {
+        let mut result = String::new();
+        let mut in_override = false;
+        for character in value.chars() {
+            match character {
+                '{' if !in_override => in_override = true,
+                '}' if in_override => in_override = false,
+                _ if !in_override => result.push(character),
+                _ => {}
+            }
+        }
+        result
+    }
+
+    fn ass_time_for_test(value: Microseconds) -> String {
+        let total_centiseconds = value.0.max(0) / 10_000;
+        let hours = total_centiseconds / 360_000;
+        let minutes = (total_centiseconds / 6_000) % 60;
+        let seconds = (total_centiseconds / 100) % 60;
+        let centiseconds = total_centiseconds % 100;
+        format!("{hours}:{minutes:02}:{seconds:02}.{centiseconds:02}")
     }
 
     #[test]

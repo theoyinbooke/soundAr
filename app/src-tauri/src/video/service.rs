@@ -4682,10 +4682,15 @@ fn timeline_caption_cache_key(
     manifest: &VideoProjectManifest,
     request: &TimelineRenderRequest,
 ) -> ServiceResult<String> {
-    CacheKeyBuilder::new(CacheStage::Captions, format!("{SERVICE_VERSION}:ass-v2"))
+    CacheKeyBuilder::new(CacheStage::Captions, format!("{SERVICE_VERSION}:ass-v3"))
         .manifest_slice(json!({
             "reviewed_scenes": &manifest.reviewed_scenes,
             "captions": &manifest.captions,
+            // Exact karaoke/highlight timing is derived through these canonical source-clock
+            // inputs. Binding them prevents a corrected transcript or retimed clip from reusing
+            // an ASS document produced for older word mappings.
+            "transcript": &manifest.transcript,
+            "tracks": &manifest.tracks,
             "timeline_duration_us": manifest.timeline_duration_us,
             "frame_rate": manifest.frame_rate,
             // ASS PlayRes, font sizing, and vertical margins are layout-aware.
@@ -6050,6 +6055,27 @@ mod tests {
         assert_ne!(
             portrait_key, custom_key,
             "layout-dependent ASS documents must never share a cache key"
+        );
+
+        manifest.captions.push(super::super::CaptionCue {
+            id: "caption-cache-cue".to_string(),
+            range: TimeRange::new(0, 1_000_000).expect("caption range"),
+            text: "Cache the exact curated caption plan.".to_string(),
+            style_id: "caption-podcast".to_string(),
+            speaker_id: None,
+            transcript_segment_id: None,
+            scene_id: None,
+        });
+        manifest.validate_strict().expect("valid caption cache cue");
+        let podcast_key =
+            timeline_caption_cache_key(&manifest, &request).expect("podcast caption key");
+        manifest.captions[0].style_id = "caption-karaoke".to_string();
+        let karaoke_key =
+            timeline_caption_cache_key(&manifest, &request).expect("karaoke caption key");
+        assert_ne!(custom_key, podcast_key);
+        assert_ne!(
+            podcast_key, karaoke_key,
+            "per-cue preset changes must invalidate the caption document cache"
         );
     }
 
