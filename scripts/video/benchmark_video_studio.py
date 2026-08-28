@@ -78,7 +78,14 @@ def unique_run_dir(root: Path) -> tuple[str, Path]:
     return run_id, run_dir
 
 
-def run_capture(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
+def run_capture(
+    command: list[str],
+    timeout: int = 30,
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    child_env = {**os.environ, "LC_ALL": "C"}
+    if env_overrides:
+        child_env.update(env_overrides)
     try:
         return subprocess.run(
             command,
@@ -86,7 +93,7 @@ def run_capture(command: list[str], timeout: int = 30) -> subprocess.CompletedPr
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**os.environ, "LC_ALL": "C"},
+            env=child_env,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise BenchmarkFailure(f"command could not run: {command[0]}: {error}") from error
@@ -272,11 +279,12 @@ def stage_record(
     run_dir: Path,
     nvidia_smi: str | None,
     timeout: int = 180,
+    env_overrides: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], subprocess.CompletedProcess[str]]:
     started = utc_now()
     begin = time.perf_counter()
     with GpuMonitor(nvidia_smi) as gpu:
-        completed = run_capture(command, timeout=timeout)
+        completed = run_capture(command, timeout=timeout, env_overrides=env_overrides)
     wall = time.perf_counter() - begin
     write_command_logs(run_dir, name, completed)
     record = {
@@ -621,8 +629,44 @@ def optional_transcription(
         "--device",
         args.transcription_device,
     ]
+    cuda_paths = run_capture(
+        [
+            str(interpreter),
+            "-c",
+            (
+                "import nvidia.cublas.lib,nvidia.cudnn.lib;"
+                "print(next(iter(nvidia.cublas.lib.__path__)));"
+                "print(next(iter(nvidia.cudnn.lib.__path__)))"
+            ),
+        ],
+        timeout=30,
+    )
+    if cuda_paths.returncode != 0:
+        raise BenchmarkFailure(
+            "the selected faster-whisper runtime is missing its private CUDA libraries"
+        )
+    private_cuda_paths: list[str] = []
+    for raw_path in cuda_paths.stdout.splitlines():
+        try:
+            library_path = Path(raw_path.strip()).resolve(strict=True)
+        except OSError as error:
+            raise BenchmarkFailure(f"invalid private CUDA library path: {error}") from error
+        if not library_path.is_dir():
+            raise BenchmarkFailure("private CUDA library path is not a directory")
+        private_cuda_paths.append(str(library_path))
+    if len(private_cuda_paths) != 2:
+        raise BenchmarkFailure("the selected runtime did not expose cuBLAS and cuDNN libraries")
+    existing_library_path = os.environ.get("LD_LIBRARY_PATH")
+    if existing_library_path:
+        private_cuda_paths.append(existing_library_path)
     record, completed = stage_record(
-        "transcription_faster_whisper", command, source_duration, run_dir, nvidia_smi, timeout=900
+        "transcription_faster_whisper",
+        command,
+        source_duration,
+        run_dir,
+        nvidia_smi,
+        timeout=900,
+        env_overrides={"LD_LIBRARY_PATH": os.pathsep.join(private_cuda_paths)},
     )
     if completed.returncode != 0:
         record["error"] = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "transcription failed"
