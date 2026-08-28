@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "profile": "linux-video-studio-obvious-regression-gate",
+  "description": "Generous release thresholds derived from the 2026-08-28 RTX 4080 Laptop baseline. They catch decode/encoder fallbacks and cache breakage without treating normal thermal variance as a failure.",
+  "max_end_to_end_wall_seconds": 15.0,
+  "max_cache_hit_to_miss_wall_ratio": 0.9,
+  "max_stage_realtime_factor": {
+    "probe_imported_source": 0.05,
+    "probe_animated_podcast_source": 0.05,
+    "proxy_render_cache_miss": 0.15,
+    "portrait_preview_render": 0.25,
+    "portrait_final_render": 0.65,
+    "animated_podcast_final_render": 0.65
+  },
+  "max_stage_peak_delta_vram_mib": {
+    "portrait_final_render": 2048,
+    "animated_podcast_final_render": 2048
+  }
+}
