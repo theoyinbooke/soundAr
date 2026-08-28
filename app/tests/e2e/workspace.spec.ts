@@ -1,9 +1,9 @@
 import { expect, test } from "@playwright/test";
 import packageMetadata from "../../package.json" with { type: "json" };
 
-const routes = ["Generate", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History"];
+const routes = ["Generate", "Video Studio", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History"];
 const allRoutes = [...routes, "Settings", "About"];
-const mobileDirectRoutes = new Set(["Generate", "Projects", "Voices", "History"]);
+const mobileDirectRoutes = new Set(["Generate", "Video Studio", "Projects", "Voices", "History"]);
 
 async function openRoute(page: import("@playwright/test").Page, route: string) {
   const mobile = page.viewportSize()!.width <= 820;
@@ -80,6 +80,35 @@ test("Music Studio previews the complete workflow without fabricating browser au
   expect(bounds.scrollWidth).toBeLessThanOrEqual(bounds.clientWidth + 1);
   expect(bounds.left).toBeGreaterThanOrEqual(-1);
   expect(bounds.right).toBeLessThanOrEqual(bounds.viewportWidth + 1);
+});
+
+test("Video Studio keeps source intake deliberate and reaches an editable local project", async ({ page }) => {
+  await page.goto("/");
+  await openRoute(page, "Video Studio");
+
+  const starts = page.getByRole("group", { name: "Start a video project" });
+  await expect(starts.getByRole("button", { name: /Import link/ })).toBeVisible();
+  await expect(starts.getByRole("button", { name: /Upload video/ })).toBeVisible();
+  await expect(starts.getByRole("button", { name: /Start from prompt or audio/ })).toBeVisible();
+
+  const importLink = starts.getByRole("button", { name: /Import link/ });
+  await importLink.click();
+  const linkDialog = page.getByRole("dialog", { name: "Import a video link" });
+  await expect(linkDialog).toBeVisible();
+  await expect(linkDialog.getByRole("textbox", { name: "Video URL" })).toBeFocused();
+  await expect(linkDialog.getByText(/one video only/i)).toBeVisible();
+  await expect(linkDialog.getByRole("button", { name: "Review source" })).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(linkDialog).toHaveCount(0);
+  await expect(importLink).toBeFocused();
+
+  await starts.getByRole("button", { name: /Start from prompt or audio/ }).click();
+  const promptDialog = page.getByRole("dialog", { name: "Start from prompt or audio" });
+  await promptDialog.getByRole("textbox", { name: "Video prompt" }).fill("A calm portrait update with measured captions");
+  await promptDialog.getByRole("button", { name: "Create project" }).click();
+  await page.getByRole("button", { name: "Render preview" }).click();
+  await expect(page.getByRole("button", { name: "Export video" })).toBeVisible();
+  await expect(page.locator(".video-studio-page")).toHaveAttribute("aria-label", "Video Studio");
 });
 
 test("implemented routes remain usable at the target viewport", async ({ page }) => {

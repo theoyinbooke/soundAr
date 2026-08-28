@@ -29,17 +29,19 @@ Public navigation contains Generate, Video Studio, Projects, Voices, Models, His
 
 The Rust domain is split into focused modules below `app/src-tauri/src/`:
 
-- `services/`: `AppServices`, typed service errors, and thin adapter entry points.
-- `media/`: safe tool discovery, FFprobe/FFmpeg, yt-dlp, transcription runtime detection, process groups, progress, and cancellation.
-- `video/contracts.rs`: manifest, source clock, candidates, scenes, tracks, captions, crop/layout, provenance, render profiles, revisions, and outputs.
-- `video/service.rs`: all Video Studio operations.
-- `video/timeline.rs`: exact mapping, quantization, gaps, and validation.
-- `video/renderer.rs`: proxies, thumbnails, captions, layouts, audio mixing, previews, NVENC final export, and software fallback.
+- `video/contracts.rs`: manifest, source clock, candidates, scenes, tracks, captions, crop/layout, narration bindings, provenance, render profiles, revisions, and outputs.
+- `video/media.rs`: bounded tool discovery and execution, FFprobe/FFmpeg and yt-dlp policy, public-only HTTPS confinement, local-media validation, caption validation, process groups, progress, and cancellation.
+- `video/timeline.rs`: exact mapping, quantization, half-open sample ranges, editable endpoints, gaps, and validation.
+- `video/assembly.rs`: canonical multi-scene audio/video graph construction from the reviewed timeline manifest.
+- `video/renderer.rs`: proxies, thumbnails, waveforms, portrait layouts, FFmpeg progress, validation, and atomic file publication.
 - `video/cache.rs`: canonical content-addressed keys and scene-level invalidation.
 - `video/scheduler.rs`: light, medium, heavy, and exclusive admission across CPU, IO, VRAM, and NVENC resources.
-- `video/publish.rs`: publish packages with MP4, manifest, checksums, captions, cover/thumbnail, copy, and provenance.
+- `video/service.rs`: durable ingest, analysis artifacts, transcription, narration replacement, preview/final rendering, variations, publishing, recovery, and shared application contracts.
+- `video/presentation.rs`: one safe UI/assistant projection for projects, jobs, and playable artifacts.
+- `video_commands.rs`: thin Tauri and assistant-facing orchestration over the same service, including Codex planning and existing soundAr synthesis.
+- `store.rs`: additive schema migrations, locks, jobs, immutable versions, rights receipts, exact artifact/output publication, assistant links, and crash recovery.
 
-Schema migrations begin after v0.5.5 schema 32. Additive tables cover project kind/revision, project locks, rights receipts, media assets, immutable video versions, transcript versions, workflow stages/dependencies, multi-artifact links, cache entries, generic output records, assistant artifact links, and performance samples. Legacy audio tables and behavior remain intact.
+Schema migrations begin after v0.5.5 schema 32 and advance additively through schema 37. The new tables cover project kind/revision, project locks, rights receipts, media assets, immutable video versions, transcript versions, workflow stages/dependencies, multi-artifact links, cache entries, generic output records, assistant artifact links, and performance samples. Legacy audio tables and behavior remain intact.
 
 The assistant exposes these service-backed tools with strict schemas and stable errors: `preview_link`, `import_link`, `analyze_video`, `plan_video`, `create_video_project`, `list_video_projects`, `get_video_project`, `render_video_preview`, `revise_video`, `export_video`, and `export_publish_package`.
 
