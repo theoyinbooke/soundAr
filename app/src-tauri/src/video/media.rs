@@ -6,15 +6,57 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fmt, fs,
+    io::{Read as _, Write as _},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
+    os::fd::AsRawFd,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 const MAX_PROBE_JSON_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MEDIA_PROCESS_STDERR_BYTES: usize = 256 * 1024;
+const MAX_TOOL_INSPECTION_BYTES: usize = 1024 * 1024;
+const MAX_MEDIA_SOURCE_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+const MAX_MANIFEST_SNIFF_BYTES: u64 = 64 * 1024;
+/// Network-bearing and indirection demuxers are deliberately absent. Keep this list aligned
+/// with ordinary, self-contained audio/video/image files supported by the studio.
+pub const LOCAL_MEDIA_FORMAT_WHITELIST: &str = concat!(
+    "aac,ac3,ac4,aiff,alaw,amr,ape,apng,asf,au,av1,avi,bmp_pipe,caf,",
+    "dirac,dnxhd,dpx_pipe,dsf,dts,dtshd,dv,eac3,exr_pipe,f32be,f32le,",
+    "f64be,f64le,flac,flv,g722,g723_1,g726,g726le,g728,g729,gif,gif_pipe,",
+    "gsm,gxf,h261,h263,h264,hdr_pipe,hevc,iamf,iff,ilbc,ivf,j2k_pipe,",
+    "jpeg_pipe,jpegls_pipe,jpegxl_anim,jpegxl_pipe,m4v,matroska,webm,mjpeg,",
+    "mjpeg_2000,mlp,mlv,mmf,mov,mp4,m4a,3gp,3g2,mj2,mp3,mpc,mpc8,mpeg,",
+    "mpegts,mpegtsraw,mpegvideo,mulaw,mxf,mxf_d10,mxf_opatom,nsv,nut,ogg,",
+    "oma,opus,png_pipe,qoi_pipe,rawvideo,rm,roq,s16be,s16le,s24be,s24le,",
+    "s32be,s32le,s8,sbc,shorten,smjpeg,sox,spdif,sunrast_pipe,svag,swf,",
+    "tak,thp,tiff_pipe,truehd,tta,txd,u16be,u16le,u24be,u24le,u32be,u32le,",
+    "u8,vc1,voc,w64,wav,wavarc,webp_pipe,wtv,wv,yuv4mpegpipe",
+);
+pub const LOCAL_MEDIA_PROTOCOL_WHITELIST: &str = "file";
 const FFPROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const TOOL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCESS_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const PROCESS_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_IMPORT_URL_BYTES: usize = 4_096;
+const MAX_IMPORT_DNS_ADDRESSES: usize = 64;
+const IMPORT_DNS_TIMEOUT: Duration = Duration::from_secs(8);
+const IMPORT_DNS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_PROXY_CONNECT_HEADER_BYTES: usize = 16 * 1024;
+const MAX_PROXY_CONNECTIONS: usize = 24;
+const PROXY_HEADER_TIMEOUT: Duration = Duration::from_secs(8);
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const PROXY_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const PROXY_IO_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+const PROXY_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PROXY_RELAY_BUFFER_BYTES: usize = 32 * 1024;
 const MAX_CAPTION_CUES: usize = 250_000;
 const MAX_CAPTION_TEXT_BYTES: usize = 16_384;
 
@@ -467,23 +509,21 @@ fn inspect_tool(kind: MediaToolKind, path: &Path) -> Result<(String, Vec<String>
         MediaToolKind::WhisperCpp => &["--version"],
         _ => &["--version"],
     };
-    let mut output = Command::new(path)
-        .args(version_args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("Could not run {}: {error}", path.display()))?;
-    if !output.status.success() && kind == MediaToolKind::WhisperCpp {
-        output = Command::new(path)
-            .arg("--help")
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+    let mut output = run_tool_inspection(path, version_args)?;
+    if !output.status_success && kind == MediaToolKind::WhisperCpp {
+        output = run_tool_inspection(path, &["--help"])?;
     }
-    if !output.status.success() {
+    if !output.status_success {
         return Err(format!(
-            "{} version check exited with {}",
+            "{} version check exited unsuccessfully",
+            path.display()
+        ));
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        return Err(format!(
+            "{} version check exceeded the {} byte output safety limit",
             path.display(),
-            output.status
+            MAX_TOOL_INSPECTION_BYTES
         ));
     }
     let combined = format!(
@@ -510,6 +550,18 @@ fn inspect_tool(kind: MediaToolKind, path: &Path) -> Result<(String, Vec<String>
         Vec::new()
     };
     Ok((version, capabilities))
+}
+
+fn run_tool_inspection(path: &Path, args: &[&str]) -> Result<BoundedCommandOutput, String> {
+    let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+    run_bounded_command_with_limits(
+        path,
+        &args,
+        TOOL_INSPECTION_TIMEOUT,
+        MAX_TOOL_INSPECTION_BYTES,
+        MAX_TOOL_INSPECTION_BYTES,
+    )
+    .map_err(|error| format!("Could not inspect {}: {error}", path.display()))
 }
 
 fn version_identity_matches(kind: MediaToolKind, first_line: &str, path: &Path) -> bool {
@@ -542,14 +594,7 @@ fn version_identity_matches(kind: MediaToolKind, first_line: &str, path: &Path) 
 
 fn inspect_ffmpeg_capabilities(ffmpeg: &Path) -> Vec<String> {
     let mut capabilities = Vec::new();
-    let encoders = Command::new(ffmpeg)
-        .args(["-hide_banner", "-encoders"])
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
+    let encoders = bounded_tool_stdout(ffmpeg, &["-hide_banner", "-encoders"]);
     for encoder in [
         "h264_nvenc",
         "hevc_nvenc",
@@ -561,14 +606,7 @@ fn inspect_ffmpeg_capabilities(ffmpeg: &Path) -> Vec<String> {
             capabilities.push(encoder.to_string());
         }
     }
-    let filters = Command::new(ffmpeg)
-        .args(["-hide_banner", "-filters"])
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
+    let filters = bounded_tool_stdout(ffmpeg, &["-hide_banner", "-filters"]);
     for filter in [
         "subtitles",
         "drawtext",
@@ -580,20 +618,23 @@ fn inspect_ffmpeg_capabilities(ffmpeg: &Path) -> Vec<String> {
             capabilities.push(filter.to_string());
         }
     }
-    let hardware = Command::new(ffmpeg)
-        .args(["-hide_banner", "-hwaccels"])
-        .stdin(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default();
+    let hardware = bounded_tool_stdout(ffmpeg, &["-hide_banner", "-hwaccels"]);
     for accelerator in ["cuda", "vaapi", "qsv", "vulkan"] {
         if hardware.lines().any(|line| line.trim() == accelerator) {
             capabilities.push(format!("hwaccel_{accelerator}"));
         }
     }
     capabilities
+}
+
+fn bounded_tool_stdout(program: &Path, args: &[&str]) -> String {
+    run_tool_inspection(program, args)
+        .ok()
+        .filter(|output| {
+            output.status_success && !output.stdout_truncated && !output.stderr_truncated
+        })
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 fn contains_capability_line(output: &str, capability: &str) -> bool {
@@ -607,30 +648,35 @@ pub fn probe_h264_nvenc_runtime(ffmpeg: &Path) -> bool {
     if !is_executable_file(ffmpeg) {
         return false;
     }
-    Command::new(ffmpeg)
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=c=black:s=32x32:r=1:d=0.05",
-            "-frames:v",
-            "1",
-            "-c:v",
-            "h264_nvenc",
-            "-f",
-            "null",
-            "-",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let args = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=32x32:r=1:d=0.05",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "h264_nvenc",
+        "-f",
+        "null",
+        "-",
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    run_bounded_command_with_limits(
+        ffmpeg,
+        &args,
+        TOOL_INSPECTION_TIMEOUT,
+        MAX_TOOL_INSPECTION_BYTES,
+        MAX_TOOL_INSPECTION_BYTES,
+    )
+    .map(|output| output.status_success)
+    .unwrap_or(false)
 }
 
 fn version_key(version: Option<&str>) -> (u64, u64, u64, u64) {
@@ -740,18 +786,31 @@ pub struct MediaChapterProbe {
     pub title: Option<String>,
 }
 
-pub fn probe_media(path: &Path, ffprobe: &Path) -> Result<MediaProbe, MediaError> {
-    let executable = fs::canonicalize(ffprobe).map_err(|error| {
-        MediaError::new("ffprobe_unavailable", "FFprobe could not be resolved")
-            .detail(error.to_string())
-    })?;
-    if !is_executable_file(&executable) {
-        return Err(MediaError::new(
-            "ffprobe_unavailable",
-            "The configured FFprobe path is not executable",
-        )
-        .detail(executable.display().to_string()));
-    }
+/// Validates an untrusted user-selected media file without invoking a media process.
+/// Renamed network/playlist manifests fail here; the returned path is canonical and size
+/// bounded. Callers that launch FFmpeg should use [`local_media_input_args`] so a manifest
+/// that evades or races this content check still cannot select an indirection demuxer or a
+/// network protocol.
+pub fn validate_local_media_source(path: &Path) -> Result<PathBuf, MediaError> {
+    validate_local_media_source_with_size(path).map(|(path, _)| path)
+}
+
+/// Produces the complete security-sensitive FFmpeg input argument group, including `-i`.
+/// Append these arguments together at the intended input position; do not append a second
+/// bare `-i <path>` for an untrusted source.
+pub fn local_media_input_args(path: &Path) -> Result<Vec<OsString>, MediaError> {
+    let source = validate_local_media_source(path)?;
+    Ok(vec![
+        OsString::from("-protocol_whitelist"),
+        OsString::from(LOCAL_MEDIA_PROTOCOL_WHITELIST),
+        OsString::from("-format_whitelist"),
+        OsString::from(LOCAL_MEDIA_FORMAT_WHITELIST),
+        OsString::from("-i"),
+        source.into_os_string(),
+    ])
+}
+
+fn validate_local_media_source_with_size(path: &Path) -> Result<(PathBuf, u64), MediaError> {
     let source = fs::canonicalize(path).map_err(|error| {
         MediaError::new(
             "media_not_found",
@@ -772,25 +831,120 @@ pub fn probe_media(path: &Path, ffprobe: &Path) -> Result<MediaProbe, MediaError
             "The selected media source is not a regular file",
         ));
     }
+    if metadata.len() > MAX_MEDIA_SOURCE_BYTES {
+        return Err(MediaError::new(
+            "media_source_too_large",
+            "The selected media exceeds the local source size limit",
+        )
+        .detail(format!(
+            "{} bytes exceeds the {} byte limit",
+            metadata.len(),
+            MAX_MEDIA_SOURCE_BYTES
+        )));
+    }
+    reject_local_manifest_content(&source)?;
+    Ok((source, metadata.len()))
+}
+
+fn reject_local_manifest_content(path: &Path) -> Result<(), MediaError> {
+    let mut prefix = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| {
+            file.take(MAX_MANIFEST_SNIFF_BYTES)
+                .read_to_end(&mut prefix)
+                .map(|_| ())
+        })
+        .map_err(|error| {
+            MediaError::new(
+                "media_not_found",
+                "The selected media file could not be inspected safely",
+            )
+            .detail(error.to_string())
+        })?;
+    if prefix.is_empty() || prefix.contains(&0) {
+        return Ok(());
+    }
+    let text = String::from_utf8_lossy(&prefix).to_ascii_lowercase();
+    let trimmed = text.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+    let lines = trimmed.lines().take(64).collect::<Vec<_>>();
+    let looks_like_hls_or_m3u = trimmed.starts_with("#extm3u")
+        || (lines
+            .iter()
+            .any(|line| line.trim_start().starts_with("#extinf"))
+            && lines.iter().any(|line| {
+                let line = line.trim();
+                line.starts_with("http://") || line.starts_with("https://")
+            }));
+    let looks_like_dash = trimmed.contains("<mpd")
+        && (trimmed.contains("urn:mpeg:dash") || trimmed.contains("minimumupdateperiod"));
+    let looks_like_playlist = trimmed.starts_with("[playlist]")
+        || trimmed.starts_with("ffconcat version")
+        || trimmed.contains("<smoothstreamingmedia")
+        || (trimmed.contains("<playlist") && trimmed.contains("xspf"))
+        || trimmed.starts_with("<asx")
+        || looks_like_sdp(&lines);
+    if looks_like_hls_or_m3u || looks_like_dash || looks_like_playlist {
+        return Err(MediaError::new(
+            "unsafe_media_manifest",
+            "Playlist and network-bearing manifest files cannot be used as local media",
+        ));
+    }
+    Ok(())
+}
+
+fn looks_like_sdp(lines: &[&str]) -> bool {
+    let mut version = false;
+    let mut origin = false;
+    let mut connection_or_media = false;
+    for line in lines.iter().map(|line| line.trim()) {
+        version |= line == "v=0";
+        origin |= line.starts_with("o=");
+        connection_or_media |= line.starts_with("c=") || line.starts_with("m=");
+    }
+    version && origin && connection_or_media
+}
+
+pub fn probe_media(path: &Path, ffprobe: &Path) -> Result<MediaProbe, MediaError> {
+    let executable = fs::canonicalize(ffprobe).map_err(|error| {
+        MediaError::new("ffprobe_unavailable", "FFprobe could not be resolved")
+            .detail(error.to_string())
+    })?;
+    if !is_executable_file(&executable) {
+        return Err(MediaError::new(
+            "ffprobe_unavailable",
+            "The configured FFprobe path is not executable",
+        )
+        .detail(executable.display().to_string()));
+    }
+    let (source, source_size) = validate_local_media_source_with_size(path)?;
 
     let args = [
         OsString::from("-v"),
         OsString::from("error"),
+        OsString::from("-protocol_whitelist"),
+        OsString::from(LOCAL_MEDIA_PROTOCOL_WHITELIST),
+        OsString::from("-format_whitelist"),
+        OsString::from(LOCAL_MEDIA_FORMAT_WHITELIST),
         OsString::from("-print_format"),
         OsString::from("json"),
         OsString::from("-show_format"),
         OsString::from("-show_streams"),
         OsString::from("-show_chapters"),
+        OsString::from("-i"),
         source.as_os_str().to_os_string(),
     ];
     let output = run_bounded_command(&executable, &args, FFPROBE_TIMEOUT)?;
     if !output.status_success {
+        let mut diagnostic = truncate_diagnostic(&output.stderr, 2_000);
+        if output.stderr_truncated {
+            diagnostic.push_str("\n[diagnostics truncated at the safety limit]");
+        }
         return Err(
             MediaError::new("ffprobe_failed", "FFprobe rejected the selected media")
-                .detail(truncate_diagnostic(&output.stderr, 2_000)),
+                .detail(diagnostic),
         );
     }
-    if output.stdout.len() > MAX_PROBE_JSON_BYTES {
+    if output.stdout_truncated || output.stdout.len() > MAX_PROBE_JSON_BYTES {
         return Err(MediaError::new(
             "ffprobe_output_too_large",
             "FFprobe returned an unexpectedly large response",
@@ -800,13 +954,56 @@ pub fn probe_media(path: &Path, ffprobe: &Path) -> Result<MediaProbe, MediaError
         MediaError::new("ffprobe_invalid_json", "FFprobe returned invalid metadata")
             .detail(error.to_string())
     })?;
-    parse_probe_value(&source, metadata.len(), &raw)
+    validate_probed_local_format(&raw)?;
+    parse_probe_value(&source, source_size, &raw)
 }
 
+fn validate_probed_local_format(raw: &Value) -> Result<(), MediaError> {
+    let format_name = raw
+        .get("format")
+        .and_then(|format| format.get("format_name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let unsafe_format = format_name.split(',').any(|name| {
+        matches!(
+            name.trim(),
+            "concat"
+                | "dash"
+                | "ffmetadata"
+                | "hls"
+                | "image2"
+                | "imf"
+                | "live_flv"
+                | "m3u"
+                | "rtsp"
+                | "sdp"
+                | "smil"
+                | "xspf"
+        )
+    });
+    if unsafe_format {
+        return Err(MediaError::new(
+            "unsafe_media_manifest",
+            "The selected file is an indirection manifest, not self-contained media",
+        )
+        .detail(format_name.to_string()));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
 struct BoundedCommandOutput {
     status_success: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+#[derive(Debug)]
+struct BoundedPipeCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
 fn run_bounded_command(
@@ -814,7 +1011,22 @@ fn run_bounded_command(
     args: &[OsString],
     timeout: Duration,
 ) -> Result<BoundedCommandOutput, MediaError> {
-    use std::io::Read;
+    run_bounded_command_with_limits(
+        program,
+        args,
+        timeout,
+        MAX_PROBE_JSON_BYTES,
+        MAX_MEDIA_PROCESS_STDERR_BYTES,
+    )
+}
+
+fn run_bounded_command_with_limits(
+    program: &Path,
+    args: &[OsString],
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<BoundedCommandOutput, MediaError> {
     use std::os::unix::process::CommandExt;
 
     let mut child = Command::new(program)
@@ -832,31 +1044,68 @@ fn run_bounded_command(
             .detail(error.to_string())
             .retryable(true)
         })?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let deadline = Instant::now() + timeout;
+    let process_group = i32::try_from(child.id()).ok();
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    if let Err(error) = set_pipe_nonblocking(&stdout).and_then(|_| set_pipe_nonblocking(&stderr)) {
+        terminate_owned_process_group(&mut child);
+        return Err(MediaError::new(
+            "media_process_failed",
+            "The media helper output could not be secured",
+        )
+        .detail(error.to_string())
+        .retryable(true));
+    }
+    let stop_readers = Arc::new(AtomicBool::new(false));
+    let stdout_reader = match spawn_bounded_pipe_reader(
+        "soundar-media-stdout",
+        stdout,
+        stdout_limit,
+        Arc::clone(&stop_readers),
+    ) {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_owned_process_group(&mut child);
+            return Err(MediaError::new(
+                "media_process_failed",
+                "The media helper output reader could not be started",
+            )
+            .detail(error.to_string())
+            .retryable(true));
+        }
+    };
+    let stderr_reader = match spawn_bounded_pipe_reader(
+        "soundar-media-stderr",
+        stderr,
+        stderr_limit,
+        Arc::clone(&stop_readers),
+    ) {
+        Ok(reader) => reader,
+        Err(error) => {
+            terminate_owned_process_group(&mut child);
+            stop_readers.store(true, Ordering::Release);
+            let _ = stdout_reader.join();
+            return Err(MediaError::new(
+                "media_process_failed",
+                "The media helper diagnostics reader could not be started",
+            )
+            .detail(error.to_string())
+            .retryable(true));
+        }
+    };
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
+                thread::sleep(Duration::from_millis(20));
             }
             Ok(None) => {
-                let process_group = -(child.id() as i32);
-                unsafe {
-                    libc::kill(process_group, libc::SIGKILL);
-                }
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                terminate_owned_process_group(&mut child);
+                let _ =
+                    finish_pipe_readers(stdout_reader, stderr_reader, stop_readers, process_group);
                 return Err(MediaError::new(
                     "media_process_timeout",
                     "The media inspection process timed out",
@@ -864,10 +1113,9 @@ fn run_bounded_command(
                 .retryable(true));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                terminate_owned_process_group(&mut child);
+                let _ =
+                    finish_pipe_readers(stdout_reader, stderr_reader, stop_readers, process_group);
                 return Err(MediaError::new(
                     "media_process_failed",
                     "The media inspection process could not be monitored",
@@ -877,28 +1125,141 @@ fn run_bounded_command(
             }
         }
     };
-    let stdout = stdout_reader
+    let (stdout, stderr, fully_drained) =
+        finish_pipe_readers(stdout_reader, stderr_reader, stop_readers, process_group)?;
+    if !fully_drained {
+        return Err(MediaError::new(
+            "media_process_failed",
+            "The media helper left its output pipes open after exiting",
+        )
+        .retryable(true));
+    }
+    Ok(BoundedCommandOutput {
+        status_success: status.success(),
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+    })
+}
+
+fn set_pipe_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+    let descriptor = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn spawn_bounded_pipe_reader<R>(
+    name: &str,
+    reader: R,
+    limit: usize,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<JoinHandle<std::io::Result<BoundedPipeCapture>>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || drain_bounded_pipe(reader, limit, &stop))
+}
+
+fn drain_bounded_pipe(
+    mut reader: impl std::io::Read,
+    limit: usize,
+    stop: &AtomicBool,
+) -> std::io::Result<BoundedPipeCapture> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut truncated = false;
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                let retained = count.min(limit.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(&chunk[..retained]);
+                truncated |= retained < count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                thread::sleep(PROCESS_PIPE_POLL_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(BoundedPipeCapture { bytes, truncated })
+}
+
+fn finish_pipe_readers(
+    stdout_reader: JoinHandle<std::io::Result<BoundedPipeCapture>>,
+    stderr_reader: JoinHandle<std::io::Result<BoundedPipeCapture>>,
+    stop: Arc<AtomicBool>,
+    process_group: Option<i32>,
+) -> Result<(BoundedPipeCapture, BoundedPipeCapture, bool), MediaError> {
+    let drain_deadline = Instant::now()
+        .checked_add(PROCESS_PIPE_DRAIN_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    while !(stdout_reader.is_finished() && stderr_reader.is_finished())
+        && Instant::now() < drain_deadline
+    {
+        thread::sleep(PROCESS_PIPE_POLL_INTERVAL);
+    }
+    let fully_drained = stdout_reader.is_finished() && stderr_reader.is_finished();
+    if !fully_drained {
+        terminate_process_group(process_group);
+    }
+    // Nonblocking readers make this a bounded join even if a descendant escaped the
+    // owned process group while retaining one of the inherited pipe descriptors.
+    stop.store(true, Ordering::Release);
+    let stdout = join_pipe_reader(stdout_reader, "output")?;
+    let stderr = join_pipe_reader(stderr_reader, "diagnostics")?;
+    Ok((stdout, stderr, fully_drained))
+}
+
+fn join_pipe_reader(
+    reader: JoinHandle<std::io::Result<BoundedPipeCapture>>,
+    label: &str,
+) -> Result<BoundedPipeCapture, MediaError> {
+    reader
         .join()
-        .map_err(|_| MediaError::new("media_process_failed", "FFprobe output reader failed"))?
-        .map_err(|error| {
-            MediaError::new("media_process_failed", "FFprobe output could not be read")
-                .detail(error.to_string())
-        })?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| MediaError::new("media_process_failed", "FFprobe error reader failed"))?
+        .map_err(|_| {
+            MediaError::new(
+                "media_process_failed",
+                format!("The media helper {label} reader failed"),
+            )
+        })?
         .map_err(|error| {
             MediaError::new(
                 "media_process_failed",
-                "FFprobe diagnostics could not be read",
+                format!("The media helper {label} could not be read"),
             )
             .detail(error.to_string())
-        })?;
-    Ok(BoundedCommandOutput {
-        status_success: status.success(),
-        stdout,
-        stderr,
-    })
+        })
+}
+
+fn terminate_owned_process_group(child: &mut Child) {
+    terminate_process_group(i32::try_from(child.id()).ok());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn terminate_process_group(process_group: Option<i32>) {
+    if let Some(process_group) = process_group {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
 }
 
 fn parse_probe_value(
@@ -1154,6 +1515,729 @@ pub struct ValidatedImportUrl {
     pub rights_confirmation_required: bool,
 }
 
+/// Resolves the canonical import authority for early intake feedback and rejects the
+/// complete answer set if any address is private, local, documentation-only, or otherwise
+/// non-public. This check intentionally stays separate from [`validate_import_url`] so syntax
+/// validation remains deterministic and offline.
+///
+/// This preflight does not pin a later downloader resolution and cannot inspect redirect
+/// authorities. Production yt-dlp execution must therefore be held behind
+/// [`PublicHttpsProxy`], which repeats this policy for every CONNECT request and connects to
+/// the validated address directly.
+pub fn preflight_import_url_destination(
+    validated: &ValidatedImportUrl,
+) -> Result<Vec<IpAddr>, MediaError> {
+    let original = validate_import_url(&validated.original)?;
+    if original != *validated {
+        return Err(MediaError::new(
+            "invalid_url_preflight",
+            "The import URL contract changed after validation",
+        ));
+    }
+    let canonical = validate_import_url(&validated.canonical)?;
+    resolve_public_import_host(&canonical.host, None)
+}
+
+/// Authenticated, loopback-only HTTPS CONNECT proxy for untrusted downloader traffic.
+///
+/// Each CONNECT authority is independently resolved, the entire DNS answer set must be
+/// public, and the upstream socket is opened against one of those validated IP addresses.
+/// This pins the checked resolution and applies the same rule to redirects. Non-CONNECT
+/// requests fail closed, so an HTTPS-to-HTTP downgrade cannot bypass the address policy.
+/// Keep this value alive for the entire child-process lifetime and pass [`Self::url`] to
+/// yt-dlp's `--proxy` option.
+pub struct PublicHttpsProxy {
+    proxy_url: String,
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    accept_thread: Option<JoinHandle<()>>,
+}
+
+impl PublicHttpsProxy {
+    pub fn start() -> Result<Self, MediaError> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|error| {
+            MediaError::new(
+                "import_proxy_unavailable",
+                "The protected link-import proxy could not be started",
+            )
+            .detail(error.to_string())
+            .retryable(true)
+        })?;
+        listener.set_nonblocking(true).map_err(|error| {
+            MediaError::new(
+                "import_proxy_unavailable",
+                "The protected link-import proxy could not be configured",
+            )
+            .detail(error.to_string())
+            .retryable(true)
+        })?;
+        let address = listener.local_addr().map_err(|error| {
+            MediaError::new(
+                "import_proxy_unavailable",
+                "The protected link-import proxy address could not be read",
+            )
+            .detail(error.to_string())
+            .retryable(true)
+        })?;
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let credentials = format!("soundar:{token}");
+        let authorization =
+            Arc::<str>::from(format!("Basic {}", encode_base64(credentials.as_bytes())));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let accept_thread = thread::Builder::new()
+            .name("soundar-import-proxy".to_string())
+            .spawn(move || run_public_https_proxy(listener, authorization, worker_stop))
+            .map_err(|error| {
+                MediaError::new(
+                    "import_proxy_unavailable",
+                    "The protected link-import proxy worker could not be started",
+                )
+                .detail(error.to_string())
+                .retryable(true)
+            })?;
+        Ok(Self {
+            proxy_url: format!("http://soundar:{token}@{address}"),
+            address,
+            stop,
+            accept_thread: Some(accept_thread),
+        })
+    }
+
+    pub fn url(&self) -> &str {
+        &self.proxy_url
+    }
+}
+
+impl fmt::Debug for PublicHttpsProxy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicHttpsProxy")
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PublicHttpsProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(100));
+        if let Some(worker) = self.accept_thread.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProxyFailure {
+    BadRequest,
+    AuthenticationRequired,
+    MethodNotAllowed,
+    Forbidden,
+    BadGateway,
+    ServiceUnavailable,
+}
+
+impl ProxyFailure {
+    fn response(self) -> &'static [u8] {
+        match self {
+            Self::BadRequest => {
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            }
+            Self::AuthenticationRequired => b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"soundAr link import\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            Self::MethodNotAllowed => b"HTTP/1.1 405 Method Not Allowed\r\nAllow: CONNECT\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            Self::Forbidden => {
+                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            }
+            Self::BadGateway => {
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            }
+            Self::ServiceUnavailable => b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        }
+    }
+}
+
+struct ProxyConnectRequest {
+    host: String,
+    initial_payload: Vec<u8>,
+}
+
+fn run_public_https_proxy(listener: TcpListener, authorization: Arc<str>, stop: Arc<AtomicBool>) {
+    let mut handlers: Vec<JoinHandle<()>> = Vec::new();
+    while !stop.load(Ordering::Acquire) {
+        let mut index = 0;
+        while index < handlers.len() {
+            if handlers[index].is_finished() {
+                let handler = handlers.swap_remove(index);
+                let _ = handler.join();
+            } else {
+                index += 1;
+            }
+        }
+        match listener.accept() {
+            Ok((mut client, _)) => {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if handlers.len() >= MAX_PROXY_CONNECTIONS {
+                    write_proxy_failure(&mut client, ProxyFailure::ServiceUnavailable);
+                    continue;
+                }
+                let handler_authorization = Arc::clone(&authorization);
+                let handler_stop = Arc::clone(&stop);
+                match thread::Builder::new()
+                    .name("soundar-import-tunnel".to_string())
+                    .spawn(move || {
+                        handle_public_proxy_connection(client, &handler_authorization, handler_stop)
+                    }) {
+                    Ok(handler) => handlers.push(handler),
+                    Err(_) => {
+                        // `client` is dropped with the failed spawn closure. The listener
+                        // remains healthy and later requests can retry.
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(PROXY_ACCEPT_POLL_INTERVAL);
+            }
+            Err(_) => break,
+        }
+    }
+    stop.store(true, Ordering::Release);
+    for handler in handlers {
+        let _ = handler.join();
+    }
+}
+
+fn handle_public_proxy_connection(
+    mut client: TcpStream,
+    authorization: &str,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = client.set_nodelay(true);
+    let request = match read_proxy_connect_request(&mut client, authorization, &stop) {
+        Ok(request) => request,
+        Err(failure) => {
+            write_proxy_failure(&mut client, failure);
+            return;
+        }
+    };
+    let mut upstream = match connect_public_import_host(&request.host, &stop) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let failure = if matches!(
+                error.code.as_str(),
+                "unsafe_url_destination" | "unsafe_url_host"
+            ) {
+                ProxyFailure::Forbidden
+            } else {
+                ProxyFailure::BadGateway
+            };
+            write_proxy_failure(&mut client, failure);
+            return;
+        }
+    };
+    if client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .is_err()
+    {
+        return;
+    }
+    if !request.initial_payload.is_empty() && upstream.write_all(&request.initial_payload).is_err()
+    {
+        return;
+    }
+    relay_proxy_tunnel(client, upstream, stop);
+}
+
+fn read_proxy_connect_request(
+    client: &mut TcpStream,
+    expected_authorization: &str,
+    stop: &AtomicBool,
+) -> Result<ProxyConnectRequest, ProxyFailure> {
+    client
+        .set_read_timeout(Some(PROXY_IO_POLL_TIMEOUT))
+        .map_err(|_| ProxyFailure::BadRequest)?;
+    client
+        .set_write_timeout(Some(PROXY_IO_POLL_TIMEOUT))
+        .map_err(|_| ProxyFailure::BadRequest)?;
+    let deadline = Instant::now()
+        .checked_add(PROXY_HEADER_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let mut request = Vec::with_capacity(2 * 1024);
+    let mut chunk = [0u8; 2 * 1024];
+    let header_end = loop {
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(ProxyFailure::BadRequest);
+        }
+        match client.read(&mut chunk) {
+            Ok(0) => return Err(ProxyFailure::BadRequest),
+            Ok(count) => {
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = find_header_end(&request) {
+                    if end > MAX_PROXY_CONNECT_HEADER_BYTES {
+                        return Err(ProxyFailure::BadRequest);
+                    }
+                    break end;
+                }
+                if request.len() > MAX_PROXY_CONNECT_HEADER_BYTES {
+                    return Err(ProxyFailure::BadRequest);
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(ProxyFailure::BadRequest),
+        }
+    };
+    let header =
+        std::str::from_utf8(&request[..header_end]).map_err(|_| ProxyFailure::BadRequest)?;
+    if !header.is_ascii() {
+        return Err(ProxyFailure::BadRequest);
+    }
+    let mut lines = header.split("\r\n");
+    let request_line = lines.next().ok_or(ProxyFailure::BadRequest)?;
+    if request_line.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(ProxyFailure::BadRequest);
+    }
+    let parts = request_line.split_ascii_whitespace().collect::<Vec<_>>();
+    if parts.len() != 3 || !matches!(parts[2], "HTTP/1.0" | "HTTP/1.1") {
+        return Err(ProxyFailure::BadRequest);
+    }
+    let mut supplied_authorization: Option<&str> = None;
+    for line in lines.filter(|line| !line.is_empty()) {
+        if line.starts_with([' ', '\t'])
+            || line
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t')
+        {
+            return Err(ProxyFailure::BadRequest);
+        }
+        let (name, value) = line.split_once(':').ok_or(ProxyFailure::BadRequest)?;
+        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+            return Err(ProxyFailure::BadRequest);
+        }
+        if name.eq_ignore_ascii_case("proxy-authorization") {
+            if supplied_authorization.is_some() {
+                return Err(ProxyFailure::AuthenticationRequired);
+            }
+            supplied_authorization = Some(value.trim());
+        }
+    }
+    if !supplied_authorization.is_some_and(|value| {
+        constant_time_equal(value.as_bytes(), expected_authorization.as_bytes())
+    }) {
+        return Err(ProxyFailure::AuthenticationRequired);
+    }
+    if parts[0] != "CONNECT" {
+        return Err(ProxyFailure::MethodNotAllowed);
+    }
+    let host = parse_connect_authority(parts[1])?;
+    Ok(ProxyConnectRequest {
+        host,
+        initial_payload: request[header_end..].to_vec(),
+    })
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+fn parse_connect_authority(authority: &str) -> Result<String, ProxyFailure> {
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.chars().any(char::is_whitespace)
+    {
+        return Err(ProxyFailure::BadRequest);
+    }
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, suffix) = bracketed.split_once(']').ok_or(ProxyFailure::BadRequest)?;
+        if suffix != ":443" || host.contains('%') {
+            return Err(ProxyFailure::Forbidden);
+        }
+        let address = host
+            .parse::<Ipv6Addr>()
+            .map_err(|_| ProxyFailure::BadRequest)?;
+        if !is_public_network_address(IpAddr::V6(address)) {
+            return Err(ProxyFailure::Forbidden);
+        }
+        return Ok(address.to_string());
+    }
+    let (host, port) = authority.rsplit_once(':').ok_or(ProxyFailure::BadRequest)?;
+    if port != "443" || host.contains(':') {
+        return Err(ProxyFailure::Forbidden);
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    validate_public_hostname(&host).map_err(|_| ProxyFailure::Forbidden)?;
+    Ok(host)
+}
+
+fn write_proxy_failure(client: &mut TcpStream, failure: ProxyFailure) {
+    let _ = client.set_write_timeout(Some(PROXY_IO_POLL_TIMEOUT));
+    let _ = client.write_all(failure.response());
+}
+
+fn relay_proxy_tunnel(client: TcpStream, upstream: TcpStream, stop: Arc<AtomicBool>) {
+    let _ = client.set_read_timeout(Some(PROXY_IO_POLL_TIMEOUT));
+    let _ = client.set_write_timeout(Some(PROXY_IO_POLL_TIMEOUT));
+    let _ = upstream.set_read_timeout(Some(PROXY_IO_POLL_TIMEOUT));
+    let _ = upstream.set_write_timeout(Some(PROXY_IO_POLL_TIMEOUT));
+    let client_reader = match client.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
+    let upstream_writer = match upstream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => return,
+    };
+    let connection_stop = Arc::new(AtomicBool::new(false));
+    let upload_stop = Arc::clone(&connection_stop);
+    let upload_global_stop = Arc::clone(&stop);
+    let upload = match thread::Builder::new()
+        .name("soundar-import-upload".to_string())
+        .spawn(move || {
+            relay_proxy_direction(
+                client_reader,
+                upstream_writer,
+                &upload_global_stop,
+                &upload_stop,
+            )
+        }) {
+        Ok(worker) => worker,
+        Err(_) => return,
+    };
+    let upstream_reader = match upstream.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => {
+            connection_stop.store(true, Ordering::Release);
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            let _ = upstream.shutdown(std::net::Shutdown::Both);
+            let _ = upload.join();
+            return;
+        }
+    };
+    let client_writer = match client.try_clone() {
+        Ok(stream) => stream,
+        Err(_) => {
+            connection_stop.store(true, Ordering::Release);
+            let _ = client.shutdown(std::net::Shutdown::Both);
+            let _ = upstream.shutdown(std::net::Shutdown::Both);
+            let _ = upload.join();
+            return;
+        }
+    };
+    relay_proxy_direction(upstream_reader, client_writer, &stop, &connection_stop);
+    connection_stop.store(true, Ordering::Release);
+    let _ = client.shutdown(std::net::Shutdown::Both);
+    let _ = upstream.shutdown(std::net::Shutdown::Both);
+    let _ = upload.join();
+}
+
+fn relay_proxy_direction(
+    mut source: TcpStream,
+    mut destination: TcpStream,
+    global_stop: &AtomicBool,
+    connection_stop: &AtomicBool,
+) {
+    let mut buffer = [0u8; PROXY_RELAY_BUFFER_BYTES];
+    while !global_stop.load(Ordering::Acquire) && !connection_stop.load(Ordering::Acquire) {
+        let count = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let mut written = 0;
+        while written < count
+            && !global_stop.load(Ordering::Acquire)
+            && !connection_stop.load(Ordering::Acquire)
+        {
+            match destination.write(&buffer[written..count]) {
+                Ok(0) => {
+                    connection_stop.store(true, Ordering::Release);
+                    let _ = source.shutdown(std::net::Shutdown::Both);
+                    let _ = destination.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                Ok(count) => written += count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    connection_stop.store(true, Ordering::Release);
+                    let _ = source.shutdown(std::net::Shutdown::Both);
+                    let _ = destination.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+            }
+        }
+    }
+    connection_stop.store(true, Ordering::Release);
+    let _ = source.shutdown(std::net::Shutdown::Both);
+    let _ = destination.shutdown(std::net::Shutdown::Both);
+}
+
+fn connect_public_import_host(host: &str, stop: &AtomicBool) -> Result<TcpStream, MediaError> {
+    let addresses = resolve_public_import_host(host, Some(stop))?;
+    let deadline = Instant::now()
+        .checked_add(PROXY_CONNECT_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let mut last_error = None;
+    for address in addresses {
+        if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let attempt_timeout = remaining.min(PROXY_CONNECT_ATTEMPT_TIMEOUT);
+        match TcpStream::connect_timeout(&SocketAddr::new(address, 443), attempt_timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(MediaError::new(
+        "url_destination_unreachable",
+        "The public media destination could not be reached",
+    )
+    .detail(last_error.unwrap_or_else(|| "connection cancelled or timed out".to_string()))
+    .retryable(true))
+}
+
+fn resolve_public_import_host(
+    host: &str,
+    stop: Option<&AtomicBool>,
+) -> Result<Vec<IpAddr>, MediaError> {
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return validate_public_destination_addresses(host, vec![address]);
+    }
+    validate_public_hostname(host)?;
+    let owned_host = host.to_string();
+    let resolver_host = owned_host.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let resolver = thread::Builder::new()
+        .name("soundar-import-dns".to_string())
+        .spawn(move || {
+            let result = (resolver_host.as_str(), 443)
+                .to_socket_addrs()
+                .map_err(|error| error.to_string())
+                .and_then(|resolved| {
+                    let mut addresses = Vec::new();
+                    for socket in resolved {
+                        let address = socket.ip();
+                        if addresses.contains(&address) {
+                            continue;
+                        }
+                        if addresses.len() >= MAX_IMPORT_DNS_ADDRESSES {
+                            return Err(format!(
+                                "DNS returned more than {MAX_IMPORT_DNS_ADDRESSES} addresses"
+                            ));
+                        }
+                        addresses.push(address);
+                    }
+                    Ok(addresses)
+                });
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            MediaError::new(
+                "url_dns_failed",
+                "The media host resolver could not be started",
+            )
+            .detail(error.to_string())
+            .retryable(true)
+        })?;
+    let deadline = Instant::now()
+        .checked_add(IMPORT_DNS_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    loop {
+        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            return Err(MediaError::new(
+                "url_dns_cancelled",
+                "The media host lookup was cancelled",
+            )
+            .retryable(true));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(
+                MediaError::new("url_dns_timeout", "The media host lookup timed out")
+                    .retryable(true),
+            );
+        }
+        match receiver.recv_timeout(
+            deadline
+                .saturating_duration_since(now)
+                .min(IMPORT_DNS_POLL_INTERVAL),
+        ) {
+            Ok(Ok(addresses)) => {
+                let _ = resolver.join();
+                return validate_public_destination_addresses(&owned_host, addresses);
+            }
+            Ok(Err(detail)) => {
+                let _ = resolver.join();
+                return Err(MediaError::new(
+                    "url_dns_failed",
+                    "The media host could not be resolved",
+                )
+                .detail(detail)
+                .retryable(true));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = resolver.join();
+                return Err(MediaError::new(
+                    "url_dns_failed",
+                    "The media host resolver stopped unexpectedly",
+                )
+                .retryable(true));
+            }
+        }
+    }
+}
+
+fn validate_public_destination_addresses(
+    host: &str,
+    addresses: Vec<IpAddr>,
+) -> Result<Vec<IpAddr>, MediaError> {
+    if addresses.is_empty() {
+        return Err(MediaError::new(
+            "url_dns_failed",
+            "The media host returned no usable network address",
+        )
+        .detail(host.to_string())
+        .retryable(true));
+    }
+    if let Some(address) = addresses
+        .iter()
+        .copied()
+        .find(|address| !is_public_network_address(*address))
+    {
+        return Err(MediaError::new(
+            "unsafe_url_destination",
+            "The media host resolves to a private or reserved destination",
+        )
+        .detail(format!("{host} resolved to {address}")));
+    }
+    Ok(addresses)
+}
+
+fn is_public_network_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, third, _] = address.octets();
+    !matches!(
+        (first, second, third),
+        (0, _, _)
+            | (10, _, _)
+            | (100, 64..=127, _)
+            | (127, _, _)
+            | (169, 254, _)
+            | (172, 16..=31, _)
+            | (192, 0, 0)
+            | (192, 0, 2)
+            | (192, 88, 99)
+            | (192, 168, _)
+            | (198, 18..=19, _)
+            | (198, 51, 100)
+            | (203, 0, 113)
+            | (224..=255, _, _)
+    )
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    let value = u128::from(address);
+    // Current globally routable unicast space is 2000::/3. Conservatively reject
+    // non-global, transition, benchmarking, documentation and ORCHID allocations inside it.
+    ipv6_has_prefix(value, 0x2000_u128 << 112, 3)
+        && !ipv6_has_prefix(value, 0x2001_u128 << 112, 23)
+        && !ipv6_has_prefix(value, 0x2001_0002_u128 << 96, 48)
+        && !ipv6_has_prefix(value, 0x2001_0010_u128 << 96, 28)
+        && !ipv6_has_prefix(value, 0x2001_0020_u128 << 96, 28)
+        && !ipv6_has_prefix(value, 0x2001_0db8_u128 << 96, 32)
+        && !ipv6_has_prefix(value, 0x2002_u128 << 112, 16)
+        && !ipv6_has_prefix(value, 0x3fff_u128 << 112, 20)
+}
+
+fn ipv6_has_prefix(address: u128, network: u128, prefix_length: u32) -> bool {
+    let mask = u128::MAX << (128 - prefix_length);
+    address & mask == network & mask
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
 pub fn validate_import_url(raw: &str) -> Result<ValidatedImportUrl, MediaError> {
     let value = raw.trim();
     if value.is_empty() {
@@ -1267,6 +2351,7 @@ pub fn validate_import_url(raw: &str) -> Result<ValidatedImportUrl, MediaError> 
 fn validate_public_hostname(host: &str) -> Result<(), MediaError> {
     if host.is_empty()
         || !host.is_ascii()
+        || host.len() > 253
         || host == "localhost"
         || host.ends_with(".localhost")
         || host.ends_with(".local")
@@ -1278,17 +2363,10 @@ fn validate_public_hostname(host: &str) -> Result<(), MediaError> {
         ));
     }
     if let Ok(address) = host.parse::<std::net::Ipv4Addr>() {
-        if address.is_private()
-            || address.is_loopback()
-            || address.is_link_local()
-            || address.is_unspecified()
-            || address.is_broadcast()
-            || address.octets()[0] == 0
-            || address.octets()[0] >= 224
-        {
+        if !is_public_network_address(IpAddr::V4(address)) {
             return Err(MediaError::new(
                 "unsafe_url_host",
-                "Private and local media hosts are not supported",
+                "Private and reserved media hosts are not supported",
             ));
         }
         return Ok(());
@@ -1541,7 +2619,7 @@ pub fn validate_caption_cues(
 mod tests {
     use super::*;
     use std::{
-        io::Write,
+        io::{Read, Write},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -1617,6 +2695,193 @@ mod tests {
     }
 
     #[test]
+    fn command_capture_drains_large_streams_with_strict_retention_limits() {
+        let args = [
+            OsString::from("-c"),
+            OsString::from("head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2"),
+        ];
+        let output = run_bounded_command_with_limits(
+            Path::new("/bin/sh"),
+            &args,
+            Duration::from_secs(5),
+            4_096,
+            2_048,
+        )
+        .expect("bounded high-volume helper");
+        assert!(output.status_success);
+        assert_eq!(output.stdout.len(), 4_096);
+        assert_eq!(output.stderr.len(), 2_048);
+        assert!(output.stdout_truncated);
+        assert!(output.stderr_truncated);
+    }
+
+    #[test]
+    fn command_timeout_kills_the_process_group_and_completes_pipe_drain() {
+        let args = [
+            OsString::from("-c"),
+            OsString::from(
+                "while :; do printf '0123456789abcdef'; printf 'fedcba9876543210' >&2; done",
+            ),
+        ];
+        let started = Instant::now();
+        let error = run_bounded_command_with_limits(
+            Path::new("/bin/sh"),
+            &args,
+            Duration::from_millis(100),
+            128,
+            128,
+        )
+        .expect_err("non-terminating helper must time out");
+        assert_eq!(error.code, "media_process_timeout");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn command_capture_does_not_hang_when_a_descendant_keeps_pipes_open() {
+        let root = TestDirectory::new("inherited-pipe");
+        let pid_path = root.0.join("descendant.pid");
+        let script = format!(
+            "(while :; do printf 'continuous-output'; done) & descendant=$!; printf '%s' \"$descendant\" > '{}'; exit 0",
+            pid_path.display()
+        );
+        let args = [OsString::from("-c"), OsString::from(script)];
+        let started = Instant::now();
+        let error = run_bounded_command_with_limits(
+            Path::new("/bin/sh"),
+            &args,
+            Duration::from_secs(5),
+            128,
+            128,
+        )
+        .expect_err("inherited output descriptors must fail closed");
+        assert_eq!(error.code, "media_process_failed");
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let descendant = fs::read_to_string(&pid_path)
+            .expect("read descendant pid")
+            .parse::<i32>()
+            .expect("parse descendant pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut descendant_is_gone = false;
+        while Instant::now() < deadline {
+            let status = unsafe { libc::kill(descendant, 0) };
+            if status < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                descendant_is_gone = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !descendant_is_gone {
+            // Best-effort cleanup keeps a failing regression test from leaving a hot loop.
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        assert!(
+            descendant_is_gone,
+            "owned descendant survived process-group cleanup"
+        );
+    }
+
+    #[test]
+    fn probe_rejects_oversized_sparse_sources_before_starting_ffprobe() {
+        let root = TestDirectory::new("source-quota");
+        let source = root.0.join("oversized.mp4");
+        let file = fs::File::create(&source).expect("create sparse source");
+        file.set_len(MAX_MEDIA_SOURCE_BYTES + 1)
+            .expect("extend sparse source");
+        drop(file);
+        let error = probe_media(&source, Path::new("/bin/false"))
+            .expect_err("source quota must precede helper execution");
+        assert_eq!(error.code, "media_source_too_large");
+    }
+
+    #[test]
+    fn local_input_policy_rejects_renamed_network_and_playlist_manifests() {
+        let root = TestDirectory::new("manifest-policy");
+        for (name, contents) in [
+            (
+                "renamed-hls.mp4",
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1280000\nhttps://private.example/live.m3u8\n",
+            ),
+            (
+                "renamed-dash.webm",
+                "<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"></MPD>",
+            ),
+            (
+                "renamed-concat.mov",
+                "ffconcat version 1.0\nfile '/etc/passwd'\n",
+            ),
+            (
+                "renamed-sdp.wav",
+                "v=0\no=- 1 1 IN IP4 127.0.0.1\nc=IN IP4 127.0.0.1\nm=audio 5004 RTP/AVP 0\n",
+            ),
+            (
+                "renamed-playlist.mp3",
+                "[playlist]\nFile1=https://private.example/audio.mp3\n",
+            ),
+            (
+                "renamed-xspf.ogg",
+                "<playlist xmlns=\"http://xspf.org/ns/0/\"><trackList /></playlist>",
+            ),
+        ] {
+            let path = root.0.join(name);
+            fs::write(&path, contents).expect("write renamed manifest");
+            let error = validate_local_media_source(&path)
+                .expect_err("renamed manifest must fail before FFmpeg/FFprobe");
+            assert_eq!(error.code, "unsafe_media_manifest", "source {name}");
+        }
+    }
+
+    #[test]
+    fn local_input_args_apply_file_only_protocol_and_safe_demuxer_allowlists() {
+        let root = TestDirectory::new("local-input-args");
+        let source = root.0.join("ordinary.mp4");
+        fs::write(&source, b"ordinary non-manifest bytes").unwrap();
+        let args = local_media_input_args(&source).expect("build guarded input arguments");
+        assert_eq!(args[0], OsString::from("-protocol_whitelist"));
+        assert_eq!(args[1], OsString::from("file"));
+        assert_eq!(args[2], OsString::from("-format_whitelist"));
+        assert_eq!(args[4], OsString::from("-i"));
+        assert_eq!(args[5], fs::canonicalize(source).unwrap().into_os_string());
+        let formats = LOCAL_MEDIA_FORMAT_WHITELIST
+            .split(',')
+            .collect::<HashSet<_>>();
+        for forbidden in [
+            "concat",
+            "dash",
+            "ffmetadata",
+            "hls",
+            "image2",
+            "imf",
+            "live_flv",
+            "rtsp",
+            "sdp",
+            "smil",
+            "xspf",
+        ] {
+            assert!(!formats.contains(forbidden), "demuxer {forbidden}");
+        }
+    }
+
+    #[test]
+    fn probe_rejects_an_unsafe_reported_demuxer_even_if_the_helper_ignores_options() {
+        let root = TestDirectory::new("reported-demuxer");
+        let source = root.0.join("ordinary.mp4");
+        fs::write(&source, b"ordinary non-manifest bytes").unwrap();
+        let fake_ffprobe = root.0.join("ffprobe");
+        fs::write(
+            &fake_ffprobe,
+            "#!/bin/sh\nprintf '%s\\n' '{\"format\":{\"format_name\":\"hls\",\"duration\":\"1\"},\"streams\":[{\"index\":0,\"codec_type\":\"video\"}]}'\n",
+        )
+        .unwrap();
+        make_test_executable(&fake_ffprobe);
+        let error = probe_media(&source, &fake_ffprobe)
+            .expect_err("unsafe reported demuxer must fail closed");
+        assert_eq!(error.code, "unsafe_media_manifest");
+    }
+
+    #[test]
     fn exact_decimal_clock_conversion_does_not_use_floating_point() {
         assert_eq!(decimal_seconds_to_us("12.3456784"), Some(12_345_678));
         assert_eq!(decimal_seconds_to_us("12.3456785"), Some(12_345_679));
@@ -1659,6 +2924,166 @@ mod tests {
                 .code,
             "invalid_url"
         );
+    }
+
+    #[test]
+    fn import_url_and_dns_policy_reject_all_reserved_address_classes() {
+        for address in [
+            "0.1.2.3",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.0.9",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "255.255.255.255",
+        ] {
+            let error = validate_import_url(&format!("https://{address}/video"))
+                .expect_err("reserved literal must be rejected syntactically");
+            assert_eq!(error.code, "unsafe_url_host", "address {address}");
+        }
+
+        for address in [
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+            "2001:2::1",
+            "2002:7f00:1::",
+            "3fff::1",
+        ] {
+            assert!(
+                !is_public_network_address(address.parse().expect("test IP")),
+                "address {address}"
+            );
+        }
+        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(
+                is_public_network_address(address.parse().expect("test IP")),
+                "address {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn dns_policy_rejects_a_mixed_public_and_private_answer_set() {
+        let error = validate_public_destination_addresses(
+            "media.example.com",
+            vec!["1.1.1.1".parse().unwrap(), "127.0.0.1".parse().unwrap()],
+        )
+        .expect_err("one unsafe answer must reject the entire destination");
+        assert_eq!(error.code, "unsafe_url_destination");
+
+        let public = validate_public_destination_addresses(
+            "media.example.com",
+            vec![
+                "1.1.1.1".parse().unwrap(),
+                "2606:4700:4700::1111".parse().unwrap(),
+            ],
+        )
+        .expect("entirely public answer set");
+        assert_eq!(public.len(), 2);
+    }
+
+    #[test]
+    fn preflight_rejects_a_forged_post_validation_contract_without_dns() {
+        let mut validated =
+            validate_import_url("https://media.example.com/video").expect("valid syntax");
+        validated.canonical = "https://other.example.com/video".to_string();
+        let error = preflight_import_url_destination(&validated)
+            .expect_err("canonical URL mutation must fail before resolution");
+        assert_eq!(error.code, "invalid_url_preflight");
+    }
+
+    #[test]
+    fn protected_proxy_requires_auth_and_rejects_private_and_http_redirects() {
+        let proxy = PublicHttpsProxy::start().expect("start protected proxy");
+        let authorization = proxy_test_authorization(&proxy);
+
+        let unauthenticated = proxy_test_request(
+            &proxy,
+            "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n",
+        );
+        assert!(unauthenticated.starts_with("HTTP/1.1 407"));
+
+        let private_redirect = proxy_test_request(
+            &proxy,
+            &format!(
+                "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\nProxy-Authorization: {authorization}\r\n\r\n"
+            ),
+        );
+        assert!(private_redirect.starts_with("HTTP/1.1 403"));
+
+        let http_downgrade = proxy_test_request(
+            &proxy,
+            &format!(
+                "GET http://127.0.0.1/secret HTTP/1.1\r\nHost: 127.0.0.1\r\nProxy-Authorization: {authorization}\r\n\r\n"
+            ),
+        );
+        assert!(http_downgrade.starts_with("HTTP/1.1 405"));
+    }
+
+    #[test]
+    fn protected_proxy_bounds_connect_headers_and_redacts_credentials_in_debug() {
+        let proxy = PublicHttpsProxy::start().expect("start protected proxy");
+        let authorization = proxy_test_authorization(&proxy);
+        let oversized = proxy_test_request(
+            &proxy,
+            &format!(
+                "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: {authorization}\r\nX-Fill: {}\r\n\r\n",
+                "x".repeat(MAX_PROXY_CONNECT_HEADER_BYTES)
+            ),
+        );
+        assert!(oversized.starts_with("HTTP/1.1 400"));
+        let debug = format!("{proxy:?}");
+        assert!(!debug.contains(proxy.url()));
+        assert!(!debug.contains(&authorization));
+    }
+
+    #[test]
+    fn proxy_tunnel_relays_both_directions_with_bounded_buffers() {
+        let (mut user, proxy_client) = connected_tcp_pair();
+        let (proxy_upstream, mut origin) = connected_tcp_pair();
+        user.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        origin
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let relay_stop = Arc::clone(&stop);
+        let relay =
+            thread::spawn(move || relay_proxy_tunnel(proxy_client, proxy_upstream, relay_stop));
+
+        user.write_all(b"request through proxy").unwrap();
+        let mut request = [0u8; 21];
+        origin.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"request through proxy");
+
+        origin.write_all(b"response through proxy").unwrap();
+        let mut response = [0u8; 22];
+        user.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"response through proxy");
+
+        stop.store(true, Ordering::Release);
+        let _ = user.shutdown(std::net::Shutdown::Both);
+        let _ = origin.shutdown(std::net::Shutdown::Both);
+        relay.join().expect("join tunnel relay");
+    }
+
+    #[test]
+    fn base64_encoder_matches_proxy_basic_auth_vectors() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"soundar:token"), "c291bmRhcjp0b2tlbg==");
     }
 
     #[test]
@@ -1776,5 +3201,39 @@ mod tests {
             .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
             .map(|directory| directory.join(name))
             .find(|path| is_executable_file(path))
+    }
+
+    fn proxy_test_authorization(proxy: &PublicHttpsProxy) -> String {
+        let credentials = proxy
+            .url()
+            .strip_prefix("http://")
+            .and_then(|value| value.split_once('@'))
+            .map(|(credentials, _)| credentials)
+            .expect("proxy URL credentials");
+        format!("Basic {}", encode_base64(credentials.as_bytes()))
+    }
+
+    fn proxy_test_request(proxy: &PublicHttpsProxy, request: &str) -> String {
+        let mut client = TcpStream::connect(proxy.address).expect("connect to proxy");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(request.as_bytes()).expect("write request");
+        let mut response = String::new();
+        client.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    fn connected_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test listener");
+        let client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect test pair");
+        let (server, _) = listener.accept().expect("accept test pair");
+        (client, server)
+    }
+
+    fn make_test_executable(path: &Path) {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions).unwrap();
     }
 }
