@@ -10,6 +10,7 @@ use super::contracts::{
     Microseconds, RationalRate, ReviewState, ReviewedScene, TimeRange, TimelineClip, TimelineGap,
     TimelineTrack, TrackKind, TranscriptSegment, TranscriptTimingSource, TranscriptVersion,
     TranscriptWord, Validate, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
+    MAX_SOURCE_DURATION_US,
 };
 use super::timeline::quantize_range_outward;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_TRANSCRIPT_ITEMS: usize = 500_000;
 const CLOCK_TOLERANCE_US: i64 = 20_000;
+const MAX_GENERATED_CANDIDATE_TITLE_BYTES: usize = 500;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -105,10 +107,10 @@ pub fn transcript_from_runtime_json(
     evidence: &Value,
     request: &TranscriptImportRequest,
 ) -> VideoResult<TranscriptVersion> {
-    if request.source_clock_duration_us.0 <= 0 {
+    if !(1..=MAX_SOURCE_DURATION_US).contains(&request.source_clock_duration_us.0) {
         return Err(VideoError::new(
             VideoErrorCode::InvalidTranscript,
-            "the probed source clock must be positive",
+            "the probed source clock must be positive and no greater than 6 hours",
         )
         .at("source_clock_duration_us"));
     }
@@ -719,8 +721,12 @@ fn candidate_title(text: &str) -> String {
     if text.split_whitespace().count() > words.len() {
         title.push('…');
     }
-    if title.len() > 500 {
-        title.truncate(500);
+    if title.len() > MAX_GENERATED_CANDIDATE_TITLE_BYTES {
+        let mut truncate_at = MAX_GENERATED_CANDIDATE_TITLE_BYTES;
+        while !title.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        title.truncate(truncate_at);
     }
     title
 }
@@ -848,6 +854,29 @@ mod tests {
         manifest.transcript = Some(transcript);
         manifest.validate_strict().unwrap();
         manifest
+    }
+
+    #[test]
+    fn candidate_title_truncates_long_unicode_token_on_a_character_boundary() {
+        let input = "界".repeat(167);
+        assert_eq!(input.len(), 501);
+
+        let title = candidate_title(&input);
+
+        assert_eq!(title, "界".repeat(166));
+        assert_eq!(title.len(), 498);
+        assert!(title.len() <= MAX_GENERATED_CANDIDATE_TITLE_BYTES);
+    }
+
+    #[test]
+    fn runtime_transcript_rejects_source_clock_beyond_product_limit() {
+        let mut request = transcript_request();
+        request.source_clock_duration_us = Microseconds(MAX_SOURCE_DURATION_US + 1);
+
+        let error = transcript_from_runtime_json(&evidence(), &request).unwrap_err();
+
+        assert_eq!(error.code, VideoErrorCode::InvalidTranscript);
+        assert_eq!(error.field.as_deref(), Some("source_clock_duration_us"));
     }
 
     #[test]

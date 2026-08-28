@@ -8,6 +8,8 @@ use std::fmt;
 pub const VIDEO_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const SHA256_HEX_LENGTH: usize = 64;
 pub const NORMALIZED_BASIS_POINTS: i32 = 10_000;
+pub const MAX_SOURCE_DURATION_US: i64 = 6 * 60 * 60 * 1_000_000;
+pub const MAX_TIMELINE_DURATION_US: i64 = MAX_SOURCE_DURATION_US;
 
 pub type VideoResult<T> = Result<T, VideoError>;
 
@@ -275,6 +277,15 @@ pub struct RationalRate {
     pub denominator: u32,
 }
 
+pub const MIN_PLAYBACK_RATE: RationalRate = RationalRate {
+    numerator: 1,
+    denominator: 8,
+};
+pub const MAX_PLAYBACK_RATE: RationalRate = RationalRate {
+    numerator: 8,
+    denominator: 1,
+};
+
 impl RationalRate {
     pub const ONE: Self = Self {
         numerator: 1,
@@ -294,6 +305,18 @@ impl Validate for RationalRate {
             return Err(VideoError::new(
                 VideoErrorCode::DurationMismatch,
                 "playback rate must be stored as a reduced rational",
+            ));
+        }
+        let numerator = u64::from(self.numerator);
+        let denominator = u64::from(self.denominator);
+        if numerator * u64::from(MIN_PLAYBACK_RATE.denominator)
+            < u64::from(MIN_PLAYBACK_RATE.numerator) * denominator
+            || numerator * u64::from(MAX_PLAYBACK_RATE.denominator)
+                > u64::from(MAX_PLAYBACK_RATE.numerator) * denominator
+        {
+            return Err(VideoError::new(
+                VideoErrorCode::DurationMismatch,
+                "playback rate must be within the supported 1/8x..=8x range",
             ));
         }
         Ok(())
@@ -400,10 +423,17 @@ pub struct MediaProbe {
 
 impl Validate for MediaProbe {
     fn validate(&self) -> VideoResult<()> {
-        if self.duration_us.0 <= 0 || (!self.has_video && !self.has_audio) {
+        if !(1..=MAX_SOURCE_DURATION_US).contains(&self.duration_us.0) {
             return Err(VideoError::new(
                 VideoErrorCode::InvalidAsset,
-                "media must have positive duration and at least one stream",
+                "media duration must be positive and no greater than 6 hours",
+            )
+            .at("media.duration_us"));
+        }
+        if !self.has_video && !self.has_audio {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidAsset,
+                "media must have at least one audio or video stream",
             ));
         }
         match (self.width, self.height, self.has_video) {
@@ -513,10 +543,17 @@ impl Validate for TranscriptVersion {
     fn validate(&self) -> VideoResult<()> {
         validate_identifier(&self.id, "transcript.id")?;
         validate_identifier(&self.source_asset_id, "transcript.source_asset_id")?;
-        if self.source_clock_duration_us.0 <= 0 || !self.preserved_source_gaps {
+        if !(1..=MAX_SOURCE_DURATION_US).contains(&self.source_clock_duration_us.0) {
             return Err(VideoError::new(
                 VideoErrorCode::InvalidTranscript,
-                "transcript timing must use the positive original source clock and preserve gaps",
+                "transcript source-clock duration must be positive and no greater than 6 hours",
+            )
+            .at("transcript.source_clock_duration_us"));
+        }
+        if !self.preserved_source_gaps {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidTranscript,
+                "transcript timing must preserve the original source-clock gaps",
             ));
         }
         validate_sha256(
@@ -1243,10 +1280,10 @@ impl Validate for VideoProjectManifest {
         validate_identifier(&self.project_id, "project_id")?;
         validate_nonempty(&self.name, "name", 512)?;
         self.frame_rate.validate()?;
-        if self.timeline_duration_us.0 <= 0 {
+        if !(1..=MAX_TIMELINE_DURATION_US).contains(&self.timeline_duration_us.0) {
             return Err(VideoError::new(
                 VideoErrorCode::InvalidTimestamp,
-                "timeline_duration_us must be positive",
+                "timeline_duration_us must be positive and no greater than 6 hours",
             )
             .at("timeline_duration_us"));
         }
@@ -2158,6 +2195,62 @@ mod tests {
         assert_eq!(error.code, VideoErrorCode::DurationMismatch);
         clip.timeline_duration_us = Microseconds(500_000);
         clip.validate().unwrap();
+    }
+
+    #[test]
+    fn playback_rate_enforces_inclusive_product_bounds() {
+        for rate in [MIN_PLAYBACK_RATE, RationalRate::ONE, MAX_PLAYBACK_RATE] {
+            rate.validate().unwrap();
+        }
+
+        for rate in [
+            RationalRate {
+                numerator: 1,
+                denominator: 9,
+            },
+            RationalRate {
+                numerator: 9,
+                denominator: 1,
+            },
+        ] {
+            let error = rate.validate().unwrap_err();
+            assert_eq!(error.code, VideoErrorCode::DurationMismatch);
+        }
+    }
+
+    #[test]
+    fn source_and_timeline_duration_enforce_inclusive_product_bounds() {
+        let mut probe = source().probe;
+        probe.duration_us = Microseconds(MAX_SOURCE_DURATION_US);
+        probe.validate().unwrap();
+        probe.duration_us = Microseconds(MAX_SOURCE_DURATION_US + 1);
+        let error = probe.validate().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidAsset);
+        assert_eq!(error.field.as_deref(), Some("media.duration_us"));
+
+        let template = manifest();
+        VideoProjectManifest::new(
+            "project-six-hours",
+            "Six-hour project",
+            RationalFrameRate::FPS_30,
+            Microseconds(MAX_TIMELINE_DURATION_US),
+            template.layout.clone(),
+            template.audio_mix.clone(),
+            timestamp(),
+        )
+        .unwrap();
+        let error = VideoProjectManifest::new(
+            "project-too-long",
+            "Overlong project",
+            RationalFrameRate::FPS_30,
+            Microseconds(MAX_TIMELINE_DURATION_US + 1),
+            template.layout,
+            template.audio_mix,
+            timestamp(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidTimestamp);
+        assert_eq!(error.field.as_deref(), Some("timeline_duration_us"));
     }
 
     #[test]
