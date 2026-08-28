@@ -31,7 +31,7 @@ jobs:
       - name: Install Tauri build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf ffmpeg
       - name: Install frontend dependencies
         working-directory: app
         run: npm ci
@@ -69,5 +69,7 @@ jobs:
         run: |
           python3 -m pip install --requirement requirements-test.txt
           python3 -m unittest discover -s tests -v
+      - name: Test Linux Video Studio media harness
+        run: scripts/video/test-harness.sh
       - name: Validate installer and package-verification scripts
         run: bash -n install-linux.sh setup-runtime.sh setup-engine-runtime.sh install.sh scripts/verify-production-boundary.sh scripts/verify-runtime-security.sh scripts/verify-linux-bundles.sh scripts/verify-package-journey.sh
