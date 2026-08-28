@@ -21,6 +21,17 @@ export interface VideoStudioState {
   error?: string;
 }
 
+export type VideoProjectNextAction = "analyze" | "review" | "preview" | "export" | "complete";
+
+export interface VideoProjectReadiness {
+  source: true;
+  analyzed: boolean;
+  reviewed: boolean;
+  previewed: boolean;
+  exported: boolean;
+  nextAction: VideoProjectNextAction;
+}
+
 export function formatVideoUpdatedAt(timestamp: string, now = Date.now()): string {
   const value = new Date(timestamp).getTime();
   if (!Number.isFinite(value)) return "Unknown";
@@ -39,7 +50,7 @@ export type VideoStudioAction =
   | { type: "projects-loaded"; projects: VideoProjectSummary[] }
   | { type: "open-intake"; entry: VideoStudioEntry }
   | { type: "close-intake" }
-  | { type: "source-accepted"; project: VideoProject; job?: VideoJob }
+  | { type: "source-accepted"; project: VideoProject; job?: VideoJob; returnPhase?: "home" | "editor" }
   | { type: "progress"; job: VideoJob }
   | { type: "analysis-complete"; project: VideoProject }
   | { type: "toggle-candidate"; candidateId: string }
@@ -68,12 +79,45 @@ function selectedCandidates(project: VideoProject): string[] {
   return project.manifest.candidates.filter((candidate) => candidate.selected).map((candidate) => candidate.id);
 }
 
-function phaseForProject(project: VideoProject): VideoStudioPhase {
+export function videoProjectReadiness(project: VideoProject): VideoProjectReadiness {
+  const analyzed = project.manifest.candidates.length > 0 || project.manifest.scenes.length > 0;
+  const reviewed = project.manifest.scenes.length > 0;
+  const previewed = Boolean(selectPreviewArtifact(project));
+  const exported = Boolean(selectMasterArtifact(project));
+  const nextAction: VideoProjectNextAction = !analyzed
+    ? "analyze"
+    : !reviewed
+      ? "review"
+      : !previewed
+        ? "preview"
+        : !exported
+          ? "export"
+          : "complete";
+  return { source: true, analyzed, reviewed, previewed, exported, nextAction };
+}
+
+export function phaseForProject(project: VideoProject): VideoStudioPhase {
   if (project.master || project.status === "exported") return "exported";
-  if (project.recoverable_job || (project.workflow_job && ["queued", "preparing", "running"].includes(project.workflow_job.status))) return "analyzing";
-  if (project.status === "review") return "review";
-  if (project.status === "analyzing") return "analyzing";
+  const readiness = videoProjectReadiness(project);
+  const workflow = project.recoverable_job
+    ?? (project.workflow_job && ["queued", "preparing", "running"].includes(project.workflow_job.status)
+      ? project.workflow_job
+      : undefined);
+  if (workflow && workflowMatchesReadiness(workflow.phase, readiness.nextAction)) return "analyzing";
+  if (!readiness.analyzed) return "editor";
+  if (!readiness.reviewed) return "review";
   return "editor";
+}
+
+function workflowMatchesReadiness(phase: VideoJob["phase"], nextAction: VideoProjectNextAction): boolean {
+  const compatible: Record<VideoProjectNextAction, VideoJob["phase"][]> = {
+    analyze: ["source", "analyze"],
+    review: ["analyze", "review"],
+    preview: ["review", "preview"],
+    export: ["preview", "export"],
+    complete: ["export"],
+  };
+  return compatible[nextAction].includes(phase);
 }
 
 function withProject(state: VideoStudioState, project: VideoProject, phase = phaseForProject(project)): VideoStudioState {
@@ -104,14 +148,14 @@ export function videoStudioReducer(state: VideoStudioState, action: VideoStudioA
     case "source-accepted":
       return {
         ...withProject(state, action.project, "analyzing"),
-        returnPhase: "home",
+        returnPhase: action.returnPhase ?? "home",
         activeJob: action.job,
         selectedCandidateIds: [],
       };
     case "progress":
       return { ...state, activeJob: action.job };
     case "analysis-complete":
-      return withProject(state, action.project, "review");
+      return withProject(state, action.project);
     case "toggle-candidate": {
       const exists = state.selectedCandidateIds.includes(action.candidateId);
       return {
@@ -122,7 +166,7 @@ export function videoStudioReducer(state: VideoStudioState, action: VideoStudioA
       };
     }
     case "review-complete":
-      return withProject(state, action.project, "editor");
+      return withProject(state, action.project);
     case "open-project":
       return withProject(state, action.project);
     case "select-scene":
@@ -143,7 +187,7 @@ export function videoStudioReducer(state: VideoStudioState, action: VideoStudioA
       return { ...state, phase: state.returnPhase, activeJob: undefined, error: undefined };
     case "fail": {
       const safeReturnPhase = state.phase === "analyzing"
-        ? "home"
+        ? state.returnPhase
         : state.phase === "rendering" || state.phase === "exporting"
           ? "editor"
           : state.phase === "error" ? state.returnPhase : state.phase;

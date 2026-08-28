@@ -1,11 +1,14 @@
-import { Captions, Check, LoaderCircle, Redo2, Save, Undo2 } from "lucide-react";
-import { useEffect, useId, useState, type KeyboardEvent } from "react";
+import { Captions, ImagePlus, LoaderCircle, Plus, Redo2, Save, Undo2 } from "lucide-react";
+import { useEffect, useId, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { capabilityForModel, compatibleVoicesForModel, qualifiedModels } from "../../lib/capabilities";
 import type { BootstrapState, InstalledModel, VoiceProfile } from "../../types";
-import type { VideoJob, VideoProject, VideoScene } from "../../types/video";
+import type { VideoCanvasBounds, VideoCaptionStyle, VideoJob, VideoProject, VideoScene, VideoTimelineOperation, VideoVisualLayer } from "../../types/video";
 import { formatVideoClock, formatVideoUpdatedAt, selectPreviewArtifact } from "../../lib/videoState";
 import { VideoPreviewPlayer } from "./VideoPreviewPlayer";
-import { VideoTimeline } from "./VideoTimeline";
+import { VideoProductionSteps } from "./VideoProductionSteps";
+import { millisecondsToMicroseconds, VideoTimeline, type VideoTimelineMode } from "./VideoTimeline";
+
+type VideoInspectorTab = "layout" | "captions" | "audio" | "visuals";
 
 export function VideoEditorWorkspace({
   project,
@@ -18,6 +21,15 @@ export function VideoEditorWorkspace({
   onRenderPreview,
   onExport,
   onSaveScene,
+  onAddVisual,
+  visualAdding,
+  onEditTimeline,
+  timelineEditing,
+  timelineFeedback,
+  canUndoTimeline,
+  canRedoTimeline,
+  onUndoTimeline,
+  onRedoTimeline,
   onCancelWorking,
   bootstrap,
   voices = [],
@@ -32,6 +44,15 @@ export function VideoEditorWorkspace({
   onRenderPreview: () => void;
   onExport: () => void;
   onSaveScene: (scene: VideoScene) => Promise<void>;
+  onAddVisual: (sceneId?: string) => Promise<boolean>;
+  visualAdding: boolean;
+  onEditTimeline: (operations: VideoTimelineOperation[], label: string) => Promise<void>;
+  timelineEditing: boolean;
+  timelineFeedback?: { tone: "status" | "error"; text: string };
+  canUndoTimeline: boolean;
+  canRedoTimeline: boolean;
+  onUndoTimeline: () => void;
+  onRedoTimeline: () => void;
   onCancelWorking: () => void;
   bootstrap?: BootstrapState;
   voices?: VoiceProfile[];
@@ -41,13 +62,61 @@ export function VideoEditorWorkspace({
   const [draft, setDraft] = useState<VideoScene | undefined>(selectedScene);
   const [redoDraft, setRedoDraft] = useState<VideoScene>();
   const [saving, setSaving] = useState(false);
-  const [activeTab, setActiveTab] = useState<"layout" | "captions" | "audio">("layout");
+  const [selectedVisualLayerId, setSelectedVisualLayerId] = useState<string>();
+  const visualLayers = project.manifest.visual_layers ?? [];
+  const fallbackVisualLayer = [...visualLayers].reverse().find((layer) => (
+    layer.scene_id === selectedScene?.id && playheadMs >= layer.start_ms && playheadMs <= layer.end_ms
+  )) ?? [...visualLayers].reverse().find((layer) => layer.scene_id === selectedScene?.id)
+    ?? [...visualLayers].reverse().find((layer) => !layer.scene_id && playheadMs >= layer.start_ms && playheadMs <= layer.end_ms);
+  const selectedVisualLayer = visualLayers.find((layer) => layer.id === selectedVisualLayerId && (
+    layer.scene_id === selectedScene?.id || (!layer.scene_id && playheadMs >= layer.start_ms && playheadMs <= layer.end_ms)
+  ));
+  const activeVisualLayer = selectedVisualLayer ?? fallbackVisualLayer;
+  const activeVisualAsset = (project.manifest.visual_assets ?? []).find((asset) => asset.id === activeVisualLayer?.asset_id);
+  const inspectorTabs: readonly VideoInspectorTab[] = activeVisualLayer
+    ? ["layout", "captions", "audio", "visuals"]
+    : ["layout", "captions", "audio"];
+  const [activeTab, setActiveTab] = useState<VideoInspectorTab>("captions");
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [scenePaneWidth, setScenePaneWidth] = useState(190);
+  const [inspectorPaneWidth, setInspectorPaneWidth] = useState(270);
+  const [timelineMode, setTimelineMode] = useState<VideoTimelineMode>(() => readTimelineMode());
+  const [timelineHeight, setTimelineHeight] = useState(() => timelineHeightForMode(readTimelineMode()));
   const tabId = useId();
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const compactPaneLayout = useRef(false);
 
   useEffect(() => {
     setDraft(selectedScene);
     setRedoDraft(undefined);
+    setSelectedVisualLayerId(undefined);
   }, [selectedScene]);
+
+  useEffect(() => {
+    if (activeTab === "visuals" && !activeVisualLayer) setActiveTab("captions");
+  }, [activeTab, activeVisualLayer]);
+
+  useEffect(() => {
+    try { window.localStorage.setItem(TIMELINE_MODE_KEY, timelineMode); } catch { /* Preference storage is optional. */ }
+  }, [timelineMode]);
+
+  useEffect(() => {
+    if (typeof ResizeObserver === "undefined" || !workspaceRef.current) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const compact = entry.contentRect.width <= 900;
+      if (compact === compactPaneLayout.current) return;
+      compactPaneLayout.current = compact;
+      if (compact) {
+        setScenePaneWidth((width) => Math.min(width, 160));
+        setInspectorPaneWidth((width) => Math.min(width, 230));
+      } else {
+        setScenePaneWidth((width) => width === 160 ? 190 : width);
+        setInspectorPaneWidth((width) => width === 230 ? 270 : width);
+      }
+    });
+    observer.observe(workspaceRef.current);
+    return () => observer.disconnect();
+  }, []);
 
   const dirty = Boolean(draft && selectedScene && JSON.stringify(draft) !== JSON.stringify(selectedScene));
 
@@ -72,11 +141,58 @@ export function VideoEditorWorkspace({
   function moveTab(event: KeyboardEvent<HTMLButtonElement>) {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
-    const tabs = ["layout", "captions", "audio"] as const;
-    const current = tabs.indexOf(activeTab);
-    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
-    setActiveTab(tabs[next]);
-    document.getElementById(`${tabId}-${tabs[next]}-tab`)?.focus();
+    const focused = inspectorTabs.findIndex((tab) => event.currentTarget.id === `${tabId}-${tab}-tab`);
+    const current = focused >= 0 ? focused : inspectorTabs.indexOf(activeTab);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? inspectorTabs.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + inspectorTabs.length) % inspectorTabs.length;
+    setActiveTab(inspectorTabs[next]);
+    document.getElementById(`${tabId}-${inspectorTabs[next]}-tab`)?.focus();
+  }
+
+  function beginPaneResize(kind: "scenes" | "inspector", event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startValue = kind === "scenes" ? scenePaneWidth : inspectorPaneWidth;
+    const move = (pointer: PointerEvent) => {
+      const delta = pointer.clientX - startX;
+      if (kind === "scenes") setScenePaneWidth(clamp(startValue + delta, 150, 300));
+      else setInspectorPaneWidth(clamp(startValue - delta, 230, 380));
+    };
+    const end = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end, { once: true });
+  }
+
+  function resizePaneWithKeyboard(kind: "scenes" | "inspector", event: KeyboardEvent<HTMLDivElement>) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    if (kind === "scenes") {
+      const next = event.key === "Home" ? 150 : event.key === "End" ? 300 : scenePaneWidth + (event.key === "ArrowRight" ? 12 : -12);
+      setScenePaneWidth(clamp(next, 150, 300));
+    } else {
+      const next = event.key === "Home" ? 230 : event.key === "End" ? 380 : inspectorPaneWidth + (event.key === "ArrowLeft" ? 12 : -12);
+      setInspectorPaneWidth(clamp(next, 230, 380));
+    }
+  }
+
+  function changeTimelineMode(mode: VideoTimelineMode) {
+    setTimelineMode(mode);
+    setTimelineHeight(timelineHeightForMode(mode));
+  }
+
+  function resizeTimeline(nextHeight: number) {
+    if (nextHeight <= 120) {
+      setTimelineMode("collapsed");
+      setTimelineHeight(48);
+    } else if (nextHeight >= 300) {
+      setTimelineMode("expanded");
+      setTimelineHeight(Math.max(320, nextHeight));
+    } else {
+      setTimelineMode("compact");
+      setTimelineHeight(Math.max(210, nextHeight));
+    }
   }
 
   const progress = Math.round((job?.progress ?? 0) * 100);
@@ -95,6 +211,7 @@ export function VideoEditorWorkspace({
     ? supportedNarrationLanguages(bootstrap, narrationModel)
     : [];
   const manualCrop = draft ? cropControls(project, draft) : undefined;
+  const captionBounds = draft?.caption_bounds ?? DEFAULT_CAPTION_BOUNDS;
 
   function selectNarrationModel(modelId: string) {
     if (!bootstrap || !draft) return;
@@ -129,31 +246,48 @@ export function VideoEditorWorkspace({
       language,
     });
   }
+
+  function commitVisualLayer(next: VideoVisualLayer, label: string) {
+    if (timelineEditing) return;
+    void onEditTimeline([visualLayerOperation(next)], label);
+  }
+
+  function commitVisualBounds(layerId: string, bounds: VideoCanvasBounds) {
+    const layer = visualLayers.find((candidate) => candidate.id === layerId);
+    if (!layer) return;
+    commitVisualLayer({
+      ...layer,
+      motion: { ...layer.motion, start_bounds: bounds, end_bounds: bounds },
+    }, "Place image");
+  }
   return (
-    <div className="video-editor-workspace">
+    <div className="video-editor-workspace" ref={workspaceRef}>
       <div className="video-editor-toolbar">
-        <div><span>Video Studio</span><h2>{project.name}</h2></div>
-        <div><button className="video-icon-button" type="button" aria-label="Undo scene changes" disabled={!dirty || saving || Boolean(working)} onClick={undoDraft}><Undo2 aria-hidden="true" size={15} /></button><button className="video-icon-button" type="button" aria-label="Redo scene changes" disabled={!redoDraft || saving || Boolean(working)} onClick={() => { if (redoDraft) { setDraft(redoDraft); setRedoDraft(undefined); } }}><Redo2 aria-hidden="true" size={15} /></button><button className="video-icon-button" type="button" aria-label="Save scene changes" disabled={!dirty || saving || Boolean(working)} onClick={() => void saveDraft()}>{saving ? <LoaderCircle className="video-spin" aria-hidden="true" size={15} /> : <Save aria-hidden="true" size={15} />}</button><button className="video-button is-primary" type="button" disabled={Boolean(working) || dirty || saving} title={dirty ? "Save scene changes before rendering" : undefined} onClick={preview ? onExport : onRenderPreview}>{working ? <LoaderCircle className="video-spin" aria-hidden="true" size={14} /> : null}{working === "rendering" ? "Rendering preview" : working === "exporting" ? "Exporting" : preview ? "Export video" : "Render preview"}</button></div>
+        <div><span>Video Studio</span><h2 title={project.name}>{project.name}</h2></div>
+        <div><div className="video-add-control"><button className="video-button is-secondary" type="button" aria-haspopup="menu" aria-expanded={addMenuOpen} disabled={visualAdding || timelineEditing || Boolean(working)} onClick={() => setAddMenuOpen((open) => !open)}>{visualAdding ? <LoaderCircle className="video-spin" aria-hidden="true" size={14} /> : <Plus aria-hidden="true" size={14} />}{visualAdding ? "Adding" : "Add"}</button>{addMenuOpen ? <div className="video-add-menu" role="menu" aria-label="Add element"><button role="menuitem" type="button" onClick={() => { if (draft && !draft.captions_enabled) updateDraft({ ...draft, captions_enabled: true }); setActiveTab("captions"); setAddMenuOpen(false); }}><Captions aria-hidden="true" size={14} /><span><strong>{draft?.captions_enabled ? "Edit captions" : "Add captions"}</strong><small>Use source-clock transcript cues</small></span></button><button role="menuitem" type="button" onClick={() => { setAddMenuOpen(false); void onAddVisual(draft?.id).then((added) => { if (added) setActiveTab("visuals"); }); }}><ImagePlus aria-hidden="true" size={14} /><span><strong>Add image</strong><small>Choose a PNG, JPEG, or WebP</small></span></button></div> : null}</div><button className="video-icon-button" type="button" aria-label={dirty ? "Undo unsaved scene changes" : "Undo last timeline edit"} disabled={(!dirty && !canUndoTimeline) || saving || timelineEditing || visualAdding || Boolean(working)} onClick={dirty ? undoDraft : onUndoTimeline}><Undo2 aria-hidden="true" size={15} /></button><button className="video-icon-button" type="button" aria-label={redoDraft ? "Redo unsaved scene changes" : "Redo last timeline edit"} disabled={(!redoDraft && !canRedoTimeline) || saving || timelineEditing || visualAdding || Boolean(working)} onClick={redoDraft ? () => { setDraft(redoDraft); setRedoDraft(undefined); } : onRedoTimeline}><Redo2 aria-hidden="true" size={15} /></button><button className="video-icon-button" type="button" aria-label="Save scene changes" disabled={!dirty || saving || timelineEditing || visualAdding || Boolean(working)} onClick={() => void saveDraft()}>{saving ? <LoaderCircle className="video-spin" aria-hidden="true" size={15} /> : <Save aria-hidden="true" size={15} />}</button><button className="video-button is-primary" type="button" disabled={Boolean(working) || dirty || saving || timelineEditing || visualAdding} title={dirty ? "Save scene changes before rendering" : undefined} onClick={preview ? onExport : onRenderPreview}>{working ? <LoaderCircle className="video-spin" aria-hidden="true" size={14} /> : null}{working === "rendering" ? "Rendering preview" : working === "exporting" ? "Exporting" : preview ? "Export video" : "Render preview"}</button></div>
       </div>
 
-      <nav className="video-production-steps" aria-label="Video production progress">
-        {[["Source", true], ["Analyze", true], ["Review", true], ["Preview", Boolean(preview)], ["Export", false]].map(([label, complete], index) => <span key={String(label)} className={complete ? "is-complete" : label === (preview ? "Export" : "Preview") ? "is-current" : ""}><i>{complete ? <Check aria-hidden="true" size={11} /> : index + 1}</i>{label}</span>)}
-      </nav>
+      <VideoProductionSteps project={project} />
 
       {working ? <div className="video-render-progress" role="status" aria-live="polite"><div><LoaderCircle className="video-spin" aria-hidden="true" size={15} /><span><strong>{job?.title ?? "Preparing render"}</strong><small>{job?.detail ?? "Starting the durable local job…"}</small></span><b>{progress}%</b><button className="video-button is-secondary" type="button" onClick={onCancelWorking}>Cancel</button></div><i><span style={{ width: `${progress}%` }} /></i></div> : null}
+      {timelineFeedback ? <div className={`video-timeline-feedback is-${timelineFeedback.tone}`} role={timelineFeedback.tone === "error" ? "alert" : "status"}>{timelineFeedback.text}</div> : null}
 
-      <div className="video-editor-grid">
+      <div className="video-editor-grid" data-workspace-layout="resizable" style={{ "--video-scene-pane": `${scenePaneWidth}px`, "--video-inspector-pane": `${inspectorPaneWidth}px`, "--video-timeline-recovery": `${210 - timelineHeight}px` } as CSSProperties}>
         <aside className="video-scene-rail" aria-label="Project scenes">
           <header><strong>Scenes</strong><span>{project.manifest.scenes.length} selected · {formatVideoClock(project.duration_ms)}</span></header>
-          <div role="group" aria-label="Scene list">{project.manifest.scenes.map((scene) => <button key={scene.id} className={scene.id === selectedScene?.id ? "is-selected" : ""} type="button" onClick={() => onSelectScene(scene.id)}><span>{scene.position}</span><span><strong>{scene.title}</strong><small>Source {formatVideoClock(scene.source_start_ms)} – {formatVideoClock(scene.source_end_ms)}</small><em>{scene.transcript}</em></span></button>)}</div>
+          <div role="group" aria-label="Scene list">{project.manifest.scenes.map((scene) => { const detail = `${scene.position}. ${scene.title}. Source ${formatVideoClock(scene.source_start_ms)} to ${formatVideoClock(scene.source_end_ms)}. ${scene.transcript}`; return <button key={scene.id} className={scene.id === selectedScene?.id ? "is-selected" : ""} type="button" aria-label={detail} title={detail} onClick={() => onSelectScene(scene.id)}><span>{scene.position}</span><strong>{scene.title}</strong></button>; })}</div>
           <footer><span>Source</span><strong>{formatVideoClock(project.manifest.source.duration_ms)}</strong></footer>
         </aside>
 
-        <VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} artifact={preview} scene={draft} projectDurationMs={project.duration_ms} playheadMs={playheadMs} onPlayheadChange={onPlayheadChange} />
+        <div className="video-pane-resizer is-scenes" role="separator" aria-label="Resize scenes panel" aria-orientation="vertical" aria-valuemin={150} aria-valuemax={300} aria-valuenow={scenePaneWidth} tabIndex={0} onPointerDown={(event) => beginPaneResize("scenes", event)} onKeyDown={(event) => resizePaneWithKeyboard("scenes", event)} />
+
+        <VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} artifact={preview} scene={draft} scenes={project.manifest.scenes} transcript={project.manifest.transcript} captionPages={project.manifest.caption_pages} visualAssets={project.manifest.visual_assets} visualLayers={project.manifest.visual_layers} projectDurationMs={project.duration_ms} playheadMs={playheadMs} onPlayheadChange={onPlayheadChange} onSelectCaption={() => setActiveTab("captions")} onCaptionBoundsChange={(caption_bounds) => { if (draft) updateDraft({ ...draft, caption_bounds }); }} selectedVisualLayerId={activeTab === "visuals" ? activeVisualLayer?.id : selectedVisualLayerId} onSelectVisual={(layerId) => { setSelectedVisualLayerId(layerId); setActiveTab("visuals"); }} onVisualBoundsChange={timelineEditing ? undefined : commitVisualBounds} />
+
+        <div className="video-pane-resizer is-inspector" role="separator" aria-label="Resize scene inspector" aria-orientation="vertical" aria-valuemin={230} aria-valuemax={380} aria-valuenow={inspectorPaneWidth} tabIndex={0} onPointerDown={(event) => beginPaneResize("inspector", event)} onKeyDown={(event) => resizePaneWithKeyboard("inspector", event)} />
 
         <aside className="video-scene-inspector" aria-label="Scene inspector">
           <header><strong>{project.manifest.scenes.length} scenes selected</strong><span>Duration {formatVideoClock(project.duration_ms)}</span></header>
-          <div className="video-inspector-tabs" role="tablist" aria-label="Scene settings">{(["layout", "captions", "audio"] as const).map((tab) => <button id={`${tabId}-${tab}-tab`} key={tab} role="tab" aria-selected={activeTab === tab} aria-controls={`${tabId}-${tab}-panel`} tabIndex={activeTab === tab ? 0 : -1} type="button" onClick={() => setActiveTab(tab)} onKeyDown={moveTab}>{tab[0].toUpperCase() + tab.slice(1)}</button>)}</div>
+          <div className="video-inspector-tabs" role="tablist" aria-label="Scene settings">{inspectorTabs.map((tab) => <button id={`${tabId}-${tab}-tab`} key={tab} role="tab" aria-selected={activeTab === tab} aria-controls={`${tabId}-${tab}-panel`} tabIndex={activeTab === tab ? 0 : -1} type="button" onClick={() => setActiveTab(tab)} onKeyDown={moveTab}>{tab === "visuals" ? "Visual" : tab[0].toUpperCase() + tab.slice(1)}</button>)}</div>
           {draft ? <div className="video-inspector-form">
             {activeTab === "layout" ? <fieldset id={`${tabId}-layout-panel`} role="tabpanel" aria-labelledby={`${tabId}-layout-tab`}><legend>Crop</legend><label><span>Aspect ratio</span><select aria-label="Scene aspect ratio" value={draft.layout === "portrait" ? "9:16" : draft.layout === "landscape" ? "16:9" : "1:1"} onChange={(event) => {
               const layout = event.target.value === "9:16" ? "portrait" : event.target.value === "16:9" ? "landscape" : "square";
@@ -166,7 +300,7 @@ export function VideoEditorWorkspace({
               <label><span>Focus Y <b>{Math.round(manualCrop.focusY)}%</b></span><input aria-label="Manual crop focus Y" type="range" min={0} max={100} step={1} value={manualCrop.focusY} onChange={(event) => updateDraft({ ...draft, crop_rect: manualCropRect(project, draft.layout, manualCrop.focusX, Number(event.target.value), manualCrop.zoom) })} /></label>
               <label><span>Zoom <b>{manualCrop.zoom.toFixed(1)}×</b></span><input aria-label="Manual crop zoom" type="range" min={1} max={3} step={0.1} value={manualCrop.zoom} onChange={(event) => updateDraft({ ...draft, crop_rect: manualCropRect(project, draft.layout, manualCrop.focusX, manualCrop.focusY, Number(event.target.value)) })} /></label>
             </> : null}</fieldset> : null}
-            {activeTab === "captions" ? <fieldset id={`${tabId}-captions-panel`} role="tabpanel" aria-labelledby={`${tabId}-captions-tab`}><legend>Captions</legend><label className="video-switch-row"><span>Show captions</span><input aria-label="Show captions" type="checkbox" checked={draft.captions_enabled} onChange={(event) => updateDraft({ ...draft, captions_enabled: event.target.checked })} /></label><label><span>Style</span><select aria-label="Caption style" value={draft.caption_style} onChange={(event) => updateDraft({ ...draft, caption_style: event.target.value as VideoScene["caption_style"] })}><option value="clean-white">Clean white</option><option value="calm">Calm</option><option value="kinetic">Kinetic</option></select></label></fieldset> : null}
+            {activeTab === "captions" ? <fieldset id={`${tabId}-captions-panel`} role="tabpanel" aria-labelledby={`${tabId}-captions-tab`}><legend>Captions</legend><label className="video-switch-row"><span>Show captions</span><input aria-label="Show captions" type="checkbox" checked={draft.captions_enabled} onChange={(event) => updateDraft({ ...draft, captions_enabled: event.target.checked })} /></label><div className="video-caption-presets" role="radiogroup" aria-label="Caption style">{captionStyles.map((style) => <button key={style.id} className={`video-caption-preset is-${style.id}`} role="radio" aria-checked={draft.caption_style === style.id} type="button" onClick={() => updateDraft({ ...draft, caption_style: style.id })}><span>{style.sample}</span><strong>{style.label}</strong></button>)}</div><div className="video-caption-geometry"><strong>Position &amp; size</strong><small>Drag on canvas or use exact controls.</small><label><span>Horizontal <b>{Math.round(captionBounds.x_bp / 100)}%</b></span><input aria-label="Caption horizontal position" type="range" min={0} max={Math.max(0, 10_000 - captionBounds.width_bp)} step={100} value={captionBounds.x_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, x_bp: Number(event.target.value) }) })} /></label><label><span>Vertical <b>{Math.round(captionBounds.y_bp / 100)}%</b></span><input aria-label="Caption vertical position" type="range" min={0} max={Math.max(0, 10_000 - captionBounds.height_bp)} step={100} value={captionBounds.y_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, y_bp: Number(event.target.value) }) })} /></label><label><span>Width <b>{Math.round(captionBounds.width_bp / 100)}%</b></span><input aria-label="Caption width" type="range" min={1600} max={10_000 - captionBounds.x_bp} step={100} value={captionBounds.width_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, width_bp: Number(event.target.value) }) })} /></label><label><span>Height <b>{Math.round(captionBounds.height_bp / 100)}%</b></span><input aria-label="Caption height" type="range" min={600} max={10_000 - captionBounds.y_bp} step={100} value={captionBounds.height_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, height_bp: Number(event.target.value) }) })} /></label></div></fieldset> : null}
             {activeTab === "audio" ? <div id={`${tabId}-audio-panel`} role="tabpanel" aria-labelledby={`${tabId}-audio-tab`}>
               <fieldset><legend>Narration route</legend>
                 {narrationModels.length ? <>
@@ -181,16 +315,84 @@ export function VideoEditorWorkspace({
               </fieldset>
               <fieldset><legend>Audio mix</legend><label><span>Voice <b>{draft.voice_gain_db.toFixed(1)} dB</b></span><input aria-label="Voice gain" type="range" min={-24} max={6} step={1} value={draft.voice_gain_db} onChange={(event) => updateDraft({ ...draft, voice_gain_db: Number(event.target.value) })} /></label><label><span>Music <b>{draft.music_gain_db.toFixed(1)} dB</b></span><input aria-label="Music gain" type="range" min={-30} max={0} step={1} value={draft.music_gain_db} onChange={(event) => updateDraft({ ...draft, music_gain_db: Number(event.target.value) })} /></label></fieldset>
             </div> : null}
-            <div className={`video-inspector-receipt ${dirty ? "is-dirty" : ""}`}><Captions aria-hidden="true" size={14} /><span>{dirty ? "Unsaved scene changes. Save to invalidate only affected preview and export segments." : "This scene matches the saved timeline version."}</span></div>
+            {activeTab === "visuals" && activeVisualLayer && activeVisualAsset ? <fieldset id={`${tabId}-visuals-panel`} role="tabpanel" aria-labelledby={`${tabId}-visuals-tab`} className="video-visual-inspector">
+              <legend>Image layer</legend>
+              <div className="video-visual-inspector-card" aria-label="Selected image layer">{activeVisualAsset.url ? <img src={activeVisualAsset.url} alt="" /> : <ImagePlus aria-hidden="true" size={18} />}<span><strong>Imported image</strong><small title={activeVisualAsset.local_path}>{activeVisualAsset.mime_type.replace("image/", "").toUpperCase()} · {activeVisualAsset.width}×{activeVisualAsset.height}</small></span></div>
+              <label><span>Fit</span><select aria-label="Image fit" value={activeVisualLayer.fit} disabled={timelineEditing} onChange={(event) => commitVisualLayer({ ...activeVisualLayer, fit: event.target.value as VideoVisualLayer["fit"] }, "Change image fit")}><option value="contain">Contain</option><option value="cover">Cover</option><option value="stretch">Stretch</option></select></label>
+              <label><span>Fade in</span><select aria-label="Image fade in" value={activeVisualLayer.transition_in_ms} disabled={timelineEditing} onChange={(event) => commitVisualLayer({ ...activeVisualLayer, transition_in_ms: Number(event.target.value) }, "Change image fade in")}>{visualTransitionOptions(activeVisualLayer, "in").map((milliseconds) => <option key={milliseconds} value={milliseconds}>{milliseconds ? `${milliseconds / 1_000}s` : "None"}</option>)}</select></label>
+              <label><span>Fade out</span><select aria-label="Image fade out" value={activeVisualLayer.transition_out_ms} disabled={timelineEditing} onChange={(event) => commitVisualLayer({ ...activeVisualLayer, transition_out_ms: Number(event.target.value) }, "Change image fade out")}>{visualTransitionOptions(activeVisualLayer, "out").map((milliseconds) => <option key={milliseconds} value={milliseconds}>{milliseconds ? `${milliseconds / 1_000}s` : "None"}</option>)}</select></label>
+              <dl><div><dt>Range</dt><dd>{formatVideoClock(activeVisualLayer.start_ms)}–{formatVideoClock(activeVisualLayer.end_ms)}</dd></div><div><dt>Placement</dt><dd>{activeVisualLayer.scene_id ? `Scene ${draft.position}` : "Full project"}</dd></div><div><dt>Canvas</dt><dd>{Math.round(activeVisualLayer.motion.start_bounds.width_bp / 100)}% × {Math.round(activeVisualLayer.motion.start_bounds.height_bp / 100)}%</dd></div><div><dt>Motion</dt><dd>{JSON.stringify(activeVisualLayer.motion.start_bounds) === JSON.stringify(activeVisualLayer.motion.end_bounds) ? "Static" : "Pan & zoom"}</dd></div></dl>
+              <p>Drag or resize the image on the canvas. Each gesture publishes one revision-bound timeline edit.</p>
+            </fieldset> : null}
+            <div className={`video-inspector-receipt ${dirty ? "is-dirty" : ""}`}>{activeTab === "visuals" ? <ImagePlus aria-hidden="true" size={14} /> : <Captions aria-hidden="true" size={14} />}<span>{dirty ? "Unsaved scene changes. Save to invalidate only affected preview and export segments." : activeTab === "visuals" ? "This image is published to the current project version." : "This scene matches the saved timeline version."}</span></div>
           </div> : null}
         </aside>
       </div>
 
-      <VideoTimeline timeline={project.manifest.timeline} scenes={project.manifest.scenes} playheadMs={playheadMs} selectedSceneId={selectedScene?.id} onPlayheadChange={onPlayheadChange} onSelectScene={onSelectScene} />
+      <VideoTimeline timeline={project.manifest.timeline} scenes={project.manifest.scenes} playheadMs={playheadMs} selectedSceneId={selectedScene?.id} onPlayheadChange={onPlayheadChange} onSelectScene={onSelectScene} onEditTimeline={onEditTimeline} editing={timelineEditing} height={timelineHeight} onHeightChange={resizeTimeline} mode={timelineMode} onModeChange={changeTimelineMode} />
       <footer className="video-project-status"><span>Project duration <strong>{formatVideoClock(project.duration_ms)}</strong></span><span>Source <strong>{formatVideoClock(project.manifest.source.duration_ms)}</strong></span><span>Revision <strong>{project.revision}</strong></span><span>Saved <strong>{formatVideoUpdatedAt(project.updated_at)}</strong></span></footer>
     </div>
   );
 }
+
+const TIMELINE_MODE_KEY = "soundar.video-studio.timeline-mode";
+const DEFAULT_CAPTION_BOUNDS = { x_bp: 800, y_bp: 7350, width_bp: 8400, height_bp: 1500 };
+
+function normalizeCaptionBounds(bounds: typeof DEFAULT_CAPTION_BOUNDS): typeof DEFAULT_CAPTION_BOUNDS {
+  const width = Math.max(1_600, Math.min(10_000, Math.round(bounds.width_bp)));
+  const height = Math.max(600, Math.min(10_000, Math.round(bounds.height_bp)));
+  return {
+    x_bp: Math.max(0, Math.min(10_000 - width, Math.round(bounds.x_bp))),
+    y_bp: Math.max(0, Math.min(10_000 - height, Math.round(bounds.y_bp))),
+    width_bp: width,
+    height_bp: height,
+  };
+}
+
+function readTimelineMode(): VideoTimelineMode {
+  try {
+    const value = window.localStorage.getItem(TIMELINE_MODE_KEY);
+    if (value === "collapsed" || value === "expanded") return value;
+  } catch { /* Preference storage is optional. */ }
+  return "compact";
+}
+
+function timelineHeightForMode(mode: VideoTimelineMode): number {
+  return mode === "collapsed" ? 48 : mode === "expanded" ? 360 : 210;
+}
+
+function visualLayerOperation(layer: VideoVisualLayer): Extract<VideoTimelineOperation, { type: "update_visual_layer" }> {
+  return {
+    type: "update_visual_layer",
+    layer_id: layer.id,
+    scene_id: layer.scene_id ?? null,
+    range: { start_us: millisecondsToMicroseconds(layer.start_ms), end_us: millisecondsToMicroseconds(layer.end_ms) },
+    fit: layer.fit,
+    crop: layer.crop ?? null,
+    z_index: layer.z_index,
+    motion: layer.motion,
+    transition_in_us: millisecondsToMicroseconds(layer.transition_in_ms),
+    transition_out_us: millisecondsToMicroseconds(layer.transition_out_ms),
+  };
+}
+
+function visualTransitionOptions(layer: VideoVisualLayer, edge: "in" | "out"): number[] {
+  const duration = Math.max(0, layer.end_ms - layer.start_ms);
+  const other = edge === "in" ? layer.transition_out_ms : layer.transition_in_ms;
+  const current = edge === "in" ? layer.transition_in_ms : layer.transition_out_ms;
+  return [...new Set([0, 150, 300, 600, current])].filter((value) => value >= 0 && value + other <= duration).sort((left, right) => left - right);
+}
+
+const captionStyles: Array<{ id: VideoCaptionStyle; label: string; sample: string }> = [
+  { id: "clean-white", label: "Clean", sample: "Aa" },
+  { id: "calm", label: "Calm", sample: "Aa" },
+  { id: "kinetic", label: "Kinetic", sample: "AA" },
+  { id: "bold-pop", label: "Bold pop", sample: "POP" },
+  { id: "highlight", label: "Highlight", sample: "Mark" },
+  { id: "karaoke", label: "Karaoke", sample: "Sing" },
+  { id: "typewriter", label: "Typewriter", sample: "Type" },
+  { id: "podcast", label: "Podcast", sample: "Talk" },
+];
 
 function compatibleNarrationVoices(
   bootstrap: BootstrapState,
@@ -202,6 +404,10 @@ function compatibleNarrationVoices(
       ? voice.consent === "not-required"
       : voice.state === "ready" && voice.consent === "confirmed" && Boolean(voice.local_path)
   ));
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.max(minimum, Math.min(maximum, value));
 }
 
 function supportedNarrationLanguages(bootstrap: BootstrapState, model: InstalledModel): string[] {

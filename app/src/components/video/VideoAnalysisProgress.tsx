@@ -24,7 +24,7 @@ export function VideoAnalysisProgress({ project, job, onCancel, onResume }: { pr
   const actionLabel = preparingSource ? "video creation" : "analysis";
   return (
     <section className="video-analysis-state" aria-labelledby="video-analysis-title">
-      <div className="video-analysis-heading"><LoaderCircle className={active ? "video-spin" : ""} aria-hidden="true" size={22} /><div><h2 id="video-analysis-title">{preparingSource ? `Preparing ${project.name}` : `Analyzing ${project.manifest.source.display_name}`}</h2><p>{visibleJob?.detail ?? (preparingSource ? "Preparing the durable prompt-to-video task…" : "Preparing the durable local analysis job…")}</p></div></div>
+      <div className="video-analysis-heading"><LoaderCircle className={active ? "video-spin" : ""} aria-hidden="true" size={22} /><div><h2 id="video-analysis-title" title={preparingSource ? project.name : project.manifest.source.display_name}>{preparingSource ? `Preparing ${project.name}` : `Analyzing ${project.manifest.source.display_name}`}</h2><p>{visibleJob?.detail ?? (preparingSource ? "Preparing the durable prompt-to-video task…" : "Preparing the durable local analysis job…")}</p></div></div>
       <div className="video-analysis-progress" role="progressbar" aria-label={preparingSource ? "Video creation progress" : "Video analysis progress"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress}><span style={{ width: `${progress}%` }} /></div>
       <ol className="video-analysis-stages">
         {stages.map((stage) => {

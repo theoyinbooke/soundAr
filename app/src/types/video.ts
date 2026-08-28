@@ -22,8 +22,75 @@ export type VideoProjectStatus =
 
 export type VideoJobPhase = "source" | "analyze" | "review" | "preview" | "export";
 export type VideoJobStatus = "queued" | "preparing" | "running" | "completed" | "failed" | "cancelled";
-export type VideoTimelineTrackKind = "video" | "captions" | "voice" | "music";
+export type VideoTimelineTrackKind = "video" | "visuals" | "captions" | "voice" | "music";
 export type VideoArtifactRole = "source" | "proxy" | "preview" | "master" | "variation" | "publish-package";
+export type VideoCaptionStyle =
+  | "clean-white"
+  | "calm"
+  | "kinetic"
+  | "bold-pop"
+  | "highlight"
+  | "karaoke"
+  | "typewriter"
+  | "podcast";
+
+export interface VideoCanvasBounds {
+  x_bp: number;
+  y_bp: number;
+  width_bp: number;
+  height_bp: number;
+}
+
+export type VideoVisualFit = "cover" | "contain" | "stretch";
+export type VideoVisualEasing = "linear" | "ease_in_out";
+
+export interface VideoVisualProvenance {
+  kind: "user_upload" | "authorized_link" | "existing_sound_ar_artifact" | "generated_locally";
+  original_uri?: string | null;
+  imported_at: string;
+  producer: string;
+  producer_version?: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface VideoVisualAsset {
+  id: string;
+  mime_type: "image/png" | "image/jpeg" | "image/webp";
+  local_path: string;
+  /** Desktop-only playback URL projected from the managed local path. */
+  url?: string;
+  width: number;
+  height: number;
+  has_alpha: boolean;
+  size_bytes: number;
+  checksum: string;
+  provenance: VideoVisualProvenance;
+  created_at: string;
+}
+
+export interface VideoVisualMotion {
+  start_bounds: VideoCanvasBounds;
+  end_bounds: VideoCanvasBounds;
+  start_opacity_milli: number;
+  end_opacity_milli: number;
+  start_rotation_milli_degrees: number;
+  end_rotation_milli_degrees: number;
+  easing: VideoVisualEasing;
+}
+
+export interface VideoVisualLayer {
+  id: string;
+  asset_id: string;
+  scene_id?: string | null;
+  start_ms: number;
+  end_ms: number;
+  fit: VideoVisualFit;
+  crop?: VideoCanvasBounds | null;
+  z_index: number;
+  motion: VideoVisualMotion;
+  transition_in_ms: number;
+  transition_out_ms: number;
+}
 
 export interface VideoToolStatus {
   id: "ffmpeg" | "ffprobe" | "yt-dlp" | "javascript" | "transcriber";
@@ -71,6 +138,25 @@ export interface VideoTranscriptSegment {
   source_clock: true;
 }
 
+export interface VideoCaptionWord {
+  text: string;
+  start_ms: number;
+  end_ms: number;
+}
+
+export interface VideoCaptionPage {
+  id: string;
+  cue_id: string;
+  scene_id?: string;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  style_id: VideoCaptionStyle;
+  words: VideoCaptionWord[];
+  bounds?: VideoCanvasBounds;
+  font_size_bp?: number;
+}
+
 export interface CandidateVideoClip {
   id: string;
   rank: number;
@@ -102,7 +188,8 @@ export interface VideoScene {
     height_bp: number;
   };
   captions_enabled: boolean;
-  caption_style: "clean-white" | "calm" | "kinetic";
+  caption_style: VideoCaptionStyle;
+  caption_bounds?: VideoCanvasBounds;
   voice_gain_db: number;
   music_gain_db: number;
   narration_binding_id?: string;
@@ -134,9 +221,17 @@ export interface VideoTimelineItem {
   start_ms: number;
   end_ms: number;
   label: string;
-  scene_id?: string;
+  scene_id?: string | null;
   source_start_ms?: number;
   source_end_ms?: number;
+  caption_style?: VideoCaptionStyle;
+  bounds?: VideoCanvasBounds;
+  font_size_bp?: number;
+  asset_id?: string;
+  start_bounds?: VideoCanvasBounds;
+  end_bounds?: VideoCanvasBounds;
+  fit?: VideoVisualFit;
+  z_index?: number;
 }
 
 export interface VideoTimelineManifest {
@@ -186,9 +281,15 @@ export interface VideoProjectManifest {
   source: VideoSourceAsset;
   transcript_version: string;
   transcript: VideoTranscriptSegment[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  caption_pages?: VideoCaptionPage[];
   candidates: CandidateVideoClip[];
   scenes: VideoScene[];
   narration_bindings: VideoNarrationBinding[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  visual_assets?: VideoVisualAsset[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  visual_layers?: VideoVisualLayer[];
   timeline: VideoTimelineManifest;
   artifacts: VideoArtifact[];
   revisions: VideoRevision[];
@@ -267,6 +368,41 @@ export interface LocalAudioSelection {
   size_bytes?: number;
 }
 
+export interface LocalVisualSelection {
+  local_path: string;
+  display_name: string;
+}
+
+export type VideoVisualAssetOrigin =
+  | { kind: "user_selected"; user_confirmed: true }
+  | { kind: "generated_locally"; producer: string; producer_version?: string; generation_id: string };
+
+export interface AddVisualAssetRequest {
+  project_id: string;
+  expected_revision: number;
+  expected_version_id: string;
+  operation_id: string;
+  source_path: string;
+  actor: string;
+  origin: VideoVisualAssetOrigin;
+  scene_id?: string;
+  range: { start_us: number; end_us: number };
+  fit: VideoVisualFit;
+  crop?: VideoCanvasBounds;
+  z_index: number;
+  motion: VideoVisualMotion;
+  transition_in_us: number;
+  transition_out_us: number;
+}
+
+export interface AddVisualAssetResponse {
+  project: VideoProject;
+  asset_id: string;
+  layer_id: string;
+  job_id: string;
+  replayed: boolean;
+}
+
 export interface CreateVideoProjectRequest {
   prompt: string;
   audio_file?: File;
@@ -281,6 +417,7 @@ export type VideoScenePatch = Partial<Pick<VideoScene,
   | "crop_rect"
   | "captions_enabled"
   | "caption_style"
+  | "caption_bounds"
   | "voice_gain_db"
   | "music_gain_db"
   | "voice_id"
@@ -297,6 +434,62 @@ export interface ReviseVideoRequest {
   scene_patch?: VideoScenePatch;
 }
 
+export type VideoTimelineOperation =
+  | { type: "split_scene"; scene_id: string; at_timeline_us: number }
+  | { type: "trim_scene"; scene_id: string; source_start_us: number; source_end_us: number }
+  | { type: "reorder_scene"; scene_id: string; to_index: number }
+  | { type: "merge_scenes"; first_scene_id: string; second_scene_id: string }
+  | {
+    type: "update_visual_layer";
+    layer_id: string;
+    scene_id: string | null;
+    range: { start_us: number; end_us: number };
+    fit: VideoVisualFit;
+    crop: VideoCanvasBounds | null;
+    z_index: number;
+    motion: VideoVisualMotion;
+    transition_in_us: number;
+    transition_out_us: number;
+  };
+
+export interface VideoTimelineEditRequest {
+  project_id: string;
+  expected_revision: number;
+  base_version_id: string;
+  operation_id: string;
+  operations: VideoTimelineOperation[];
+}
+
+export type VideoRevisionStage =
+  | "ingest"
+  | "transcript"
+  | "analysis"
+  | "plan"
+  | "speech"
+  | "music"
+  | "captions"
+  | "tracking"
+  | "scene_render"
+  | "preview"
+  | "final_render"
+  | "publish_package";
+
+export interface VideoTimelineChangeReceipt {
+  project_id: string;
+  expected_revision: number;
+  base_version_id: string;
+  operation_id: string;
+  changed_paths: string[];
+  invalidated_stages: VideoRevisionStage[];
+}
+
+export interface VideoTimelineEditResponse {
+  project: VideoProject;
+  receipt: VideoTimelineChangeReceipt;
+  job_id: string;
+  replayed: boolean;
+}
+
 export interface VideoExportRequest {
   project_id: string;
   version_id: string;
@@ -310,6 +503,7 @@ export interface VideoStudioService {
   importLink(request: ImportLinkRequest): Promise<VideoProject>;
   pickLocalVideo?(): Promise<LocalVideoSelection | undefined>;
   pickLocalAudio?(): Promise<LocalAudioSelection | undefined>;
+  pickLocalVisual?(): Promise<LocalVisualSelection | undefined>;
   importLocalVideo(request: ImportLocalVideoRequest): Promise<VideoProject>;
   analyzeVideo(projectId: string, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;
   planVideo(projectId: string, selectedCandidateIds?: string[]): Promise<VideoProject>;
@@ -317,6 +511,8 @@ export interface VideoStudioService {
   listVideoProjects(): Promise<VideoProjectSummary[]>;
   getVideoProject(projectId: string): Promise<VideoProject>;
   renderVideoPreview(projectId: string, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;
+  editVideoTimeline(request: VideoTimelineEditRequest): Promise<VideoTimelineEditResponse>;
+  addVideoVisualAsset(request: AddVisualAssetRequest): Promise<AddVisualAssetResponse>;
   reviseVideo(request: ReviseVideoRequest): Promise<VideoProject>;
   exportVideo(request: VideoExportRequest, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;
   exportPublishPackage(projectId: string): Promise<VideoArtifact>;

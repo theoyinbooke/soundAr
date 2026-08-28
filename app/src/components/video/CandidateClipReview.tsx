@@ -1,6 +1,7 @@
 import { Check, Clock3, Play, Scissors } from "lucide-react";
 import type { VideoProject } from "../../types/video";
 import { candidateDuration, formatVideoClock } from "../../lib/videoState";
+import { VideoProductionSteps } from "./VideoProductionSteps";
 
 export function CandidateClipReview({
   project,
@@ -19,6 +20,7 @@ export function CandidateClipReview({
   const total = project.manifest.candidates.reduce((duration, candidate) => duration + (selected.has(candidate.id) ? candidateDuration(candidate) : 0), 0);
   return (
     <section className="video-review-state" aria-labelledby="candidate-review-title">
+      <VideoProductionSteps project={project} />
       <header className="video-review-heading"><div><h2 id="candidate-review-title">Review candidate clips</h2><p>Source-clock timings and silent gaps remain attached to every selection.</p></div><div><span>{selected.size} selected</span><strong>{formatVideoClock(total)} content</strong></div></header>
       <div className="video-review-grid">
         <div className="video-candidate-panel">
@@ -31,7 +33,7 @@ export function CandidateClipReview({
               <span className="video-candidate-score">Score {candidate.score}</span>
             </label>)}
           </div>
-          <footer><span>{selected.size} selected · {formatVideoClock(total)} total</span><button className="video-button is-primary" type="button" disabled={!selected.size} onClick={onContinue}><Scissors aria-hidden="true" size={14} />Add to timeline</button></footer>
+          <footer><span>{selected.size} selected · {formatVideoClock(total)} total</span><button className="video-button is-primary" type="button" disabled={!selected.size} onClick={onContinue}><Scissors aria-hidden="true" size={14} />Plan selected clips</button></footer>
         </div>
         <div className="video-review-preview">
           <span className="video-section-label">Source preview</span>

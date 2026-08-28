@@ -1,8 +1,68 @@
 import { describe, expect, it } from "vitest";
 import { createBrowserPreviewVideoService } from "./videoBridge";
-import { initialVideoStudioState, videoStudioReducer, type VideoStudioState } from "./videoState";
+import {
+  initialVideoStudioState,
+  phaseForProject,
+  videoProjectReadiness,
+  videoStudioReducer,
+  type VideoStudioState,
+} from "./videoState";
 
 describe("videoStudioReducer", () => {
+  it("derives Analyze, Review, and Preview from durable manifest contents", async () => {
+    const service = createBrowserPreviewVideoService();
+    const sourceOnly = await service.getVideoProject("creator-update");
+    sourceOnly.status = "editing";
+    sourceOnly.manifest.candidates = [];
+    sourceOnly.manifest.scenes = [];
+    sourceOnly.manifest.timeline = {
+      ...sourceOnly.manifest.timeline,
+      duration_ms: 0,
+      tracks: sourceOnly.manifest.timeline.tracks.map((track) => ({ ...track, items: [] })),
+    };
+    expect(videoProjectReadiness(sourceOnly).nextAction).toBe("analyze");
+    expect(phaseForProject(sourceOnly)).toBe("editor");
+
+    const analyzed = await service.getVideoProject("product-demo");
+    analyzed.status = "editing";
+    expect(analyzed.manifest.candidates.length).toBeGreaterThan(0);
+    expect(analyzed.manifest.scenes).toHaveLength(0);
+    expect(videoProjectReadiness(analyzed).nextAction).toBe("review");
+    expect(phaseForProject(analyzed)).toBe("review");
+
+    const planned = await service.getVideoProject("creator-update");
+    expect(videoProjectReadiness(planned).nextAction).toBe("preview");
+    expect(phaseForProject(planned)).toBe("editor");
+  });
+
+  it("ignores a downstream preview recovery when the manifest still needs analysis", async () => {
+    const project = await createBrowserPreviewVideoService().getVideoProject("creator-update");
+    project.status = "failed";
+    project.manifest.candidates = [];
+    project.manifest.scenes = [];
+    project.manifest.timeline = {
+      ...project.manifest.timeline,
+      duration_ms: 0,
+      tracks: project.manifest.timeline.tracks.map((track) => ({ ...track, items: [] })),
+    };
+    project.recoverable_job = {
+      id: "stale-preview-job",
+      project_id: project.id,
+      phase: "preview",
+      status: "failed",
+      progress: .2,
+      title: "Render preview",
+      detail: "video.reviewed_scenes_required: Review at least one scene before rendering the timeline",
+      error: "video.reviewed_scenes_required: Review at least one scene before rendering the timeline",
+      durable: true,
+      created_at: project.created_at,
+      updated_at: project.updated_at,
+    };
+
+    expect(videoProjectReadiness(project).nextAction).toBe("analyze");
+    expect(phaseForProject(project)).toBe("editor");
+  });
+
   it("moves a durable project through intake, analysis, review, render, and export", async () => {
     const service = createBrowserPreviewVideoService();
     let state: VideoStudioState = initialVideoStudioState;
