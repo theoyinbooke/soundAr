@@ -368,21 +368,36 @@ export interface LocalAudioSelection {
   size_bytes?: number;
 }
 
-export interface LocalVisualSelection {
-  local_path: string;
-  display_name: string;
+export type VideoVisualAssetOrigin =
+  | { kind: "user_selected"; receipt_id: string }
+  | { kind: "generated_locally"; receipt_id: string };
+
+export interface AuthorizeVisualSelectionRequest {
+  project_id: string;
+  expected_revision: number;
+  expected_version_id: string;
 }
 
-export type VideoVisualAssetOrigin =
-  | { kind: "user_selected"; user_confirmed: true }
-  | { kind: "generated_locally"; producer: string; producer_version?: string; generation_id: string };
+export interface VisualSourceReceipt {
+  id: string;
+  receipt_kind: "user_selected" | "generated_locally";
+  project_id: string;
+  expected_revision: number;
+  expected_version_id: string;
+  display_name: string;
+  sha256: string;
+  mime_type: "image/png" | "image/jpeg" | "image/webp";
+  size_bytes: number;
+  width: number;
+  height: number;
+  expires_at: string;
+}
 
 export interface AddVisualAssetRequest {
   project_id: string;
   expected_revision: number;
   expected_version_id: string;
   operation_id: string;
-  source_path: string;
   actor: string;
   origin: VideoVisualAssetOrigin;
   scene_id?: string;
@@ -503,7 +518,7 @@ export interface VideoStudioService {
   importLink(request: ImportLinkRequest): Promise<VideoProject>;
   pickLocalVideo?(): Promise<LocalVideoSelection | undefined>;
   pickLocalAudio?(): Promise<LocalAudioSelection | undefined>;
-  pickLocalVisual?(): Promise<LocalVisualSelection | undefined>;
+  chooseVideoVisualAsset(request: AuthorizeVisualSelectionRequest): Promise<VisualSourceReceipt | null>;
   importLocalVideo(request: ImportLocalVideoRequest): Promise<VideoProject>;
   analyzeVideo(projectId: string, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;
   planVideo(projectId: string, selectedCandidateIds?: string[]): Promise<VideoProject>;

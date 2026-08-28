@@ -341,16 +341,22 @@ export function VideoStudioView({
   async function addVisual(sceneId?: string): Promise<boolean> {
     const project = state.project;
     if (!project) return false;
-    if (!videoService.pickLocalVisual) {
-      setTimelineFeedback({ tone: "error", text: "Image selection is available in the installed desktop app." });
-      return false;
-    }
     setVisualAdding(true);
     try {
-      const selection = await videoService.pickLocalVisual();
-      if (!selection) {
+      const receipt = await videoService.chooseVideoVisualAsset({
+        project_id: project.id,
+        expected_revision: project.revision,
+        expected_version_id: project.manifest.version_id,
+      });
+      if (!receipt) {
         setStatusAnnouncement("Image selection cancelled.");
         return false;
+      }
+      if (receipt.receipt_kind !== "user_selected"
+        || receipt.project_id !== project.id
+        || receipt.expected_revision !== project.revision
+        || receipt.expected_version_id !== project.manifest.version_id) {
+        throw new Error("video.invalid_visual_receipt: The image selection does not match this project version.");
       }
       const scene = sceneId ? project.manifest.scenes.find((candidate) => candidate.id === sceneId) : undefined;
       if (sceneId && !scene) throw new Error("video.missing_reference: The selected scene is no longer available.");
@@ -365,10 +371,9 @@ export function VideoStudioView({
         expected_revision: project.revision,
         expected_version_id: project.manifest.version_id,
         operation_id: newVideoOperationId("visual"),
-        source_path: selection.local_path,
         actor: "desktop-ui",
-        // The native chooser returning an exact path is the approval boundary.
-        origin: { kind: "user_selected", user_confirmed: true },
+        // Only the native backend chooser can mint this one-use receipt.
+        origin: { kind: "user_selected", receipt_id: receipt.id },
         scene_id: scene?.id,
         range: { start_us: startUs, end_us: endUs },
         fit: "contain",
@@ -385,7 +390,7 @@ export function VideoStudioView({
         transition_in_us: transitionUs,
         transition_out_us: transitionUs,
       };
-      setTimelineFeedback({ tone: "status", text: `Adding ${selection.display_name} to the saved scene…` });
+      setTimelineFeedback({ tone: "status", text: `Adding ${receipt.display_name} to the saved scene…` });
       const response = await videoService.addVideoVisualAsset(request);
       timelineKnownVersion.current = response.project.manifest.version_id;
       dispatch({ type: "open-project", project: response.project });
@@ -394,8 +399,8 @@ export function VideoStudioView({
       onProjectChanged?.(response.project);
       setTimelineUndo([]);
       setTimelineRedo([]);
-      setTimelineFeedback({ tone: "status", text: `${selection.display_name} added. Preview and export will refresh.` });
-      setStatusAnnouncement(`${selection.display_name} was added to scene ${scene?.position ?? "timeline"}.`);
+      setTimelineFeedback({ tone: "status", text: `${receipt.display_name} added. Preview and export will refresh.` });
+      setStatusAnnouncement(`${receipt.display_name} was added to scene ${scene?.position ?? "timeline"}.`);
       void refreshProjects().catch(() => undefined);
       return true;
     } catch (caught) {

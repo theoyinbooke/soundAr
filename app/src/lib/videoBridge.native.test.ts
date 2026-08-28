@@ -93,8 +93,21 @@ describe("native Video Studio bridge", () => {
     expect(response).toMatchObject({ project: { revision: 8 }, job_id: "timeline-job-1", replayed: false });
   });
 
-  it("confirms the exact chosen image and forwards the strict visual composition request", async () => {
-    tauri.open.mockResolvedValue("/home/user/Pictures/cover.webp");
+  it("mints a native selection receipt before forwarding a path-free visual composition request", async () => {
+    const receipt = {
+      id: "visual-receipt-1",
+      receipt_kind: "user_selected" as const,
+      project_id: "project-1",
+      expected_revision: 4,
+      expected_version_id: "version-5",
+      display_name: "cover.webp",
+      sha256: "b".repeat(64),
+      mime_type: "image/webp" as const,
+      size_bytes: 42_000,
+      width: 1080,
+      height: 1920,
+      expires_at: "2026-08-28T01:00:00Z",
+    };
     const project = {
       id: "project-1",
       revision: 5,
@@ -118,20 +131,27 @@ describe("native Video Studio bridge", () => {
         visual_layers: [],
       },
     } as unknown as VideoProject;
-    tauri.invoke.mockResolvedValue({ project, asset_id: "visual-1", layer_id: "layer-1", job_id: "visual-job-1", replayed: false });
+    tauri.invoke.mockImplementation(async (command: string) => command === "choose_video_visual_asset"
+      ? receipt
+      : { project, asset_id: "visual-1", layer_id: "layer-1", job_id: "visual-job-1", replayed: false });
     const service = createVideoStudioService();
 
-    const selection = await service.pickLocalVisual?.();
-    expect(tauri.open).toHaveBeenCalledWith({ multiple: false, directory: false, filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }] });
-    expect(selection).toEqual({ local_path: "/home/user/Pictures/cover.webp", display_name: "cover.webp" });
+    const authorization = {
+      project_id: "project-1",
+      expected_revision: 4,
+      expected_version_id: "version-5",
+    };
+    const selection = await service.chooseVideoVisualAsset(authorization);
+    expect(tauri.invoke).toHaveBeenCalledWith("choose_video_visual_asset", { request: authorization });
+    expect(tauri.open).not.toHaveBeenCalled();
+    expect(selection).toEqual(receipt);
     const request = {
       project_id: "project-1",
       expected_revision: 4,
       expected_version_id: "version-5",
       operation_id: "visual-operation-1",
-      source_path: selection!.local_path,
       actor: "desktop-ui",
-      origin: { kind: "user_selected" as const, user_confirmed: true as const },
+      origin: { kind: "user_selected" as const, receipt_id: selection!.id },
       scene_id: "scene-opening",
       range: { start_us: 0, end_us: 12_000_000 },
       fit: "contain" as const,
@@ -152,6 +172,7 @@ describe("native Video Studio bridge", () => {
     const response = await service.addVideoVisualAsset(request);
 
     expect(tauri.invoke).toHaveBeenCalledWith("add_video_visual_asset", { request });
+    expect(request).not.toHaveProperty("source_path");
     expect(response.project.manifest.visual_assets?.[0].url).toBe("asset:///managed/project-1/visual-1.webp");
     expect(response).toMatchObject({ asset_id: "visual-1", layer_id: "layer-1", job_id: "visual-job-1", replayed: false });
   });

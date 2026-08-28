@@ -4,12 +4,12 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AddVisualAssetRequest,
   AddVisualAssetResponse,
+  AuthorizeVisualSelectionRequest,
   CandidateVideoClip,
   CreateVideoProjectRequest,
   ImportLinkRequest,
   ImportLocalVideoRequest,
   LocalAudioSelection,
-  LocalVisualSelection,
   LocalVideoSelection,
   ReviseVideoRequest,
   VideoArtifact,
@@ -30,6 +30,7 @@ import type {
   VideoToolStatus,
   VideoVisualAsset,
   VideoVisualLayer,
+  VisualSourceReceipt,
 } from "../types/video";
 
 const FIXTURE_VIDEO_URL = "data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAMObW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAjl0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAEAAAABwAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAGxbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAABAAAAAQABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABXG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAARxzdGJsAAAAuHN0c2QAAAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAEAAcABIAAAASAAAAAAAAAABFUxhdmM2Mi4xMS4xMDAgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBQsAK/+EAFmdCwAraEPsBEAAAAwAQAAADACDxImoBAAVozgGXIAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAABNQAAAAAAAAABhzdHRzAAAAAAAAAAEAAAABAABAAAAAABxzdHNjAAAAAAAAAAEAAAABAAAAAQAAAAEAAAAUc3RzegAAAAAAAAJqAAAAAQAAABRzdGNvAAAAAAAAAAEAAAM+AAAAYXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAsaWxzdAAAACSpdG9vAAAAHGRhdGEAAAABAAAAAExhdmY2Mi4zLjEwMAAAAAhmcmVlAAACcm1kYXQAAAJFBgX//0HcRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUgMTY1IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyNSAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0wOjA6MCBhbmFseXNlPTA6MCBtZT1kaWEgc3VibWU9MCBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0wIHRocmVhZHM9MyBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0wIGtleWludD0yNTAga2V5aW50X21pbj0xIHNjZW5lY3V0PTAgaW50cmFfcmVmcmVzaD0wIHJjPWNyZiBtYnRyZWU9MCBjcmY9NTEuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0wAIAAAAAdZYiEOiYoADJycnXXXXXXXXXXXXXXXXXXXXXXXXg=";
@@ -302,8 +303,8 @@ function microsecondsToMilliseconds(value: number, field: string): number {
 }
 
 function validateVisualRequest(request: AddVisualAssetRequest, project: VideoProject): void {
-  if (!request.source_path.trim() || !request.actor.trim() || !request.operation_id.trim()) {
-    throw new Error("video.invalid_visual: Image path, actor, and operation identifier are required.");
+  if (!request.origin.receipt_id.trim() || !request.actor.trim() || !request.operation_id.trim()) {
+    throw new Error("video.invalid_visual: Image receipt, actor, and operation identifier are required.");
   }
   if (!Number.isSafeInteger(request.range.start_us) || !Number.isSafeInteger(request.range.end_us)
     || request.range.start_us < 0 || request.range.end_us <= request.range.start_us) {
@@ -484,6 +485,8 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
   const cancelledJobs = new Set<string>();
   const timelineEditReplays = new Map<string, VideoTimelineEditResponse>();
   const visualAssetReplays = new Map<string, AddVisualAssetResponse>();
+  const visualReceipts = new Map<string, VisualSourceReceipt & { consumed: boolean; localPath: string }>();
+  let visualReceiptSequence = 1;
 
   const store = (project: VideoProject) => {
     projects.set(project.id, clone(project));
@@ -523,8 +526,31 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       project.manifest.timeline = makeTimeline([], project.manifest.source.duration_ms);
       return store(project);
     },
-    async pickLocalVisual(): Promise<LocalVisualSelection> {
-      return { local_path: FIXTURE_VISUAL_URL, display_name: "editorial-glass-study.webp" };
+    async chooseVideoVisualAsset(request: AuthorizeVisualSelectionRequest): Promise<VisualSourceReceipt> {
+      const current = projects.get(request.project_id);
+      if (!current) throw new Error("Video project was not found.");
+      if (current.revision !== request.expected_revision || current.manifest.version_id !== request.expected_version_id) {
+        throw new Error("video.revision_conflict: The project changed before the image was selected.");
+      }
+      const receipt: VisualSourceReceipt & { consumed: boolean; localPath: string } = {
+        id: `visual-receipt-${visualReceiptSequence++}`,
+        receipt_kind: "user_selected",
+        project_id: request.project_id,
+        expected_revision: request.expected_revision,
+        expected_version_id: request.expected_version_id,
+        display_name: "editorial-glass-study.webp",
+        sha256: "b".repeat(64),
+        mime_type: "image/webp",
+        size_bytes: 18_506,
+        width: 640,
+        height: 1_138,
+        expires_at: "2099-01-01T00:00:00.000Z",
+        consumed: false,
+        localPath: FIXTURE_VISUAL_URL,
+      };
+      visualReceipts.set(receipt.id, receipt);
+      const { consumed: _consumed, localPath: _localPath, ...publicReceipt } = receipt;
+      return clone(publicReceipt);
     },
     async analyzeVideo(projectId, onProgress) {
       const current = projects.get(projectId);
@@ -630,8 +656,17 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       if (current.revision !== request.expected_revision || current.manifest.version_id !== request.expected_version_id) {
         throw new Error("video.revision_conflict: The project changed before the image could be added.");
       }
-      if (request.origin.kind !== "user_selected" || request.origin.user_confirmed !== true) {
+      if (request.origin.kind !== "user_selected") {
         throw new Error("video.approval_required: Choose the exact image through the file picker before adding it.");
+      }
+      const receipt = visualReceipts.get(request.origin.receipt_id);
+      if (!receipt || receipt.consumed) {
+        throw new Error("video.invalid_visual_receipt: The selected image receipt is missing, expired, or already used.");
+      }
+      if (receipt.project_id !== request.project_id
+        || receipt.expected_revision !== request.expected_revision
+        || receipt.expected_version_id !== request.expected_version_id) {
+        throw new Error("video.revision_conflict: The selected image receipt belongs to a different project version.");
       }
       validateVisualRequest(request, current);
       const edited = clone(current);
@@ -643,7 +678,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       const visual: VideoVisualAsset = {
         id: assetId,
         mime_type: "image/webp",
-        local_path: request.source_path,
+        local_path: receipt.localPath,
         url: FIXTURE_VISUAL_URL,
         width: 640,
         height: 1_138,
@@ -654,7 +689,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
           kind: "user_upload",
           imported_at: FIXED_NOW,
           producer: "soundAr Video Studio",
-          metadata: { operation_id: request.operation_id, display_name: "editorial-glass-study.webp" },
+          metadata: { operation_id: request.operation_id, display_name: receipt.display_name },
         },
         created_at: FIXED_NOW,
       };
@@ -693,6 +728,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
         job_id: `visual-job-${request.operation_id}`,
         replayed: false,
       };
+      receipt.consumed = true;
       visualAssetReplays.set(request.operation_id, clone(response));
       return clone(response);
     },
@@ -829,10 +865,7 @@ function createNativeVideoService(): VideoStudioService {
       const selected = await open({ multiple: false, directory: false, filters: [{ name: "Audio", extensions: ["wav", "flac", "mp3", "m4a", "ogg"] }] });
       return typeof selected === "string" ? { local_path: selected, display_name: selected.split(/[\\/]/).at(-1) ?? "audio" } : undefined;
     },
-    async pickLocalVisual(): Promise<LocalVisualSelection | undefined> {
-      const selected = await open({ multiple: false, directory: false, filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }] });
-      return typeof selected === "string" ? { local_path: selected, display_name: selected.split(/[\\/]/).at(-1) ?? "image" } : undefined;
-    },
+    chooseVideoVisualAsset: (request) => invoke<VisualSourceReceipt | null>("choose_video_visual_asset", { request }),
     importLocalVideo: (request: ImportLocalVideoRequest) => {
       if (!request.local_path) throw new Error("Choose a local video through the desktop file picker.");
       return invoke<VideoProject>("import_video_file", { request: { ...request, file: undefined } }).then(withNativeProjectUrls);

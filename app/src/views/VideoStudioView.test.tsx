@@ -215,7 +215,7 @@ describe("VideoStudioView", () => {
   it("adds a picker-confirmed image to the selected scene through the shared durable service", async () => {
     const user = userEvent.setup();
     const service = createBrowserPreviewVideoService();
-    const pickLocalVisual = vi.spyOn(service, "pickLocalVisual");
+    const chooseVideoVisualAsset = vi.spyOn(service, "chooseVideoVisualAsset");
     const addVideoVisualAsset = vi.spyOn(service, "addVideoVisualAsset");
     const editVideoTimeline = vi.spyOn(service, "editVideoTimeline");
     render(<VideoStudioView service={service} assistantOpen />);
@@ -225,14 +225,17 @@ describe("VideoStudioView", () => {
     await user.click(screen.getByRole("menuitem", { name: /Add image/ }));
 
     await waitFor(() => expect(addVideoVisualAsset).toHaveBeenCalledOnce());
-    expect(pickLocalVisual).toHaveBeenCalledOnce();
+    expect(chooseVideoVisualAsset).toHaveBeenCalledWith({
+      project_id: "creator-update",
+      expected_revision: 0,
+      expected_version_id: "creator-update-v1",
+    });
     expect(addVideoVisualAsset.mock.calls[0]?.[0]).toMatchObject({
       project_id: "creator-update",
       expected_revision: 0,
       expected_version_id: "creator-update-v1",
-      source_path: "/video-studio-editorial-visual.webp",
       actor: "desktop-ui",
-      origin: { kind: "user_selected", user_confirmed: true },
+      origin: { kind: "user_selected", receipt_id: "visual-receipt-1" },
       scene_id: "scene-clip-1",
       range: { start_us: 0, end_us: 18_000_000 },
       fit: "contain",
@@ -249,6 +252,7 @@ describe("VideoStudioView", () => {
       transition_in_us: 300_000,
       transition_out_us: 300_000,
     });
+    expect(addVideoVisualAsset.mock.calls[0]?.[0]).not.toHaveProperty("source_path");
     expect(addVideoVisualAsset.mock.calls[0]?.[0].operation_id).toMatch(/^visual-/);
     expect(await screen.findByRole("group", { name: "Visuals track" })).toBeVisible();
     expect(screen.getByRole("region", { name: "Video timeline" })).toHaveAttribute("data-track-count", "5");
@@ -278,6 +282,23 @@ describe("VideoStudioView", () => {
       }],
     });
     expect((await screen.findAllByText(/Place image saved/i)).some((element) => element.matches(".video-timeline-feedback"))).toBe(true);
+  });
+
+  it("treats a cancelled native visual receipt as a no-op", async () => {
+    const user = userEvent.setup();
+    const base = createBrowserPreviewVideoService();
+    const chooseVideoVisualAsset = vi.fn<VideoStudioService["chooseVideoVisualAsset"]>(async () => null);
+    const addVideoVisualAsset = vi.spyOn(base, "addVideoVisualAsset");
+    render(<VideoStudioView service={{ ...base, chooseVideoVisualAsset }} />);
+
+    await user.click(await screen.findByRole("button", { name: /Creator update · Reel draft/i }));
+    await user.click(screen.getByRole("button", { name: "Add" }));
+    await user.click(screen.getByRole("menuitem", { name: /Add image/ }));
+
+    await waitFor(() => expect(chooseVideoVisualAsset).toHaveBeenCalledOnce());
+    expect(addVideoVisualAsset).not.toHaveBeenCalled();
+    expect(screen.getByRole("status")).toHaveTextContent("Image selection cancelled.");
+    expect(screen.queryByRole("group", { name: "Visuals track" })).not.toBeInTheDocument();
   });
 
   it("shows only scene and clip titles while preserving exact timing accessibly, and remembers timeline size", async () => {
