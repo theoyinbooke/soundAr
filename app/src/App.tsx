@@ -184,7 +184,7 @@ export default function App() {
   }
 
   return (
-    <VideoIntegrationProvider service={videoService} revision={videoRevision} onOpenProject={openVideoProject}>
+    <VideoIntegrationProvider service={videoService} revision={videoRevision} activeProjectId={selectedVideoProjectId} onOpenProject={openVideoProject}>
       <AppShell current={current} onNavigate={navigate} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId} assistantOpen={assistantOpen} onAssistantOpenChange={setAssistantOpen} onAssistantStudioChanged={handleAssistantStudioChanged}>
         {runtimeNotice ? <div className="runtime-warning">Local operation failed: {runtimeNotice}</div> : null}
         {availableUpdate ? <UpdateNotice update={availableUpdate} installKind={bootstrap.install_kind} onDismiss={() => { void availableUpdate.close(); setAvailableUpdate(undefined); }} /> : null}

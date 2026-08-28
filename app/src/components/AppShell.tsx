@@ -30,6 +30,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { FeatureState, HistoryItem, NavKey, SystemStatus, Theme } from "../types";
 import { BrandLockup } from "./Brand";
 import { AssistantLauncher, AssistantPane } from "./AssistantPane";
+import { useVideoIntegration, useVideoProjectSummaries } from "./video/VideoIntegrationContext";
 
 interface NavItem {
   key: NavKey;
@@ -157,9 +158,17 @@ export function AppShell({
   const accountRef = useRef<HTMLDivElement>(null);
   const appMenuRef = useRef<HTMLDivElement>(null);
   const accountButtonRef = useRef<HTMLButtonElement>(null);
+  const { activeProjectId: activeVideoProjectId, onOpenProject: onOpenVideoProject } = useVideoIntegration();
+  const { projects: videoProjects } = useVideoProjectSummaries();
   const availableVram = Math.max(0, system.vram_total_mb - system.vram_used_mb) / 1024;
   const settingsMode = current === "settings";
-  const visibleHistory = history.filter((item) => `${item.title} ${item.text} ${item.voice} ${item.model_id}`.toLowerCase().includes(recentQuery.trim().toLowerCase())).slice(0, 24);
+  const normalizedRecentQuery = recentQuery.trim().toLowerCase();
+  const recentItems = [
+    ...history.map((item) => ({ kind: "audio" as const, id: item.id, title: item.title || item.text.slice(0, 48) || "Untitled generation", detail: item.generation_kind === "music" ? "Music" : item.voice || "Voice", updatedAt: item.created_at })),
+    ...videoProjects.map((project) => ({ kind: "video" as const, id: project.id, title: project.name || "Untitled video", detail: project.master ? "Video" : "Video draft", updatedAt: project.updated_at })),
+  ].filter((item) => `${item.title} ${item.detail}`.toLowerCase().includes(normalizedRecentQuery))
+    .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+    .slice(0, 24);
 
   function navigateTo(key: NavKey) {
     if (key === current) return;
@@ -289,7 +298,13 @@ export function AppShell({
                   <nav aria-label={`${group.label} navigation`}>{group.items.map(renderNavItem)}</nav>
                 </div>
               ))}
-              {history.length ? <div className="nav-group recent-work-group"><span className="nav-section-label">Recent</span><nav aria-label="Recent generations">{visibleHistory.map((item) => <button className={`recent-work-item ${current === "history" && selectedHistoryId === item.id ? "is-active" : ""}`} key={item.id} type="button" title={item.title || item.text} aria-current={current === "history" && selectedHistoryId === item.id ? "page" : undefined} onClick={() => { onSelectHistory?.(item.id); navigateTo("history"); }}><span>{item.title || item.text.slice(0, 48) || "Untitled generation"}</span><small>{item.generation_kind === "music" ? "Music" : item.voice || "Voice"}</small></button>)}{!visibleHistory.length ? <small className="sidebar-history-empty">No matching generations</small> : null}</nav></div> : null}
+              {history.length || videoProjects.length ? <div className="nav-group recent-work-group"><span className="nav-section-label">Recent</span><nav aria-label="Recent work">{recentItems.map((item) => {
+                const active = item.kind === "audio" ? current === "history" && selectedHistoryId === item.id : current === "video" && activeVideoProjectId === item.id;
+                return <button className={`recent-work-item ${active ? "is-active" : ""}`} key={`${item.kind}-${item.id}`} type="button" title={item.title} aria-current={active ? "page" : undefined} onClick={() => {
+                  if (item.kind === "video") onOpenVideoProject?.(item.id);
+                  else { onSelectHistory?.(item.id); navigateTo("history"); }
+                }}><span>{item.title}</span><small>{item.detail}</small></button>;
+              })}{!recentItems.length ? <small className="sidebar-history-empty">No matching work</small> : null}</nav></div> : null}
             </div>
             <div className="sidebar-footer" ref={accountRef}>
               {accountMenuOpen ? (

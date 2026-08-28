@@ -46,6 +46,7 @@ describe("VideoMasterCard", () => {
     render(<VideoMasterCard project={project} variant="history" onOpen={onOpen} />);
 
     expect(screen.getByLabelText("Play Portrait master")).toBeInstanceOf(HTMLVideoElement);
+    expect(screen.getByLabelText("Play Portrait master")).toHaveAttribute("src", "/master.mp4#t=0.001");
     const details = screen.getByText("2 additional deliverables").closest("details");
     expect(details).not.toHaveAttribute("open");
     expect(screen.queryByLabelText("Play Calm variation")).not.toBeInTheDocument();

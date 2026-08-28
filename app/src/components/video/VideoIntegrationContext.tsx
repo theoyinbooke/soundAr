@@ -4,6 +4,7 @@ import type { VideoProjectSummary, VideoStudioService } from "../../types/video"
 interface VideoIntegrationValue {
   service?: VideoStudioService;
   revision: number;
+  activeProjectId?: string;
   onOpenProject?: (projectId: string) => void;
 }
 
@@ -12,15 +13,17 @@ const VideoIntegrationContext = createContext<VideoIntegrationValue>({ revision:
 export function VideoIntegrationProvider({
   children,
   onOpenProject,
+  activeProjectId,
   revision = 0,
   service,
 }: {
   children: ReactNode;
   onOpenProject: (projectId: string) => void;
+  activeProjectId?: string;
   revision?: number;
   service: VideoStudioService;
 }) {
-  const value = useMemo(() => ({ service, revision, onOpenProject }), [onOpenProject, revision, service]);
+  const value = useMemo(() => ({ service, revision, activeProjectId, onOpenProject }), [activeProjectId, onOpenProject, revision, service]);
   return <VideoIntegrationContext.Provider value={value}>{children}</VideoIntegrationContext.Provider>;
 }
 

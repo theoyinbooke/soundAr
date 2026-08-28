@@ -820,7 +820,11 @@ async function nativeWithProgress<T>(projectId: string, command: string, payload
 }
 
 function withNativeArtifactUrl(artifact: VideoArtifact): VideoArtifact {
-  return artifact.url || !artifact.local_path ? artifact : { ...artifact, url: convertFileSrc(artifact.local_path) };
+  return {
+    ...artifact,
+    url: artifact.url || !artifact.local_path ? artifact.url : convertFileSrc(artifact.local_path),
+    poster_url: artifact.poster_url?.startsWith("/") ? convertFileSrc(artifact.poster_url) : artifact.poster_url,
+  };
 }
 
 function withNativeProjectUrls(project: VideoProject): VideoProject {
@@ -829,13 +833,16 @@ function withNativeProjectUrls(project: VideoProject): VideoProject {
   const deliverables = project.deliverables?.map(withNativeArtifactUrl);
   return {
     ...project,
+    poster_url: project.poster_url?.startsWith("/") ? convertFileSrc(project.poster_url) : project.poster_url,
     master,
     deliverables,
     manifest: {
       ...project.manifest,
-      source: project.manifest.source.preview_url || !project.manifest.source.local_path
-        ? project.manifest.source
-        : { ...project.manifest.source, preview_url: convertFileSrc(project.manifest.source.local_path) },
+      source: {
+        ...project.manifest.source,
+        preview_url: project.manifest.source.preview_url ?? (project.manifest.source.local_path ? convertFileSrc(project.manifest.source.local_path) : undefined),
+        poster_url: project.manifest.source.poster_url?.startsWith("/") ? convertFileSrc(project.manifest.source.poster_url) : project.manifest.source.poster_url,
+      },
       visual_assets: project.manifest.visual_assets?.map((asset) => ({
         ...asset,
         url: asset.url || !asset.local_path ? asset.url : convertFileSrc(asset.local_path),
@@ -848,6 +855,7 @@ function withNativeProjectUrls(project: VideoProject): VideoProject {
 function withNativeSummaryUrls(project: VideoProjectSummary): VideoProjectSummary {
   return {
     ...project,
+    poster_url: project.poster_url?.startsWith("/") ? convertFileSrc(project.poster_url) : project.poster_url,
     master: project.master ? withNativeArtifactUrl(project.master) : undefined,
     deliverables: project.deliverables?.map(withNativeArtifactUrl),
   };

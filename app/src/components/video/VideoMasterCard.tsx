@@ -1,6 +1,7 @@
 import { Archive, ChevronDown, Clapperboard, Download, ExternalLink, FileVideo2 } from "lucide-react";
 import { useState } from "react";
 import type { VideoProjectSummary } from "../../types/video";
+import { videoSourceWithFirstFrame } from "../../lib/videoPlayback";
 
 function formatDuration(milliseconds = 0) {
   const seconds = Math.max(0, Math.round(milliseconds / 1000));
@@ -28,14 +29,14 @@ export function VideoMasterCard({
   return (
     <article className={`video-library-card is-${variant}${master ? " has-master" : " is-draft"}`}>
       <div className="video-library-media">
-        {master?.playable && source ? <video aria-label={`Play ${title}`} controls playsInline preload="metadata" poster={master.poster_url ?? project.poster_url} src={source} /> : <div className="video-library-placeholder" aria-label={`${project.name} has no final master yet`}><Clapperboard aria-hidden="true" size={19} /><span>{project.status === "exported" ? "Master unavailable" : "Draft in progress"}</span></div>}
+        {master?.playable && source ? <video aria-label={`Play ${title}`} controls playsInline preload="auto" poster={master.poster_url ?? project.poster_url} src={videoSourceWithFirstFrame(source)} /> : <div className="video-library-placeholder" aria-label={`${project.name} has no final master yet`}><Clapperboard aria-hidden="true" size={19} /><span>{project.status === "exported" ? "Master unavailable" : "Draft in progress"}</span></div>}
       </div>
       <div className="video-library-copy">
         <span className="section-label">{master ? "Primary video master" : "Video project"}</span>
         <h3>{title}</h3>
         <p>{project.scene_count} scene{project.scene_count === 1 ? "" : "s"} · {formatDuration(master?.duration_ms ?? project.duration_ms)}{master ? ` · ${formatDimensions(master.width, master.height)} · ${master.codec ?? master.format.toUpperCase()}` : ` · ${project.status.replaceAll("-", " ")}`}</p>
         {secondary.length ? <details className="video-library-deliverables" onToggle={(event) => setDeliverablesOpen(event.currentTarget.open)}><summary><span>{secondary.length} additional deliverable{secondary.length === 1 ? "" : "s"}</span><ChevronDown aria-hidden="true" size={11} /></summary>{deliverablesOpen ? <div>{secondary.map((artifact) => <article key={artifact.id}>
-          {artifact.playable && artifact.url ? <video aria-label={`Play ${artifact.title}`} controls playsInline preload="none" src={artifact.url} /> : <span className="video-library-file-icon">{artifact.role === "publish-package" ? <Archive aria-hidden="true" size={13} /> : <FileVideo2 aria-hidden="true" size={13} />}</span>}
+          {artifact.playable && artifact.url ? <video aria-label={`Play ${artifact.title}`} controls playsInline preload="metadata" src={videoSourceWithFirstFrame(artifact.url)} /> : <span className="video-library-file-icon">{artifact.role === "publish-package" ? <Archive aria-hidden="true" size={13} /> : <FileVideo2 aria-hidden="true" size={13} />}</span>}
           <span><strong>{artifact.title}</strong><small>{artifact.role === "publish-package" ? "Publish ZIP" : `${formatDuration(artifact.duration_ms)} · ${formatDimensions(artifact.width, artifact.height)}`}</small></span>
           {artifact.url ? <a aria-label={`Download ${artifact.title}`} download={artifact.download_name} href={artifact.url}><Download aria-hidden="true" size={11} /></a> : null}
         </article>)}</div> : null}</details> : null}

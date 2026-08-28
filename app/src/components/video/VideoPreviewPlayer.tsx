@@ -2,6 +2,7 @@ import { Maximize2, Minus, Pause, Play, Plus, SkipBack, SkipForward, Volume2 } f
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { VideoArtifact, VideoCanvasBounds, VideoCaptionPage, VideoScene, VideoTranscriptSegment, VideoVisualAsset, VideoVisualLayer } from "../../types/video";
 import { formatVideoClock } from "../../lib/videoState";
+import { videoSourceWithFirstFrame } from "../../lib/videoPlayback";
 
 export function VideoPreviewPlayer({
   sourceUrl,
@@ -286,7 +287,7 @@ export function VideoPreviewPlayer({
       <header><select aria-label="Preview aspect ratio" value={aspectRatio} onChange={(event) => setAspectRatio(event.target.value)}><option value="9 / 16">9:16 Portrait</option><option value="16 / 9">16:9 Landscape</option><option value="1">1:1 Square</option></select><div className="video-preview-zoom" role="group" aria-label="Canvas zoom"><button type="button" aria-label="Zoom canvas out" disabled={zoom === 50} onClick={() => setZoom((value) => value === "fit" || value === 100 ? 75 : 50)}><Minus aria-hidden="true" size={12} /></button><button type="button" aria-label="Fit canvas" aria-pressed={zoom === "fit"} onClick={() => setZoom("fit")}>{zoom === "fit" ? "Fit" : `${zoom}%`}</button><button type="button" aria-label="Zoom canvas in" disabled={zoom === 100} onClick={() => setZoom((value) => value === 50 ? 75 : 100)}><Plus aria-hidden="true" size={12} /></button></div><span>{artifact ? "Rendered preview" : "Low-resolution proxy"}</span></header>
       <div className="video-preview-stage">
         <div className="video-portrait-frame" style={{ aspectRatio, height: zoom === "fit" ? undefined : `${zoom}%` }} onDoubleClick={() => void enterFullscreen()}>
-          <video ref={videoRef} src={artifact?.url ?? sourceUrl} playsInline preload="metadata" aria-label={artifact?.title ?? "Project proxy preview"} onPlay={() => setPlaying(true)} onPause={() => { if (!gapPlayback) setPlaying(false); }} onTimeUpdate={(event) => {
+          <video ref={videoRef} src={videoSourceWithFirstFrame(artifact?.url ?? sourceUrl)} poster={artifact?.poster_url} playsInline preload="auto" aria-label={artifact?.title ?? "Project proxy preview"} onPlay={() => setPlaying(true)} onPause={() => { if (!gapPlayback) setPlaying(false); }} onTimeUpdate={(event) => {
             if (!playing) return;
             const currentMs = event.currentTarget.currentTime * 1000;
             if (artifact) onPlayheadChange(Math.max(0, Math.min(projectDurationMs, currentMs)));

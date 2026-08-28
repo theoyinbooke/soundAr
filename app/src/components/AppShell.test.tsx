@@ -1,8 +1,10 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "./AppShell";
 import { PageHeader } from "./ui";
 import type { FeatureState } from "../types";
+import { VideoIntegrationProvider } from "./video/VideoIntegrationContext";
+import { createBrowserPreviewVideoService } from "../lib/videoBridge";
 
 const system = {
   gpu_name: "Test GPU",
@@ -115,5 +117,22 @@ describe("AppShell capability navigation", () => {
     fireEvent.click(within(menu!).getByRole("button", { name: "Compare" }));
     expect(navigate).toHaveBeenCalledWith("compare");
     expect(document.getElementById("mobile-more-menu")).toBeNull();
+  });
+
+  it("merges video projects into Recent and opens the exact Studio project", async () => {
+    const openProject = vi.fn();
+    render(
+      <VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={openProject}>
+        <AppShell current="generate" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features} history={[]} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
+          <div>Content</div>
+        </AppShell>
+      </VideoIntegrationProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByRole("navigation", { name: "Recent work" })).toBeInTheDocument());
+    const video = screen.getByTitle("Creator update · Reel master");
+    expect(within(video).getByText("Video")).toBeInTheDocument();
+    fireEvent.click(video);
+    expect(openProject).toHaveBeenCalledWith("creator-update-master");
   });
 });
