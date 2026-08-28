@@ -5,6 +5,7 @@ Pure backend — no Qt dependency. Class-based for model caching.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -87,6 +88,7 @@ class STTEngine:
 
     def load_model(self, model_id: str, model_path: str, engine: str) -> None:
         """Load an STT model, unloading the previous one if different."""
+        from engines.stt.faster_whisper_stt import FasterWhisperSTT
         from engines.stt.transformers_stt import TransformersSTT
         from engines.stt.nemo_stt import NeMoSTT
         from engines.stt.voxtral_stt import VoxtralSTT
@@ -97,12 +99,18 @@ class STTEngine:
 
             self._unload_model_unsafe()
 
+            prefer_faster_whisper = (
+                engine == "transformers"
+                and model_id.lower().startswith("openai/whisper")
+                and os.environ.get("SOUNDAR_DISABLE_FASTER_WHISPER") != "1"
+                and FasterWhisperSTT.dependencies_available()
+            )
             engine_map = {
                 "transformers": TransformersSTT,
                 "nemo": NeMoSTT,
                 "voxtral": VoxtralSTT,
             }
-            cls = engine_map.get(engine)
+            cls = FasterWhisperSTT if prefer_faster_whisper else engine_map.get(engine)
             if cls is None:
                 raise ValueError(f"Unsupported STT engine: {engine}")
             impl = cls(self._gpu_manager)
@@ -110,7 +118,7 @@ class STTEngine:
             impl.load(model_id, model_path)
             self._engine_impl = impl
             self._model_id = model_id
-            self._engine = engine
+            self._engine = cls.engine_name
 
     def unload_model(self) -> None:
         """Unload current model and free VRAM."""

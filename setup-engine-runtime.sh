@@ -203,7 +203,7 @@ esac
 progress "Verifying $ENGINE imports..."
 case "$ENGINE" in
   kokoro) "$PYTHON" -c 'import kokoro, soundfile, torch' ;;
-  transformers) "$PYTHON" -c 'import soundfile, torch, transformers' ;;
+  transformers) "$PYTHON" -c 'import ctranslate2, faster_whisper, soundfile, torch, transformers' ;;
   speaker-verification) "$PYTHON" -c 'from transformers import AutoFeatureExtractor, AutoModelForAudioXVector; import soundfile, torch' ;;
   alignment) "$PYTHON" -c 'from transformers import AutoModelForCTC, AutoProcessor; import soundfile, torch' ;;
   speecht5) SOUNDAR_SPEECHT5_MODEL_PATH="${SOUNDAR_SPEECHT5_MODEL_PATH:-$HOME/.soundAr/models/microsoft__speecht5_tts}" "$PYTHON" -c 'import os; from transformers import SpeechT5ForTextToSpeech, SpeechT5Processor; import soundfile, torch; SpeechT5Processor.from_pretrained(os.environ["SOUNDAR_SPEECHT5_MODEL_PATH"], local_files_only=True)' ;;
