@@ -2,6 +2,7 @@ import { Archive, ChevronDown, Clapperboard, Download, ExternalLink, FileVideo2 
 import { useState } from "react";
 import type { VideoProjectSummary } from "../../types/video";
 import { videoSourceForIdlePoster, videoSourceWithFirstFrame } from "../../lib/videoPlayback";
+import { OpeningFrameVideo } from "./OpeningFrameVideo";
 
 function formatDuration(milliseconds = 0) {
   const seconds = Math.max(0, Math.round(milliseconds / 1000));
@@ -29,7 +30,7 @@ export function VideoMasterCard({
   return (
     <article className={`video-library-card is-${variant}${master ? " has-master" : " is-draft"}`}>
       <div className="video-library-media">
-        {master?.playable && source ? <video aria-label={`Play ${title}`} controls playsInline preload={master.poster_url ?? project.poster_url ? "metadata" : "auto"} poster={master.poster_url ?? project.poster_url} src={videoSourceForIdlePoster(source, master.poster_url ?? project.poster_url)} /> : <div className="video-library-placeholder" aria-label={`${project.name} has no final master yet`}><Clapperboard aria-hidden="true" size={19} /><span>{project.status === "exported" ? "Master unavailable" : "Draft in progress"}</span></div>}
+        {master?.playable && source ? <OpeningFrameVideo aria-label={`Play ${title}`} controls playsInline preload={master.poster_url ?? project.poster_url ? "metadata" : "auto"} poster={master.poster_url ?? project.poster_url} src={videoSourceForIdlePoster(source, master.poster_url ?? project.poster_url)} /> : <div className="video-library-placeholder" aria-label={`${project.name} has no final master yet`}><Clapperboard aria-hidden="true" size={19} /><span>{project.status === "exported" ? "Master unavailable" : "Draft in progress"}</span></div>}
       </div>
       <div className="video-library-copy">
         <span className="section-label">{master ? "Primary video master" : "Video project"}</span>
