@@ -7,15 +7,16 @@
 use super::{
     build_ass_document, build_portrait_command_with_layout, build_proxy_command,
     build_thumbnail_command, build_timeline_render_plan, build_waveform_command,
-    discover_media_runtime, probe_media, publish_atomic, sibling_staging_path,
-    terminate_process_group, validate_import_url, write_ass_document_atomic, AdmissionOutcome,
-    AssemblyOptions, CacheKeyBuilder, CacheStage, CaptionTheme, FfmpegProgressParser, MediaError,
-    MediaRuntimeStatus, Microseconds, PortraitLayout, Provenance, ProvenanceKind, PublicationState,
-    RationalFrameRate, RationalRate, RenderArtifact, RenderArtifactRole, RenderCommand,
-    RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass, ResourceRequest,
-    ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis, RightsConfirmation,
-    RuntimeMediaProbe, SourceAsset, SourceAssetKind, TimeRange, TimelineClip, TimelineTrack,
-    TrackKind, Validate, VideoEncoder, VideoError, VideoProjectManifest,
+    discover_media_runtime, local_media_input_args, preflight_import_url_destination, probe_media,
+    publish_atomic, sibling_staging_path, terminate_process_group, validate_import_url,
+    write_ass_document_atomic, AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage,
+    CaptionTheme, FfmpegProgressParser, MediaError, MediaRuntimeStatus, Microseconds,
+    NarrationBinding, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
+    PublicationState, RationalFrameRate, RationalRate, RenderArtifact, RenderArtifactRole,
+    RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass,
+    ResourceRequest, ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis,
+    RightsConfirmation, RuntimeMediaProbe, SourceAsset, SourceAssetKind, TimeRange, TimelineClip,
+    TimelineTrack, TrackKind, Validate, VideoEncoder, VideoError, VideoProjectManifest,
 };
 use crate::store::Store;
 use chrono::{SecondsFormat, Utc};
@@ -24,15 +25,21 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    ffi::OsString,
+    ffi::{CString, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::process::CommandExt,
+    mem::MaybeUninit,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
+        process::CommandExt,
+    },
     path::{Component, Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -44,9 +51,20 @@ const PROJECT_LOCK_SECONDS: i64 = 120;
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 128 * 1024;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const COMMAND_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LINK_PREVIEW_TIMEOUT: Duration = Duration::from_secs(45);
 const LINK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_PACKAGE_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_PACKAGE_ARCHIVE_BYTES: u64 = MAX_PACKAGE_AGGREGATE_BYTES + 64 * 1024 * 1024;
+const PACKAGE_METADATA_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
+const DISK_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const PRIVATE_FILE_MODE: u32 = 0o600;
+const SHAREABLE_FILE_MODE: u32 = 0o644;
+const MAX_RENDER_DURATION: Duration = Duration::from_secs(12 * 60 * 60);
+const MAX_MEDIA_DURATION_US: i64 = 6 * 60 * 60 * 1_000_000;
 
 pub type ServiceResult<T> = Result<T, VideoServiceError>;
 pub type ProgressCallback = Arc<dyn Fn(VideoServiceProgress) + Send + Sync + 'static>;
@@ -107,6 +125,304 @@ impl VideoServiceError {
     pub fn stable_message(&self) -> String {
         format!("{}: {}", self.code, self.message)
     }
+}
+
+fn secure_private_directory(path: &Path) -> ServiceResult<()> {
+    if let Err(error) = fs::DirBuilder::new()
+        .mode(PRIVATE_DIRECTORY_MODE)
+        .create(path)
+    {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(VideoServiceError::io(
+                "video.storage_unavailable",
+                "A private managed directory could not be created",
+                error,
+            ));
+        }
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            VideoServiceError::io(
+                "video.unsafe_storage_path",
+                "A managed storage path is not a safe directory",
+                error,
+            )
+        })?;
+    let metadata = directory.metadata().map_err(|error| {
+        VideoServiceError::io(
+            "video.storage_unavailable",
+            "A managed directory could not be inspected",
+            error,
+        )
+    })?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != effective_uid {
+        return Err(VideoServiceError::new(
+            "video.unsafe_storage_path",
+            "Managed directories must be owned by the current user and may not be symlinks",
+        )
+        .details(json!({
+            "path": path,
+            "owner_uid": metadata.uid(),
+            "effective_uid": effective_uid,
+        })));
+    }
+    directory
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
+        .map_err(|error| {
+            VideoServiceError::io(
+                "video.storage_permissions_failed",
+                "Private permissions could not be applied to a managed directory",
+                error,
+            )
+        })?;
+    let secured = directory.metadata().map_err(|error| {
+        VideoServiceError::io(
+            "video.storage_permissions_failed",
+            "Managed directory permissions could not be verified",
+            error,
+        )
+    })?;
+    if secured.mode() & 0o7777 != PRIVATE_DIRECTORY_MODE || secured.uid() != effective_uid {
+        return Err(VideoServiceError::new(
+            "video.storage_permissions_failed",
+            "Managed directory permissions did not remain private",
+        )
+        .details(json!({
+            "path": path,
+            "mode": format!("{:o}", secured.mode() & 0o7777),
+        })));
+    }
+    Ok(())
+}
+
+fn secure_managed_directory_path(root: &Path, path: &Path) -> ServiceResult<()> {
+    secure_private_directory(root)?;
+    let relative = path.strip_prefix(root).map_err(|_| {
+        VideoServiceError::new(
+            "video.unsafe_storage_path",
+            "A managed directory escaped Video Studio storage",
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => current.push(value),
+            Component::CurDir => continue,
+            _ => {
+                return Err(VideoServiceError::new(
+                    "video.unsafe_storage_path",
+                    "Managed directory paths may only contain normal components",
+                ))
+            }
+        }
+        secure_private_directory(&current)?;
+    }
+    Ok(())
+}
+
+fn secure_managed_file(path: &Path) -> ServiceResult<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            VideoServiceError::io(
+                "video.unsafe_artifact_path",
+                "A managed artifact is not a safe regular file",
+                error,
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        VideoServiceError::io(
+            "video.artifact_not_found",
+            "A managed artifact could not be inspected",
+            error,
+        )
+    })?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file() || metadata.uid() != effective_uid || metadata.nlink() != 1 {
+        return Err(VideoServiceError::new(
+            "video.unsafe_artifact_path",
+            "Managed artifacts must be single-link regular files owned by the current user",
+        )
+        .details(json!({
+            "path": path,
+            "owner_uid": metadata.uid(),
+            "effective_uid": effective_uid,
+            "link_count": metadata.nlink(),
+        })));
+    }
+    file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+        .map_err(|error| {
+            VideoServiceError::io(
+                "video.storage_permissions_failed",
+                "Private permissions could not be applied to a managed artifact",
+                error,
+            )
+        })?;
+    let secured = file.metadata().map_err(|error| {
+        VideoServiceError::io(
+            "video.storage_permissions_failed",
+            "Managed artifact permissions could not be verified",
+            error,
+        )
+    })?;
+    if secured.mode() & 0o7777 != PRIVATE_FILE_MODE || secured.uid() != effective_uid {
+        return Err(VideoServiceError::new(
+            "video.storage_permissions_failed",
+            "Managed artifact permissions did not remain private",
+        )
+        .details(json!({
+            "path": path,
+            "mode": format!("{:o}", secured.mode() & 0o7777),
+        })));
+    }
+    Ok(())
+}
+
+fn available_disk_bytes(path: &Path) -> ServiceResult<u64> {
+    let encoded = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        VideoServiceError::new(
+            "video.storage_unavailable",
+            "The storage path contains an invalid null byte",
+        )
+    })?;
+    let mut stats = MaybeUninit::<libc::statvfs>::zeroed();
+    if unsafe { libc::statvfs(encoded.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(VideoServiceError::io(
+            "video.storage_unavailable",
+            "Available disk space could not be inspected",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let stats = unsafe { stats.assume_init() };
+    let fragment_size = if stats.f_frsize > 0 {
+        stats.f_frsize as u64
+    } else {
+        stats.f_bsize as u64
+    };
+    Ok((stats.f_bavail as u64).saturating_mul(fragment_size))
+}
+
+fn ensure_disk_capacity(path: &Path, required_bytes: u64, operation: &str) -> ServiceResult<()> {
+    let available_bytes = available_disk_bytes(path)?;
+    if available_bytes < required_bytes {
+        return Err(VideoServiceError::new(
+            "video.insufficient_disk_space",
+            "Video Studio needs more free disk space before this task can start",
+        )
+        .retryable(true)
+        .details(json!({
+            "operation": operation,
+            "path": path,
+            "required_bytes": required_bytes,
+            "available_bytes": available_bytes,
+        })));
+    }
+    Ok(())
+}
+
+fn with_disk_headroom(payload_bytes: u64, multiplier: u64) -> u64 {
+    payload_bytes
+        .saturating_mul(multiplier)
+        .saturating_add(DISK_HEADROOM_BYTES)
+}
+
+fn validate_package_aggregate_bytes(aggregate_bytes: u64) -> ServiceResult<()> {
+    if aggregate_bytes > MAX_PACKAGE_AGGREGATE_BYTES {
+        return Err(VideoServiceError::new(
+            "video.package_too_large",
+            "Publish package contents exceed the 64 GiB local package limit",
+        )
+        .details(json!({
+            "aggregate_bytes": aggregate_bytes,
+            "maximum_bytes": MAX_PACKAGE_AGGREGATE_BYTES,
+        })));
+    }
+    Ok(())
+}
+
+fn bounded_publish_package_bytes(master_bytes: u64) -> ServiceResult<u64> {
+    let bounded_bytes = master_bytes.saturating_add(PACKAGE_METADATA_RESERVE_BYTES);
+    if bounded_bytes > MAX_PACKAGE_AGGREGATE_BYTES {
+        return Err(VideoServiceError::new(
+            "video.package_too_large",
+            "The final master leaves insufficient room for bounded publish metadata",
+        )
+        .details(json!({
+            "master_bytes": master_bytes,
+            "maximum_bytes": MAX_PACKAGE_AGGREGATE_BYTES,
+            "reserved_metadata_bytes": PACKAGE_METADATA_RESERVE_BYTES,
+        })));
+    }
+    Ok(bounded_bytes)
+}
+
+fn validate_source_size(size_bytes: u64) -> ServiceResult<()> {
+    if size_bytes > MAX_SOURCE_BYTES {
+        return Err(VideoServiceError::new(
+            "video.source_too_large",
+            "Video Studio supports individual source files up to 8 GiB",
+        )
+        .details(json!({
+            "size_bytes": size_bytes,
+            "maximum_bytes": MAX_SOURCE_BYTES,
+        })));
+    }
+    Ok(())
+}
+
+fn validate_media_duration(duration_us: i64) -> ServiceResult<()> {
+    if duration_us <= 0 || duration_us > MAX_MEDIA_DURATION_US {
+        return Err(VideoServiceError::new(
+            "video.duration_out_of_range",
+            "Video Studio media duration must be positive and no longer than 6 hours",
+        )
+        .details(json!({
+            "duration_us": duration_us,
+            "maximum_duration_us": MAX_MEDIA_DURATION_US,
+        })));
+    }
+    Ok(())
+}
+
+fn estimated_render_bytes(duration_us: i64, profile: RenderProfile) -> ServiceResult<u64> {
+    validate_media_duration(duration_us)?;
+    let seconds = u64::try_from(duration_us)
+        .unwrap_or(0)
+        .saturating_add(999_999)
+        / 1_000_000;
+    let bits_per_second = match profile {
+        RenderProfile::Proxy => 8_000_000_u64,
+        RenderProfile::Preview => 16_000_000_u64,
+        RenderProfile::Final => 50_000_000_u64,
+    };
+    let encoded_bytes = seconds.saturating_mul(bits_per_second).saturating_add(7) / 8;
+    Ok(encoded_bytes.saturating_add(256 * 1024 * 1024))
+}
+
+fn render_timeout(duration_us: Option<i64>, profile: RenderProfile) -> ServiceResult<Duration> {
+    let duration_us = duration_us.unwrap_or(60_000_000);
+    validate_media_duration(duration_us)?;
+    let media_seconds = u64::try_from(duration_us)
+        .unwrap_or(0)
+        .saturating_add(999_999)
+        / 1_000_000;
+    let (minimum, multiplier, allowance) = match profile {
+        RenderProfile::Proxy => (5 * 60, 3, 60),
+        RenderProfile::Preview => (5 * 60, 4, 60),
+        RenderProfile::Final => (10 * 60, 8, 120),
+    };
+    let seconds = media_seconds
+        .saturating_mul(multiplier)
+        .saturating_add(allowance)
+        .max(minimum)
+        .min(MAX_RENDER_DURATION.as_secs());
+    Ok(Duration::from_secs(seconds))
 }
 
 /// Application-wide GPU admission request. The Video Studio keeps CPU, I/O,
@@ -405,12 +721,80 @@ pub struct TimelineRenderRequest {
     pub burn_captions: bool,
 }
 
+/// Renders multiple deterministic alternates from one frozen editorial
+/// manifest, then publishes every output against one resulting version.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TimelineRenderBatchRequest {
+    pub base: TimelineRenderRequest,
+    pub variations: Vec<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NarrationReplacement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_id: Option<String>,
+    pub history_id: String,
+    pub voice_id: String,
+    pub model_id: String,
+    pub speaker: String,
+    pub language: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceNarrationRequest {
+    pub project_id: String,
+    pub expected_revision: i64,
+    pub expected_version_id: String,
+    pub actor: String,
+    /// Durable owning workflow id. RuntimeState uses this to adopt an already
+    /// queued replacement after a crash between child creation and checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_job_id: Option<String>,
+    pub replacements: Vec<NarrationReplacement>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DurableLinkImportRequest {
     request: LinkImportRequest,
     canonical_url: String,
     rights_confirmation: RightsConfirmation,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum DurableLocalImportOrigin {
+    #[default]
+    UserUpload,
+    SoundArHistory {
+        history_id: String,
+        generation_job_id: String,
+        generation_kind: String,
+        model_id: String,
+        voice: String,
+        engine: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DurableLocalImportRequest {
+    project_id: String,
+    source_path: PathBuf,
+    actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default)]
+    origin: DurableLocalImportOrigin,
+    #[serde(default = "default_normal_priority")]
+    priority: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -423,12 +807,17 @@ fn default_true() -> bool {
     true
 }
 
+fn default_normal_priority() -> String {
+    "normal".to_string()
+}
+
 /// Shared service instance.  Put this behind one `Arc` in RuntimeState and pass
 /// that same instance to every transport adapter.
 pub struct VideoStudioService {
     store: Arc<Store>,
     video_root: PathBuf,
     scheduler: Mutex<ResourceScheduler>,
+    storage_reservations: Mutex<StorageReservationState>,
     gpu_admission_gate: Option<Arc<dyn SharedGpuAdmissionGate>>,
     cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     runtime_cache: Mutex<Option<(Instant, MediaRuntimeStatus)>>,
@@ -542,13 +931,26 @@ impl VideoStudioService {
             })?;
         let master_path = PathBuf::from(value_string(master, "artifact_path")?);
         let master_path = self.resolve_absolute_managed_path(&master_path)?;
+        let master_size = fs::metadata(&master_path)
+            .map_err(|error| {
+                VideoServiceError::io(
+                    "video.package_failed",
+                    "The final master could not be inspected for packaging",
+                    error,
+                )
+            })?
+            .len();
+        let bounded_package_bytes = bounded_publish_package_bytes(master_size)?;
+        // Package construction writes an independent package master and ZIP.
+        // Reserve both before the first potentially multi-gigabyte integrity
+        // pass so concurrent workers cannot all spend the same free bytes.
+        let _storage_lease = self.reserve_storage(
+            format!("{job_id}:publish-package"),
+            &self.video_root,
+            with_disk_headroom(bounded_package_bytes, 2),
+            "publish_package",
+        )?;
         let master_sha = value_string(master, "sha256")?;
-        if sha256_file(&master_path)? != master_sha {
-            return Err(VideoServiceError::new(
-                "video.integrity_failed",
-                "The final master checksum no longer matches its output record",
-            ));
-        }
         let version_sha = project
             .get("version")
             .and_then(|value| value.get("sha256"))
@@ -569,6 +971,22 @@ impl VideoStudioService {
             .profile(json!({ "format": "publish-zip-v2" }))
             .build()?
             .into_string();
+        // Construct every metadata payload and enforce the exact aggregate
+        // before reading or copying a potentially 64 GiB master.
+        self.build_publish_package_payloads(
+            &manifest,
+            &project,
+            master,
+            master_size,
+            &master_sha,
+            &cache_key,
+        )?;
+        if sha256_file_with_cancel(&master_path, Some(cancel))? != master_sha {
+            return Err(VideoServiceError::new(
+                "video.integrity_failed",
+                "The final master checksum no longer matches its output record",
+            ));
+        }
         self.checkpoint_stage(
             &request.project_id,
             project
@@ -587,47 +1005,57 @@ impl VideoStudioService {
             None,
         )?;
         let package_parent = self.project_dir(&request.project_id)?.join("packages");
-        fs::create_dir_all(&package_parent).map_err(|error| {
-            VideoServiceError::io(
-                "video.storage_unavailable",
-                "The package directory could not be created",
-                error,
-            )
-        })?;
+        self.secure_managed_directory(&package_parent)?;
         let package_path = package_parent.join(format!("publish-{}", &cache_key[..16]));
-        if !valid_package_directory(&package_path) {
+        if package_path.exists() {
+            self.secure_managed_flat_directory(&package_path)?;
+        }
+        let package_is_valid =
+            match validate_package_directory_with_cancel(&package_path, Some(cancel)) {
+                Ok(()) => true,
+                Err(error) if error.code == "video.cancelled" => return Err(error),
+                Err(_) => false,
+            };
+        if !package_is_valid {
             if package_path.exists() {
                 return Err(VideoServiceError::new(
                     "video.package_invalid",
                     "A conflicting managed package directory already exists",
                 ));
             }
+            ensure_disk_capacity(
+                &package_parent,
+                with_disk_headroom(master_size, 2),
+                "publish_package",
+            )?;
             let staging = package_parent.join(format!(
                 ".publish-{}.{}.partial",
                 &cache_key[..16],
                 new_id()
             ));
-            fs::create_dir(&staging).map_err(|error| {
-                VideoServiceError::io(
-                    "video.package_failed",
-                    "The publish package could not be staged",
-                    error,
-                )
-            })?;
-            let build_result = self.write_publish_package(
-                &staging,
-                &manifest,
-                &project,
-                master,
-                &master_path,
-                &master_sha,
-                &cache_key,
-            );
+            self.secure_managed_directory(&staging)?;
+            let build_result = (|| -> ServiceResult<()> {
+                self.write_publish_package(
+                    &staging,
+                    &manifest,
+                    &project,
+                    master,
+                    &master_path,
+                    &master_sha,
+                    &cache_key,
+                    cancel,
+                )?;
+                // Enforce the aggregate contract while the package is still
+                // disposable. A master just below 64 GiB can cross the limit
+                // once manifests/captions are added; it must never be renamed
+                // into durable managed storage in that state.
+                package_member_inventory(&staging, Some(cancel))?;
+                sync_directory_tree(&staging)
+            })();
             if let Err(error) = build_result {
                 let _ = fs::remove_dir_all(&staging);
                 return Err(error);
             }
-            sync_directory_tree(&staging)?;
             fs::rename(&staging, &package_path).map_err(|error| {
                 let _ = fs::remove_dir_all(&staging);
                 VideoServiceError::io(
@@ -637,24 +1065,29 @@ impl VideoStudioService {
                 )
             })?;
             sync_directory(&package_parent)?;
+            self.secure_managed_flat_directory(&package_path)?;
         }
-        if !valid_package_directory(&package_path) {
-            return Err(VideoServiceError::new(
-                "video.package_invalid",
-                "The published package is incomplete",
-            ));
-        }
-        validate_package_identity(&package_path, &cache_key, &master_sha)?;
+        validate_package_directory_with_cancel(&package_path, Some(cancel))?;
+        validate_package_identity(&package_path, &cache_key, &master_sha, Some(cancel))?;
         let archive_path = package_parent.join(format!("publish-{}.zip", &cache_key[..16]));
-        write_publish_zip_atomic(&package_path, &archive_path)?;
-        validate_publish_zip(&archive_path, &package_path)?;
-        let archive_sha = sha256_file(&archive_path)?;
+        if !archive_path.exists() {
+            let package_bytes = package_regular_files_within_limit(&package_path, Some(cancel))?
+                .iter()
+                .fold(0_u64, |total, (_, _, size)| total.saturating_add(*size));
+            ensure_disk_capacity(
+                &package_parent,
+                with_disk_headroom(package_bytes, 1),
+                "publish_package_archive",
+            )?;
+        }
+        write_publish_zip_atomic(&package_path, &archive_path, cancel)?;
+        validate_publish_zip_with_cancel(&archive_path, &package_path, Some(cancel))?;
+        let archive_sha = sha256_file_with_cancel(&archive_path, Some(cancel))?;
         // A publish package is an output of the current timeline, not an edit
         // to it. Registering it in Store keeps Projects/History/assistant parity
         // without advancing the manifest and immediately making its master
         // stale. The managed ZIP remains content-addressed and durable.
-        let committed = self.get_project(&request.project_id)?;
-        ensure_project_matches(&committed, &expectation)?;
+        ensure_project_matches(&self.get_project(&request.project_id)?, &expectation)?;
         self.store
             .put_video_cache(
                 &cache_key,
@@ -666,39 +1099,52 @@ impl VideoStudioService {
             .map_err(VideoServiceError::store)?;
         let committed_expectation = expectation;
         let export_path = if let Some(destination) = &request.destination_dir {
-            // Hold the project lease across the user-visible copy. The package
-            // may be prepared optimistically, but it cannot be exported from a
-            // timeline that changes during publication.
-            let export_lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
             ensure_project_matches(
                 &self.get_project(&request.project_id)?,
                 &committed_expectation,
             )?;
-            let path =
-                export_package_directory(&package_path, destination, &manifest.name, &cache_key)?;
-            drop(export_lock);
+            let export_bytes = package_regular_files_within_limit(&package_path, Some(cancel))?
+                .iter()
+                .fold(0_u64, |total, (_, _, size)| total.saturating_add(*size));
+            let _export_storage_lease = self.reserve_storage(
+                format!("{job_id}:publish-export"),
+                destination,
+                with_disk_headroom(export_bytes, 1),
+                "publish_package_export",
+            )?;
+            let path = export_package_directory(
+                &package_path,
+                destination,
+                &manifest.name,
+                &cache_key,
+                cancel,
+                || {
+                    let lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
+                    ensure_project_matches(
+                        &self.get_project(&request.project_id)?,
+                        &committed_expectation,
+                    )?;
+                    Ok(lock)
+                },
+            )?;
             Some(path)
         } else {
             None
         };
+        // Final registration is a short CAS-critical section. Expensive ZIP
+        // and optional user export work happens before this fresh lease; no
+        // non-primary package output can attach after the editorial version
+        // changes merely because Store only guards primary outputs.
+        let publication_lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
+        let committed = self.get_project(&request.project_id)?;
+        ensure_project_matches(&committed, &committed_expectation)?;
         let version_id = Some(committed_expectation.version_id.as_str());
-        let existing_output = committed
-            .get("outputs")
-            .and_then(Value::as_array)
-            .and_then(|outputs| {
-                outputs.iter().find(|output| {
-                    output.get("version_id").and_then(Value::as_str) == version_id
-                        && output.get("kind").and_then(Value::as_str) == Some("publish-package")
-                        && output.get("sha256").and_then(Value::as_str)
-                            == Some(archive_sha.as_str())
-                })
-            })
-            .cloned();
-        let output = if let Some(output) = existing_output {
-            output
-        } else {
-            self.store
-                .publish_video_output(&json!({
+        let output_id = stable_output_id(&request.project_id, "publish-package", &cache_key, 0);
+        let output = self
+            .store
+            .publish_video_output_current_cancellable(
+                &json!({
+                    "id": output_id,
                     "project_id": request.project_id,
                     "version_id": version_id,
                     "job_id": job_id,
@@ -717,9 +1163,18 @@ impl VideoStudioService {
                         "cache_key": cache_key,
                         "export_path": export_path,
                     },
-                }))
-                .map_err(VideoServiceError::store)?
-        };
+                }),
+                committed_expectation.revision,
+                &committed_expectation.version_id,
+                &publication_lock.token,
+                cancel,
+            )
+            .map_err(VideoServiceError::store)?;
+        ensure_project_matches(
+            &self.get_project(&request.project_id)?,
+            &committed_expectation,
+        )?;
+        drop(publication_lock);
         self.checkpoint_stage(
             &request.project_id,
             version_id,
@@ -747,34 +1202,27 @@ impl VideoStudioService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn write_publish_package(
+    fn build_publish_package_payloads(
         &self,
-        staging: &Path,
         manifest: &VideoProjectManifest,
         project: &Value,
         master: &Value,
-        master_path: &Path,
+        master_size: u64,
         master_sha: &str,
         cache_key: &str,
-    ) -> ServiceResult<()> {
-        let packaged_master = staging.join("master.mp4");
-        copy_file_verified(master_path, &packaged_master)?;
+    ) -> ServiceResult<PublishPackagePayloads> {
         let (publish_manifest, query_parameters_redacted) = redact_publish_manifest_urls(manifest);
-        write_new_file(
-            &staging.join("timeline-manifest.json"),
-            &serde_json::to_vec_pretty(&publish_manifest).map_err(json_error)?,
-        )?;
-        if !manifest.captions.is_empty() {
-            write_new_file(
-                &staging.join("captions.srt"),
-                captions_to_srt(manifest)?.as_bytes(),
-            )?;
-        }
+        let timeline_manifest = serde_json::to_vec_pretty(&publish_manifest).map_err(json_error)?;
+        let captions = if manifest.captions.is_empty() {
+            None
+        } else {
+            Some(captions_to_srt(manifest)?.into_bytes())
+        };
         let readme = format!(
             "soundAr publish package\n\nProject: {}\nGenerated: {}\n\nContents\n- master.mp4: final assembled video\n- timeline-manifest.json: versioned edit source of truth\n- package-manifest.json: checksums, provenance and rights receipts\n{}{}\nThis package was rendered locally. Verify destination-specific publishing requirements before upload.\n",
             manifest.name,
             manifest.updated_at,
-            if manifest.captions.is_empty() {
+            if captions.is_none() {
                 ""
             } else {
                 "- captions.srt: timed captions\n"
@@ -784,25 +1232,31 @@ impl VideoStudioService {
             } else {
                 ""
             },
-        );
-        write_new_file(&staging.join("README.txt"), readme.as_bytes())?;
-        let mut files = Vec::new();
-        for name in [
-            "master.mp4",
-            "timeline-manifest.json",
-            "captions.srt",
-            "README.txt",
-        ] {
-            let path = staging.join(name);
-            if path.is_file() {
-                files.push(json!({
-                    "path": name,
-                    "size_bytes": fs::metadata(&path).map_err(|error| VideoServiceError::io("video.package_failed", "A package file could not be inspected", error))?.len(),
-                    "sha256": sha256_file(&path)?,
-                }));
-            }
+        )
+        .into_bytes();
+        let mut files = vec![json!({
+            "path": "master.mp4",
+            "size_bytes": master_size,
+            "sha256": master_sha,
+        })];
+        files.push(json!({
+            "path": "timeline-manifest.json",
+            "size_bytes": timeline_manifest.len(),
+            "sha256": sha256_bytes(&timeline_manifest),
+        }));
+        if let Some(captions) = captions.as_ref() {
+            files.push(json!({
+                "path": "captions.srt",
+                "size_bytes": captions.len(),
+                "sha256": sha256_bytes(captions),
+            }));
         }
-        let package_manifest = json!({
+        files.push(json!({
+            "path": "README.txt",
+            "size_bytes": readme.len(),
+            "sha256": sha256_bytes(&readme),
+        }));
+        let package_manifest_value = json!({
             "schema_version": 1,
             "kind": "soundar_publish_package",
             "project": {
@@ -836,10 +1290,79 @@ impl VideoStudioService {
                 "rights_confirmation_id": asset.rights_confirmation_id,
             })).collect::<Vec<_>>(),
         });
+        let package_manifest =
+            serde_json::to_vec_pretty(&package_manifest_value).map_err(json_error)?;
+        if package_manifest.len() > MAX_CAPTURE_BYTES {
+            return Err(VideoServiceError::new(
+                "video.package_too_large",
+                "The publish package metadata exceeds its bounded manifest limit",
+            ));
+        }
+        let aggregate_bytes = master_size
+            .saturating_add(timeline_manifest.len() as u64)
+            .saturating_add(captions.as_ref().map_or(0, |value| value.len() as u64))
+            .saturating_add(readme.len() as u64)
+            .saturating_add(package_manifest.len() as u64);
+        validate_package_aggregate_bytes(aggregate_bytes)?;
+        Ok(PublishPackagePayloads {
+            timeline_manifest,
+            captions,
+            readme,
+            package_manifest,
+            aggregate_bytes,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_publish_package(
+        &self,
+        staging: &Path,
+        manifest: &VideoProjectManifest,
+        project: &Value,
+        master: &Value,
+        master_path: &Path,
+        master_sha: &str,
+        cache_key: &str,
+        cancel: &AtomicBool,
+    ) -> ServiceResult<()> {
+        let master_size = fs::metadata(master_path)
+            .map_err(|error| {
+                VideoServiceError::io(
+                    "video.package_failed",
+                    "The final master could not be inspected for packaging",
+                    error,
+                )
+            })?
+            .len();
+        let payloads = self.build_publish_package_payloads(
+            manifest,
+            project,
+            master,
+            master_size,
+            master_sha,
+            cache_key,
+        )?;
+        let packaged_master = staging.join("master.mp4");
+        copy_file_verified(
+            master_path,
+            &packaged_master,
+            CopiedFileVisibility::ManagedPrivate,
+            cancel,
+        )?;
+        write_new_file(
+            &staging.join("timeline-manifest.json"),
+            &payloads.timeline_manifest,
+        )?;
+        if let Some(captions) = payloads.captions.as_ref() {
+            write_new_file(&staging.join("captions.srt"), captions)?;
+        }
+        write_new_file(&staging.join("README.txt"), &payloads.readme)?;
         write_new_file(
             &staging.join("package-manifest.json"),
-            &serde_json::to_vec_pretty(&package_manifest).map_err(json_error)?,
-        )
+            &payloads.package_manifest,
+        )?;
+        debug_assert!(payloads.aggregate_bytes <= MAX_PACKAGE_AGGREGATE_BYTES);
+        Ok(())
     }
 }
 
@@ -897,6 +1420,32 @@ impl Drop for SchedulerLease<'_> {
     }
 }
 
+#[derive(Default)]
+struct StorageReservationState {
+    active: HashMap<String, StorageReservation>,
+}
+
+#[derive(Clone, Copy)]
+struct StorageReservation {
+    device_id: u64,
+    bytes: u64,
+}
+
+struct StorageLease<'a> {
+    reservations: &'a Mutex<StorageReservationState>,
+    id: String,
+}
+
+impl Drop for StorageLease<'_> {
+    fn drop(&mut self) {
+        self.reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+            .remove(&self.id);
+    }
+}
+
 struct PreparedManagedFile {
     path: PathBuf,
     relative_path: String,
@@ -951,6 +1500,42 @@ struct PublishedPackageResult {
     export_path: Option<PathBuf>,
 }
 
+struct PublishPackagePayloads {
+    timeline_manifest: Vec<u8>,
+    captions: Option<Vec<u8>>,
+    readme: Vec<u8>,
+    package_manifest: Vec<u8>,
+    aggregate_bytes: u64,
+}
+
+struct PreparedNarrationReplacement {
+    clip_id: String,
+    replaced_binding_id: Option<String>,
+    artifact: RenderArtifact,
+    binding: NarrationBinding,
+}
+
+struct PreparedTimelineRender {
+    request: TimelineRenderRequest,
+    caption_artifact: RenderArtifact,
+    render_artifact: RenderArtifact,
+    output_path: PathBuf,
+    output_sha: String,
+    output_duration_us: i64,
+    width: u32,
+    height: u32,
+    caption_key: String,
+    render_key: String,
+    stage_key: String,
+    scope_key: String,
+    resource_class: String,
+    caption_cache_hit: bool,
+    render_cache_hit: bool,
+    wall_seconds: f64,
+    scene_count: usize,
+    nvenc_with_software_fallback: bool,
+}
+
 enum RenderRunError {
     Cancelled(VideoServiceError),
     Failed {
@@ -959,15 +1544,56 @@ enum RenderRunError {
     },
 }
 
+struct StagedRenderCleanup {
+    paths: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl StagedRenderCleanup {
+    fn for_plan(plan: &RenderCommandPlan) -> Self {
+        let mut paths = vec![plan.primary.output.clone()];
+        if let Some(fallback) = &plan.software_fallback {
+            if !paths.contains(&fallback.output) {
+                paths.push(fallback.output.clone());
+            }
+        }
+        Self { paths, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedRenderCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            for path in &self.paths {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct CapturedOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
 
-enum CapturedChunk {
-    Stdout(Result<Vec<u8>, std::io::Error>),
-    Stderr(Result<Vec<u8>, std::io::Error>),
+#[derive(Debug)]
+struct BoundedPipeCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CommandOutputQuota {
+    directory: PathBuf,
+    prefix: String,
+    max_file_bytes: u64,
+    max_aggregate_bytes: u64,
 }
 
 fn run_captured_command(
@@ -976,21 +1602,59 @@ fn run_captured_command(
     timeout: Duration,
     cancel: Option<&AtomicBool>,
     max_stdout_bytes: usize,
+    proxy_url: Option<&str>,
+    output_quota: Option<&CommandOutputQuota>,
 ) -> ServiceResult<CapturedOutput> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("HTTP_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("https_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| {
-            VideoServiceError::io(
-                "video.command_start_failed",
-                "The local media command could not be started",
-                error,
-            )
-        })?;
+        .process_group(0);
+    if let Some(proxy_url) = proxy_url {
+        // yt-dlp receives the same URL explicitly. Setting every conventional
+        // proxy variable also confines any JavaScript-runtime or downloader
+        // descendants it launches; clearing NO_PROXY prevents a private
+        // redirect from bypassing the authenticated CONNECT-only proxy.
+        command
+            .env("HTTP_PROXY", proxy_url)
+            .env("http_proxy", proxy_url)
+            .env("HTTPS_PROXY", proxy_url)
+            .env("https_proxy", proxy_url)
+            .env("ALL_PROXY", proxy_url)
+            .env("all_proxy", proxy_url);
+    }
+    // yt-dlp and its FFmpeg merger create only private files inside the
+    // owner-only managed source directory, including transient fragments.
+    unsafe {
+        command.pre_exec(|| {
+            libc::umask(0o077);
+            let file_size_limit = libc::rlimit {
+                rlim_cur: MAX_SOURCE_BYTES as libc::rlim_t,
+                rlim_max: MAX_SOURCE_BYTES as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &file_size_limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| {
+        VideoServiceError::io(
+            "video.command_start_failed",
+            "The local media command could not be started",
+            error,
+        )
+    })?;
     let stdout = child.stdout.take().ok_or_else(|| {
         VideoServiceError::new(
             "video.command_start_failed",
@@ -1003,128 +1667,344 @@ fn run_captured_command(
             "The local media command has no diagnostic stream",
         )
     })?;
-    let (sender, receiver) = mpsc::channel();
-    let stdout_sender = sender.clone();
-    let stdout_reader = thread::spawn(move || {
-        tagged_stream_reader(stdout, stdout_sender, true);
-    });
-    let stderr_sender = sender.clone();
-    let stderr_reader = thread::spawn(move || {
-        tagged_stream_reader(stderr, stderr_sender, false);
-    });
-    drop(sender);
-    let started = Instant::now();
-    let mut captured_stdout = Vec::new();
-    let mut captured_stderr = Vec::new();
-    let status = loop {
-        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            let _ = terminate_process_group(&mut child, Duration::from_secs(2));
+    if let Err(error) =
+        set_capture_pipe_nonblocking(&stdout).and_then(|_| set_capture_pipe_nonblocking(&stderr))
+    {
+        stop_captured_process_group(&mut child);
+        return Err(VideoServiceError::io(
+            "video.command_read_failed",
+            "The local media command output could not be secured",
+            error,
+        ));
+    }
+    let process_group = i32::try_from(child.id()).ok();
+    let stop_readers = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_bounded_capture_reader(
+        "soundar-video-command-stdout",
+        stdout,
+        max_stdout_bytes,
+        Arc::clone(&stop_readers),
+    )
+    .map_err(|error| {
+        stop_captured_process_group(&mut child);
+        VideoServiceError::io(
+            "video.command_read_failed",
+            "The local media command output reader could not be started",
+            error,
+        )
+    })?;
+    let stderr_reader = match spawn_bounded_capture_reader(
+        "soundar-video-command-stderr",
+        stderr,
+        MAX_DIAGNOSTIC_BYTES,
+        Arc::clone(&stop_readers),
+    ) {
+        Ok(reader) => reader,
+        Err(error) => {
+            stop_captured_process_group(&mut child);
+            stop_readers.store(true, Ordering::Release);
             let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            return Err(VideoServiceError::io(
+                "video.command_read_failed",
+                "The local media command diagnostic reader could not be started",
+                error,
+            ));
+        }
+    };
+    let started = Instant::now();
+    let status = loop {
+        if let Some(quota) = output_quota {
+            if let Err(error) = validate_command_output_quota(quota) {
+                stop_captured_process_group(&mut child);
+                let _ = finish_captured_readers(
+                    stdout_reader,
+                    stderr_reader,
+                    stop_readers,
+                    process_group,
+                );
+                return Err(error);
+            }
+        }
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            stop_captured_process_group(&mut child);
+            let _ =
+                finish_captured_readers(stdout_reader, stderr_reader, stop_readers, process_group);
             return Err(VideoServiceError::cancelled());
         }
         if started.elapsed() > timeout {
-            let _ = terminate_process_group(&mut child, Duration::from_secs(2));
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            stop_captured_process_group(&mut child);
+            let _ =
+                finish_captured_readers(stdout_reader, stderr_reader, stop_readers, process_group);
             return Err(VideoServiceError::new(
                 "video.command_timeout",
                 "The local media command timed out",
             )
             .retryable(true));
         }
-        match receiver.recv_timeout(COMMAND_POLL_INTERVAL) {
-            Ok(CapturedChunk::Stdout(Ok(chunk))) => {
-                if captured_stdout.len().saturating_add(chunk.len()) > max_stdout_bytes {
-                    let _ = terminate_process_group(&mut child, Duration::from_secs(2));
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(VideoServiceError::new(
-                        "video.command_output_too_large",
-                        "The local media command returned too much data",
-                    ));
-                }
-                captured_stdout.extend_from_slice(&chunk);
-            }
-            Ok(CapturedChunk::Stderr(Ok(chunk))) => {
-                extend_bounded(&mut captured_stderr, &chunk, MAX_DIAGNOSTIC_BYTES);
-            }
-            Ok(CapturedChunk::Stdout(Err(error))) | Ok(CapturedChunk::Stderr(Err(error))) => {
-                let _ = terminate_process_group(&mut child, Duration::from_secs(2));
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                stop_captured_process_group(&mut child);
+                let _ = finish_captured_readers(
+                    stdout_reader,
+                    stderr_reader,
+                    stop_readers,
+                    process_group,
+                );
                 return Err(VideoServiceError::io(
-                    "video.command_read_failed",
-                    "The local media command output could not be read",
+                    "video.command_monitor_failed",
+                    "The local media command could not be monitored",
                     error,
                 ));
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
-        if let Some(status) = child.try_wait().map_err(|error| {
-            VideoServiceError::io(
-                "video.command_monitor_failed",
-                "The local media command could not be monitored",
-                error,
-            )
-        })? {
-            break status;
-        }
+        thread::sleep(Duration::from_millis(20));
     };
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
-    while let Ok(chunk) = receiver.try_recv() {
-        match chunk {
-            CapturedChunk::Stdout(Ok(chunk)) => {
-                if captured_stdout.len().saturating_add(chunk.len()) <= max_stdout_bytes {
-                    captured_stdout.extend_from_slice(&chunk);
-                }
-            }
-            CapturedChunk::Stderr(Ok(chunk)) => {
-                extend_bounded(&mut captured_stderr, &chunk, MAX_DIAGNOSTIC_BYTES)
-            }
-            _ => {}
-        }
+    let (stdout, stderr, fully_drained) =
+        finish_captured_readers(stdout_reader, stderr_reader, stop_readers, process_group)?;
+    if !fully_drained {
+        return Err(VideoServiceError::new(
+            "video.command_pipe_open",
+            "The local media command left its output pipes open after exiting",
+        )
+        .retryable(true));
+    }
+    if let Some(quota) = output_quota {
+        validate_command_output_quota(quota)?;
+    }
+    if stdout.truncated {
+        return Err(VideoServiceError::new(
+            "video.command_output_too_large",
+            "The local media command returned too much data",
+        ));
     }
     Ok(CapturedOutput {
         status,
-        stdout: captured_stdout,
-        stderr: captured_stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
     })
 }
 
-fn tagged_stream_reader<R: Read>(mut reader: R, sender: mpsc::Sender<CapturedChunk>, stdout: bool) {
-    let mut buffer = vec![0_u8; 32 * 1024];
-    loop {
-        let value = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(size) => Ok(buffer[..size].to_vec()),
-            Err(error) => Err(error),
+fn validate_command_output_quota(quota: &CommandOutputQuota) -> ServiceResult<()> {
+    let mut aggregate_bytes = 0_u64;
+    for entry in fs::read_dir(&quota.directory).map_err(|error| {
+        VideoServiceError::io(
+            "video.link_import_failed",
+            "The download staging directory could not be monitored",
+            error,
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            VideoServiceError::io(
+                "video.link_import_failed",
+                "A download staging entry could not be monitored",
+                error,
+            )
+        })?;
+        let matches = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&quota.prefix));
+        if !matches {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(VideoServiceError::io(
+                    "video.link_import_failed",
+                    "A download staging entry could not be inspected",
+                    error,
+                ))
+            }
         };
-        let failed = value.is_err();
-        let message = if stdout {
-            CapturedChunk::Stdout(value)
-        } else {
-            CapturedChunk::Stderr(value)
-        };
-        if sender.send(message).is_err() || failed {
-            break;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(VideoServiceError::new(
+                "video.unsafe_artifact_path",
+                "Downloaded media staging may only contain regular files",
+            ));
+        }
+        let size = metadata.len();
+        // RLIMIT_FSIZE prevents the child and all descendants from crossing
+        // this boundary. Treat reaching it as a quota failure too, so a helper
+        // terminated by SIGXFSZ reports the stable product error.
+        if size >= quota.max_file_bytes {
+            return Err(VideoServiceError::new(
+                "video.source_too_large",
+                "The authorized download reached the 8 GiB source limit",
+            )
+            .details(json!({
+                "file_bytes": size,
+                "maximum_bytes": quota.max_file_bytes,
+            })));
+        }
+        aggregate_bytes = aggregate_bytes.saturating_add(size);
+        if aggregate_bytes > quota.max_aggregate_bytes {
+            return Err(VideoServiceError::new(
+                "video.source_too_large",
+                "The authorized download exceeded its bounded staging quota",
+            )
+            .details(json!({
+                "aggregate_bytes": aggregate_bytes,
+                "maximum_bytes": quota.max_aggregate_bytes,
+            })));
         }
     }
+    Ok(())
 }
 
-fn stream_reader<R: Read>(mut reader: R, sender: mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
-    let mut buffer = vec![0_u8; 32 * 1024];
+fn set_capture_pipe_nonblocking(pipe: &impl AsRawFd) -> std::io::Result<()> {
+    let descriptor = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn spawn_bounded_capture_reader<R>(
+    name: &str,
+    reader: R,
+    limit: usize,
+    stop: Arc<AtomicBool>,
+) -> std::io::Result<thread::JoinHandle<std::io::Result<BoundedPipeCapture>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || drain_bounded_capture(reader, limit, &stop))
+}
+
+fn drain_bounded_capture(
+    mut reader: impl Read,
+    limit: usize,
+    stop: &AtomicBool,
+) -> std::io::Result<BoundedPipeCapture> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut truncated = false;
+    let mut buffer = [0_u8; 16 * 1024];
     loop {
-        let value = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(size) => Ok(buffer[..size].to_vec()),
-            Err(error) => Err(error),
-        };
-        let failed = value.is_err();
-        if sender.send(value).is_err() || failed {
+        if stop.load(Ordering::Acquire) {
             break;
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => {
+                let retained = size.min(limit.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(&buffer[..retained]);
+                truncated |= retained < size;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(BoundedPipeCapture { bytes, truncated })
+}
+
+fn finish_captured_readers(
+    stdout_reader: thread::JoinHandle<std::io::Result<BoundedPipeCapture>>,
+    stderr_reader: thread::JoinHandle<std::io::Result<BoundedPipeCapture>>,
+    stop: Arc<AtomicBool>,
+    process_group: Option<i32>,
+) -> ServiceResult<(BoundedPipeCapture, BoundedPipeCapture, bool)> {
+    let deadline = Instant::now()
+        .checked_add(COMMAND_PIPE_DRAIN_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    while !(stdout_reader.is_finished() && stderr_reader.is_finished()) && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let fully_drained = stdout_reader.is_finished() && stderr_reader.is_finished();
+    if !fully_drained {
+        if let Some(process_group) = process_group {
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+        stop.store(true, Ordering::Release);
+    }
+    let stdout = join_captured_reader(stdout_reader, "output");
+    let stderr = join_captured_reader(stderr_reader, "diagnostics");
+    let stdout = stdout?;
+    let stderr = stderr?;
+    Ok((stdout, stderr, fully_drained))
+}
+
+fn join_captured_reader(
+    reader: thread::JoinHandle<std::io::Result<BoundedPipeCapture>>,
+    label: &str,
+) -> ServiceResult<BoundedPipeCapture> {
+    reader
+        .join()
+        .map_err(|_| {
+            VideoServiceError::new(
+                "video.command_read_failed",
+                format!("The local media command {label} reader failed"),
+            )
+        })?
+        .map_err(|error| {
+            VideoServiceError::io(
+                "video.command_read_failed",
+                "The local media command output could not be read",
+                error,
+            )
+        })
+}
+
+fn stop_captured_process_group(child: &mut Child) {
+    let process_group = i32::try_from(child.id()).ok();
+    if let Some(process_group) = process_group {
+        unsafe {
+            libc::kill(-process_group, libc::SIGTERM);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if let Some(process_group) = process_group {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn read_nonblocking_chunks(
+    reader: &mut impl Read,
+    max_chunks: usize,
+) -> std::io::Result<(Vec<Vec<u8>>, bool)> {
+    let mut chunks = Vec::with_capacity(max_chunks.min(16));
+    let mut buffer = [0_u8; 16 * 1024];
+    while chunks.len() < max_chunks {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok((chunks, true)),
+            Ok(size) => chunks.push(buffer[..size].to_vec()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((chunks, false))
+}
+
+fn kill_process_group_by_id(child_id: u32) {
+    if let Ok(process_group) = i32::try_from(child_id) {
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
         }
     }
 }
@@ -1214,13 +2094,17 @@ fn copy_file_cancelable<F>(
 where
     F: FnMut(f64),
 {
-    let mut input = File::open(source).map_err(|error| {
-        VideoServiceError::io(
-            "video.source_not_found",
-            "The selected media could not be opened",
-            error,
-        )
-    })?;
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(source)
+        .map_err(|error| {
+            VideoServiceError::io(
+                "video.source_not_found",
+                "The selected media could not be opened safely",
+                error,
+            )
+        })?;
     let total = input
         .metadata()
         .map_err(|error| {
@@ -1231,9 +2115,11 @@ where
             )
         })?
         .len();
+    validate_source_size(total)?;
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
         .open(destination)
         .map_err(|error| {
             VideoServiceError::io(
@@ -1270,6 +2156,7 @@ where
             })?;
             hasher.update(&buffer[..size]);
             copied = copied.saturating_add(size as u64);
+            validate_source_size(copied)?;
             let fraction = if total == 0 {
                 1.0
             } else {
@@ -1287,6 +2174,7 @@ where
                 error,
             )
         })?;
+        secure_managed_file(destination)?;
         Ok(hex_digest(hasher.finalize().as_slice()))
     })();
     if result.is_err() {
@@ -1297,6 +2185,10 @@ where
 }
 
 fn sha256_file(path: &Path) -> ServiceResult<String> {
+    sha256_file_with_cancel(path, None)
+}
+
+fn sha256_file_with_cancel(path: &Path, cancel: Option<&AtomicBool>) -> ServiceResult<String> {
     let mut file = File::open(path).map_err(|error| {
         VideoServiceError::io(
             "video.artifact_not_found",
@@ -1307,6 +2199,9 @@ fn sha256_file(path: &Path) -> ServiceResult<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(VideoServiceError::cancelled());
+        }
         let size = file.read(&mut buffer).map_err(|error| {
             VideoServiceError::io(
                 "video.integrity_failed",
@@ -1324,6 +2219,16 @@ fn sha256_file(path: &Path) -> ServiceResult<String> {
 
 fn sha256_bytes(bytes: &[u8]) -> String {
     hex_digest(Sha256::digest(bytes).as_slice())
+}
+
+/// Stable semantic identity for a published output. The content-addressed
+/// cache key makes equivalent durable retries converge across artifact-only
+/// manifest versions, while the role and variation discriminator keep
+/// intentionally distinct outputs separate even when FFmpeg happens to emit
+/// byte-identical media.
+fn stable_output_id(project_id: &str, role: &str, cache_key: &str, variation: u16) -> String {
+    let identity = json!([project_id, role, cache_key, variation]).to_string();
+    format!("video-output-{}", sha256_bytes(identity.as_bytes()))
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -1509,6 +2414,7 @@ fn ensure_path_in_root(root: &Path, path: &Path) -> ServiceResult<()> {
             "The artifact is outside managed video storage",
         ));
     }
+    secure_managed_file(&path)?;
     Ok(())
 }
 
@@ -1869,17 +2775,35 @@ fn cleanup_prefixed_files(directory: &Path, prefix: &str) {
     }
 }
 
-fn copy_file_verified(source: &Path, destination: &Path) -> ServiceResult<()> {
+fn cleanup_failed_download(directory: &Path, prefix: &str, published_path: Option<&Path>) {
+    cleanup_prefixed_files(directory, prefix);
+    if let Some(path) = published_path {
+        let is_owned_final = path.parent() == Some(directory)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("source-"));
+        if is_owned_final {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopiedFileVisibility {
+    ManagedPrivate,
+    UserShareable,
+}
+
+fn copy_file_verified(
+    source: &Path,
+    destination: &Path,
+    visibility: CopiedFileVisibility,
+    cancel: &AtomicBool,
+) -> ServiceResult<()> {
     // Never hard-link across a publication boundary. A package or user export
     // is writable independently and must not alias the managed render cache.
-    let expected_sha256 = sha256_file(source)?;
-    let copied = fs::copy(source, destination).map_err(|error| {
-        VideoServiceError::io(
-            "video.package_failed",
-            "A package artifact could not be copied",
-            error,
-        )
-    })?;
+    let expected_sha256 = sha256_file_with_cancel(source, Some(cancel))?;
     let source_size = fs::metadata(source)
         .map_err(|error| {
             VideoServiceError::io(
@@ -1889,29 +2813,93 @@ fn copy_file_verified(source: &Path, destination: &Path) -> ServiceResult<()> {
             )
         })?
         .len();
-    if copied != source_size {
-        let _ = fs::remove_file(destination);
-        return Err(VideoServiceError::new(
+    let mut input = File::open(source).map_err(|error| {
+        VideoServiceError::io(
             "video.package_failed",
-            "A package artifact was copied incompletely",
-        ));
-    }
-    File::open(destination)
-        .and_then(|file| file.sync_all())
+            "A package artifact could not be opened",
+            error,
+        )
+    })?;
+    let mode = match visibility {
+        CopiedFileVisibility::ManagedPrivate => PRIVATE_FILE_MODE,
+        CopiedFileVisibility::UserShareable => SHAREABLE_FILE_MODE,
+    };
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(destination)
         .map_err(|error| {
+            VideoServiceError::io(
+                "video.package_failed",
+                "A package artifact could not be staged",
+                error,
+            )
+        })?;
+    let result = (|| -> ServiceResult<()> {
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut copied = 0_u64;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(VideoServiceError::cancelled());
+            }
+            let size = input.read(&mut buffer).map_err(|error| {
+                VideoServiceError::io(
+                    "video.package_failed",
+                    "A package artifact could not be read",
+                    error,
+                )
+            })?;
+            if size == 0 {
+                break;
+            }
+            output.write_all(&buffer[..size]).map_err(|error| {
+                VideoServiceError::io(
+                    "video.package_failed",
+                    "A package artifact could not be copied",
+                    error,
+                )
+            })?;
+            copied = copied.saturating_add(size as u64);
+        }
+        if copied != source_size {
+            return Err(VideoServiceError::new(
+                "video.package_failed",
+                "A package artifact was copied incompletely",
+            ));
+        }
+        output.sync_all().map_err(|error| {
             VideoServiceError::io(
                 "video.package_failed",
                 "A package artifact could not be synchronized",
                 error,
             )
         })?;
-    let actual_sha256 = sha256_file(destination)?;
-    if actual_sha256 != expected_sha256 {
+        match visibility {
+            CopiedFileVisibility::ManagedPrivate => secure_managed_file(destination)?,
+            CopiedFileVisibility::UserShareable => output
+                .set_permissions(fs::Permissions::from_mode(SHAREABLE_FILE_MODE))
+                .map_err(|error| {
+                    VideoServiceError::io(
+                        "video.export_failed",
+                        "Shareable permissions could not be applied to an exported artifact",
+                        error,
+                    )
+                })?,
+        }
+        let actual_sha256 = sha256_file_with_cancel(destination, Some(cancel))?;
+        if actual_sha256 != expected_sha256 {
+            return Err(VideoServiceError::new(
+                "video.integrity_failed",
+                "A copied package artifact failed checksum verification",
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        drop(output);
         let _ = fs::remove_file(destination);
-        return Err(VideoServiceError::new(
-            "video.integrity_failed",
-            "A copied package artifact failed checksum verification",
-        ));
+        return result;
     }
     Ok(())
 }
@@ -1920,6 +2908,7 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> ServiceResult<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
         .open(path)
         .map_err(|error| {
             VideoServiceError::io(
@@ -1936,14 +2925,100 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> ServiceResult<()> {
                 "A package file could not be written",
                 error,
             )
-        })
+        })?;
+    secure_managed_file(path)
 }
 
+#[cfg(test)]
 fn valid_package_directory(path: &Path) -> bool {
     validate_package_directory(path).is_ok()
 }
 
+#[cfg(test)]
 fn validate_package_directory(path: &Path) -> ServiceResult<()> {
+    validate_package_directory_with_cancel(path, None)
+}
+
+fn package_regular_files_within_limit(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> ServiceResult<Vec<(String, PathBuf, u64)>> {
+    let directory_metadata = fs::symlink_metadata(path).map_err(|error| {
+        VideoServiceError::io(
+            "video.package_invalid",
+            "The publish package could not be inspected",
+            error,
+        )
+    })?;
+    if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+        return Err(VideoServiceError::new(
+            "video.package_invalid",
+            "The publish package is not a regular directory",
+        ));
+    }
+    let mut aggregate_bytes = 0_u64;
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path).map_err(|error| {
+        VideoServiceError::io(
+            "video.package_invalid",
+            "The package directory could not be read",
+            error,
+        )
+    })? {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(VideoServiceError::cancelled());
+        }
+        let entry = entry.map_err(|error| {
+            VideoServiceError::io(
+                "video.package_invalid",
+                "A package entry could not be read",
+                error,
+            )
+        })?;
+        let entry_path = entry.path();
+        let metadata = fs::symlink_metadata(&entry_path).map_err(|error| {
+            VideoServiceError::io(
+                "video.package_invalid",
+                "A package entry could not be inspected",
+                error,
+            )
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(VideoServiceError::new(
+                "video.package_invalid",
+                "Publish packages may only contain regular files",
+            ));
+        }
+        let name = entry
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.package_invalid",
+                    "A package filename is not valid UTF-8",
+                )
+            })?;
+        if name.as_bytes().len() > u16::MAX as usize {
+            return Err(VideoServiceError::new(
+                "video.package_invalid",
+                "A package filename is too long for ZIP publication",
+            ));
+        }
+        aggregate_bytes = aggregate_bytes.saturating_add(metadata.len());
+        // This metadata-only first pass prevents an oversized sparse or real
+        // file from consuming minutes of checksum work before rejection.
+        validate_package_aggregate_bytes(aggregate_bytes)?;
+        files.push((name, entry_path, metadata.len()));
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(files)
+}
+
+fn validate_package_directory_with_cancel(
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> ServiceResult<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         VideoServiceError::io(
             "video.package_invalid",
@@ -1957,6 +3032,7 @@ fn validate_package_directory(path: &Path) -> ServiceResult<()> {
             "The publish package is not a regular directory",
         ));
     }
+    package_regular_files_within_limit(path, cancel)?;
     let manifest_path = path.join("package-manifest.json");
     let manifest_metadata = fs::symlink_metadata(&manifest_path).map_err(|error| {
         VideoServiceError::io(
@@ -2016,6 +3092,9 @@ fn validate_package_directory(path: &Path) -> ServiceResult<()> {
     ]);
     let mut listed = BTreeSet::new();
     for record in files {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(VideoServiceError::cancelled());
+        }
         let name = value_string(record, "path")?;
         if !allowed.contains(name.as_str()) || !listed.insert(name.clone()) {
             return Err(VideoServiceError::new(
@@ -2038,7 +3117,9 @@ fn validate_package_directory(path: &Path) -> ServiceResult<()> {
             .and_then(Value::as_u64)
             .ok_or_else(|| invalid_store_shape("files.size_bytes"))?;
         let expected_sha256 = value_string(record, "sha256")?;
-        if file_metadata.len() != expected_size || sha256_file(&file_path)? != expected_sha256 {
+        if file_metadata.len() != expected_size
+            || sha256_file_with_cancel(&file_path, cancel)? != expected_sha256
+        {
             return Err(VideoServiceError::new(
                 "video.integrity_failed",
                 "A publish package file does not match its checksum inventory",
@@ -2052,7 +3133,7 @@ fn validate_package_directory(path: &Path) -> ServiceResult<()> {
             "The publish package is missing required files",
         ));
     }
-    let master_sha = sha256_file(&path.join("master.mp4"))?;
+    let master_sha = sha256_file_with_cancel(&path.join("master.mp4"), cancel)?;
     if manifest
         .get("master")
         .and_then(|value| value.get("sha256"))
@@ -2072,6 +3153,9 @@ fn validate_package_directory(path: &Path) -> ServiceResult<()> {
             error,
         )
     })? {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(VideoServiceError::cancelled());
+        }
         let entry = entry.map_err(|error| {
             VideoServiceError::io(
                 "video.package_invalid",
@@ -2105,8 +3189,9 @@ fn validate_package_identity(
     path: &Path,
     expected_cache_key: &str,
     expected_master_sha256: &str,
+    cancel: Option<&AtomicBool>,
 ) -> ServiceResult<()> {
-    validate_package_directory(path)?;
+    validate_package_directory_with_cancel(path, cancel)?;
     let manifest: Value = serde_json::from_slice(
         &fs::read(path.join("package-manifest.json")).map_err(|error| {
             VideoServiceError::io(
@@ -2161,54 +3246,33 @@ struct ZipWriteMember {
 
 fn package_member_inventory(
     package_directory: &Path,
+    cancel: Option<&AtomicBool>,
 ) -> ServiceResult<BTreeMap<String, PackageMemberIntegrity>> {
-    validate_package_directory(package_directory)?;
+    let entries = package_regular_files_within_limit(package_directory, cancel)?;
+    validate_package_directory_with_cancel(package_directory, cancel)?;
     let mut inventory = BTreeMap::new();
-    for entry in fs::read_dir(package_directory).map_err(|error| {
-        VideoServiceError::io(
-            "video.package_invalid",
-            "The package directory could not be read",
-            error,
-        )
-    })? {
-        let entry = entry.map_err(|error| {
-            VideoServiceError::io(
-                "video.package_invalid",
-                "A package entry could not be read",
-                error,
-            )
-        })?;
-        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+    for (name, path, expected_size) in entries {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(VideoServiceError::cancelled());
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
             VideoServiceError::io(
                 "video.package_invalid",
                 "A package entry could not be inspected",
                 error,
             )
         })?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != expected_size
+        {
             return Err(VideoServiceError::new(
-                "video.package_invalid",
-                "Publish packages may only contain regular files",
+                "video.package_changed",
+                "A package file changed while its archive was being prepared",
             ));
         }
-        let name = entry
-            .file_name()
-            .to_str()
-            .map(str::to_string)
-            .ok_or_else(|| {
-                VideoServiceError::new(
-                    "video.package_invalid",
-                    "A package filename is not valid UTF-8",
-                )
-            })?;
-        if name.as_bytes().len() > u16::MAX as usize {
-            return Err(VideoServiceError::new(
-                "video.package_invalid",
-                "A package filename is too long for ZIP publication",
-            ));
-        }
-        let (crc32, size) = crc32_file(&entry.path())?;
-        if size != metadata.len() {
+        let (crc32, size) = crc32_file(&path, cancel)?;
+        if size != expected_size {
             return Err(VideoServiceError::new(
                 "video.package_changed",
                 "A package file changed while its archive was being prepared",
@@ -2219,7 +3283,7 @@ fn package_member_inventory(
             name,
             PackageMemberIntegrity {
                 size,
-                sha256: sha256_file(&entry.path())?,
+                sha256: sha256_file_with_cancel(&path, cancel)?,
                 crc32,
             },
         );
@@ -2231,10 +3295,40 @@ fn package_member_inventory(
 /// directory. Stored entries avoid any dependency on an optional system ZIP
 /// executable and make member checksums independently verifiable. ZIP64 is
 /// emitted when a long final master crosses the classic 4 GiB boundary.
-fn write_publish_zip_atomic(package_directory: &Path, archive_path: &Path) -> ServiceResult<()> {
-    let inventory = package_member_inventory(package_directory)?;
+fn write_publish_zip_atomic(
+    package_directory: &Path,
+    archive_path: &Path,
+    cancel: &AtomicBool,
+) -> ServiceResult<()> {
     if archive_path.exists() {
-        validate_publish_zip_with_inventory(archive_path, &inventory)?;
+        let archive_metadata = fs::symlink_metadata(archive_path).map_err(|error| {
+            VideoServiceError::io(
+                "video.package_invalid",
+                "The existing publish ZIP could not be inspected",
+                error,
+            )
+        })?;
+        if !archive_metadata.is_file() || archive_metadata.file_type().is_symlink() {
+            return Err(VideoServiceError::new(
+                "video.package_invalid",
+                "The existing publish ZIP is not a regular file",
+            ));
+        }
+        if archive_metadata.len() > MAX_PACKAGE_ARCHIVE_BYTES {
+            return Err(VideoServiceError::new(
+                "video.package_too_large",
+                "The existing publish ZIP exceeds the bounded archive limit",
+            )
+            .details(json!({
+                "archive_bytes": archive_metadata.len(),
+                "maximum_bytes": MAX_PACKAGE_ARCHIVE_BYTES,
+            })));
+        }
+    }
+    let inventory = package_member_inventory(package_directory, Some(cancel))?;
+    if archive_path.exists() {
+        secure_managed_file(archive_path)?;
+        validate_publish_zip_with_inventory(archive_path, &inventory, Some(cancel))?;
         return Ok(());
     }
     let parent = archive_path.parent().ok_or_else(|| {
@@ -2248,12 +3342,15 @@ fn write_publish_zip_atomic(package_directory: &Path, archive_path: &Path) -> Se
         .and_then(|name| name.to_str())
         .unwrap_or("publish.zip");
     let staging = parent.join(format!(".{archive_name}.{}.partial", new_id()));
-    let write_result = write_publish_zip_file(package_directory, &inventory, &staging);
-    if let Err(error) = write_result {
+    let staging_result = (|| -> ServiceResult<()> {
+        write_publish_zip_file(package_directory, &inventory, &staging, cancel)?;
+        validate_publish_zip_with_inventory(&staging, &inventory, Some(cancel))?;
+        secure_managed_file(&staging)
+    })();
+    if let Err(error) = staging_result {
         let _ = fs::remove_file(&staging);
         return Err(error);
     }
-    validate_publish_zip_with_inventory(&staging, &inventory)?;
     fs::rename(&staging, archive_path).map_err(|error| {
         let _ = fs::remove_file(&staging);
         VideoServiceError::io(
@@ -2263,17 +3360,20 @@ fn write_publish_zip_atomic(package_directory: &Path, archive_path: &Path) -> Se
         )
     })?;
     sync_directory(parent)?;
-    validate_publish_zip_with_inventory(archive_path, &inventory)
+    secure_managed_file(archive_path)?;
+    validate_publish_zip_with_inventory(archive_path, &inventory, Some(cancel))
 }
 
 fn write_publish_zip_file(
     package_directory: &Path,
     inventory: &BTreeMap<String, PackageMemberIntegrity>,
     destination: &Path,
+    cancel: &AtomicBool,
 ) -> ServiceResult<()> {
     let mut archive = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
         .open(destination)
         .map_err(|error| {
             VideoServiceError::io(
@@ -2284,6 +3384,9 @@ fn write_publish_zip_file(
         })?;
     let mut members = Vec::with_capacity(inventory.len());
     for (name, integrity) in inventory {
+        if cancel.load(Ordering::Acquire) {
+            return Err(VideoServiceError::cancelled());
+        }
         let local_header_offset = archive.stream_position().map_err(zip_write_error)?;
         let needs_zip64 = integrity.size >= u32::MAX as u64;
         let mut extra = Vec::new();
@@ -2320,7 +3423,21 @@ fn write_publish_zip_file(
                 error,
             )
         })?;
-        let copied = std::io::copy(&mut source, &mut archive).map_err(zip_write_error)?;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut copied = 0_u64;
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(VideoServiceError::cancelled());
+            }
+            let size = source.read(&mut buffer).map_err(zip_write_error)?;
+            if size == 0 {
+                break;
+            }
+            archive
+                .write_all(&buffer[..size])
+                .map_err(zip_write_error)?;
+            copied = copied.saturating_add(size as u64);
+        }
         if copied != integrity.size {
             return Err(VideoServiceError::new(
                 "video.package_changed",
@@ -2339,6 +3456,9 @@ fn write_publish_zip_file(
     let central_offset = archive.stream_position().map_err(zip_write_error)?;
     let mut member_uses_zip64 = false;
     for member in &members {
+        if cancel.load(Ordering::Acquire) {
+            return Err(VideoServiceError::cancelled());
+        }
         // Recheck the source after copying so concurrent mutation cannot produce
         // an archive whose bytes disagree with the managed directory.
         if fs::metadata(&member.path)
@@ -2351,7 +3471,7 @@ fn write_publish_zip_file(
             })?
             .len()
             != member.integrity.size
-            || sha256_file(&member.path)? != member.integrity.sha256
+            || sha256_file_with_cancel(&member.path, Some(cancel))? != member.integrity.sha256
         {
             return Err(VideoServiceError::new(
                 "video.package_changed",
@@ -2463,9 +3583,18 @@ fn write_publish_zip_file(
     archive.sync_all().map_err(zip_write_error)
 }
 
+#[cfg(test)]
 fn validate_publish_zip(archive_path: &Path, package_directory: &Path) -> ServiceResult<()> {
-    let inventory = package_member_inventory(package_directory)?;
-    validate_publish_zip_with_inventory(archive_path, &inventory)
+    validate_publish_zip_with_cancel(archive_path, package_directory, None)
+}
+
+fn validate_publish_zip_with_cancel(
+    archive_path: &Path,
+    package_directory: &Path,
+    cancel: Option<&AtomicBool>,
+) -> ServiceResult<()> {
+    let inventory = package_member_inventory(package_directory, cancel)?;
+    validate_publish_zip_with_inventory(archive_path, &inventory, cancel)
 }
 
 /// Reads every stored member and verifies CRC32, SHA-256, size, local-header
@@ -2474,6 +3603,7 @@ fn validate_publish_zip(archive_path: &Path, package_directory: &Path) -> Servic
 fn validate_publish_zip_with_inventory(
     archive_path: &Path,
     expected: &BTreeMap<String, PackageMemberIntegrity>,
+    cancel: Option<&AtomicBool>,
 ) -> ServiceResult<()> {
     let metadata = fs::symlink_metadata(archive_path).map_err(|error| {
         VideoServiceError::io(
@@ -2489,9 +3619,22 @@ fn validate_publish_zip_with_inventory(
         ));
     }
     let archive_len = metadata.len();
+    if archive_len > MAX_PACKAGE_ARCHIVE_BYTES {
+        return Err(VideoServiceError::new(
+            "video.package_too_large",
+            "The publish ZIP exceeds the bounded package output limit",
+        )
+        .details(json!({
+            "archive_bytes": archive_len,
+            "maximum_bytes": MAX_PACKAGE_ARCHIVE_BYTES,
+        })));
+    }
     let mut archive = File::open(archive_path).map_err(zip_read_error)?;
     let mut local_members = BTreeMap::<String, (PackageMemberIntegrity, u64)>::new();
     let central_offset = loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(VideoServiceError::cancelled());
+        }
         let header_offset = archive.stream_position().map_err(zip_read_error)?;
         let signature = read_zip_u32(&mut archive)?;
         if signature == ZIP_CENTRAL_DIRECTORY_HEADER {
@@ -2554,6 +3697,9 @@ fn validate_publish_zip_with_inventory(
         let mut sha = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
         while remaining > 0 {
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(VideoServiceError::cancelled());
+            }
             let count = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
             archive
                 .read_exact(&mut buffer[..count])
@@ -2733,7 +3879,7 @@ fn validate_publish_zip_with_inventory(
     Ok(())
 }
 
-fn crc32_file(path: &Path) -> ServiceResult<(u32, u64)> {
+fn crc32_file(path: &Path, cancel: Option<&AtomicBool>) -> ServiceResult<(u32, u64)> {
     let mut file = File::open(path).map_err(|error| {
         VideoServiceError::io(
             "video.package_failed",
@@ -2745,6 +3891,9 @@ fn crc32_file(path: &Path) -> ServiceResult<(u32, u64)> {
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(VideoServiceError::cancelled());
+        }
         let count = file.read(&mut buffer).map_err(|error| {
             VideoServiceError::io(
                 "video.package_failed",
@@ -2956,12 +4105,17 @@ fn sync_directory_tree(path: &Path) -> ServiceResult<()> {
     sync_directory(path)
 }
 
-fn export_package_directory(
+fn export_package_directory<F, G>(
     source: &Path,
     destination_parent: &Path,
     project_name: &str,
     cache_key: &str,
-) -> ServiceResult<PathBuf> {
+    cancel: &AtomicBool,
+    before_publish: F,
+) -> ServiceResult<PathBuf>
+where
+    F: FnOnce() -> ServiceResult<G>,
+{
     let parent = fs::canonicalize(destination_parent).map_err(|error| {
         VideoServiceError::io(
             "video.export_destination_invalid",
@@ -2978,14 +4132,29 @@ fn export_package_directory(
     let slug = filename_slug(project_name);
     let final_path = parent.join(format!("soundar-{slug}-{}", &cache_key[..12]));
     if final_path.exists() {
-        if valid_package_directory(&final_path) && package_directories_equal(source, &final_path)? {
-            return Ok(final_path);
+        match validate_package_directory_with_cancel(&final_path, Some(cancel)) {
+            Ok(()) if package_directories_equal(source, &final_path, Some(cancel))? => {
+                let publication_guard = before_publish()?;
+                drop(publication_guard);
+                return Ok(final_path);
+            }
+            Err(error) if error.code == "video.cancelled" => return Err(error),
+            _ => {}
         }
         return Err(VideoServiceError::new(
             "video.export_conflict",
             "The export destination already contains a conflicting package",
         ));
     }
+    let inventory = package_member_inventory(source, Some(cancel))?;
+    let aggregate_bytes = inventory
+        .values()
+        .fold(0_u64, |total, member| total.saturating_add(member.size));
+    ensure_disk_capacity(
+        &parent,
+        with_disk_headroom(aggregate_bytes, 1),
+        "publish_package_export",
+    )?;
     let staging = parent.join(format!(".soundar-{slug}-{}.partial", new_id()));
     fs::create_dir(&staging).map_err(|error| {
         VideoServiceError::io(
@@ -3022,15 +4191,27 @@ fn export_package_directory(
                     "Managed publish packages may only contain regular files",
                 ));
             }
-            copy_file_verified(&entry.path(), &staging.join(entry.file_name()))?;
+            copy_file_verified(
+                &entry.path(),
+                &staging.join(entry.file_name()),
+                CopiedFileVisibility::UserShareable,
+                cancel,
+            )?;
         }
         sync_directory_tree(&staging)?;
-        validate_package_directory(&staging)
+        validate_package_directory_with_cancel(&staging, Some(cancel))
     })();
     if let Err(error) = copy_result {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
+    let publication_guard = match before_publish() {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
     fs::rename(&staging, &final_path).map_err(|error| {
         let _ = fs::remove_dir_all(&staging);
         VideoServiceError::io(
@@ -3040,13 +4221,18 @@ fn export_package_directory(
         )
     })?;
     sync_directory(&parent)?;
-    validate_package_directory(&final_path)?;
+    drop(publication_guard);
+    validate_package_directory_with_cancel(&final_path, Some(cancel))?;
     Ok(final_path)
 }
 
-fn package_directories_equal(left: &Path, right: &Path) -> ServiceResult<bool> {
-    validate_package_directory(left)?;
-    validate_package_directory(right)?;
+fn package_directories_equal(
+    left: &Path,
+    right: &Path,
+    cancel: Option<&AtomicBool>,
+) -> ServiceResult<bool> {
+    validate_package_directory_with_cancel(left, cancel)?;
+    validate_package_directory_with_cancel(right, cancel)?;
     let inventory = |directory: &Path| -> ServiceResult<BTreeMap<String, String>> {
         let mut files = BTreeMap::new();
         for entry in fs::read_dir(directory).map_err(|error| {
@@ -3073,7 +4259,10 @@ fn package_directories_equal(left: &Path, right: &Path) -> ServiceResult<bool> {
                         "A package filename could not be compared",
                     )
                 })?;
-            files.insert(name, sha256_file(&entry.path())?);
+            if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(VideoServiceError::cancelled());
+            }
+            files.insert(name, sha256_file_with_cancel(&entry.path(), cancel)?);
         }
         Ok(files)
     };
@@ -3269,6 +4458,35 @@ fn timeline_caption_cache_key(
         .build()
         .map(|key| key.into_string())
         .map_err(VideoServiceError::from)
+}
+
+fn effective_timeline_variation_request(request: &TimelineRenderRequest) -> TimelineRenderRequest {
+    let mut effective = request.clone();
+    if request.variation == 0 {
+        return effective;
+    }
+    let layout_index = match request.portrait_layout {
+        PortraitSourceLayout::CenterCrop => 0,
+        PortraitSourceLayout::Contain => 1,
+        PortraitSourceLayout::BlurPad => 2,
+    };
+    let theme_index = match request.caption_theme {
+        CaptionTheme::CleanWhite => 0,
+        CaptionTheme::Calm => 1,
+        CaptionTheme::Kinetic => 2,
+    };
+    let discriminator = usize::from(request.variation);
+    effective.portrait_layout = match (layout_index + discriminator % 3) % 3 {
+        0 => PortraitSourceLayout::CenterCrop,
+        1 => PortraitSourceLayout::Contain,
+        _ => PortraitSourceLayout::BlurPad,
+    };
+    effective.caption_theme = match (theme_index + (discriminator / 3) % 3) % 3 {
+        0 => CaptionTheme::CleanWhite,
+        1 => CaptionTheme::Calm,
+        _ => CaptionTheme::Kinetic,
+    };
+    effective
 }
 
 fn escape_json_pointer_component(value: &str) -> String {
@@ -3474,6 +4692,86 @@ fn require_text<'a>(
     } else {
         Ok(value)
     }
+}
+
+fn narration_replacements_applied(
+    manifest: &VideoProjectManifest,
+    replacements: &[NarrationReplacement],
+) -> bool {
+    replacements.iter().all(|replacement| {
+        let binding = if let Some(binding_id) = replacement.binding_id.as_deref() {
+            manifest
+                .narration_bindings
+                .iter()
+                .find(|binding| binding.id == binding_id)
+        } else if let Some(scene_id) = replacement.scene_id.as_deref() {
+            manifest
+                .narration_bindings
+                .iter()
+                .find(|binding| binding.scene_id.as_deref() == Some(scene_id))
+        } else if let Some(clip_id) = replacement.clip_id.as_deref() {
+            manifest
+                .tracks
+                .iter()
+                .flat_map(|track| track.clips.iter())
+                .find(|clip| clip.id == clip_id)
+                .and_then(|clip| clip.media.render_artifact_id.as_deref())
+                .and_then(|artifact_id| {
+                    manifest
+                        .narration_bindings
+                        .iter()
+                        .find(|binding| binding.render_artifact_id == artifact_id)
+                })
+        } else {
+            None
+        };
+        let Some(binding) = binding else {
+            return false;
+        };
+        let clip_matches = replacement.clip_id.as_deref().is_none_or(|clip_id| {
+            manifest
+                .tracks
+                .iter()
+                .flat_map(|track| track.clips.iter())
+                .any(|clip| {
+                    clip.id == clip_id
+                        && clip.media.render_artifact_id.as_deref()
+                            == Some(binding.render_artifact_id.as_str())
+                })
+        });
+        clip_matches
+            && replacement
+                .scene_id
+                .as_deref()
+                .is_none_or(|scene_id| binding.scene_id.as_deref() == Some(scene_id))
+            && binding.history_id == replacement.history_id
+            && binding.voice_id == replacement.voice_id
+            && binding.model_id == replacement.model_id
+            && binding.speaker == replacement.speaker
+            && binding.language == replacement.language
+    })
+}
+
+fn atempo_filter_chain(rate: f64) -> ServiceResult<String> {
+    if !rate.is_finite() || !(0.125..=8.0).contains(&rate) {
+        return Err(VideoServiceError::new(
+            "video.narration_duration_incompatible",
+            "The replacement speech duration is too different from the reviewed scene timing",
+        )
+        .details(json!({ "tempo_ratio": rate })));
+    }
+    let mut remaining = rate;
+    let mut filters = Vec::new();
+    while remaining > 2.0 {
+        filters.push("atempo=2.0".to_string());
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 {
+        filters.push("atempo=0.5".to_string());
+        remaining /= 0.5;
+    }
+    filters.push(format!("atempo={remaining:.8}"));
+    Ok(filters.join(","))
 }
 
 fn validate_safe_component(value: &str, code: &'static str) -> ServiceResult<()> {
@@ -3901,7 +5199,7 @@ mod tests {
             .expect("first shared GPU lease");
         assert_eq!(state.active.load(Ordering::Acquire), 1);
 
-        let (acquired_sender, acquired_receiver) = mpsc::channel();
+        let (acquired_sender, acquired_receiver) = std::sync::mpsc::channel();
         let second_service = Arc::clone(&workspace.service);
         let second = thread::spawn(move || -> ServiceResult<()> {
             let cancel = AtomicBool::new(false);
@@ -4093,6 +5391,209 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "production network smoke; set SOUNDAR_RUN_NETWORK_VIDEO_SMOKE=1"]
+    fn production_wikimedia_public_domain_link_import_render_and_package() {
+        if std::env::var("SOUNDAR_RUN_NETWORK_VIDEO_SMOKE").as_deref() != Ok("1") {
+            eprintln!("Set SOUNDAR_RUN_NETWORK_VIDEO_SMOKE=1 to run the Wikimedia link smoke");
+            return;
+        }
+        let workspace = TestWorkspace::new();
+        let runtime = workspace.service.runtime_status(true);
+        assert!(runtime.ready_for_link_import, "link runtime must be ready");
+        assert!(runtime.ready_for_local_media, "media runtime must be ready");
+        let source_url =
+            "https://commons.wikimedia.org/wiki/File:CC_Public_Domain_Mark_video_bumper.webm";
+        let preview = workspace
+            .service
+            .preview_link(source_url)
+            .expect("preview one Wikimedia source through the confined proxy");
+        assert!(!preview.canonical_url.is_empty());
+        assert!(preview.rights_confirmation_required);
+        assert!(preview.has_video);
+
+        let project_id = format!("project-{}", new_id());
+        workspace.create_project(&project_id, "Wikimedia public-domain smoke");
+        let import = workspace
+            .service
+            .queue_link_import(
+                LinkImportRequest {
+                    project_id: project_id.clone(),
+                    url: preview.canonical_url.clone(),
+                    actor: "production-link-smoke".to_string(),
+                    rights: LinkRightsRequest {
+                        confirmed_url: preview.canonical_url,
+                        basis: RightsBasis::PublicDomain,
+                        statement: "This exact Wikimedia Commons source is marked for public-domain use; import only this one confirmed source.".to_string(),
+                        confirmed_by: "soundAr production smoke".to_string(),
+                    },
+                    title: Some(preview.title),
+                },
+                None,
+            )
+            .expect("queue authorized Wikimedia import");
+        let imported = workspace
+            .service
+            .wait_for_job(&import.job_id, &project_id, Duration::from_secs(10 * 60))
+            .expect("import authorized Wikimedia source");
+        let imported_manifest: VideoProjectManifest =
+            serde_json::from_value(imported.project.get("manifest").cloned().expect("manifest"))
+                .expect("typed imported manifest");
+        assert_eq!(imported_manifest.rights_confirmations.len(), 1);
+        assert_eq!(
+            imported_manifest.rights_confirmations[0].basis,
+            RightsBasis::PublicDomain
+        );
+        let source = imported_manifest
+            .source_assets
+            .iter()
+            .find(|source| matches!(source.kind, SourceAssetKind::ImportedLink))
+            .expect("authorized link source")
+            .clone();
+        assert!(imported_manifest
+            .render_artifacts
+            .iter()
+            .any(|artifact| artifact.role == RenderArtifactRole::Proxy));
+        let duration_us = source.probe.duration_us.0.min(3_000_000);
+        assert!(duration_us > 0);
+        let source_id = source.id.clone();
+        let reviewed = workspace
+            .service
+            .commit_manifest_mutation(
+                &project_id,
+                "production-link-smoke",
+                "Review a short public-domain source-clock scene",
+                Some("ready"),
+                vec![
+                    "/timeline_duration_us".to_string(),
+                    "/reviewed_scenes".to_string(),
+                    "/tracks".to_string(),
+                ],
+                BTreeSet::from([
+                    RevisionStage::Plan,
+                    RevisionStage::SceneRender,
+                    RevisionStage::Preview,
+                    RevisionStage::FinalRender,
+                    RevisionStage::PublishPackage,
+                ]),
+                move |manifest| {
+                    manifest.timeline_duration_us = Microseconds(duration_us);
+                    manifest.reviewed_scenes = vec![ReviewedScene {
+                        id: "wikimedia-scene".to_string(),
+                        candidate_id: None,
+                        source_asset_id: Some(source_id.clone()),
+                        source_range: Some(TimeRange::new(0, duration_us)?),
+                        timeline_start_us: Microseconds::ZERO,
+                        timeline_duration_us: Microseconds(duration_us),
+                        title: "Public-domain mark".to_string(),
+                        script: "A short public-domain source verification.".to_string(),
+                        review_state: ReviewState::Approved,
+                        revision: 1,
+                    }];
+                    let make_clip = |id: &str| TimelineClip {
+                        id: id.to_string(),
+                        scene_id: Some("wikimedia-scene".to_string()),
+                        media: MediaReference {
+                            source_asset_id: Some(source_id.clone()),
+                            render_artifact_id: None,
+                        },
+                        source_range: TimeRange::new(0, duration_us)
+                            .expect("bounded source-clock range"),
+                        timeline_start_us: Microseconds::ZERO,
+                        timeline_duration_us: Microseconds(duration_us),
+                        playback_rate: RationalRate::ONE,
+                        gain_db_milli: 0,
+                        muted: false,
+                        crop: None,
+                    };
+                    // The canonical assembler carries embedded audio from the
+                    // primary video track and synthesizes silence when absent.
+                    manifest.tracks = vec![TimelineTrack {
+                        id: "wikimedia-video".to_string(),
+                        kind: TrackKind::Video,
+                        clips: vec![make_clip("wikimedia-video-clip")],
+                        preserve_gaps: true,
+                    }];
+                    manifest.gaps.clear();
+                    Ok(())
+                },
+            )
+            .expect("commit reviewed public-domain scene");
+        let expectation = project_expectation(&reviewed).expect("reviewed expectation");
+        let render = workspace
+            .service
+            .queue_timeline_render_batch(
+                TimelineRenderBatchRequest {
+                    base: TimelineRenderRequest {
+                        project_id: project_id.clone(),
+                        expected_revision: expectation.revision,
+                        expected_version_id: expectation.version_id,
+                        profile: TimelineRenderProfile::Final,
+                        caption_theme: CaptionTheme::Calm,
+                        portrait_layout: PortraitSourceLayout::Contain,
+                        actor: "production-link-smoke".to_string(),
+                        variation: 0,
+                        include_title_cards: true,
+                        include_speaker_cards: false,
+                        burn_captions: true,
+                    },
+                    variations: vec![0],
+                },
+                None,
+            )
+            .expect("queue final Wikimedia render");
+        let rendered = workspace
+            .service
+            .wait_for_job(&render.job_id, &project_id, Duration::from_secs(10 * 60))
+            .expect("render final Wikimedia output");
+        let master = rendered
+            .project
+            .get("outputs")
+            .and_then(Value::as_array)
+            .and_then(|outputs| {
+                outputs.iter().find(|output| {
+                    output.get("kind").and_then(Value::as_str) == Some("master")
+                        && output.get("is_primary").and_then(Value::as_bool) == Some(true)
+                })
+            })
+            .expect("playable final master");
+        let master_path =
+            PathBuf::from(value_string(master, "artifact_path").expect("master path"));
+        let master_probe = probe_media(
+            &master_path,
+            runtime.ffprobe.path.as_deref().expect("ffprobe path"),
+        )
+        .expect("probe final master");
+        assert!(master_probe.primary_video_stream.is_some());
+        let package = workspace
+            .service
+            .export_publish_package(PublishPackageRequest {
+                project_id,
+                expected_revision: None,
+                expected_version_id: None,
+                destination_dir: None,
+                actor: "production-link-smoke".to_string(),
+            })
+            .expect("build managed Wikimedia publish package");
+        let archive = PathBuf::from(
+            package
+                .get("archive_path")
+                .and_then(Value::as_str)
+                .expect("package archive"),
+        );
+        validate_publish_zip_with_cancel(
+            &archive,
+            &PathBuf::from(
+                package
+                    .get("package_path")
+                    .and_then(Value::as_str)
+                    .expect("package directory"),
+            ),
+            None,
+        )
+        .expect("validate complete publish ZIP");
+    }
+
+    #[test]
     fn caption_cache_key_changes_with_the_effective_canvas() {
         let mut manifest = empty_manifest("project-caption-cache", "Caption cache");
         let request = TimelineRenderRequest {
@@ -4191,6 +5692,662 @@ mod tests {
     }
 
     #[test]
+    fn real_ffmpeg_narration_revision_preserves_scene_clock_and_is_idempotent() {
+        let workspace = TestWorkspace::new();
+        let runtime = workspace.service.runtime_status(true);
+        if !runtime.ready_for_local_media {
+            eprintln!("Skipping narration revision smoke because FFmpeg/FFprobe are unavailable");
+            return;
+        }
+        let ffmpeg = runtime.ffmpeg.path.as_deref().expect("ffmpeg path");
+        let ffprobe = runtime.ffprobe.path.as_deref().expect("ffprobe path");
+        let script = "A calm replacement voice keeps this exact scene clock.";
+        let project_id = format!("project-{}", new_id());
+        workspace.create_project(&project_id, "Narration revision");
+
+        let original_audio = workspace.root.join("original-narration.wav");
+        let status = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=330:sample_rate=48000:duration=1.5",
+                "-c:a",
+                "pcm_s16le",
+                "-y",
+            ])
+            .arg(&original_audio)
+            .status()
+            .expect("generate original narration fixture");
+        assert!(status.success());
+        let import_job = workspace
+            .service
+            .queue_local_import(
+                LocalImportRequest {
+                    project_id: project_id.clone(),
+                    source_path: original_audio,
+                    actor: "service-test".to_string(),
+                    title: Some("Original narration".to_string()),
+                },
+                None,
+            )
+            .expect("queue narration source");
+        let _imported = workspace
+            .service
+            .wait_for_job(&import_job.job_id, &project_id, Duration::from_secs(120))
+            .expect("import original narration");
+        let scene_id = "scene-narration-one".to_string();
+        let prepared = workspace
+            .service
+            .commit_manifest_mutation(
+                &project_id,
+                "service-test",
+                "Bind the original narration clip to its reviewed scene",
+                Some("ready"),
+                vec!["/reviewed_scenes".to_string(), "/tracks".to_string()],
+                BTreeSet::from([
+                    RevisionStage::Speech,
+                    RevisionStage::SceneRender,
+                    RevisionStage::Preview,
+                    RevisionStage::FinalRender,
+                    RevisionStage::PublishPackage,
+                ]),
+                {
+                    let scene_id = scene_id.clone();
+                    move |manifest| {
+                        let duration = manifest.timeline_duration_us;
+                        manifest.reviewed_scenes = vec![ReviewedScene {
+                            id: scene_id.clone(),
+                            candidate_id: None,
+                            source_asset_id: None,
+                            source_range: None,
+                            timeline_start_us: Microseconds::ZERO,
+                            timeline_duration_us: duration,
+                            title: "Narration scene".to_string(),
+                            script: script.to_string(),
+                            review_state: ReviewState::Approved,
+                            revision: 1,
+                        }];
+                        let clip = manifest
+                            .tracks
+                            .iter_mut()
+                            .find(|track| matches!(track.kind, TrackKind::Audio))
+                            .and_then(|track| track.clips.first_mut())
+                            .ok_or_else(|| {
+                                VideoServiceError::new(
+                                    "video.test_fixture_invalid",
+                                    "Imported audio did not create a timeline clip",
+                                )
+                            })?;
+                        clip.scene_id = Some(scene_id);
+                        Ok(())
+                    }
+                },
+            )
+            .expect("prepare reviewed narration scene");
+        let before: VideoProjectManifest = serde_json::from_value(
+            prepared
+                .get("manifest")
+                .cloned()
+                .expect("prepared manifest"),
+        )
+        .expect("typed prepared manifest");
+        let original_clip = before
+            .tracks
+            .iter()
+            .find(|track| matches!(track.kind, TrackKind::Audio))
+            .and_then(|track| track.clips.first())
+            .expect("original narration clip")
+            .clone();
+
+        let history_audio = workspace
+            .root
+            .join("artifacts")
+            .join("replacement-voice.wav");
+        let status = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=660:sample_rate=24000:duration=0.8",
+                "-c:a",
+                "pcm_s16le",
+                "-y",
+            ])
+            .arg(&history_audio)
+            .status()
+            .expect("generate replacement History fixture");
+        assert!(status.success());
+        let synthesis_request = json!({
+            "model_id": "test/voice-model",
+            "text": script,
+            "speaker": "speaker-new",
+            "voice_name": "New voice",
+            "language": "en",
+            "generation_kind": "speech",
+            "output_format": "wav",
+        });
+        let synthesis_job = workspace
+            .service
+            .store
+            .create_job("synthesis", &synthesis_request)
+            .expect("create synthesis fixture job");
+        workspace
+            .service
+            .store
+            .start_job(&synthesis_job)
+            .expect("start synthesis fixture job");
+        let history_id = format!("history-{}", new_id());
+        workspace
+            .service
+            .store
+            .complete_synthesis(
+                &synthesis_job,
+                &synthesis_request,
+                &json!({
+                    "id": history_id,
+                    "model_id": "test/voice-model",
+                    "engine": "service-test",
+                    "audio_path": history_audio,
+                    "sample_rate": 24_000,
+                    "duration_seconds": 0.8,
+                    "inference_seconds": 0.1,
+                    "rtf": 0.125,
+                    "vram_peak_mb": 0,
+                    "waveform": [0.2, 0.8],
+                }),
+            )
+            .expect("register replacement in History");
+        let expectation = project_expectation(&prepared).expect("prepared expectation");
+        let parent_job_id = workspace
+            .service
+            .store
+            .create_job(
+                "video_regenerate_narration",
+                &json!({ "project_id": project_id, "scene_id": scene_id }),
+            )
+            .expect("create narration parent job");
+        workspace
+            .service
+            .store
+            .start_job(&parent_job_id)
+            .expect("start narration parent job");
+        let request = ReplaceNarrationRequest {
+            project_id: project_id.clone(),
+            expected_revision: expectation.revision,
+            expected_version_id: expectation.version_id,
+            actor: "service-test".to_string(),
+            parent_job_id: Some(parent_job_id),
+            replacements: vec![NarrationReplacement {
+                binding_id: None,
+                scene_id: Some(scene_id.clone()),
+                clip_id: None,
+                history_id: history_id.clone(),
+                voice_id: "voice-new".to_string(),
+                model_id: "test/voice-model".to_string(),
+                speaker: "speaker-new".to_string(),
+                language: "en".to_string(),
+            }],
+        };
+        let replacement = workspace
+            .service
+            .queue_narration_replacement(request.clone(), None)
+            .expect("queue narration replacement");
+        let replaced = workspace
+            .service
+            .wait_for_job(&replacement.job_id, &project_id, Duration::from_secs(120))
+            .expect("narration replacement completes");
+        let manifest: VideoProjectManifest =
+            serde_json::from_value(replaced.project.get("manifest").cloned().expect("manifest"))
+                .expect("typed replaced manifest");
+        assert_eq!(manifest.timeline_duration_us, before.timeline_duration_us);
+        let binding = manifest
+            .narration_bindings
+            .iter()
+            .find(|binding| binding.scene_id.as_deref() == Some(scene_id.as_str()))
+            .expect("active narration binding");
+        assert_eq!(binding.history_id, history_id);
+        assert_eq!(binding.voice_id, "voice-new");
+        let replaced_clip = manifest
+            .tracks
+            .iter()
+            .find(|track| matches!(track.kind, TrackKind::Audio))
+            .and_then(|track| track.clips.first())
+            .expect("replaced narration clip");
+        assert_eq!(
+            replaced_clip.media.render_artifact_id.as_deref(),
+            Some(binding.render_artifact_id.as_str())
+        );
+        assert_eq!(
+            replaced_clip.timeline_start_us,
+            original_clip.timeline_start_us
+        );
+        assert_eq!(
+            replaced_clip.timeline_duration_us,
+            original_clip.timeline_duration_us
+        );
+        assert_eq!(replaced_clip.playback_rate, RationalRate::ONE);
+        let artifact = manifest
+            .render_artifacts
+            .iter()
+            .find(|artifact| artifact.id == binding.render_artifact_id)
+            .expect("conformed narration artifact");
+        assert_eq!(
+            artifact.duration_us,
+            Some(original_clip.timeline_duration_us)
+        );
+        let conformed_path = workspace
+            .service
+            .resolve_managed_path(&artifact.managed_path)
+            .expect("managed conformed narration");
+        let conformed_probe = probe_media(&conformed_path, ffprobe).expect("probe narration");
+        assert!(
+            (conformed_probe.duration_us - original_clip.timeline_duration_us.0).abs() <= 50_000,
+            "replacement must preserve the source-clock scene duration"
+        );
+        let invalidated = &manifest
+            .revision_history
+            .last()
+            .expect("narration revision")
+            .invalidated_stages;
+        assert_eq!(
+            invalidated,
+            &BTreeSet::from([
+                RevisionStage::Speech,
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ])
+        );
+
+        let adopted = workspace
+            .service
+            .queue_narration_replacement(request, None)
+            .expect("adopt durable narration child");
+        assert_eq!(adopted.job_id, replacement.job_id);
+        let adopted = workspace
+            .service
+            .wait_for_job(&adopted.job_id, &project_id, Duration::from_secs(5))
+            .expect("adopted child remains complete");
+        assert_eq!(
+            adopted.project.get("revision").and_then(Value::as_i64),
+            replaced.project.get("revision").and_then(Value::as_i64),
+            "idempotent adoption must not create another manifest revision"
+        );
+
+        let before_cancel = workspace
+            .service
+            .get_project(&project_id)
+            .expect("project before parent cancellation");
+        let cancel_expectation =
+            project_expectation(&before_cancel).expect("cancellation expectation");
+        let cancel_parent_job_id = workspace
+            .service
+            .store
+            .create_job(
+                "video_regenerate_narration",
+                &json!({ "project_id": project_id, "scene_id": scene_id }),
+            )
+            .expect("create cancellation parent job");
+        workspace
+            .service
+            .store
+            .start_job(&cancel_parent_job_id)
+            .expect("start cancellation parent job");
+        let cancel_request = ReplaceNarrationRequest {
+            project_id: project_id.clone(),
+            expected_revision: cancel_expectation.revision,
+            expected_version_id: cancel_expectation.version_id,
+            actor: "service-test".to_string(),
+            parent_job_id: Some(cancel_parent_job_id.clone()),
+            replacements: vec![NarrationReplacement {
+                binding_id: None,
+                scene_id: Some(scene_id.clone()),
+                clip_id: None,
+                history_id: history_id.clone(),
+                voice_id: "voice-cancelled-before-commit".to_string(),
+                model_id: "test/voice-model".to_string(),
+                speaker: "speaker-new".to_string(),
+                language: "en".to_string(),
+            }],
+        };
+        let cancellation_observed = Arc::new(AtomicBool::new(false));
+        let callback_service = Arc::clone(&workspace.service);
+        let callback_parent_id = cancel_parent_job_id.clone();
+        let callback_observed = Arc::clone(&cancellation_observed);
+        let cancel_callback: ProgressCallback = Arc::new(move |progress| {
+            if progress.phase == "narration_take_ready"
+                && !callback_observed.swap(true, Ordering::AcqRel)
+            {
+                let _ = callback_service.cancel_job(&callback_parent_id);
+            }
+        });
+        let cancelled = workspace
+            .service
+            .queue_narration_replacement(cancel_request, Some(cancel_callback))
+            .expect("queue cancellation narration replacement");
+        let cancelled_error = workspace
+            .service
+            .wait_for_job(&cancelled.job_id, &project_id, Duration::from_secs(120))
+            .expect_err("parent cancellation must stop the child before commit");
+        assert_eq!(cancelled_error.code, "video.cancelled");
+        assert!(
+            cancellation_observed.load(Ordering::Acquire),
+            "the test must cancel after the prepared take and before manifest commit"
+        );
+        let after_cancel = workspace
+            .service
+            .get_project(&project_id)
+            .expect("project after parent cancellation");
+        assert_eq!(
+            project_expectation(&after_cancel).expect("unchanged expectation"),
+            project_expectation(&before_cancel).expect("baseline expectation"),
+            "parent cancellation must leave the project revision and version unchanged"
+        );
+        let after_cancel_manifest: VideoProjectManifest =
+            serde_json::from_value(after_cancel.get("manifest").cloned().expect("manifest"))
+                .expect("typed manifest after parent cancellation");
+        assert!(
+            after_cancel_manifest
+                .narration_bindings
+                .iter()
+                .all(|binding| { binding.voice_id != "voice-cancelled-before-commit" }),
+            "a cancelled parent must never publish the prepared narration binding"
+        );
+    }
+
+    #[test]
+    fn generated_history_audio_origin_survives_cancelled_restart_and_resume() {
+        let workspace = TestWorkspace::new();
+        let runtime = workspace.service.runtime_status(true);
+        if !runtime.ready_for_local_media {
+            eprintln!("Skipping generated-origin smoke because FFmpeg/FFprobe are unavailable");
+            return;
+        }
+        let ffmpeg = runtime.ffmpeg.path.as_deref().expect("ffmpeg path");
+        let project_id = format!("project-{}", new_id());
+        workspace.create_project(&project_id, "Prompt-generated narration import");
+        let generated_audio = workspace
+            .root
+            .join("artifacts")
+            .join("prompt-generated-history.wav");
+        let status = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=510:sample_rate=24000:duration=1.2",
+                "-c:a",
+                "pcm_s16le",
+                "-y",
+            ])
+            .arg(&generated_audio)
+            .status()
+            .expect("generate prompt History fixture");
+        assert!(status.success());
+        let synthesis_request = json!({
+            "model_id": "test/prompt-voice-model",
+            "text": "A prompt-generated narration artifact.",
+            "speaker": "prompt-speaker",
+            "voice_name": "Prompt voice",
+            "language": "en",
+            "generation_kind": "speech",
+            "output_format": "wav",
+        });
+        let synthesis_job = workspace
+            .service
+            .store
+            .create_job("synthesis", &synthesis_request)
+            .expect("create synthesis origin job");
+        workspace
+            .service
+            .store
+            .start_job(&synthesis_job)
+            .expect("start synthesis origin job");
+        let history_id = format!("history-{}", new_id());
+        workspace
+            .service
+            .store
+            .complete_synthesis(
+                &synthesis_job,
+                &synthesis_request,
+                &json!({
+                    "id": history_id,
+                    "model_id": "test/prompt-voice-model",
+                    "engine": "service-test-prompt-engine",
+                    "audio_path": generated_audio,
+                    "sample_rate": 24_000,
+                    "duration_seconds": 1.2,
+                    "inference_seconds": 0.1,
+                    "rtf": 0.0833,
+                    "vram_peak_mb": 0,
+                    "waveform": [0.1, 0.7, 0.2],
+                }),
+            )
+            .expect("register prompt-generated History artifact");
+
+        // Cancel exactly at the first durable progress event. This leaves the
+        // queue-produced request available for a restart-style resume without
+        // importing or duplicating the source first.
+        let cancel_service = Arc::clone(&workspace.service);
+        let cancel_once = Arc::new(AtomicBool::new(false));
+        let callback_once = Arc::clone(&cancel_once);
+        let cancel_callback: ProgressCallback = Arc::new(move |progress| {
+            if progress.phase == "validating" && !callback_once.swap(true, Ordering::AcqRel) {
+                let _ = cancel_service.cancel_job(&progress.job_id);
+            }
+        });
+        let queued = workspace
+            .service
+            .queue_local_import(
+                LocalImportRequest {
+                    project_id: project_id.clone(),
+                    source_path: generated_audio.clone(),
+                    actor: "service-test".to_string(),
+                    title: Some("Prompt narration".to_string()),
+                },
+                Some(cancel_callback),
+            )
+            .expect("queue prompt-generated History import");
+        let cancelled = workspace
+            .service
+            .wait_for_job(&queued.job_id, &project_id, Duration::from_secs(30))
+            .expect_err("first import attempt is cancelled before copy");
+        assert_eq!(cancelled.code, "video.cancelled");
+        assert!(cancel_once.load(Ordering::Acquire));
+
+        let (resumed_job, durable_value) = workspace
+            .service
+            .store
+            .resume_video_job(&queued.job_id, &["video_import_local"])
+            .expect("rearm durable generated import");
+        assert_eq!(
+            resumed_job.get("status").and_then(Value::as_str),
+            Some("preparing"),
+            "the durable queue presentation should return to its active initial phase"
+        );
+        let durable: DurableLocalImportRequest =
+            serde_json::from_value(durable_value.clone()).expect("typed durable local import");
+        assert_eq!(durable.source_path, generated_audio);
+        assert_eq!(
+            durable.origin,
+            DurableLocalImportOrigin::SoundArHistory {
+                history_id: history_id.clone(),
+                generation_job_id: synthesis_job.clone(),
+                generation_kind: "speech".to_string(),
+                model_id: "test/prompt-voice-model".to_string(),
+                voice: "Prompt voice".to_string(),
+                engine: "service-test-prompt-engine".to_string(),
+            },
+            "the queue must persist immutable History identity in the durable request"
+        );
+        workspace
+            .service
+            .dispatch_resumed_job(
+                queued.job_id.clone(),
+                "video_import_local",
+                durable_value,
+                None,
+            )
+            .expect("dispatch restart-style local import");
+        let imported = workspace
+            .service
+            .wait_for_job(&queued.job_id, &project_id, Duration::from_secs(120))
+            .expect("resumed generated import completes");
+        let manifest: VideoProjectManifest =
+            serde_json::from_value(imported.project.get("manifest").cloned().expect("manifest"))
+                .expect("typed generated import manifest");
+        let source = manifest
+            .source_assets
+            .iter()
+            .find(|source| matches!(source.kind, SourceAssetKind::SoundArSpeech))
+            .expect("soundAr speech source");
+        assert_eq!(source.provenance.kind, ProvenanceKind::GeneratedLocally);
+        assert_eq!(
+            source
+                .provenance
+                .metadata
+                .get("history_id")
+                .and_then(Value::as_str),
+            Some(history_id.as_str())
+        );
+        assert_eq!(
+            source
+                .provenance
+                .metadata
+                .get("generation_job_id")
+                .and_then(Value::as_str),
+            Some(synthesis_job.as_str())
+        );
+        assert_eq!(
+            source
+                .provenance
+                .metadata
+                .get("model_id")
+                .and_then(Value::as_str),
+            Some("test/prompt-voice-model")
+        );
+        assert_eq!(
+            source
+                .provenance
+                .metadata
+                .get("voice")
+                .and_then(Value::as_str),
+            Some("Prompt voice")
+        );
+        let assets = workspace
+            .service
+            .store
+            .list_video_assets(&project_id)
+            .expect("list generated video assets");
+        assert!(assets.iter().any(|asset| {
+            asset.get("id").and_then(Value::as_str) == Some(source.id.as_str())
+                && asset.get("kind").and_then(Value::as_str) == Some("speech")
+                && asset.get("source_kind").and_then(Value::as_str) == Some("generated")
+        }));
+        assert_eq!(
+            manifest
+                .source_assets
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .provenance
+                        .metadata
+                        .get("history_id")
+                        .and_then(Value::as_str)
+                        == Some(history_id.as_str())
+                })
+                .count(),
+            1,
+            "resume must import one managed speech source, never duplicate History"
+        );
+
+        let tamper_project_id = format!("project-{}", new_id());
+        workspace.create_project(&tamper_project_id, "Tampered History rejection");
+        let tamper_project_before = workspace
+            .service
+            .get_project(&tamper_project_id)
+            .expect("tamper project baseline");
+        let mut tampered_request = durable;
+        tampered_request.project_id = tamper_project_id.clone();
+        let tampered_job_id = workspace
+            .service
+            .store
+            .create_job(
+                "video_import_local",
+                &serde_json::to_value(&tampered_request).expect("durable tamper request"),
+            )
+            .expect("create durable tamper import");
+        assert!(workspace
+            .service
+            .store
+            .cancel_job(&tampered_job_id)
+            .expect("cancel durable tamper import"));
+        let (_, resumed_tamper_request) = workspace
+            .service
+            .store
+            .resume_video_job(&tampered_job_id, &["video_import_local"])
+            .expect("rearm durable tamper import");
+        OpenOptions::new()
+            .append(true)
+            .open(&generated_audio)
+            .and_then(|mut file| file.write_all(b"tampered-after-queue"))
+            .expect("tamper registered History after durable queueing");
+        workspace
+            .service
+            .dispatch_resumed_job(
+                tampered_job_id.clone(),
+                "video_import_local",
+                resumed_tamper_request,
+                None,
+            )
+            .expect("dispatch tampered durable import");
+        let tamper_error = workspace
+            .service
+            .wait_for_job(
+                &tampered_job_id,
+                &tamper_project_id,
+                Duration::from_secs(30),
+            )
+            .expect_err("tampered History must fail exact path/integrity revalidation");
+        assert_eq!(tamper_error.code, "video.job_failed");
+        assert!(
+            tamper_error
+                .message
+                .contains("registered soundAr audio changed"),
+            "the durable resume must report the History integrity failure: {}",
+            tamper_error.message
+        );
+        let tamper_project_after = workspace
+            .service
+            .get_project(&tamper_project_id)
+            .expect("tamper project after rejection");
+        assert_eq!(
+            project_expectation(&tamper_project_after).expect("tamper current expectation"),
+            project_expectation(&tamper_project_before).expect("tamper baseline expectation"),
+            "a changed History artifact must not advance the video project"
+        );
+        let tamper_manifest: VideoProjectManifest = serde_json::from_value(
+            tamper_project_after
+                .get("manifest")
+                .cloned()
+                .expect("tamper manifest"),
+        )
+        .expect("typed tamper manifest");
+        assert!(tamper_manifest.source_assets.is_empty());
+    }
+
+    #[test]
     fn real_ffmpeg_ingest_audio_video_render_and_package_smoke() {
         let workspace = TestWorkspace::new();
         let runtime = workspace.service.runtime_status(true);
@@ -4260,6 +6417,27 @@ mod tests {
             .render_artifacts
             .iter()
             .any(|artifact| artifact.role == RenderArtifactRole::Waveform));
+        for managed_path in imported_manifest
+            .source_assets
+            .iter()
+            .map(|source| source.managed_path.as_str())
+            .chain(
+                imported_manifest
+                    .render_artifacts
+                    .iter()
+                    .map(|artifact| artifact.managed_path.as_str()),
+            )
+        {
+            let path = workspace
+                .service
+                .resolve_managed_path(managed_path)
+                .expect("resolve private ingest artifact");
+            assert_eq!(
+                fs::metadata(path).expect("ingest artifact mode").mode() & 0o7777,
+                PRIVATE_FILE_MODE,
+                "managed source/proxy/thumbnail/waveform files stay owner-only"
+            );
+        }
         let first_proxy = imported_manifest
             .render_artifacts
             .iter()
@@ -4515,6 +6693,17 @@ mod tests {
                 .expect("timeline manifest"),
         )
         .expect("typed rendered timeline");
+        for artifact in &first_timeline_manifest.render_artifacts {
+            let path = workspace
+                .service
+                .resolve_managed_path(&artifact.managed_path)
+                .expect("resolve private timeline artifact");
+            assert_eq!(
+                fs::metadata(path).expect("timeline artifact mode").mode() & 0o7777,
+                PRIVATE_FILE_MODE,
+                "ASS documents and cached timeline renders stay owner-only"
+            );
+        }
         let timeline_artifact = first_timeline_manifest
             .render_artifacts
             .iter()
@@ -4587,8 +6776,302 @@ mod tests {
                 .count(),
             1
         );
+        let batch_base_expectation =
+            project_expectation(&cached_timeline.project).expect("batch base expectation");
+        let batch_base_revision = batch_base_expectation.revision;
+        let batch = workspace
+            .service
+            .queue_timeline_render_batch(
+                TimelineRenderBatchRequest {
+                    base: TimelineRenderRequest {
+                        project_id: video_project.clone(),
+                        expected_revision: batch_base_expectation.revision,
+                        expected_version_id: batch_base_expectation.version_id,
+                        profile: TimelineRenderProfile::Final,
+                        caption_theme: CaptionTheme::Calm,
+                        portrait_layout: PortraitSourceLayout::CenterCrop,
+                        actor: "service-test".to_string(),
+                        variation: 0,
+                        include_title_cards: true,
+                        include_speaker_cards: true,
+                        burn_captions: true,
+                    },
+                    variations: vec![0, 1, 2],
+                },
+                None,
+            )
+            .expect("queue frozen final variation batch");
+        let batch_result = workspace
+            .service
+            .wait_for_job(&batch.job_id, &video_project, Duration::from_secs(300))
+            .expect("final variation batch completes");
+        let batch_expectation =
+            project_expectation(&batch_result.project).expect("batch result expectation");
+        assert_eq!(
+            batch_expectation.revision,
+            batch_base_revision + 1,
+            "three variations must create exactly one artifact revision"
+        );
+        let current_batch_outputs = batch_result
+            .project
+            .get("outputs")
+            .and_then(Value::as_array)
+            .expect("batch outputs")
+            .iter()
+            .filter(|output| {
+                output.get("version_id").and_then(Value::as_str)
+                    == Some(batch_expectation.version_id.as_str())
+                    && output.get("job_id").and_then(Value::as_str) == Some(batch.job_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(current_batch_outputs.len(), 3);
+        assert_eq!(
+            current_batch_outputs
+                .iter()
+                .filter(|output| output.get("is_primary").and_then(Value::as_bool) == Some(true))
+                .count(),
+            1
+        );
+        assert_eq!(
+            current_batch_outputs
+                .iter()
+                .filter(|output| output.get("kind").and_then(Value::as_str) == Some("variation"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            current_batch_outputs
+                .iter()
+                .map(|output| output
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .expect("output sha"))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3,
+            "variation layout/style choices must produce distinct playable masters"
+        );
+        let batch_manifest: VideoProjectManifest = serde_json::from_value(
+            batch_result
+                .project
+                .get("manifest")
+                .cloned()
+                .expect("batch manifest"),
+        )
+        .expect("typed batch manifest");
+        assert_eq!(
+            batch_manifest
+                .revision_history
+                .iter()
+                .filter(|record| record.revision as i64 > batch_base_revision)
+                .count(),
+            1
+        );
+
+        let replay = workspace
+            .service
+            .queue_timeline_render_batch(
+                TimelineRenderBatchRequest {
+                    base: TimelineRenderRequest {
+                        project_id: video_project.clone(),
+                        expected_revision: batch_expectation.revision,
+                        expected_version_id: batch_expectation.version_id.clone(),
+                        profile: TimelineRenderProfile::Final,
+                        caption_theme: CaptionTheme::Calm,
+                        portrait_layout: PortraitSourceLayout::CenterCrop,
+                        actor: "service-test".to_string(),
+                        variation: 0,
+                        include_title_cards: true,
+                        include_speaker_cards: true,
+                        burn_captions: true,
+                    },
+                    variations: vec![0, 1, 2],
+                },
+                None,
+            )
+            .expect("queue cached variation batch replay");
+        let replay = workspace
+            .service
+            .wait_for_job(&replay.job_id, &video_project, Duration::from_secs(120))
+            .expect("cached batch replay completes");
+        assert_eq!(
+            replay.project.get("revision").and_then(Value::as_i64),
+            Some(batch_expectation.revision),
+            "cache/idempotency replay must not advance the artifact revision"
+        );
+        assert_eq!(
+            replay
+                .project
+                .get("outputs")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            batch_result
+                .project
+                .get("outputs")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            "current-output identity adoption must not duplicate the batch"
+        );
+
+        let crash_base = project_expectation(&replay.project).expect("crash batch base");
+        let crash_request = TimelineRenderBatchRequest {
+            base: TimelineRenderRequest {
+                project_id: video_project.clone(),
+                expected_revision: crash_base.revision,
+                expected_version_id: crash_base.version_id,
+                profile: TimelineRenderProfile::Final,
+                caption_theme: CaptionTheme::Calm,
+                portrait_layout: PortraitSourceLayout::CenterCrop,
+                actor: "service-test".to_string(),
+                variation: 0,
+                include_title_cards: true,
+                include_speaker_cards: true,
+                burn_captions: true,
+            },
+            variations: vec![3],
+        };
+        let crash_job = workspace
+            .service
+            .store
+            .create_job(
+                "video_render_timeline_batch_final",
+                &serde_json::to_value(&crash_request).expect("durable crash batch"),
+            )
+            .expect("create crash-window batch job");
+        workspace
+            .service
+            .perform_timeline_render_batch(
+                &crash_job,
+                &crash_request,
+                &AtomicBool::new(false),
+                None,
+            )
+            .expect("atomic batch commit before simulated crash");
+        let after_atomic_commit = workspace
+            .service
+            .get_project(&video_project)
+            .expect("project after atomic batch commit");
+        let crash_committed_expectation =
+            project_expectation(&after_atomic_commit).expect("atomic batch expectation");
+        let crash_output_count = after_atomic_commit
+            .get("outputs")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .expect("output count after atomic batch");
+        workspace
+            .service
+            .store
+            .fail_job(&crash_job, "simulated crash after atomic commit")
+            .expect("mark crash-window job resumable");
+        let recovered = workspace
+            .service
+            .resume_job(&crash_job, None)
+            .expect("resume atomically committed batch");
+        let recovered = workspace
+            .service
+            .wait_for_job(&recovered.job_id, &video_project, Duration::from_secs(30))
+            .expect("adopt complete batch after restart");
+        assert_eq!(
+            project_expectation(&recovered.project).expect("recovered expectation"),
+            crash_committed_expectation,
+            "post-commit recovery must not create a duplicate artifact revision"
+        );
+        assert_eq!(
+            recovered
+                .project
+                .get("outputs")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(crash_output_count),
+            "post-commit recovery must adopt, not duplicate, output rows"
+        );
+
+        let stale_base = project_expectation(&recovered.project).expect("stale batch base");
+        let output_count_before_stale = recovered
+            .project
+            .get("outputs")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .expect("output count before stale batch");
+        let advanced = Arc::new(AtomicBool::new(false));
+        let advance_flag = Arc::clone(&advanced);
+        let advance_service = Arc::clone(&workspace.service);
+        let advance_project = video_project.clone();
+        let callback: ProgressCallback = Arc::new(move |progress| {
+            if progress.phase == "assembling"
+                && advance_flag
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                advance_service
+                    .commit_manifest_mutation(
+                        &advance_project,
+                        "concurrent-service-test",
+                        "Advance editorial state while a frozen batch is rendering",
+                        Some("draft"),
+                        vec!["/name".to_string()],
+                        BTreeSet::from([RevisionStage::PublishPackage]),
+                        |manifest| {
+                            manifest.name = "Imported reel concurrently revised".to_string();
+                            Ok(())
+                        },
+                    )
+                    .expect("concurrent editorial revision");
+            }
+        });
+        let stale_batch = workspace
+            .service
+            .queue_timeline_render_batch(
+                TimelineRenderBatchRequest {
+                    base: TimelineRenderRequest {
+                        project_id: video_project.clone(),
+                        expected_revision: stale_base.revision,
+                        expected_version_id: stale_base.version_id,
+                        profile: TimelineRenderProfile::Preview,
+                        caption_theme: CaptionTheme::Kinetic,
+                        portrait_layout: PortraitSourceLayout::BlurPad,
+                        actor: "service-test".to_string(),
+                        variation: 0,
+                        include_title_cards: false,
+                        include_speaker_cards: false,
+                        burn_captions: true,
+                    },
+                    variations: vec![0, 1],
+                },
+                Some(callback),
+            )
+            .expect("queue intentionally stale variation batch");
+        let stale_error = workspace
+            .service
+            .wait_for_job(
+                &stale_batch.job_id,
+                &video_project,
+                Duration::from_secs(180),
+            )
+            .expect_err("a concurrent edit must reject the entire frozen batch");
+        assert_eq!(stale_error.code, "video.job_failed");
+        assert!(advanced.load(Ordering::Acquire));
+        let after_stale = workspace
+            .service
+            .get_project(&video_project)
+            .expect("project after stale batch");
+        assert_eq!(
+            after_stale
+                .get("outputs")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(output_count_before_stale),
+            "a rejected frozen batch must publish zero partial outputs"
+        );
+        assert!(!after_stale
+            .get("outputs")
+            .and_then(Value::as_array)
+            .is_some_and(|outputs| outputs.iter().any(|output| {
+                output.get("job_id").and_then(Value::as_str) == Some(stale_batch.job_id.as_str())
+            })));
+
         let cancellation_expectation =
-            project_expectation(&cached_timeline.project).expect("cancellation expectation");
+            project_expectation(&after_stale).expect("cancellation expectation");
         let cancellable = workspace
             .service
             .queue_timeline_render(
@@ -4729,6 +7212,28 @@ mod tests {
         assert!(valid_package_directory(&package_path));
         validate_publish_zip(&archive_path, &package_path).expect("managed ZIP integrity");
         assert_eq!(
+            fs::metadata(&package_path)
+                .expect("package directory mode")
+                .mode()
+                & 0o7777,
+            PRIVATE_DIRECTORY_MODE
+        );
+        for entry in fs::read_dir(&package_path).expect("private package members") {
+            let path = entry.expect("package entry").path();
+            assert_eq!(
+                fs::metadata(path).expect("package member mode").mode() & 0o7777,
+                PRIVATE_FILE_MODE,
+                "managed package members stay owner-only"
+            );
+        }
+        assert_eq!(
+            fs::metadata(&archive_path)
+                .expect("managed ZIP mode")
+                .mode()
+                & 0o7777,
+            PRIVATE_FILE_MODE
+        );
+        assert_eq!(
             package
                 .get("output")
                 .and_then(|output| output.get("mime_type"))
@@ -4760,7 +7265,7 @@ mod tests {
         );
         validate_package_directory(&extracted_path).expect("extracted package integrity");
         assert!(
-            package_directories_equal(&package_path, &extracted_path)
+            package_directories_equal(&package_path, &extracted_path, None)
                 .expect("compare extracted hashes"),
             "every extracted ZIP member must match the managed package"
         );
@@ -4852,6 +7357,13 @@ mod tests {
                 .ino(),
             "user exports must never hard-link managed artifacts"
         );
+        assert_eq!(
+            fs::metadata(&exported_master)
+                .expect("shareable exported master mode")
+                .mode()
+                & 0o7777,
+            SHAREABLE_FILE_MODE
+        );
         OpenOptions::new()
             .append(true)
             .open(&exported_master)
@@ -4891,6 +7403,509 @@ mod tests {
             })
             .expect_err("an older-version master must not be packaged for a revised timeline");
         assert_eq!(stale_error.code, "video.final_master_required");
+    }
+
+    #[test]
+    fn managed_storage_is_private_and_user_exports_remain_independent() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        workspace.create_project(&project_id, "Private storage contract");
+        let project_directory = workspace
+            .service
+            .project_dir(&project_id)
+            .expect("private project directory");
+        let cache_key = sha256_bytes(b"private-mode-fixture");
+        let managed_file = workspace
+            .service
+            .cache_path("mode-test", &cache_key, "json")
+            .expect("private cache path");
+        write_new_file(&managed_file, br#"{"private":true}"#).expect("private managed file");
+
+        for directory in [
+            workspace.service.video_root.as_path(),
+            project_directory.as_path(),
+            managed_file.parent().expect("cache parent"),
+        ] {
+            assert_eq!(
+                fs::metadata(directory).expect("directory metadata").mode() & 0o7777,
+                PRIVATE_DIRECTORY_MODE,
+                "managed directories must be owner-only: {}",
+                directory.display()
+            );
+        }
+        assert_eq!(
+            fs::metadata(&managed_file)
+                .expect("managed file metadata")
+                .mode()
+                & 0o7777,
+            PRIVATE_FILE_MODE
+        );
+
+        // Opening an older app-owned artifact repairs ambient permissions at
+        // the same service boundary used by Projects, History and the agent.
+        fs::set_permissions(&managed_file, fs::Permissions::from_mode(0o644))
+            .expect("loosen fixture permissions");
+        workspace
+            .service
+            .resolve_absolute_managed_path(&managed_file)
+            .expect("managed resolution repairs permissions");
+        assert_eq!(
+            fs::metadata(&managed_file)
+                .expect("repaired metadata")
+                .mode()
+                & 0o7777,
+            PRIVATE_FILE_MODE
+        );
+
+        let user_copy = workspace.root.join("shareable-copy.json");
+        copy_file_verified(
+            &managed_file,
+            &user_copy,
+            CopiedFileVisibility::UserShareable,
+            &AtomicBool::new(false),
+        )
+        .expect("shareable independent copy");
+        assert_eq!(
+            fs::metadata(&user_copy).expect("shareable metadata").mode() & 0o7777,
+            SHAREABLE_FILE_MODE
+        );
+        assert_ne!(
+            fs::metadata(&managed_file).expect("managed inode").ino(),
+            fs::metadata(&user_copy).expect("export inode").ino(),
+            "shareable copies must not alias managed artifacts"
+        );
+
+        let external = workspace.root.join("external-hardlink-source.json");
+        fs::write(&external, br#"{"external":true}"#).expect("external fixture");
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o644))
+            .expect("external fixture permissions");
+        let aliased_managed = workspace
+            .service
+            .cache_path(
+                "mode-test",
+                &sha256_bytes(b"external-hardlink-alias"),
+                "json",
+            )
+            .expect("managed alias path");
+        fs::hard_link(&external, &aliased_managed).expect("hard-link attack fixture");
+        let error = secure_managed_file(&aliased_managed)
+            .expect_err("multi-link managed artifacts must fail closed");
+        assert_eq!(error.code, "video.unsafe_artifact_path");
+        assert_eq!(
+            fs::metadata(&external)
+                .expect("external mode remains visible")
+                .mode()
+                & 0o7777,
+            0o644,
+            "rejecting a managed hard-link must not chmod its external alias"
+        );
+
+        let outside = workspace.root.join("outside-directory");
+        fs::create_dir(&outside).expect("outside directory");
+        let unsafe_link = workspace.service.video_root.join("unsafe-link");
+        std::os::unix::fs::symlink(&outside, &unsafe_link).expect("managed symlink fixture");
+        let error = secure_managed_directory_path(&workspace.service.video_root, &unsafe_link)
+            .expect_err("managed directory symlinks must fail closed");
+        assert_eq!(error.code, "video.unsafe_storage_path");
+    }
+
+    #[test]
+    fn source_disk_duration_and_package_limits_fail_before_expensive_work() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        workspace.create_project(&project_id, "Resource bounds");
+        let oversized = workspace.root.join("oversized-source.mp4");
+        File::create(&oversized)
+            .and_then(|file| file.set_len(MAX_SOURCE_BYTES + 1))
+            .expect("sparse oversized fixture");
+        let error = workspace
+            .service
+            .queue_local_import(
+                LocalImportRequest {
+                    project_id,
+                    source_path: oversized,
+                    actor: "service-test".to_string(),
+                    title: None,
+                },
+                None,
+            )
+            .expect_err("oversized source must fail before FFprobe or job creation");
+        assert_eq!(error.code, "video.source_too_large");
+
+        let error = ensure_disk_capacity(
+            &workspace.service.video_root,
+            u64::MAX,
+            "impossible-test-allocation",
+        )
+        .expect_err("impossible disk reservation must fail");
+        assert_eq!(error.code, "video.insufficient_disk_space");
+        assert!(error.retryable);
+
+        assert_eq!(
+            render_timeout(Some(1_000_000), RenderProfile::Proxy).expect("short proxy deadline"),
+            Duration::from_secs(5 * 60)
+        );
+        assert_eq!(
+            render_timeout(Some(1_000_000), RenderProfile::Final).expect("short final deadline"),
+            Duration::from_secs(10 * 60)
+        );
+        assert_eq!(
+            render_timeout(Some(MAX_MEDIA_DURATION_US), RenderProfile::Final)
+                .expect("bounded six-hour deadline"),
+            MAX_RENDER_DURATION
+        );
+        assert_eq!(
+            render_timeout(Some(MAX_MEDIA_DURATION_US + 1), RenderProfile::Preview)
+                .expect_err("overlong render must fail")
+                .code,
+            "video.duration_out_of_range"
+        );
+        assert_eq!(
+            validate_package_aggregate_bytes(MAX_PACKAGE_AGGREGATE_BYTES + 1)
+                .expect_err("oversized package must fail")
+                .code,
+            "video.package_too_large"
+        );
+        assert_eq!(
+            bounded_publish_package_bytes(
+                MAX_PACKAGE_AGGREGATE_BYTES - PACKAGE_METADATA_RESERVE_BYTES
+            )
+            .expect("master with metadata reserve fits"),
+            MAX_PACKAGE_AGGREGATE_BYTES
+        );
+        assert_eq!(
+            bounded_publish_package_bytes(
+                MAX_PACKAGE_AGGREGATE_BYTES - PACKAGE_METADATA_RESERVE_BYTES + 1
+            )
+            .expect_err("metadata reserve is enforced before package copying")
+            .code,
+            "video.package_too_large"
+        );
+    }
+
+    #[test]
+    fn long_publication_copy_observes_cancellation_and_removes_partial_output() {
+        let workspace = TestWorkspace::new();
+        let source = workspace.root.join("copy-source.bin");
+        let mut file = File::create(&source).expect("copy source");
+        file.write_all(&vec![0x5a; 2 * 1024 * 1024])
+            .expect("copy fixture bytes");
+        file.sync_all().expect("copy source sync");
+        let destination = workspace.root.join("copy-destination.bin");
+        let cancel = AtomicBool::new(true);
+        let error = copy_file_verified(
+            &source,
+            &destination,
+            CopiedFileVisibility::UserShareable,
+            &cancel,
+        )
+        .expect_err("cancelled package copy must stop");
+        assert_eq!(error.code, "video.cancelled");
+        assert!(
+            !destination.exists(),
+            "a cancelled publication may not leave a partial file"
+        );
+    }
+
+    #[test]
+    fn captured_command_bounds_hot_output_and_descendant_pipe_drain() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            eprintln!("Skipping bounded command test because /bin/sh is unavailable");
+            return;
+        }
+        let hot_output = [
+            OsString::from("-c"),
+            OsString::from("yes x | head -c 16777216"),
+        ];
+        let error = run_captured_command(
+            shell,
+            &hot_output,
+            Duration::from_secs(5),
+            None,
+            1_024,
+            None,
+            None,
+        )
+        .expect_err("oversized helper output must stay bounded and fail closed");
+        assert_eq!(error.code, "video.command_output_too_large");
+
+        let inherited_pipe = [OsString::from("-c"), OsString::from("(sleep 30) & exit 0")];
+        let started = Instant::now();
+        let error = run_captured_command(
+            shell,
+            &inherited_pipe,
+            Duration::from_secs(10),
+            None,
+            1_024,
+            None,
+            None,
+        )
+        .expect_err("a descendant-held pipe must not hang the service");
+        assert_eq!(error.code, "video.command_pipe_open");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "pipe drain and process-group cleanup must remain bounded"
+        );
+
+        let proxy_url = "http://127.0.0.1:43117/fixture-token";
+        let inspect_proxy_env = [
+            OsString::from("-c"),
+            OsString::from(
+                "printf '%s|%s|%s|%s|%s' \"$HTTP_PROXY\" \"$HTTPS_PROXY\" \"$ALL_PROXY\" \"${NO_PROXY-unset}\" \"${no_proxy-unset}\"",
+            ),
+        ];
+        let captured = run_captured_command(
+            shell,
+            &inspect_proxy_env,
+            Duration::from_secs(5),
+            None,
+            1_024,
+            Some(proxy_url),
+            None,
+        )
+        .expect("sanitized proxy environment");
+        assert!(captured.status.success());
+        assert_eq!(
+            String::from_utf8(captured.stdout).expect("UTF-8 proxy fixture"),
+            format!("{proxy_url}|{proxy_url}|{proxy_url}|unset|unset")
+        );
+
+        let workspace = TestWorkspace::new();
+        let quota_dir = workspace.root.join("watched-download");
+        fs::create_dir(&quota_dir).expect("watched download directory");
+        let quota = CommandOutputQuota {
+            directory: quota_dir.clone(),
+            prefix: ".download-quota".to_string(),
+            max_file_bytes: 128 * 1024,
+            max_aggregate_bytes: 128 * 1024,
+        };
+        let streaming_writer = [
+            OsString::from("-c"),
+            OsString::from("yes x > \"$1/.download-quota.bin\""),
+            OsString::from("soundar-quota-test"),
+            quota_dir.as_os_str().to_os_string(),
+        ];
+        let started = Instant::now();
+        let error = run_captured_command(
+            shell,
+            &streaming_writer,
+            Duration::from_secs(10),
+            None,
+            1_024,
+            None,
+            Some(&quota),
+        )
+        .expect_err("a streaming helper must be killed at its watched-prefix quota");
+        assert_eq!(error.code, "video.source_too_large");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn storage_reservations_prevent_concurrent_overcommit_and_release_on_drop() {
+        let workspace = TestWorkspace::new();
+        let available = available_disk_bytes(&workspace.service.video_root)
+            .expect("available storage for reservation fixture");
+        let first_bytes = (available / 2).max(1);
+        let second_bytes = available.saturating_sub(first_bytes).saturating_add(1);
+        let first = workspace
+            .service
+            .reserve_storage(
+                "reservation-one",
+                &workspace.service.video_root,
+                first_bytes,
+                "reservation-test",
+            )
+            .expect("first reservation");
+        let error = workspace
+            .service
+            .reserve_storage(
+                "reservation-two",
+                &workspace.service.video_root,
+                second_bytes,
+                "reservation-test",
+            )
+            .err()
+            .expect("concurrent reservations may not overcommit one device");
+        assert_eq!(error.code, "video.insufficient_disk_space");
+        drop(first);
+        workspace
+            .service
+            .reserve_storage(
+                "reservation-two",
+                &workspace.service.video_root,
+                second_bytes,
+                "reservation-test",
+            )
+            .expect("RAII release restores storage capacity");
+    }
+
+    #[test]
+    fn failed_download_cleanup_removes_only_job_owned_artifacts() {
+        let workspace = TestWorkspace::new();
+        let source_dir = workspace.root.join("download-cleanup");
+        fs::create_dir(&source_dir).expect("download cleanup directory");
+        let prefix = ".download-owned";
+        let partial = source_dir.join(format!("{prefix}.mp4"));
+        File::create(&partial)
+            .and_then(|file| file.set_len(MAX_SOURCE_BYTES + 1))
+            .expect("oversized sparse download fixture");
+        assert_eq!(
+            validate_source_size(fs::metadata(&partial).expect("partial metadata").len())
+                .expect_err("post-download quota must reject oversized media")
+                .code,
+            "video.source_too_large"
+        );
+        let published = source_dir.join("source-owned.mp4");
+        fs::write(&published, b"published").expect("published fixture");
+        let unrelated = source_dir.join("keep.mp4");
+        fs::write(&unrelated, b"unrelated").expect("unrelated fixture");
+
+        cleanup_failed_download(&source_dir, prefix, Some(&published));
+
+        assert!(!partial.exists());
+        assert!(!published.exists());
+        assert_eq!(
+            fs::read(&unrelated).expect("unrelated retained"),
+            b"unrelated"
+        );
+    }
+
+    #[test]
+    fn package_aggregate_preflight_rejects_sparse_member_before_hashing() {
+        let workspace = TestWorkspace::new();
+        let package = workspace.root.join("oversized-package");
+        fs::create_dir(&package).expect("package directory");
+        File::create(package.join("master.mp4"))
+            .and_then(|file| file.set_len(MAX_PACKAGE_AGGREGATE_BYTES + 1))
+            .expect("oversized sparse package fixture");
+        let started = Instant::now();
+        let error = package_member_inventory(&package, None)
+            .expect_err("aggregate cap must run before checksum work");
+        assert_eq!(error.code, "video.package_too_large");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "metadata preflight must reject sparse oversized packages immediately"
+        );
+
+        let archive = workspace.root.join("oversized-package.zip");
+        File::create(&archive)
+            .and_then(|file| file.set_len(MAX_PACKAGE_ARCHIVE_BYTES + 1))
+            .expect("oversized sparse archive fixture");
+        let empty_package = workspace.root.join("empty-package");
+        fs::create_dir(&empty_package).expect("empty package fixture");
+        let started = Instant::now();
+        let error = write_publish_zip_atomic(&empty_package, &archive, &AtomicBool::new(false))
+            .expect_err("archive cap must run before package inventory hashing");
+        assert_eq!(error.code, "video.package_too_large");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn render_staging_cleanup_covers_cancellation_and_descendant_pipes() {
+        let shell = Path::new("/bin/sh");
+        if !shell.is_file() {
+            eprintln!("Skipping render cleanup test because /bin/sh is unavailable");
+            return;
+        }
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        workspace.create_project(&project_id, "Render cleanup");
+        let output = workspace
+            .service
+            .cache_path("render-cleanup", &sha256_bytes(b"cancelled-render"), "mp4")
+            .expect("render staging output");
+        let plan = RenderCommandPlan {
+            profile: RenderProfile::Proxy,
+            workload_class: RenderWorkloadClass::Medium,
+            primary: RenderCommand {
+                program: shell.to_path_buf(),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from("printf partial > \"$1\"; sleep 30"),
+                    OsString::from("soundar-render-test"),
+                    output.as_os_str().to_os_string(),
+                ],
+                output: output.clone(),
+                encoder: VideoEncoder::Libx264,
+                emits_progress: false,
+            },
+            software_fallback: None,
+        };
+        let service = Arc::clone(&workspace.service);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_project = project_id.clone();
+        let worker = thread::spawn(move || {
+            service.execute_render_plan(
+                "render-cleanup-job",
+                &worker_project,
+                &plan,
+                Some(1_000_000),
+                0.0,
+                1.0,
+                &worker_cancel,
+                None,
+            )
+        });
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while !output.exists() && Instant::now() < wait_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(output.exists(), "fixture must create a staged render");
+        cancel.store(true, Ordering::Release);
+        let error = worker
+            .join()
+            .expect("render cleanup worker")
+            .expect_err("cancelled render must stop");
+        assert_eq!(error.code, "video.cancelled");
+        assert!(!output.exists(), "cancelled render staging must be removed");
+
+        let inherited_output = workspace
+            .service
+            .cache_path(
+                "render-cleanup",
+                &sha256_bytes(b"inherited-render-pipe"),
+                "mp4",
+            )
+            .expect("inherited-pipe output");
+        let inherited_plan = RenderCommandPlan {
+            profile: RenderProfile::Proxy,
+            workload_class: RenderWorkloadClass::Medium,
+            primary: RenderCommand {
+                program: shell.to_path_buf(),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from("(sleep 30 >&2) & printf partial > \"$1\"; exit 0"),
+                    OsString::from("soundar-render-test"),
+                    inherited_output.as_os_str().to_os_string(),
+                ],
+                output: inherited_output.clone(),
+                encoder: VideoEncoder::Libx264,
+                emits_progress: false,
+            },
+            software_fallback: None,
+        };
+        let started = Instant::now();
+        let error = workspace
+            .service
+            .execute_render_plan(
+                "render-pipe-job",
+                &project_id,
+                &inherited_plan,
+                Some(1_000_000),
+                0.0,
+                1.0,
+                &AtomicBool::new(false),
+                None,
+            )
+            .expect_err("descendant-held render pipe must fail closed");
+        assert_eq!(error.code, "video.render_pipe_open");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            !inherited_output.exists(),
+            "failed render staging must be removed"
+        );
     }
 }
 
@@ -5146,6 +8161,70 @@ impl VideoStudioService {
         }
     }
 
+    fn reserve_storage<'a>(
+        &'a self,
+        reservation_id: impl Into<String>,
+        path: &Path,
+        required_bytes: u64,
+        operation: &str,
+    ) -> ServiceResult<StorageLease<'a>> {
+        let reservation_id = reservation_id.into();
+        let device_id = fs::metadata(path)
+            .map_err(|error| {
+                VideoServiceError::io(
+                    "video.storage_unavailable",
+                    "The storage reservation path could not be inspected",
+                    error,
+                )
+            })?
+            .dev();
+        let available_bytes = available_disk_bytes(path)?;
+        let mut state = self
+            .storage_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active.contains_key(&reservation_id) {
+            return Err(VideoServiceError::new(
+                "video.storage_reservation_conflict",
+                "This video task already owns a storage reservation",
+            )
+            .details(json!({ "reservation_id": reservation_id })));
+        }
+        let reserved_bytes = state
+            .active
+            .values()
+            .filter(|reservation| reservation.device_id == device_id)
+            .fold(0_u64, |total, reservation| {
+                total.saturating_add(reservation.bytes)
+            });
+        let committed_bytes = reserved_bytes.saturating_add(required_bytes);
+        if available_bytes < committed_bytes {
+            return Err(VideoServiceError::new(
+                "video.insufficient_disk_space",
+                "Video Studio needs more unreserved disk space before this task can start",
+            )
+            .retryable(true)
+            .details(json!({
+                "operation": operation,
+                "path": path,
+                "required_bytes": required_bytes,
+                "already_reserved_bytes": reserved_bytes,
+                "available_bytes": available_bytes,
+            })));
+        }
+        state.active.insert(
+            reservation_id.clone(),
+            StorageReservation {
+                device_id,
+                bytes: required_bytes,
+            },
+        );
+        Ok(StorageLease {
+            reservations: &self.storage_reservations,
+            id: reservation_id,
+        })
+    }
+
     fn ensure_not_cancelled(&self, cancel: &AtomicBool) -> ServiceResult<()> {
         if cancel.load(Ordering::Acquire) {
             Err(VideoServiceError::cancelled())
@@ -5205,20 +8284,30 @@ impl VideoStudioService {
         cancel: &AtomicBool,
         callback: Option<&ProgressCallback>,
     ) -> ServiceResult<()> {
+        let timeout = render_timeout(expected_duration_us, plan.profile)?;
+        let mut staging_cleanup = StagedRenderCleanup::for_plan(plan);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| Instant::now() + MAX_RENDER_DURATION);
         let first = self.execute_render_command(
             job_id,
             project_id,
             &plan.primary,
             expected_duration_us,
+            deadline,
+            timeout,
             progress_start,
             progress_end,
             cancel,
             callback,
         );
-        match first {
+        let result = match first {
             Ok(()) => Ok(()),
             Err(RenderRunError::Cancelled(error)) => Err(error),
             Err(RenderRunError::Failed { error, stderr }) => {
+                if error.code == "video.render_timeout" {
+                    return Err(error);
+                }
                 let Some(fallback) = plan.command_after_failure(&stderr) else {
                     return Err(error);
                 };
@@ -5246,6 +8335,8 @@ impl VideoStudioService {
                     project_id,
                     fallback,
                     expected_duration_us,
+                    deadline,
+                    timeout,
                     progress_start,
                     progress_end,
                     cancel,
@@ -5255,6 +8346,51 @@ impl VideoStudioService {
                     Err(RenderRunError::Cancelled(error)) => Err(error),
                     Err(RenderRunError::Failed { error, .. }) => Err(error),
                 }
+            }
+        };
+        if result.is_ok() {
+            staging_cleanup.disarm();
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn consume_render_progress_chunk(
+        &self,
+        job_id: &str,
+        project_id: &str,
+        chunk: &[u8],
+        expected_duration_us: Option<i64>,
+        progress_start: f64,
+        progress_end: f64,
+        callback: Option<&ProgressCallback>,
+        parser: &mut FfmpegProgressParser,
+        diagnostic: &mut Vec<u8>,
+        last_persisted: &mut f64,
+    ) {
+        extend_bounded(diagnostic, chunk, MAX_DIAGNOSTIC_BYTES);
+        for record in parser.push(chunk, expected_duration_us) {
+            if let Some(fraction) = record.fraction {
+                let progress =
+                    progress_start + fraction.clamp(0.0, 1.0) * (progress_end - progress_start);
+                if progress - *last_persisted >= 0.01 || fraction >= 1.0 {
+                    let _ = self.store.update_job(job_id, "running", progress);
+                    *last_persisted = progress;
+                }
+                emit_progress(
+                    callback,
+                    job_id,
+                    project_id,
+                    "rendering",
+                    progress,
+                    "Rendering local video",
+                    None,
+                    Some(json!({
+                        "fps": record.fps,
+                        "speed": record.speed,
+                        "out_time_us": record.out_time_us,
+                    })),
+                );
             }
         }
     }
@@ -5266,102 +8402,188 @@ impl VideoStudioService {
         project_id: &str,
         render: &RenderCommand,
         expected_duration_us: Option<i64>,
+        deadline: Instant,
+        timeout: Duration,
         progress_start: f64,
         progress_end: f64,
         cancel: &AtomicBool,
         callback: Option<&ProgressCallback>,
     ) -> Result<(), RenderRunError> {
-        let mut child = render
-            .command()
-            .spawn()
-            .map_err(|error| RenderRunError::Failed {
-                error: VideoServiceError::io(
-                    "video.render_start_failed",
-                    "FFmpeg could not be started",
-                    error,
-                ),
-                stderr: String::new(),
-            })?;
-        let stderr = child.stderr.take().ok_or_else(|| RenderRunError::Failed {
-            error: VideoServiceError::new(
+        let mut command = render.command();
+        // FFmpeg writes staged media directly. Apply an owner-only child umask
+        // before exec so even in-progress files never acquire ambient 0644.
+        unsafe {
+            command.pre_exec(|| {
+                libc::umask(0o077);
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| RenderRunError::Failed {
+            error: VideoServiceError::io(
                 "video.render_start_failed",
-                "FFmpeg did not expose its progress stream",
+                "FFmpeg could not be started",
+                error,
             ),
             stderr: String::new(),
         })?;
-        let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
-        let reader = thread::spawn(move || stream_reader(stderr, sender));
+        let child_id = child.id();
+        let mut stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let _ = terminate_process_group(&mut child, Duration::from_secs(2));
+                return Err(RenderRunError::Failed {
+                    error: VideoServiceError::new(
+                        "video.render_start_failed",
+                        "FFmpeg did not expose its progress stream",
+                    ),
+                    stderr: String::new(),
+                });
+            }
+        };
+        if let Err(error) = set_capture_pipe_nonblocking(&stderr) {
+            let _ = terminate_process_group(&mut child, Duration::from_secs(2));
+            return Err(RenderRunError::Failed {
+                error: VideoServiceError::io(
+                    "video.render_progress_failed",
+                    "FFmpeg progress could not be secured",
+                    error,
+                ),
+                stderr: String::new(),
+            });
+        }
         let mut parser = FfmpegProgressParser::default();
         let mut diagnostic = Vec::new();
-        let mut status = None;
+        let mut stderr_eof = false;
         let mut last_persisted = progress_start - 0.02;
-        while status.is_none() {
+        let status = loop {
             if cancel.load(Ordering::Acquire) {
                 let _ = terminate_process_group(&mut child, Duration::from_secs(2));
-                let _ = reader.join();
                 return Err(RenderRunError::Cancelled(VideoServiceError::cancelled()));
             }
-            match receiver.recv_timeout(COMMAND_POLL_INTERVAL) {
-                Ok(Ok(chunk)) => {
-                    extend_bounded(&mut diagnostic, &chunk, MAX_DIAGNOSTIC_BYTES);
-                    for record in parser.push(&chunk, expected_duration_us) {
-                        if let Some(fraction) = record.fraction {
-                            let progress = progress_start
-                                + fraction.clamp(0.0, 1.0) * (progress_end - progress_start);
-                            if progress - last_persisted >= 0.01 || fraction >= 1.0 {
-                                let _ = self.store.update_job(job_id, "running", progress);
-                                last_persisted = progress;
-                            }
-                            emit_progress(
-                                callback,
+            if Instant::now() >= deadline {
+                let _ = terminate_process_group(&mut child, Duration::from_secs(2));
+                return Err(RenderRunError::Failed {
+                    error: VideoServiceError::new(
+                        "video.render_timeout",
+                        "FFmpeg exceeded the bounded local render deadline",
+                    )
+                    .retryable(true)
+                    .details(json!({
+                        "timeout_seconds": timeout.as_secs(),
+                        "expected_duration_us": expected_duration_us,
+                        "encoder": render.encoder,
+                    })),
+                    stderr: String::from_utf8_lossy(&diagnostic).into_owned(),
+                });
+            }
+            if !stderr_eof {
+                match read_nonblocking_chunks(&mut stderr, 32) {
+                    Ok((chunks, reached_eof)) => {
+                        stderr_eof = reached_eof;
+                        for chunk in chunks {
+                            self.consume_render_progress_chunk(
                                 job_id,
                                 project_id,
-                                "rendering",
-                                progress,
-                                "Rendering local video",
-                                None,
-                                Some(json!({
-                                    "fps": record.fps,
-                                    "speed": record.speed,
-                                    "out_time_us": record.out_time_us,
-                                })),
+                                &chunk,
+                                expected_duration_us,
+                                progress_start,
+                                progress_end,
+                                callback,
+                                &mut parser,
+                                &mut diagnostic,
+                                &mut last_persisted,
                             );
                         }
                     }
+                    Err(error) => {
+                        let _ = terminate_process_group(&mut child, Duration::from_secs(2));
+                        return Err(RenderRunError::Failed {
+                            error: VideoServiceError::io(
+                                "video.render_progress_failed",
+                                "FFmpeg progress could not be read",
+                                error,
+                            ),
+                            stderr: String::from_utf8_lossy(&diagnostic).into_owned(),
+                        });
+                    }
                 }
-                Ok(Err(error)) => {
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
                     let _ = terminate_process_group(&mut child, Duration::from_secs(2));
-                    let _ = reader.join();
                     return Err(RenderRunError::Failed {
                         error: VideoServiceError::io(
-                            "video.render_progress_failed",
-                            "FFmpeg progress could not be read",
+                            "video.render_monitor_failed",
+                            "FFmpeg could not be monitored",
                             error,
                         ),
                         stderr: String::from_utf8_lossy(&diagnostic).into_owned(),
                     });
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {}
             }
-            status = child.try_wait().map_err(|error| RenderRunError::Failed {
-                error: VideoServiceError::io(
-                    "video.render_monitor_failed",
-                    "FFmpeg could not be monitored",
-                    error,
-                ),
+            thread::sleep(COMMAND_POLL_INTERVAL.min(Duration::from_millis(20)));
+        };
+
+        // The FFmpeg leader may exit while a helper still owns its stderr.
+        // Drain without blocking for a fixed interval, then kill the dedicated
+        // process group and fail closed instead of joining an unbounded reader.
+        let drain_deadline = Instant::now()
+            .checked_add(COMMAND_PIPE_DRAIN_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        while !stderr_eof && Instant::now() < drain_deadline {
+            match read_nonblocking_chunks(&mut stderr, 32) {
+                Ok((chunks, reached_eof)) => {
+                    stderr_eof = reached_eof;
+                    let had_output = !chunks.is_empty();
+                    for chunk in chunks {
+                        self.consume_render_progress_chunk(
+                            job_id,
+                            project_id,
+                            &chunk,
+                            expected_duration_us,
+                            progress_start,
+                            progress_end,
+                            callback,
+                            &mut parser,
+                            &mut diagnostic,
+                            &mut last_persisted,
+                        );
+                    }
+                    if !had_output && !stderr_eof {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                Err(error) => {
+                    kill_process_group_by_id(child_id);
+                    return Err(RenderRunError::Failed {
+                        error: VideoServiceError::io(
+                            "video.render_progress_failed",
+                            "FFmpeg progress could not be drained",
+                            error,
+                        ),
+                        stderr: String::from_utf8_lossy(&diagnostic).into_owned(),
+                    });
+                }
+            }
+        }
+        if !stderr_eof {
+            kill_process_group_by_id(child_id);
+            return Err(RenderRunError::Failed {
+                error: VideoServiceError::new(
+                    "video.render_pipe_open",
+                    "FFmpeg left its progress pipe open after exiting",
+                )
+                .retryable(true),
                 stderr: String::from_utf8_lossy(&diagnostic).into_owned(),
-            })?;
+            });
         }
-        while let Ok(chunk) = receiver.try_recv() {
-            match chunk {
-                Ok(chunk) => extend_bounded(&mut diagnostic, &chunk, MAX_DIAGNOSTIC_BYTES),
-                Err(_) => break,
-            }
-        }
-        let _ = reader.join();
-        if status.is_some_and(|status| status.success()) {
-            Ok(())
+        if status.success() {
+            secure_managed_file(&render.output).map_err(|error| RenderRunError::Failed {
+                error,
+                stderr: String::from_utf8_lossy(&diagnostic).into_owned(),
+            })
         } else {
             let stderr = String::from_utf8_lossy(&diagnostic).into_owned();
             Err(RenderRunError::Failed {
@@ -5381,14 +8603,33 @@ impl VideoStudioService {
     fn project_dir(&self, project_id: &str) -> ServiceResult<PathBuf> {
         validate_safe_component(project_id, "video.invalid_project_id")?;
         let directory = self.video_root.join("projects").join(project_id);
-        fs::create_dir_all(&directory).map_err(|error| {
+        secure_managed_directory_path(&self.video_root, &directory)?;
+        Ok(directory)
+    }
+
+    fn secure_managed_directory(&self, directory: &Path) -> ServiceResult<()> {
+        secure_managed_directory_path(&self.video_root, directory)
+    }
+
+    fn secure_managed_flat_directory(&self, directory: &Path) -> ServiceResult<()> {
+        self.secure_managed_directory(directory)?;
+        for entry in fs::read_dir(directory).map_err(|error| {
             VideoServiceError::io(
                 "video.storage_unavailable",
-                "The managed project directory could not be created",
+                "A managed directory could not be inspected",
                 error,
             )
-        })?;
-        Ok(directory)
+        })? {
+            let entry = entry.map_err(|error| {
+                VideoServiceError::io(
+                    "video.storage_unavailable",
+                    "A managed directory entry could not be inspected",
+                    error,
+                )
+            })?;
+            secure_managed_file(&entry.path())?;
+        }
+        Ok(())
     }
 
     fn cache_path(
@@ -5401,13 +8642,7 @@ impl VideoStudioService {
         validate_hash(cache_key)?;
         validate_safe_component(extension, "video.invalid_extension")?;
         let directory = self.video_root.join("cache").join(namespace);
-        fs::create_dir_all(&directory).map_err(|error| {
-            VideoServiceError::io(
-                "video.storage_unavailable",
-                "The video cache directory could not be created",
-                error,
-            )
-        })?;
+        secure_managed_directory_path(&self.video_root, &directory)?;
         Ok(directory.join(format!("{cache_key}.{extension}")))
     }
 
@@ -5432,6 +8667,7 @@ impl VideoStudioService {
                 "The artifact is outside managed video storage",
             )
         })?;
+        secure_managed_file(&path)?;
         relative.to_str().map(str::to_string).ok_or_else(|| {
             VideoServiceError::new(
                 "video.invalid_artifact_path",
@@ -5480,6 +8716,7 @@ impl VideoStudioService {
                 "The artifact is outside managed video storage",
             ));
         }
+        secure_managed_file(&path)?;
         Ok(path)
     }
 
@@ -5499,7 +8736,10 @@ impl VideoStudioService {
         else {
             return Ok(None);
         };
-        let path = PathBuf::from(value_string(&cache, "artifact_path")?);
+        let path = self.resolve_absolute_managed_path(&PathBuf::from(value_string(
+            &cache,
+            "artifact_path",
+        )?))?;
         let product = if let Some(ffprobe) = ffprobe {
             product_from_media(
                 &self.video_root,
@@ -5586,10 +8826,12 @@ impl VideoStudioService {
                 error,
             )
         })?;
+        secure_private_directory(&video_root)?;
         Ok(Self {
             store,
             video_root,
             scheduler: Mutex::new(ResourceScheduler::for_rtx_4080_laptop()),
+            storage_reservations: Mutex::new(StorageReservationState::default()),
             gpu_admission_gate,
             cancellations: Mutex::new(HashMap::new()),
             runtime_cache: Mutex::new(None),
@@ -5840,7 +9082,10 @@ impl VideoStudioService {
             "video.yt_dlp_unavailable",
             "yt-dlp is required to preview this link",
         )?;
+        preflight_import_url_destination(&validated)?;
+        let proxy = PublicHttpsProxy::start()?;
         let args = vec![
+            OsString::from("--ignore-config"),
             OsString::from("--dump-single-json"),
             OsString::from("--skip-download"),
             OsString::from("--no-playlist"),
@@ -5849,11 +9094,20 @@ impl VideoStudioService {
             OsString::from("15"),
             OsString::from("--match-filter"),
             OsString::from("!is_live & duration <= 21600"),
+            OsString::from("--proxy"),
+            OsString::from(proxy.url()),
             OsString::from("--"),
             OsString::from(&validated.canonical),
         ];
-        let captured =
-            run_captured_command(yt_dlp, &args, LINK_PREVIEW_TIMEOUT, None, MAX_CAPTURE_BYTES)?;
+        let captured = run_captured_command(
+            yt_dlp,
+            &args,
+            LINK_PREVIEW_TIMEOUT,
+            None,
+            MAX_CAPTURE_BYTES,
+            Some(proxy.url()),
+            None,
+        )?;
         if !captured.status.success() {
             return Err(command_failed_error(
                 "video.link_preview_failed",
@@ -5965,26 +9219,35 @@ impl VideoStudioService {
                 "The selected media must resolve to a regular local file",
             ));
         }
-        let durable_request = json!({
-            "project_id": request.project_id,
-            "source_path": source,
-            "actor": request.actor,
-            "title": request.title,
-            "priority": "normal",
-        });
+        validate_source_size(metadata.len())?;
+        ensure_disk_capacity(
+            &self.video_root,
+            with_disk_headroom(metadata.len(), 3),
+            "local_import",
+        )?;
+        let origin = self.detect_local_import_origin(&source)?;
+        let durable_request = DurableLocalImportRequest {
+            project_id: request.project_id.clone(),
+            source_path: source,
+            actor: request.actor.clone(),
+            title: request.title.clone(),
+            origin,
+            priority: default_normal_priority(),
+        };
         let job_id = self
             .store
-            .create_job("video_import_local", &durable_request)
+            .create_job(
+                "video_import_local",
+                &serde_json::to_value(&durable_request).map_err(json_error)?,
+            )
             .map_err(VideoServiceError::store)?;
-        let project_id = request.project_id.clone();
-        let mut normalized = request;
-        normalized.source_path = source;
+        let project_id = durable_request.project_id.clone();
         self.spawn_worker(
             job_id.clone(),
             project_id.clone(),
             callback,
             move |service, job_id, cancel, callback| {
-                service.perform_local_import(&job_id, &normalized, &cancel, callback.as_ref())
+                service.perform_local_import(&job_id, &durable_request, &cancel, callback.as_ref())
             },
         )?;
         Ok(QueuedVideoJob {
@@ -5992,6 +9255,67 @@ impl VideoStudioService {
             project_id,
             kind: "video_import_local".to_string(),
         })
+    }
+
+    fn detect_local_import_origin(
+        &self,
+        source_path: &Path,
+    ) -> ServiceResult<DurableLocalImportOrigin> {
+        let raw_path = source_path.to_str().ok_or_else(|| {
+            VideoServiceError::new(
+                "video.invalid_source_path",
+                "The selected source path is not valid UTF-8",
+            )
+        })?;
+        let history = match self.store.get_registered_history_by_audio_path(raw_path) {
+            Ok(history) => history,
+            // The Store intentionally rejects arbitrary paths before querying
+            // History. That result means this is an ordinary user-selected
+            // upload, not a failed soundAr integrity check.
+            Err(error) if error.contains("outside the managed artifact directory") => None,
+            Err(error) => return Err(VideoServiceError::store(error)),
+        };
+        let Some(history) = history else {
+            return Ok(DurableLocalImportOrigin::UserUpload);
+        };
+        let generation_kind = value_string(&history, "generation_kind")?;
+        if !matches!(generation_kind.as_str(), "speech" | "music") {
+            return Err(VideoServiceError::new(
+                "video.invalid_soundar_origin",
+                "The registered soundAr artifact has an unsupported generation kind",
+            ));
+        }
+        Ok(DurableLocalImportOrigin::SoundArHistory {
+            history_id: value_string(&history, "id")?,
+            generation_job_id: value_string(&history, "job_id")?,
+            generation_kind,
+            model_id: value_string(&history, "model_id")?,
+            voice: history
+                .get("voice")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            engine: value_string(&history, "engine")?,
+        })
+    }
+
+    fn verify_local_import_origin(
+        &self,
+        source_path: &Path,
+        origin: &DurableLocalImportOrigin,
+    ) -> ServiceResult<()> {
+        if matches!(origin, DurableLocalImportOrigin::UserUpload) {
+            return Ok(());
+        }
+        let current = self.detect_local_import_origin(source_path)?;
+        if &current != origin {
+            return Err(VideoServiceError::new(
+                "video.soundar_origin_changed",
+                "The registered soundAr artifact no longer matches the durable import request",
+            )
+            .details(json!({ "expected": origin, "actual": current })));
+        }
+        Ok(())
     }
 
     pub fn queue_link_import(
@@ -6032,6 +9356,12 @@ impl VideoStudioService {
             )
             .details(json!({ "setup_actions": runtime.setup_actions })));
         }
+        preflight_import_url_destination(&validated)?;
+        ensure_disk_capacity(
+            &self.video_root,
+            with_disk_headroom(MAX_SOURCE_BYTES, 3),
+            "link_import",
+        )?;
         let receipt = self
             .store
             .record_video_rights_receipt(
@@ -6169,6 +9499,205 @@ impl VideoStudioService {
         })
     }
 
+    pub fn queue_timeline_render_batch(
+        self: &Arc<Self>,
+        request: TimelineRenderBatchRequest,
+        callback: Option<ProgressCallback>,
+    ) -> ServiceResult<QueuedVideoJob> {
+        require_text(
+            &request.base.actor,
+            "video.invalid_actor",
+            "An actor is required",
+        )?;
+        if request.base.variation != 0 {
+            return Err(VideoServiceError::new(
+                "video.invalid_variation_batch",
+                "The batch base variation must be zero; list every requested variation explicitly",
+            ));
+        }
+        if request.variations.is_empty() || request.variations.len() > 8 {
+            return Err(VideoServiceError::new(
+                "video.invalid_variation_batch",
+                "Choose between 1 and 8 render variations",
+            ));
+        }
+        let unique = request.variations.iter().copied().collect::<BTreeSet<_>>();
+        if unique.len() != request.variations.len() {
+            return Err(VideoServiceError::new(
+                "video.invalid_variation_batch",
+                "Each render variation discriminator must be unique",
+            ));
+        }
+        ensure_project_matches(
+            &self.get_project(&request.base.project_id)?,
+            &ProjectExpectation {
+                revision: request.base.expected_revision,
+                version_id: request.base.expected_version_id.clone(),
+            },
+        )?;
+        let durable_request = serde_json::to_value(&request).map_err(json_error)?;
+        let kind = match request.base.profile {
+            TimelineRenderProfile::Preview => "video_render_timeline_batch_preview",
+            TimelineRenderProfile::Final => "video_render_timeline_batch_final",
+        };
+        let job_id = self
+            .store
+            .create_job(kind, &durable_request)
+            .map_err(VideoServiceError::store)?;
+        let project_id = request.base.project_id.clone();
+        self.spawn_worker(
+            job_id.clone(),
+            project_id.clone(),
+            callback,
+            move |service, job_id, cancel, callback| {
+                service.perform_timeline_render_batch(&job_id, &request, &cancel, callback.as_ref())
+            },
+        )?;
+        Ok(QueuedVideoJob {
+            job_id,
+            project_id,
+            kind: kind.to_string(),
+        })
+    }
+
+    /// Adopts already-generated, registered soundAr History speech and swaps
+    /// only the exact narration clips it targets. RuntimeState owns synthesis;
+    /// this service owns media conformance, provenance, timeline CAS, and the
+    /// durable revision job shared by native and Codex surfaces.
+    pub fn queue_narration_replacement(
+        self: &Arc<Self>,
+        request: ReplaceNarrationRequest,
+        callback: Option<ProgressCallback>,
+    ) -> ServiceResult<QueuedVideoJob> {
+        require_text(
+            &request.actor,
+            "video.invalid_actor",
+            "An actor is required",
+        )?;
+        if request.replacements.is_empty() || request.replacements.len() > 32 {
+            return Err(VideoServiceError::new(
+                "video.invalid_narration_replacement",
+                "Choose between 1 and 32 narration replacements",
+            ));
+        }
+        if let Some(parent_job_id) = request.parent_job_id.as_deref() {
+            validate_safe_component(parent_job_id, "video.invalid_parent_job_id")?;
+        }
+        let mut targets = BTreeSet::new();
+        for replacement in &request.replacements {
+            for value in [
+                replacement.history_id.as_str(),
+                replacement.voice_id.as_str(),
+                replacement.model_id.as_str(),
+                replacement.speaker.as_str(),
+                replacement.language.as_str(),
+            ] {
+                require_text(
+                    value,
+                    "video.invalid_narration_replacement",
+                    "Narration replacement route fields are required",
+                )?;
+            }
+            let target = replacement
+                .binding_id
+                .as_deref()
+                .map(|value| format!("binding:{value}"))
+                .or_else(|| {
+                    replacement
+                        .clip_id
+                        .as_deref()
+                        .map(|value| format!("clip:{value}"))
+                })
+                .or_else(|| {
+                    replacement
+                        .scene_id
+                        .as_deref()
+                        .map(|value| format!("scene:{value}"))
+                })
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.narration_target_required",
+                        "Select an exact narration binding, clip, or scene",
+                    )
+                })?;
+            if !targets.insert(target) {
+                return Err(VideoServiceError::new(
+                    "video.duplicate_narration_target",
+                    "A narration target may be replaced only once per revision",
+                ));
+            }
+        }
+        let expectation = ProjectExpectation {
+            revision: request.expected_revision,
+            version_id: request.expected_version_id.clone(),
+        };
+        let durable_request = serde_json::to_value(&request).map_err(json_error)?;
+        let (job_id, created) = if let Some(parent_job_id) = request.parent_job_id.as_deref() {
+            self.store
+                .create_idempotent_job(
+                    "video_replace_narration",
+                    &format!("narration-replacement:{parent_job_id}"),
+                    &durable_request,
+                )
+                .map_err(VideoServiceError::store)?
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.idempotency_conflict",
+                        "The narration parent job is already bound to a different replacement request",
+                    )
+                })?
+        } else {
+            (
+                self.store
+                    .create_job("video_replace_narration", &durable_request)
+                    .map_err(VideoServiceError::store)?,
+                true,
+            )
+        };
+        let project_id = request.project_id.clone();
+        if !created {
+            let job = self
+                .store
+                .get_job(&job_id)
+                .map_err(VideoServiceError::store)?
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.job_not_found",
+                        "The durable narration replacement could not be reloaded",
+                    )
+                })?;
+            return match job.get("status").and_then(Value::as_str) {
+                Some("failed" | "cancelled") => self.resume_job(&job_id, callback),
+                Some("preparing" | "queued" | "running" | "completed") => Ok(QueuedVideoJob {
+                    job_id,
+                    project_id,
+                    kind: "video_replace_narration".to_string(),
+                }),
+                _ => Err(VideoServiceError::new(
+                    "video.job_state_invalid",
+                    "The durable narration replacement has an unsupported state",
+                )),
+            };
+        }
+        if let Err(error) = ensure_project_matches(&self.get_project(&project_id)?, &expectation) {
+            let _ = self.store.fail_job(&job_id, &error.stable_message());
+            return Err(error);
+        }
+        self.spawn_worker(
+            job_id.clone(),
+            project_id.clone(),
+            callback,
+            move |service, job_id, cancel, callback| {
+                service.perform_narration_replacement(&job_id, &request, &cancel, callback.as_ref())
+            },
+        )?;
+        Ok(QueuedVideoJob {
+            job_id,
+            project_id,
+            kind: "video_replace_narration".to_string(),
+        })
+    }
+
     /// Resumes a failed/cancelled durable Video Studio job through its owning
     /// runner. This deliberately reuses the original job id and request; it
     /// never creates a shadow workflow or duplicate job.
@@ -6184,6 +9713,9 @@ impl VideoStudioService {
             "video_render_final",
             "video_render_timeline_preview",
             "video_render_timeline_final",
+            "video_render_timeline_batch_preview",
+            "video_render_timeline_batch_final",
+            "video_replace_narration",
             "video_publish_package",
         ];
         let (job, durable_request) =
@@ -6232,7 +9764,7 @@ impl VideoStudioService {
     ) -> ServiceResult<String> {
         match kind {
             "video_import_local" => {
-                let mut request: LocalImportRequest = parse_resume_request(durable_request)?;
+                let mut request: DurableLocalImportRequest = parse_resume_request(durable_request)?;
                 let source = fs::canonicalize(&request.source_path).map_err(|error| {
                     VideoServiceError::io(
                         "video.source_not_found",
@@ -6347,6 +9879,52 @@ impl VideoStudioService {
                     callback,
                     move |service, job_id, cancel, callback| {
                         service.perform_timeline_render(
+                            &job_id,
+                            &request,
+                            &cancel,
+                            callback.as_ref(),
+                        )
+                    },
+                )?;
+                Ok(project_id)
+            }
+            "video_render_timeline_batch_preview" | "video_render_timeline_batch_final" => {
+                let request: TimelineRenderBatchRequest = parse_resume_request(durable_request)?;
+                let expected_kind = match request.base.profile {
+                    TimelineRenderProfile::Preview => "video_render_timeline_batch_preview",
+                    TimelineRenderProfile::Final => "video_render_timeline_batch_final",
+                };
+                if kind != expected_kind {
+                    return Err(VideoServiceError::new(
+                        "video.resume_request_invalid",
+                        "The saved timeline batch profile does not match its durable workflow kind",
+                    ));
+                }
+                let project_id = request.base.project_id.clone();
+                self.spawn_worker(
+                    job_id,
+                    project_id.clone(),
+                    callback,
+                    move |service, job_id, cancel, callback| {
+                        service.perform_timeline_render_batch(
+                            &job_id,
+                            &request,
+                            &cancel,
+                            callback.as_ref(),
+                        )
+                    },
+                )?;
+                Ok(project_id)
+            }
+            "video_replace_narration" => {
+                let request: ReplaceNarrationRequest = parse_resume_request(durable_request)?;
+                let project_id = request.project_id.clone();
+                self.spawn_worker(
+                    job_id,
+                    project_id.clone(),
+                    callback,
+                    move |service, job_id, cancel, callback| {
+                        service.perform_narration_replacement(
                             &job_id,
                             &request,
                             &cancel,
@@ -6651,6 +10229,7 @@ impl VideoStudioService {
                 "The selected source is not playable",
             ));
         }
+        validate_media_duration(probe.duration_us)?;
         let resources = render_resource_request(request.profile, runtime.h264_nvenc_runtime);
         let _lease =
             self.acquire_resources(job_id, &request.project_id, resources, cancel, callback)?;
@@ -6737,6 +10316,15 @@ impl VideoStudioService {
         } else {
             let output = self.cache_path(cache_namespace, &cache_key, "mp4")?;
             if !output.is_file() {
+                let _storage_lease = self.reserve_storage(
+                    format!("{job_id}:portrait:{cache_key}"),
+                    &self.video_root,
+                    with_disk_headroom(
+                        estimated_render_bytes(probe.duration_us, request.profile)?,
+                        2,
+                    ),
+                    "portrait_render",
+                )?;
                 let staging = sibling_staging_path(&output)?;
                 let plan = if has_video {
                     build_portrait_command_with_layout(
@@ -6805,6 +10393,7 @@ impl VideoStudioService {
                 .map_err(VideoServiceError::store)?;
             output
         };
+        let output_path = self.resolve_absolute_managed_path(&output_path)?;
         self.ensure_not_cancelled(cancel)?;
         let output_probe = probe_media(&output_path, ffprobe)?;
         let checksum = sha256_file(&output_path)?;
@@ -6874,38 +10463,67 @@ impl VideoStudioService {
             )?
         };
         let committed_expectation = project_expectation(&committed)?;
+        let publication_lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
+        let current = self.get_project(&request.project_id)?;
+        ensure_project_matches(&current, &committed_expectation)?;
+        let version_id = Some(committed_expectation.version_id.as_str());
+        let output_kind = if request.variation > 0 {
+            "variation"
+        } else if request.profile == RenderProfile::Final {
+            "master"
+        } else {
+            "preview"
+        };
+        let output_id = stable_output_id(
+            &request.project_id,
+            &format!("portrait-{output_kind}"),
+            &cache_key,
+            request.variation,
+        );
+        let output = self
+            .store
+            .publish_video_output_current_cancellable(
+                &json!({
+                    "id": output_id,
+                    "project_id": request.project_id,
+                    "version_id": version_id,
+                    "job_id": job_id,
+                    "kind": output_kind,
+                    "label": match (request.profile, request.variation) {
+                        (RenderProfile::Final, 0) => "Final master".to_string(),
+                        (RenderProfile::Final, variation) => format!("Final variation {variation}"),
+                        (_, 0) => "Video preview".to_string(),
+                        (_, variation) => format!("Preview variation {variation}"),
+                    },
+                    "artifact_path": output_path,
+                    "mime_type": "video/mp4",
+                    "sha256": checksum,
+                    "duration_us": output_probe.duration_us,
+                    "width": width,
+                    "height": height,
+                    "is_primary": request.profile == RenderProfile::Final && request.variation == 0,
+                    "provenance": {
+                        "producer": "soundAr Video Studio",
+                        "producer_version": SERVICE_VERSION,
+                        "source_asset_id": source.id,
+                        "cache_key": cache_key,
+                        "profile": request.profile,
+                        "layout": request.layout,
+                        "variation": request.variation,
+                        "audio_only": !has_video,
+                    },
+                }),
+                committed_expectation.revision,
+                &committed_expectation.version_id,
+                &publication_lock.token,
+                cancel,
+            )
+            .map_err(VideoServiceError::store)?;
         ensure_project_matches(
             &self.get_project(&request.project_id)?,
             &committed_expectation,
         )?;
-        let version_id = Some(committed_expectation.version_id.as_str());
-        let output = self
-            .store
-            .publish_video_output(&json!({
-                "project_id": request.project_id,
-                "version_id": version_id,
-                "job_id": job_id,
-                "kind": if request.profile == RenderProfile::Final { "master" } else { "preview" },
-                "label": if request.profile == RenderProfile::Final { "Final master" } else { "Video preview" },
-                "artifact_path": output_path,
-                "mime_type": "video/mp4",
-                "sha256": checksum,
-                "duration_us": output_probe.duration_us,
-                "width": width,
-                "height": height,
-                "is_primary": request.profile == RenderProfile::Final,
-                "provenance": {
-                    "producer": "soundAr Video Studio",
-                    "producer_version": SERVICE_VERSION,
-                    "source_asset_id": source.id,
-                    "cache_key": cache_key,
-                    "profile": request.profile,
-                    "layout": request.layout,
-                    "variation": request.variation,
-                    "audio_only": !has_video,
-                },
-            }))
-            .map_err(VideoServiceError::store)?;
+        drop(publication_lock);
         self.checkpoint_stage(
             &request.project_id,
             version_id,
@@ -6951,6 +10569,712 @@ impl VideoStudioService {
         Ok(())
     }
 
+    fn perform_narration_replacement(
+        &self,
+        job_id: &str,
+        request: &ReplaceNarrationRequest,
+        cancel: &AtomicBool,
+        callback: Option<&ProgressCallback>,
+    ) -> ServiceResult<()> {
+        self.ensure_not_cancelled(cancel)?;
+        let status = self
+            .store
+            .start_job(job_id)
+            .map_err(VideoServiceError::store)?;
+        if status == "cancelled" {
+            return Err(VideoServiceError::cancelled());
+        }
+        let expectation = ProjectExpectation {
+            revision: request.expected_revision,
+            version_id: request.expected_version_id.clone(),
+        };
+        let project = self.get_project(&request.project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            project
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+        if let Err(conflict) = ensure_project_matches(&project, &expectation) {
+            if narration_replacements_applied(&manifest, &request.replacements) {
+                self.store
+                    .update_job(job_id, "running", 0.99)
+                    .map_err(VideoServiceError::store)?;
+                emit_progress(
+                    callback,
+                    job_id,
+                    &request.project_id,
+                    "narration_ready",
+                    0.99,
+                    "The requested narration revision was already applied",
+                    None,
+                    Some(json!({ "idempotent_replay": true })),
+                );
+                return Ok(());
+            }
+            return Err(conflict);
+        }
+        if narration_replacements_applied(&manifest, &request.replacements) {
+            self.store
+                .update_job(job_id, "running", 0.99)
+                .map_err(VideoServiceError::store)?;
+            return Ok(());
+        }
+
+        let runtime = self.runtime_status(false);
+        let ffmpeg = required_tool_path(
+            &runtime.ffmpeg,
+            "video.ffmpeg_unavailable",
+            "FFmpeg is required to conform generated narration",
+        )?;
+        let ffprobe = required_tool_path(
+            &runtime.ffprobe,
+            "video.ffprobe_unavailable",
+            "FFprobe is required to validate generated narration",
+        )?;
+        let resources = ResourceRequest {
+            class: ResourceClass::Medium,
+            vram_mb: 0,
+            cpu_threads: 4,
+            io_slots: 2,
+            nvenc_sessions: 0,
+        };
+        let _resource_lease =
+            self.acquire_resources(job_id, &request.project_id, resources, cancel, callback)?;
+        let request_sha = sha256_bytes(serde_json::to_vec(request).map_err(json_error)?.as_slice());
+        self.checkpoint_stage(
+            &request.project_id,
+            Some(&expectation.version_id),
+            "speech",
+            "narration-replacement",
+            job_id,
+            "running",
+            resource_class_name(resources.class),
+            0.05,
+            &request_sha,
+            None,
+            json!({ "replacement_count": request.replacements.len() }),
+            None,
+        )?;
+        emit_progress(
+            callback,
+            job_id,
+            &request.project_id,
+            "conforming_narration",
+            0.05,
+            "Preparing the new voice takes for the existing scene timing",
+            None,
+            None,
+        );
+
+        let mut prepared = Vec::with_capacity(request.replacements.len());
+        let mut prepared_clip_ids = BTreeSet::new();
+        let mut prepared_scene_ids = BTreeSet::new();
+        for (index, replacement) in request.replacements.iter().enumerate() {
+            self.ensure_not_cancelled(cancel)?;
+            let existing_binding = if let Some(binding_id) = replacement.binding_id.as_deref() {
+                Some(
+                    manifest
+                        .narration_bindings
+                        .iter()
+                        .find(|binding| binding.id == binding_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            VideoServiceError::new(
+                                "video.narration_target_not_found",
+                                "The selected narration binding no longer exists",
+                            )
+                        })?,
+                )
+            } else if let Some(scene_id) = replacement.scene_id.as_deref() {
+                manifest
+                    .narration_bindings
+                    .iter()
+                    .find(|binding| binding.scene_id.as_deref() == Some(scene_id))
+                    .cloned()
+            } else if let Some(clip_id) = replacement.clip_id.as_deref() {
+                let artifact_id = manifest
+                    .tracks
+                    .iter()
+                    .flat_map(|track| track.clips.iter())
+                    .find(|clip| clip.id == clip_id)
+                    .and_then(|clip| clip.media.render_artifact_id.as_deref());
+                artifact_id.and_then(|artifact_id| {
+                    manifest
+                        .narration_bindings
+                        .iter()
+                        .find(|binding| binding.render_artifact_id == artifact_id)
+                        .cloned()
+                })
+            } else {
+                None
+            };
+            let candidate_clips = manifest
+                .tracks
+                .iter()
+                .filter(|track| matches!(track.kind, TrackKind::Audio))
+                .flat_map(|track| track.clips.iter())
+                .filter(|clip| {
+                    if let Some(clip_id) = replacement.clip_id.as_deref() {
+                        return clip.id == clip_id;
+                    }
+                    if let Some(binding) = existing_binding.as_ref() {
+                        return clip.media.render_artifact_id.as_deref()
+                            == Some(binding.render_artifact_id.as_str());
+                    }
+                    replacement
+                        .scene_id
+                        .as_deref()
+                        .is_some_and(|scene_id| clip.scene_id.as_deref() == Some(scene_id))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let target_clip = match candidate_clips.as_slice() {
+                [clip] => clip.clone(),
+                [] => {
+                    return Err(VideoServiceError::new(
+                        "video.narration_target_not_found",
+                        "The selected scene has no exact audio clip to replace",
+                    ))
+                }
+                _ => return Err(VideoServiceError::new(
+                    "video.narration_target_ambiguous",
+                    "The selected scene has multiple audio clips; choose the exact narration clip",
+                )),
+            };
+            if !prepared_clip_ids.insert(target_clip.id.clone()) {
+                return Err(VideoServiceError::new(
+                    "video.duplicate_narration_target",
+                    "Two replacements resolved to the same narration clip",
+                ));
+            }
+            let scene_id = replacement
+                .scene_id
+                .clone()
+                .or_else(|| {
+                    existing_binding
+                        .as_ref()
+                        .and_then(|binding| binding.scene_id.clone())
+                })
+                .or_else(|| target_clip.scene_id.clone());
+            if replacement.scene_id.is_some()
+                && target_clip.scene_id.as_deref() != replacement.scene_id.as_deref()
+            {
+                return Err(VideoServiceError::new(
+                    "video.narration_target_mismatch",
+                    "The selected clip does not belong to the requested scene",
+                ));
+            }
+            if let Some(scene_id) = scene_id.as_deref() {
+                if !prepared_scene_ids.insert(scene_id.to_string()) {
+                    return Err(VideoServiceError::new(
+                        "video.duplicate_narration_target",
+                        "A scene can receive only one narration take per revision",
+                    ));
+                }
+            }
+            let scene = scene_id
+                .as_deref()
+                .map(|scene_id| {
+                    manifest
+                        .reviewed_scenes
+                        .iter()
+                        .find(|scene| scene.id == scene_id)
+                        .ok_or_else(|| {
+                            VideoServiceError::new(
+                                "video.narration_target_not_found",
+                                "The narration scene no longer exists",
+                            )
+                        })
+                })
+                .transpose()?;
+
+            let history = self
+                .store
+                .get_history(&replacement.history_id)
+                .map_err(VideoServiceError::store)?
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.history_not_found",
+                        "The generated speech take is no longer in soundAr History",
+                    )
+                })?;
+            if history.get("artifact_state").and_then(Value::as_str) != Some("available") {
+                return Err(VideoServiceError::new(
+                    "video.history_artifact_unavailable",
+                    "The selected History speech artifact is missing or changed",
+                ));
+            }
+            if history.get("model_id").and_then(Value::as_str)
+                != Some(replacement.model_id.as_str())
+            {
+                return Err(VideoServiceError::new(
+                    "video.narration_route_mismatch",
+                    "The generated speech model does not match the requested voice route",
+                ));
+            }
+            let source_path = PathBuf::from(value_string(&history, "audio_path")?);
+            let registered = self
+                .store
+                .get_registered_history_by_audio_path(source_path.to_str().ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.invalid_history_artifact",
+                        "The History artifact path is not valid UTF-8",
+                    )
+                })?)
+                .map_err(VideoServiceError::store)?
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.history_artifact_unregistered",
+                        "The selected speech take is not an integrity-bound History artifact",
+                    )
+                })?;
+            if registered.get("id").and_then(Value::as_str) != Some(replacement.history_id.as_str())
+            {
+                return Err(VideoServiceError::new(
+                    "video.history_artifact_mismatch",
+                    "The selected History id does not own the speech artifact",
+                ));
+            }
+            let script = scene
+                .map(|scene| scene.script.as_str())
+                .unwrap_or_else(|| history.get("text").and_then(Value::as_str).unwrap_or(""));
+            let script_sha = sha256_bytes(script.as_bytes());
+            if scene.is_some()
+                && history
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| sha256_bytes(text.as_bytes()))
+                    .as_deref()
+                    != Some(script_sha.as_str())
+            {
+                return Err(VideoServiceError::new(
+                    "video.narration_script_mismatch",
+                    "The generated speech does not match the current reviewed scene script",
+                ));
+            }
+            let source_probe = probe_media(&source_path, ffprobe)?;
+            if source_probe.primary_audio_stream.is_none() || source_probe.duration_us <= 0 {
+                return Err(VideoServiceError::new(
+                    "video.invalid_history_artifact",
+                    "The selected History item is not playable audio",
+                ));
+            }
+            validate_media_duration(source_probe.duration_us)?;
+            let source_sha = sha256_file_with_cancel(&source_path, Some(cancel))?;
+            let target_duration_us = target_clip.timeline_duration_us.0;
+            let cache_key = CacheKeyBuilder::new(
+                CacheStage::Speech,
+                format!("{SERVICE_VERSION}:narration-conform-v1"),
+            )
+            .artifact("history_speech", source_sha.clone())
+            .tool_version(
+                "ffmpeg",
+                runtime
+                    .ffmpeg
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
+            .manifest_slice(json!({
+                "clip_id": target_clip.id,
+                "scene_id": scene_id,
+                "script_sha256": script_sha,
+                "timeline_duration_us": target_duration_us,
+            }))
+            .profile(json!({
+                "format": "pcm_s16le_48000_stereo_wav",
+                "voice_id": replacement.voice_id,
+                "model_id": replacement.model_id,
+                "speaker": replacement.speaker,
+                "language": replacement.language,
+            }))
+            .build()?
+            .into_string();
+            let mut cache_hit = false;
+            let conformed_path = if let Some(cache) = self
+                .store
+                .get_video_cache(&cache_key)
+                .map_err(VideoServiceError::store)?
+            {
+                cache_hit = true;
+                self.resolve_absolute_managed_path(&PathBuf::from(value_string(
+                    &cache,
+                    "artifact_path",
+                )?))?
+            } else {
+                let output = self.cache_path("narration", &cache_key, "wav")?;
+                if !output.is_file() {
+                    let estimated_bytes = u64::try_from(target_duration_us)
+                        .unwrap_or_default()
+                        .saturating_mul(192_000)
+                        / 1_000_000;
+                    let _storage_lease = self.reserve_storage(
+                        format!("{job_id}:narration:{cache_key}"),
+                        &self.video_root,
+                        with_disk_headroom(estimated_bytes.max(1_048_576), 1),
+                        "narration_conform",
+                    )?;
+                    let staging = sibling_staging_path(&output)?;
+                    let plan = self.build_narration_conform_plan(
+                        ffmpeg,
+                        &source_path,
+                        &staging,
+                        source_probe.duration_us,
+                        target_duration_us,
+                    )?;
+                    let progress_start =
+                        0.08 + (index as f64 / request.replacements.len() as f64) * 0.7;
+                    let progress_end =
+                        0.08 + ((index + 1) as f64 / request.replacements.len() as f64) * 0.7;
+                    self.execute_render_plan(
+                        job_id,
+                        &request.project_id,
+                        &plan,
+                        Some(target_duration_us),
+                        progress_start,
+                        progress_end,
+                        cancel,
+                        callback,
+                    )?;
+                    publish_atomic(&staging, &output, |path| {
+                        let probe = probe_media(path, ffprobe)?;
+                        if probe.primary_audio_stream.is_none()
+                            || (probe.duration_us - target_duration_us).abs() > 50_000
+                        {
+                            return Err(MediaError::new(
+                                "narration_duration_mismatch",
+                                "The conformed narration does not match the scene clock",
+                            ));
+                        }
+                        Ok(())
+                    })?;
+                }
+                secure_managed_file(&output)?;
+                self.store
+                    .put_video_cache(
+                        &cache_key,
+                        "narration",
+                        Some(&request.project_id),
+                        &json!({
+                            "history_id": replacement.history_id,
+                            "source_sha256": source_sha,
+                            "duration_us": target_duration_us,
+                        }),
+                        &output,
+                    )
+                    .map_err(VideoServiceError::store)?;
+                output
+            };
+            let conformed_probe = probe_media(&conformed_path, ffprobe)?;
+            if conformed_probe.primary_audio_stream.is_none()
+                || (conformed_probe.duration_us - target_duration_us).abs() > 50_000
+            {
+                return Err(VideoServiceError::new(
+                    "video.cache_invalid",
+                    "The cached narration no longer matches its scene timing",
+                ));
+            }
+            let conformed_sha = sha256_file_with_cancel(&conformed_path, Some(cancel))?;
+            let existing_artifact = manifest
+                .render_artifacts
+                .iter()
+                .find(|artifact| artifact.cache_key == cache_key)
+                .cloned();
+            let artifact = existing_artifact.unwrap_or(RenderArtifact {
+                id: new_id(),
+                role: RenderArtifactRole::SceneSegment,
+                scene_id: scene_id.clone(),
+                managed_path: self.relative_managed_path(&conformed_path)?,
+                sha256: conformed_sha.clone(),
+                cache_key: cache_key.clone(),
+                mime_type: "audio/wav".to_string(),
+                duration_us: Some(Microseconds(target_duration_us)),
+                width: None,
+                height: None,
+                publication_state: PublicationState::Published,
+                created_at: utc_now(),
+            });
+            artifact.validate()?;
+            if artifact.sha256 != conformed_sha
+                || artifact.duration_us != Some(Microseconds(target_duration_us))
+            {
+                return Err(VideoServiceError::new(
+                    "video.cache_collision",
+                    "A narration cache key resolved to different media",
+                ));
+            }
+            let generation_job_id = value_string(&history, "job_id")?;
+            let binding = NarrationBinding {
+                id: existing_binding
+                    .as_ref()
+                    .map(|binding| binding.id.clone())
+                    .unwrap_or_else(new_id),
+                scene_id: scene_id.clone(),
+                render_artifact_id: artifact.id.clone(),
+                history_id: replacement.history_id.clone(),
+                generation_job_id,
+                voice_id: replacement.voice_id.clone(),
+                model_id: replacement.model_id.clone(),
+                speaker: replacement.speaker.clone(),
+                language: replacement.language.clone(),
+                script_sha256: script_sha,
+                created_at: utc_now(),
+            };
+            binding.validate()?;
+            self.store
+                .upsert_video_asset(&json!({
+                    "id": artifact.id,
+                    "project_id": request.project_id,
+                    "kind": "speech",
+                    "source_kind": "derived",
+                    "local_path": conformed_path,
+                    "mime_type": "audio/wav",
+                    "content_sha256": conformed_sha,
+                    "size_bytes": fs::metadata(&conformed_path).map(|metadata| metadata.len() as i64).ok(),
+                    "duration_us": target_duration_us,
+                    "status": "ready",
+                    "probe": conformed_probe,
+                    "provenance": {
+                        "producer": "soundAr Video Studio narration revision",
+                        "producer_version": SERVICE_VERSION,
+                        "history_id": replacement.history_id,
+                        "generation_job_id": binding.generation_job_id,
+                        "voice_id": replacement.voice_id,
+                        "model_id": replacement.model_id,
+                        "speaker": replacement.speaker,
+                        "language": replacement.language,
+                        "cache_key": cache_key,
+                    },
+                }))
+                .map_err(VideoServiceError::store)?;
+            emit_progress(
+                callback,
+                job_id,
+                &request.project_id,
+                "narration_take_ready",
+                0.08 + ((index + 1) as f64 / request.replacements.len() as f64) * 0.7,
+                "A replacement narration take is ready",
+                Some(json!({
+                    "kind": "narration",
+                    "artifact_path": conformed_path,
+                    "mime_type": "audio/wav",
+                    "duration_us": target_duration_us,
+                })),
+                Some(json!({ "scene_id": scene_id, "cache_hit": cache_hit })),
+            );
+            prepared.push(PreparedNarrationReplacement {
+                clip_id: target_clip.id,
+                replaced_binding_id: existing_binding.map(|binding| binding.id),
+                artifact,
+                binding,
+            });
+        }
+
+        self.ensure_not_cancelled(cancel)?;
+        if let Some(parent_job_id) = request.parent_job_id.as_deref() {
+            let parent = self
+                .store
+                .get_job(parent_job_id)
+                .map_err(VideoServiceError::store)?
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.parent_job_not_found",
+                        "The narration revision parent task no longer exists",
+                    )
+                })?;
+            match parent.get("status").and_then(Value::as_str) {
+                Some("queued" | "preparing" | "running") => {}
+                Some("cancelled") => return Err(VideoServiceError::cancelled()),
+                _ => {
+                    return Err(VideoServiceError::new(
+                        "video.parent_job_inactive",
+                        "The narration revision parent task is no longer active",
+                    ))
+                }
+            }
+        }
+        self.ensure_not_cancelled(cancel)?;
+        ensure_project_matches(&self.get_project(&request.project_id)?, &expectation)?;
+        let committed = self.commit_manifest_mutation_at(
+            &request.project_id,
+            &expectation,
+            &request.actor,
+            "Regenerated selected narration with a revised voice",
+            Some("ready"),
+            vec![
+                "/tracks".to_string(),
+                "/render_artifacts".to_string(),
+                "/narration_bindings".to_string(),
+            ],
+            BTreeSet::from([
+                RevisionStage::Speech,
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ]),
+            move |manifest| {
+                for replacement in &prepared {
+                    let mut found = false;
+                    for clip in manifest
+                        .tracks
+                        .iter_mut()
+                        .filter(|track| matches!(track.kind, TrackKind::Audio))
+                        .flat_map(|track| track.clips.iter_mut())
+                    {
+                        if clip.id == replacement.clip_id {
+                            clip.media.source_asset_id = None;
+                            clip.media.render_artifact_id = Some(replacement.artifact.id.clone());
+                            clip.source_range = TimeRange::new(0, clip.timeline_duration_us.0)?;
+                            clip.playback_rate = RationalRate::ONE;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return Err(VideoServiceError::new(
+                            "video.narration_target_not_found",
+                            "The narration clip changed before the revision was committed",
+                        ));
+                    }
+                    if !manifest
+                        .render_artifacts
+                        .iter()
+                        .any(|artifact| artifact.id == replacement.artifact.id)
+                    {
+                        manifest.render_artifacts.push(replacement.artifact.clone());
+                    }
+                    manifest.narration_bindings.retain(|binding| {
+                        replacement.replaced_binding_id.as_deref() != Some(binding.id.as_str())
+                            && replacement.binding.scene_id.as_deref()
+                                != binding.scene_id.as_deref()
+                    });
+                    manifest
+                        .narration_bindings
+                        .push(replacement.binding.clone());
+                }
+                Ok(())
+            },
+        )?;
+        let committed_expectation = project_expectation(&committed)?;
+        self.checkpoint_stage(
+            &request.project_id,
+            Some(&committed_expectation.version_id),
+            "speech",
+            "narration-replacement",
+            job_id,
+            "completed",
+            resource_class_name(resources.class),
+            1.0,
+            &request_sha,
+            Some(&committed_expectation.version_id),
+            json!({
+                "revision": committed_expectation.revision,
+                "version_id": committed_expectation.version_id,
+                "replacement_count": request.replacements.len(),
+            }),
+            None,
+        )?;
+        self.store
+            .update_job(job_id, "running", 0.99)
+            .map_err(VideoServiceError::store)?;
+        emit_progress(
+            callback,
+            job_id,
+            &request.project_id,
+            "narration_ready",
+            0.99,
+            "The new voice is in the timeline; only affected renders need rebuilding",
+            Some(json!({
+                "kind": "video_project",
+                "project_id": request.project_id,
+                "revision": committed_expectation.revision,
+                "version_id": committed_expectation.version_id,
+            })),
+            Some(json!({ "replacement_count": request.replacements.len() })),
+        );
+        Ok(())
+    }
+
+    fn build_narration_conform_plan(
+        &self,
+        ffmpeg: &Path,
+        input: &Path,
+        output: &Path,
+        input_duration_us: i64,
+        target_duration_us: i64,
+    ) -> ServiceResult<RenderCommandPlan> {
+        if input_duration_us <= 0 || target_duration_us <= 0 {
+            return Err(VideoServiceError::new(
+                "video.invalid_narration_duration",
+                "Narration source and target durations must be positive",
+            ));
+        }
+        validate_media_duration(target_duration_us)?;
+        let parent = output.parent().ok_or_else(|| {
+            VideoServiceError::new(
+                "video.invalid_render_output",
+                "The narration output has no parent directory",
+            )
+        })?;
+        self.secure_managed_directory(parent)?;
+        if output.exists() {
+            return Err(VideoServiceError::new(
+                "video.render_output_exists",
+                "The narration staging output already exists",
+            ));
+        }
+        let tempo = input_duration_us as f64 / target_duration_us as f64;
+        let filter = format!(
+            "{},apad,atrim=duration={:.6},asetpts=N/SR/TB",
+            atempo_filter_chain(tempo)?,
+            target_duration_us as f64 / 1_000_000.0,
+        );
+        let mut args = vec![
+            OsString::from("-hide_banner"),
+            OsString::from("-loglevel"),
+            OsString::from("error"),
+            OsString::from("-nostdin"),
+            OsString::from("-n"),
+            OsString::from("-progress"),
+            OsString::from("pipe:2"),
+            OsString::from("-stats_period"),
+            OsString::from("0.25"),
+        ];
+        args.extend(local_media_input_args(input)?);
+        args.extend([
+            OsString::from("-map"),
+            OsString::from("0:a:0"),
+            OsString::from("-vn"),
+            OsString::from("-af"),
+            OsString::from(filter),
+            OsString::from("-c:a"),
+            OsString::from("pcm_s16le"),
+            OsString::from("-ar"),
+            OsString::from("48000"),
+            OsString::from("-ac"),
+            OsString::from("2"),
+            OsString::from("-f"),
+            OsString::from("wav"),
+            output.as_os_str().to_os_string(),
+        ]);
+        Ok(RenderCommandPlan {
+            profile: RenderProfile::Preview,
+            workload_class: RenderWorkloadClass::Medium,
+            primary: RenderCommand {
+                program: ffmpeg.to_path_buf(),
+                args,
+                output: output.to_path_buf(),
+                encoder: VideoEncoder::Libx264,
+                emits_progress: true,
+            },
+            software_fallback: None,
+        })
+    }
+
     fn perform_timeline_render(
         &self,
         job_id: &str,
@@ -6958,6 +11282,502 @@ impl VideoStudioService {
         cancel: &AtomicBool,
         callback: Option<&ProgressCallback>,
     ) -> ServiceResult<()> {
+        self.run_timeline_render(job_id, request, false, cancel, callback)
+            .map(|_| ())
+    }
+
+    fn perform_timeline_render_batch(
+        &self,
+        job_id: &str,
+        request: &TimelineRenderBatchRequest,
+        cancel: &AtomicBool,
+        callback: Option<&ProgressCallback>,
+    ) -> ServiceResult<()> {
+        let expectation = ProjectExpectation {
+            revision: request.base.expected_revision,
+            version_id: request.base.expected_version_id.clone(),
+        };
+        let frozen = self.get_project(&request.base.project_id)?;
+        if let Err(conflict) = ensure_project_matches(&frozen, &expectation) {
+            if self.timeline_batch_already_published(&frozen, job_id, request, cancel)? {
+                self.store
+                    .update_job(job_id, "running", 0.99)
+                    .map_err(VideoServiceError::store)?;
+                emit_progress(
+                    callback,
+                    job_id,
+                    &request.base.project_id,
+                    "published",
+                    0.99,
+                    "The complete variation batch was recovered after restart",
+                    None,
+                    Some(json!({
+                        "idempotent_replay": true,
+                        "variation_count": request.variations.len(),
+                    })),
+                );
+                return Ok(());
+            }
+            return Err(conflict);
+        }
+        let frozen_manifest: VideoProjectManifest = serde_json::from_value(
+            frozen
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        frozen_manifest.validate_strict()?;
+        let mut prepared = Vec::with_capacity(request.variations.len());
+        for variation in &request.variations {
+            self.ensure_not_cancelled(cancel)?;
+            let mut variation_request = request.base.clone();
+            variation_request.variation = *variation;
+            let output = self
+                .run_timeline_render(job_id, &variation_request, true, cancel, callback)?
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.batch_render_failed",
+                        "A deferred timeline render was published unexpectedly",
+                    )
+                })?;
+            prepared.push(output);
+        }
+        self.ensure_not_cancelled(cancel)?;
+        ensure_project_matches(&self.get_project(&request.base.project_id)?, &expectation)?;
+
+        let existing_cache_keys = frozen_manifest
+            .render_artifacts
+            .iter()
+            .map(|artifact| artifact.cache_key.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut additions_by_cache = BTreeMap::<String, RenderArtifact>::new();
+        for output in &prepared {
+            for artifact in [&output.caption_artifact, &output.render_artifact] {
+                if !existing_cache_keys.contains(artifact.cache_key.as_str()) {
+                    additions_by_cache
+                        .entry(artifact.cache_key.clone())
+                        .or_insert_with(|| artifact.clone());
+                }
+            }
+        }
+        let reason = match request.base.profile {
+            TimelineRenderProfile::Preview => "Published reviewed-timeline preview variations",
+            TimelineRenderProfile::Final => "Published reviewed final-render variations",
+        };
+        let status = match request.base.profile {
+            TimelineRenderProfile::Preview => "ready",
+            TimelineRenderProfile::Final => "completed",
+        };
+        let invalidated_stage = match request.base.profile {
+            TimelineRenderProfile::Preview => RevisionStage::Preview,
+            TimelineRenderProfile::Final => RevisionStage::FinalRender,
+        };
+        let build_output_requests = |version_id: Option<&str>| {
+            prepared
+                .iter()
+                .map(|render| {
+                let output_kind = match (render.request.profile, render.request.variation) {
+                    (_, variation) if variation > 0 => "variation",
+                    (TimelineRenderProfile::Preview, _) => "preview",
+                    (TimelineRenderProfile::Final, _) => "master",
+                };
+                let semantic_role = match render.request.profile {
+                    TimelineRenderProfile::Preview => "timeline-preview",
+                    TimelineRenderProfile::Final => "timeline-final",
+                };
+                let output_id = stable_output_id(
+                    &render.request.project_id,
+                    semantic_role,
+                    &render.render_key,
+                    render.request.variation,
+                );
+                json!({
+                    "id": output_id,
+                    "project_id": render.request.project_id,
+                    "version_id": version_id,
+                    "job_id": job_id,
+                    "kind": output_kind,
+                    "label": match (render.request.profile, render.request.variation) {
+                        (TimelineRenderProfile::Final, 0) => "Final master".to_string(),
+                        (TimelineRenderProfile::Final, variation) => format!("Final variation {variation}"),
+                        (TimelineRenderProfile::Preview, 0) => "Timeline preview".to_string(),
+                        (TimelineRenderProfile::Preview, variation) => format!("Preview variation {variation}"),
+                    },
+                    "artifact_path": render.output_path,
+                    "mime_type": "video/mp4",
+                    "sha256": render.output_sha,
+                    "duration_us": render.output_duration_us,
+                    "width": render.width,
+                    "height": render.height,
+                    "is_primary": render.request.profile == TimelineRenderProfile::Final
+                        && render.request.variation == 0,
+                    "provenance": {
+                        "producer": "soundAr Video Studio timeline assembler",
+                        "producer_version": SERVICE_VERSION,
+                        "manifest_revision": request.base.expected_revision,
+                        "source_version_id": request.base.expected_version_id,
+                        "render_cache_key": render.render_key,
+                        "caption_cache_key": render.caption_key,
+                        "profile": render.request.profile,
+                        "variation": render.request.variation,
+                        "caption_theme": render.request.caption_theme,
+                        "portrait_layout": render.request.portrait_layout,
+                        "batch_size": prepared.len(),
+                        "nvenc_with_software_fallback": render.nvenc_with_software_fallback,
+                    },
+                })
+            })
+                .collect::<Vec<_>>()
+        };
+        let publication_lock =
+            ProjectLock::acquire(self, &request.base.project_id, &request.base.actor)?;
+        let current = self.get_project(&request.base.project_id)?;
+        ensure_project_matches(&current, &expectation)?;
+        let (committed, outputs) = if additions_by_cache.is_empty() {
+            let output_requests = build_output_requests(Some(&expectation.version_id));
+            let outputs = self
+                .store
+                .publish_video_outputs_current_cancellable(
+                    &output_requests,
+                    expectation.revision,
+                    &expectation.version_id,
+                    &publication_lock.token,
+                    cancel,
+                )
+                .map_err(VideoServiceError::store)?;
+            (current, outputs)
+        } else {
+            let actor = require_text(
+                &request.base.actor,
+                "video.invalid_actor",
+                "An actor is required",
+            )?;
+            let mut next_manifest = frozen_manifest.clone();
+            next_manifest
+                .render_artifacts
+                .extend(additions_by_cache.into_values());
+            if i64::try_from(next_manifest.revision).ok() != Some(expectation.revision) {
+                return Err(VideoServiceError::new(
+                    "video.revision_integrity_failed",
+                    "The frozen manifest and project revision are not aligned",
+                ));
+            }
+            let next_revision = next_manifest.revision.checked_add(1).ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.revision_overflow",
+                    "The batch artifact revision could not be advanced",
+                )
+            })?;
+            let created_at = utc_now();
+            let parent_id = next_manifest
+                .revision_history
+                .last()
+                .map(|record| record.id.clone());
+            next_manifest.revision = next_revision;
+            next_manifest.updated_at = created_at.clone();
+            next_manifest.revision_history.push(RevisionRecord {
+                id: new_id(),
+                revision: next_revision,
+                parent_id,
+                actor: actor.to_string(),
+                reason: reason.to_string(),
+                changed_paths: vec!["/render_artifacts".to_string()],
+                invalidated_stages: BTreeSet::from([invalidated_stage]),
+                created_at,
+            });
+            next_manifest.validate_strict()?;
+            let manifest_value = serde_json::to_value(&next_manifest).map_err(json_error)?;
+            let output_requests = build_output_requests(None);
+            let committed = self
+                .store
+                .commit_video_manifest_with_outputs_cancellable(
+                    &request.base.project_id,
+                    expectation.revision,
+                    &manifest_value,
+                    actor,
+                    reason,
+                    &publication_lock.token,
+                    Some(status),
+                    &output_requests,
+                    cancel,
+                )
+                .map_err(VideoServiceError::store)?;
+            let committed_expectation = project_expectation(&committed)?;
+            if committed_expectation.revision != expectation.revision + 1
+                || i64::try_from(next_manifest.revision).ok()
+                    != Some(committed_expectation.revision)
+            {
+                return Err(VideoServiceError::new(
+                    "video.revision_integrity_failed",
+                    "The atomic batch revision did not advance exactly once",
+                ));
+            }
+            let saved = committed
+                .get("outputs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| invalid_store_shape("outputs"))?;
+            let outputs = prepared
+                .iter()
+                .map(|render| {
+                    let kind = if render.request.variation > 0 {
+                        "variation"
+                    } else if render.request.profile == TimelineRenderProfile::Final {
+                        "master"
+                    } else {
+                        "preview"
+                    };
+                    saved
+                        .iter()
+                        .find(|output| {
+                            output.get("version_id").and_then(Value::as_str)
+                                == Some(committed_expectation.version_id.as_str())
+                                && output.get("kind").and_then(Value::as_str) == Some(kind)
+                                && output.get("sha256").and_then(Value::as_str)
+                                    == Some(render.output_sha.as_str())
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            VideoServiceError::new(
+                                "video.store_contract_failed",
+                                "An atomically published batch output could not be reloaded",
+                            )
+                        })
+                })
+                .collect::<ServiceResult<Vec<_>>>()?;
+            (committed, outputs)
+        };
+        let committed_expectation = project_expectation(&committed)?;
+        ensure_project_matches(
+            &self.get_project(&request.base.project_id)?,
+            &committed_expectation,
+        )?;
+        drop(publication_lock);
+
+        for (render, output) in prepared.iter().zip(&outputs) {
+            self.checkpoint_stage(
+                &request.base.project_id,
+                Some(&committed_expectation.version_id),
+                &render.stage_key,
+                &render.scope_key,
+                job_id,
+                "completed",
+                &render.resource_class,
+                1.0,
+                &render.render_key,
+                Some(&render.output_sha),
+                json!({
+                    "output_id": output.get("id"),
+                    "render_cache_hit": render.render_cache_hit,
+                    "caption_cache_hit": render.caption_cache_hit,
+                    "batch_size": outputs.len(),
+                }),
+                None,
+            )?;
+            let media_seconds = render.output_duration_us as f64 / 1_000_000.0;
+            let _ = self.store.record_video_performance(&json!({
+                "project_id": request.base.project_id,
+                "job_id": job_id,
+                "operation": if render.request.profile == TimelineRenderProfile::Final {
+                    "timeline_final_render"
+                } else {
+                    "timeline_preview_render"
+                },
+                "profile": if render.request.profile == TimelineRenderProfile::Final { "final" } else { "preview" },
+                "wall_seconds": render.wall_seconds,
+                "media_seconds": media_seconds,
+                "realtime_factor": if media_seconds > 0.0 {
+                    Some(render.wall_seconds / media_seconds)
+                } else {
+                    None
+                },
+                "cache_hit": render.render_cache_hit,
+                "details": {
+                    "caption_cache_hit": render.caption_cache_hit,
+                    "scene_count": render.scene_count,
+                    "variation": render.request.variation,
+                    "batch_size": outputs.len(),
+                    "encoder": if render.nvenc_with_software_fallback {
+                        "nvenc_with_software_fallback"
+                    } else {
+                        "libx264"
+                    },
+                },
+            }));
+        }
+        self.store
+            .update_job(job_id, "running", 0.99)
+            .map_err(VideoServiceError::store)?;
+        let prominent = outputs
+            .iter()
+            .zip(&prepared)
+            .find(|(_, render)| render.request.variation == 0)
+            .map(|(output, _)| output.clone())
+            .or_else(|| outputs.first().cloned());
+        emit_progress(
+            callback,
+            job_id,
+            &request.base.project_id,
+            "published",
+            0.99,
+            &format!("{} timeline variations are ready to play", outputs.len()),
+            prominent,
+            Some(json!({
+                "variation_count": outputs.len(),
+                "outputs": outputs,
+                "revision": committed_expectation.revision,
+                "version_id": committed_expectation.version_id,
+            })),
+        );
+        Ok(())
+    }
+
+    fn timeline_batch_already_published(
+        &self,
+        project: &Value,
+        job_id: &str,
+        request: &TimelineRenderBatchRequest,
+        cancel: &AtomicBool,
+    ) -> ServiceResult<bool> {
+        let current = project_expectation(project)?;
+        if current.revision != request.base.expected_revision.saturating_add(1) {
+            return Ok(false);
+        }
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            project
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+        let expected_reason = match request.base.profile {
+            TimelineRenderProfile::Preview => "Published reviewed-timeline preview variations",
+            TimelineRenderProfile::Final => "Published reviewed final-render variations",
+        };
+        let expected_stage = match request.base.profile {
+            TimelineRenderProfile::Preview => RevisionStage::Preview,
+            TimelineRenderProfile::Final => RevisionStage::FinalRender,
+        };
+        let Some(record) = manifest.revision_history.last() else {
+            return Ok(false);
+        };
+        if record.revision as i64 != current.revision
+            || record.actor != request.base.actor
+            || record.reason != expected_reason
+            || record.changed_paths != ["/render_artifacts".to_string()]
+            || record.invalidated_stages != BTreeSet::from([expected_stage])
+        {
+            return Ok(false);
+        }
+        let expected_variations = request
+            .variations
+            .iter()
+            .map(|variation| u64::from(*variation))
+            .collect::<BTreeSet<_>>();
+        let outputs = project
+            .get("outputs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid_store_shape("outputs"))?
+            .iter()
+            .filter(|output| {
+                output.get("version_id").and_then(Value::as_str)
+                    == Some(current.version_id.as_str())
+                    && output.get("job_id").and_then(Value::as_str) == Some(job_id)
+            })
+            .collect::<Vec<_>>();
+        if outputs.len() != expected_variations.len() {
+            return Ok(false);
+        }
+        let observed_variations = outputs
+            .iter()
+            .filter_map(|output| {
+                output
+                    .get("provenance")
+                    .and_then(|value| value.get("variation"))
+                    .and_then(Value::as_u64)
+            })
+            .collect::<BTreeSet<_>>();
+        if observed_variations != expected_variations {
+            return Ok(false);
+        }
+        let runtime = self.runtime_status(false);
+        let ffprobe = required_tool_path(
+            &runtime.ffprobe,
+            "video.ffprobe_unavailable",
+            "FFprobe is required to recover rendered variations",
+        )?;
+        for output in outputs {
+            self.ensure_not_cancelled(cancel)?;
+            let provenance = output.get("provenance").ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.store_contract_failed",
+                    "A recovered variation has no provenance",
+                )
+            })?;
+            if provenance.get("source_version_id").and_then(Value::as_str)
+                != Some(request.base.expected_version_id.as_str())
+                || provenance.get("manifest_revision").and_then(Value::as_i64)
+                    != Some(request.base.expected_revision)
+            {
+                return Ok(false);
+            }
+            let variation = provenance
+                .get("variation")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid_store_shape("outputs.provenance.variation"))?;
+            let expected_kind = if variation > 0 {
+                "variation"
+            } else if request.base.profile == TimelineRenderProfile::Final {
+                "master"
+            } else {
+                "preview"
+            };
+            if output.get("kind").and_then(Value::as_str) != Some(expected_kind)
+                || output.get("is_primary").and_then(Value::as_bool)
+                    != Some(request.base.profile == TimelineRenderProfile::Final && variation == 0)
+            {
+                return Ok(false);
+            }
+            let expected_sha = value_string(output, "sha256")?;
+            let output_path = self.resolve_absolute_managed_path(&PathBuf::from(value_string(
+                output,
+                "artifact_path",
+            )?))?;
+            if sha256_file_with_cancel(&output_path, Some(cancel))? != expected_sha {
+                return Err(VideoServiceError::new(
+                    "video.integrity_failed",
+                    "A recovered variation no longer matches its output checksum",
+                ));
+            }
+            let probe = probe_media(&output_path, ffprobe)?;
+            if probe.primary_video_stream.is_none() || probe.duration_us <= 0 {
+                return Err(VideoServiceError::new(
+                    "video.invalid_render",
+                    "A recovered variation is not a playable video",
+                ));
+            }
+            if !manifest
+                .render_artifacts
+                .iter()
+                .any(|artifact| artifact.sha256 == expected_sha)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn run_timeline_render(
+        &self,
+        job_id: &str,
+        request: &TimelineRenderRequest,
+        defer_publication: bool,
+        cancel: &AtomicBool,
+        callback: Option<&ProgressCallback>,
+    ) -> ServiceResult<Option<PreparedTimelineRender>> {
+        let effective_request = effective_timeline_variation_request(request);
+        let request = &effective_request;
         self.ensure_not_cancelled(cancel)?;
         let status = self
             .store
@@ -6982,6 +11802,8 @@ impl VideoStudioService {
         .map_err(json_error)?;
         manifest.validate_strict()?;
         validate_timeline_render_contract(&manifest, request.profile)?;
+        let render_profile: RenderProfile = request.profile.into();
+        validate_media_duration(manifest.timeline_duration_us.0)?;
 
         let runtime = self.runtime_status(false);
         let ffmpeg = required_tool_path(
@@ -6994,7 +11816,6 @@ impl VideoStudioService {
             "video.ffprobe_unavailable",
             "FFprobe is required to validate the assembled timeline",
         )?;
-        let render_profile: RenderProfile = request.profile.into();
         let resources = render_resource_request(render_profile, runtime.h264_nvenc_runtime);
         let _lease =
             self.acquire_resources(job_id, &request.project_id, resources, cancel, callback)?;
@@ -7124,7 +11945,10 @@ impl VideoStudioService {
             .get_video_cache(&caption_key)
             .map_err(VideoServiceError::store)?
         {
-            let path = PathBuf::from(value_string(&cache, "artifact_path")?);
+            let path = self.resolve_absolute_managed_path(&PathBuf::from(value_string(
+                &cache,
+                "artifact_path",
+            )?))?;
             if sha256_file(&path)? != expected_ass_sha {
                 return Err(VideoServiceError::new(
                     "video.cache_collision",
@@ -7137,6 +11961,7 @@ impl VideoStudioService {
             if !path.is_file() || sha256_file(&path)? != expected_ass_sha {
                 write_ass_document_atomic(&path, &ass_document)?;
             }
+            secure_managed_file(&path)?;
             self.store
                 .put_video_cache(
                     &caption_key,
@@ -7246,6 +12071,15 @@ impl VideoStudioService {
         } else {
             let output = self.cache_path(namespace, &render_key, "mp4")?;
             if !output.is_file() {
+                let _storage_lease = self.reserve_storage(
+                    format!("{job_id}:timeline:{render_key}"),
+                    &self.video_root,
+                    with_disk_headroom(
+                        estimated_render_bytes(manifest.timeline_duration_us.0, render_profile)?,
+                        2,
+                    ),
+                    "timeline_render",
+                )?;
                 let staging = sibling_staging_path(&output)?;
                 let plan = build_timeline_render_plan(
                     ffmpeg,
@@ -7313,6 +12147,7 @@ impl VideoStudioService {
                 .map_err(VideoServiceError::store)?;
             output
         };
+        let output_path = self.resolve_absolute_managed_path(&output_path)?;
         self.ensure_not_cancelled(cancel)?;
         // Re-check before any manifest/output publication. A stale render may
         // remain reusable in content-addressed cache, but never becomes current.
@@ -7366,6 +12201,28 @@ impl VideoStudioService {
             created_at: utc_now(),
         };
         render_artifact.validate()?;
+        if defer_publication {
+            return Ok(Some(PreparedTimelineRender {
+                request: request.clone(),
+                caption_artifact,
+                render_artifact,
+                output_path,
+                output_sha,
+                output_duration_us: output_probe.duration_us,
+                width,
+                height,
+                caption_key,
+                render_key,
+                stage_key: stage_key.to_string(),
+                scope_key,
+                resource_class: resource_class_name(resources.class).to_string(),
+                caption_cache_hit,
+                render_cache_hit,
+                wall_seconds: started.elapsed().as_secs_f64(),
+                scene_count: manifest.reviewed_scenes.len(),
+                nvenc_with_software_fallback: runtime.h264_nvenc_runtime,
+            }));
+        }
         let has_caption_artifact = manifest
             .render_artifacts
             .iter()
@@ -7414,32 +12271,29 @@ impl VideoStudioService {
             )?
         };
         let committed_expectation = project_expectation(&committed)?;
-        ensure_project_matches(
-            &self.get_project(&request.project_id)?,
-            &committed_expectation,
-        )?;
+        let publication_lock = ProjectLock::acquire(self, &request.project_id, &request.actor)?;
+        let current = self.get_project(&request.project_id)?;
+        ensure_project_matches(&current, &committed_expectation)?;
         let output_kind = match (request.profile, request.variation) {
             (_, variation) if variation > 0 => "variation",
             (TimelineRenderProfile::Preview, _) => "preview",
             (TimelineRenderProfile::Final, _) => "master",
         };
-        let existing_output = committed
-            .get("outputs")
-            .and_then(Value::as_array)
-            .and_then(|outputs| {
-                outputs.iter().find(|output| {
-                    output.get("version_id").and_then(Value::as_str)
-                        == Some(committed_expectation.version_id.as_str())
-                        && output.get("kind").and_then(Value::as_str) == Some(output_kind)
-                        && output.get("sha256").and_then(Value::as_str) == Some(output_sha.as_str())
-                })
-            })
-            .cloned();
-        let output = if let Some(output) = existing_output {
-            output
-        } else {
-            self.store
-                .publish_video_output(&json!({
+        let semantic_role = match request.profile {
+            TimelineRenderProfile::Preview => "timeline-preview",
+            TimelineRenderProfile::Final => "timeline-final",
+        };
+        let output_id = stable_output_id(
+            &request.project_id,
+            semantic_role,
+            &render_key,
+            request.variation,
+        );
+        let output = self
+            .store
+            .publish_video_output_current_cancellable(
+                &json!({
+                    "id": output_id,
                     "project_id": request.project_id,
                     "version_id": committed_expectation.version_id,
                     "job_id": job_id,
@@ -7470,9 +12324,18 @@ impl VideoStudioService {
                         "portrait_layout": request.portrait_layout,
                         "nvenc_with_software_fallback": runtime.h264_nvenc_runtime,
                     },
-                }))
-                .map_err(VideoServiceError::store)?
-        };
+                }),
+                committed_expectation.revision,
+                &committed_expectation.version_id,
+                &publication_lock.token,
+                cancel,
+            )
+            .map_err(VideoServiceError::store)?;
+        ensure_project_matches(
+            &self.get_project(&request.project_id)?,
+            &committed_expectation,
+        )?;
+        drop(publication_lock);
         self.checkpoint_stage(
             &request.project_id,
             Some(&committed_expectation.version_id),
@@ -7530,7 +12393,7 @@ impl VideoStudioService {
                 "wall_seconds": wall_seconds,
             })),
         );
-        Ok(())
+        Ok(None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7564,13 +12427,7 @@ impl VideoStudioService {
                 "The render output has no parent directory",
             )
         })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            VideoServiceError::io(
-                "video.storage_unavailable",
-                "The render directory could not be created",
-                error,
-            )
-        })?;
+        self.secure_managed_directory(parent)?;
         if output.exists() {
             return Err(VideoServiceError::new(
                 "video.render_output_exists",
@@ -7579,19 +12436,14 @@ impl VideoStudioService {
         }
         let title_key = sha256_bytes(title.as_bytes());
         let title_dir = self.video_root.join("cache").join("title");
-        fs::create_dir_all(&title_dir).map_err(|error| {
-            VideoServiceError::io(
-                "video.storage_unavailable",
-                "The title-card cache could not be created",
-                error,
-            )
-        })?;
+        self.secure_managed_directory(&title_dir)?;
         let title_path = title_dir.join(format!("{title_key}.txt"));
         if !title_path.is_file() {
             let staging = sibling_staging_path(&title_path)?;
             let mut file = OpenOptions::new()
                 .create_new(true)
                 .write(true)
+                .mode(PRIVATE_FILE_MODE)
                 .open(&staging)
                 .map_err(|error| {
                     VideoServiceError::io(
@@ -7609,6 +12461,7 @@ impl VideoStudioService {
                         error,
                     )
                 })?;
+            secure_managed_file(&staging)?;
             publish_atomic(&staging, &title_path, |path| {
                 let valid = fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0);
                 if valid {
@@ -7621,6 +12474,7 @@ impl VideoStudioService {
                 }
             })?;
         }
+        secure_managed_file(&title_path)?;
         let (width, height) = portrait_dimensions(profile);
         let (background, foreground) = match variation % 3 {
             1 => ("0xe9e9e7", "0x262626"),
@@ -7638,7 +12492,7 @@ impl VideoStudioService {
             "{:.6}",
             probe_duration_seconds(&audio, &self.runtime_status(false))?
         );
-        let common = vec![
+        let mut common = vec![
             OsString::from("-hide_banner"),
             OsString::from("-loglevel"),
             OsString::from("error"),
@@ -7652,8 +12506,9 @@ impl VideoStudioService {
             OsString::from("lavfi"),
             OsString::from("-i"),
             OsString::from(format!("color=c={background}:s={width}x{height}:r=30")),
-            OsString::from("-i"),
-            audio.as_os_str().to_os_string(),
+        ];
+        common.extend(local_media_input_args(&audio)?);
+        common.extend([
             OsString::from("-filter_complex"),
             OsString::from(filter),
             OsString::from("-map"),
@@ -7662,7 +12517,7 @@ impl VideoStudioService {
             OsString::from("1:a:0"),
             OsString::from("-t"),
             OsString::from(duration_seconds),
-        ];
+        ]);
         let make = |encoder: VideoEncoder| {
             let mut args = common.clone();
             args.extend(service_encoder_arguments(encoder, profile));
@@ -7718,7 +12573,7 @@ impl VideoStudioService {
     fn perform_local_import(
         &self,
         job_id: &str,
-        request: &LocalImportRequest,
+        request: &DurableLocalImportRequest,
         cancel: &AtomicBool,
         callback: Option<&ProgressCallback>,
     ) -> ServiceResult<()> {
@@ -7732,6 +12587,26 @@ impl VideoStudioService {
         }
         let started = Instant::now();
         let runtime = self.runtime_status(false);
+        let source_metadata = fs::symlink_metadata(&request.source_path).map_err(|error| {
+            VideoServiceError::io(
+                "video.source_not_found",
+                "The selected local media could not be re-inspected",
+                error,
+            )
+        })?;
+        if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
+            return Err(VideoServiceError::new(
+                "video.invalid_source",
+                "The selected media must remain a regular local file",
+            ));
+        }
+        self.verify_local_import_origin(&request.source_path, &request.origin)?;
+        validate_source_size(source_metadata.len())?;
+        ensure_disk_capacity(
+            &self.video_root,
+            with_disk_headroom(source_metadata.len(), 3),
+            "local_import",
+        )?;
         let ffprobe = required_tool_path(
             &runtime.ffprobe,
             "video.ffprobe_unavailable",
@@ -7768,11 +12643,7 @@ impl VideoStudioService {
             None,
         );
         let initial_probe = probe_media(&request.source_path, ffprobe)?;
-        let source_kind = if initial_probe.primary_video_stream.is_some() {
-            SourceAssetKind::LocalVideo
-        } else {
-            SourceAssetKind::LocalAudio
-        };
+        validate_media_duration(initial_probe.duration_us)?;
         let request_resources =
             if initial_probe.primary_video_stream.is_some() && runtime.h264_nvenc_runtime {
                 ResourceRequest::medium_nvenc()
@@ -7794,6 +12665,24 @@ impl VideoStudioService {
             cancel,
             callback,
         )?;
+        // Admission may wait behind another media workload. Recheck at the
+        // actual copy boundary so an earlier UX preflight cannot go stale.
+        let admitted_source_size = fs::symlink_metadata(&request.source_path)
+            .map_err(|error| {
+                VideoServiceError::io(
+                    "video.source_not_found",
+                    "The selected local media could not be re-inspected after admission",
+                    error,
+                )
+            })?
+            .len();
+        validate_source_size(admitted_source_size)?;
+        let _storage_lease = self.reserve_storage(
+            format!("{job_id}:local-import"),
+            &self.video_root,
+            with_disk_headroom(admitted_source_size, 3),
+            "local_import",
+        )?;
         let asset_id = new_id();
         let managed = self.prepare_local_source(
             job_id,
@@ -7804,6 +12693,69 @@ impl VideoStudioService {
             cancel,
             callback,
         )?;
+        let (source_kind, provenance_kind, producer, mut provenance_metadata) =
+            match &request.origin {
+                DurableLocalImportOrigin::UserUpload => (
+                    if managed.probe.primary_video_stream.is_some() {
+                        SourceAssetKind::LocalVideo
+                    } else {
+                        SourceAssetKind::LocalAudio
+                    },
+                    ProvenanceKind::UserUpload,
+                    "soundAr Video Studio".to_string(),
+                    BTreeMap::new(),
+                ),
+                DurableLocalImportOrigin::SoundArHistory {
+                    history_id,
+                    generation_job_id,
+                    generation_kind,
+                    model_id,
+                    voice,
+                    engine,
+                } => {
+                    if managed.probe.primary_video_stream.is_some()
+                        || managed.probe.primary_audio_stream.is_none()
+                    {
+                        return Err(VideoServiceError::new(
+                            "video.invalid_soundar_origin",
+                            "A registered soundAr History artifact must be audio-only",
+                        ));
+                    }
+                    (
+                        if generation_kind == "music" {
+                            SourceAssetKind::SoundArMusic
+                        } else {
+                            SourceAssetKind::SoundArSpeech
+                        },
+                        ProvenanceKind::GeneratedLocally,
+                        format!("soundAr {engine}"),
+                        BTreeMap::from([
+                            ("history_id".to_string(), Value::String(history_id.clone())),
+                            (
+                                "generation_job_id".to_string(),
+                                Value::String(generation_job_id.clone()),
+                            ),
+                            (
+                                "generation_kind".to_string(),
+                                Value::String(generation_kind.clone()),
+                            ),
+                            ("model_id".to_string(), Value::String(model_id.clone())),
+                            ("voice".to_string(), Value::String(voice.clone())),
+                            ("engine".to_string(), Value::String(engine.clone())),
+                        ]),
+                    )
+                }
+            };
+        provenance_metadata.insert("source_clock_preserved".to_string(), Value::Bool(true));
+        provenance_metadata.insert(
+            "display_title".to_string(),
+            Value::String(
+                request
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| display_name(&request.source_path)),
+            ),
+        );
         let source = ManagedSource {
             id: asset_id,
             path: managed.path,
@@ -7812,23 +12764,12 @@ impl VideoStudioService {
             probe: managed.probe,
             kind: source_kind,
             provenance: Provenance {
-                kind: ProvenanceKind::UserUpload,
+                kind: provenance_kind,
                 original_uri: None,
                 imported_at: utc_now(),
-                producer: "soundAr Video Studio".to_string(),
+                producer,
                 producer_version: Some(SERVICE_VERSION.to_string()),
-                metadata: BTreeMap::from([
-                    ("source_clock_preserved".to_string(), Value::Bool(true)),
-                    (
-                        "display_title".to_string(),
-                        Value::String(
-                            request
-                                .title
-                                .clone()
-                                .unwrap_or_else(|| display_name(&request.source_path)),
-                        ),
-                    ),
-                ]),
+                metadata: provenance_metadata,
             },
             rights: None,
         };
@@ -7876,6 +12817,24 @@ impl VideoStudioService {
         }
         let started = Instant::now();
         let runtime = self.runtime_status(false);
+        let validated = validate_import_url(canonical_url)?;
+        let requested = validate_import_url(&request.url)?;
+        if validated.is_playlist
+            || validated.canonical != canonical_url
+            || requested.canonical != canonical_url
+            || rights.source_uri != canonical_url
+        {
+            return Err(VideoServiceError::new(
+                "video.link_request_changed",
+                "The authorized link changed before download and must be confirmed again",
+            ));
+        }
+        let _storage_lease = self.reserve_storage(
+            format!("{job_id}:link-import"),
+            &self.video_root,
+            with_disk_headroom(MAX_SOURCE_BYTES, 3),
+            "link_import",
+        )?;
         let yt_dlp = required_tool_path(
             &runtime.yt_dlp,
             "video.yt_dlp_unavailable",
@@ -7904,6 +12863,14 @@ impl VideoStudioService {
             cancel,
             callback,
         )?;
+        // Shared GPU/IO admission can queue for an arbitrary time. Reserve no
+        // assumptions from intake: require the conservative download budget
+        // again immediately before starting yt-dlp.
+        ensure_disk_capacity(
+            &self.video_root,
+            with_disk_headroom(MAX_SOURCE_BYTES, 3),
+            "link_import",
+        )?;
         let input_key = sha256_bytes(canonical_url.as_bytes());
         self.checkpoint_stage(
             &request.project_id,
@@ -7931,16 +12898,13 @@ impl VideoStudioService {
         );
         let asset_id = new_id();
         let source_dir = self.project_dir(&request.project_id)?.join("sources");
-        fs::create_dir_all(&source_dir).map_err(|error| {
-            VideoServiceError::io(
-                "video.storage_unavailable",
-                "The source directory could not be created",
-                error,
-            )
-        })?;
+        self.secure_managed_directory(&source_dir)?;
         let prefix = format!(".download-{}", new_id());
         let output_template = source_dir.join(format!("{prefix}.%(ext)s"));
+        preflight_import_url_destination(&validated)?;
+        let proxy = PublicHttpsProxy::start()?;
         let args = vec![
+            OsString::from("--ignore-config"),
             OsString::from("--no-playlist"),
             OsString::from("--max-downloads"),
             OsString::from("1"),
@@ -7961,17 +12925,27 @@ impl VideoStudioService {
             OsString::from("mp4"),
             OsString::from("--format"),
             OsString::from("bv*+ba/b"),
+            OsString::from("--proxy"),
+            OsString::from(proxy.url()),
             OsString::from("--output"),
             output_template.as_os_str().to_os_string(),
             OsString::from("--"),
             OsString::from(canonical_url),
         ];
+        let output_quota = CommandOutputQuota {
+            directory: source_dir.clone(),
+            prefix: prefix.clone(),
+            max_file_bytes: MAX_SOURCE_BYTES,
+            max_aggregate_bytes: MAX_SOURCE_BYTES,
+        };
         let captured = run_captured_command(
             yt_dlp,
             &args,
             LINK_DOWNLOAD_TIMEOUT,
             Some(cancel),
             MAX_CAPTURE_BYTES,
+            Some(proxy.url()),
+            Some(&output_quota),
         );
         if let Err(error) = &captured {
             cleanup_prefixed_files(&source_dir, &prefix);
@@ -7987,24 +12961,52 @@ impl VideoStudioService {
                 true,
             ));
         }
-        self.ensure_not_cancelled(cancel)?;
-        let downloaded = single_downloaded_file(&source_dir, &prefix)?;
-        let probe = probe_media(&downloaded, ffprobe)?;
-        if probe.primary_video_stream.is_none() && probe.primary_audio_stream.is_none() {
-            cleanup_prefixed_files(&source_dir, &prefix);
-            return Err(VideoServiceError::new(
-                "video.invalid_source",
-                "The imported source contains no playable audio or video",
-            ));
-        }
-        let extension = safe_extension(&downloaded, probe.primary_video_stream.is_some());
-        let final_path = source_dir.join(format!("source-{asset_id}.{extension}"));
-        let publication = publish_atomic(&downloaded, &final_path, |path| {
-            probe_media(path, ffprobe).map(|_| ())
-        })?;
+        let mut published_path = None;
+        let prepared = (|| -> ServiceResult<(PathBuf, String, String, RuntimeMediaProbe)> {
+            self.ensure_not_cancelled(cancel)?;
+            let downloaded = single_downloaded_file(&source_dir, &prefix)?;
+            let downloaded_size = fs::metadata(&downloaded)
+                .map_err(|error| {
+                    VideoServiceError::io(
+                        "video.link_import_failed",
+                        "The downloaded source could not be inspected",
+                        error,
+                    )
+                })?
+                .len();
+            validate_source_size(downloaded_size)?;
+            secure_managed_file(&downloaded)?;
+            let probe = probe_media(&downloaded, ffprobe)?;
+            validate_media_duration(probe.duration_us)?;
+            if probe.primary_video_stream.is_none() && probe.primary_audio_stream.is_none() {
+                return Err(VideoServiceError::new(
+                    "video.invalid_source",
+                    "The imported source contains no playable audio or video",
+                ));
+            }
+            let extension = safe_extension(&downloaded, probe.primary_video_stream.is_some());
+            let final_path = source_dir.join(format!("source-{asset_id}.{extension}"));
+            let publication = publish_atomic(&downloaded, &final_path, |path| {
+                probe_media(path, ffprobe).map(|_| ())
+            })?;
+            published_path = Some(publication.path.clone());
+            secure_managed_file(&publication.path)?;
+            self.ensure_not_cancelled(cancel)?;
+            let checksum = sha256_file_with_cancel(&publication.path, Some(cancel))?;
+            let final_probe = probe_media(&publication.path, ffprobe)?;
+            validate_source_size(final_probe.size_bytes)?;
+            validate_media_duration(final_probe.duration_us)?;
+            let relative_path = self.relative_managed_path(&publication.path)?;
+            Ok((publication.path, relative_path, checksum, final_probe))
+        })();
+        let (source_path, relative_path, checksum, final_probe) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cleanup_failed_download(&source_dir, &prefix, published_path.as_deref());
+                return Err(error);
+            }
+        };
         cleanup_prefixed_files(&source_dir, &prefix);
-        let checksum = sha256_file(&publication.path)?;
-        let final_probe = probe_media(&publication.path, ffprobe)?;
         emit_progress(
             callback,
             job_id,
@@ -8012,13 +13014,13 @@ impl VideoStudioService {
             "downloaded",
             0.25,
             "Authorized source is ready",
-            Some(json!({ "path": publication.path, "kind": "source" })),
+            Some(json!({ "path": source_path, "kind": "source" })),
             None,
         );
         let source = ManagedSource {
             id: asset_id,
-            path: publication.path.clone(),
-            relative_path: self.relative_managed_path(&publication.path)?,
+            path: source_path,
+            relative_path,
             sha256: checksum,
             probe: final_probe,
             kind: SourceAssetKind::ImportedLink,
@@ -8087,13 +13089,7 @@ impl VideoStudioService {
         }
         let extension = safe_extension(source_path, initial_probe.primary_video_stream.is_some());
         let source_dir = self.project_dir(project_id)?.join("sources");
-        fs::create_dir_all(&source_dir).map_err(|error| {
-            VideoServiceError::io(
-                "video.storage_unavailable",
-                "The source directory could not be created",
-                error,
-            )
-        })?;
+        self.secure_managed_directory(&source_dir)?;
         let final_path = source_dir.join(format!("source-{asset_id}.{extension}"));
         let staging = sibling_staging_path(&final_path)?;
         let checksum = copy_file_cancelable(source_path, &staging, cancel, |fraction| {
@@ -8152,21 +13148,35 @@ impl VideoStudioService {
         )?;
         let has_video = source.probe.primary_video_stream.is_some();
         let has_audio = source.probe.primary_audio_stream.is_some();
-        let source_value = self.store.upsert_video_asset(&json!({
-            "id": source.id,
-            "project_id": project_id,
-            "kind": "source",
-            "source_kind": match source.kind { SourceAssetKind::ImportedLink => "link", _ => "local" },
-            "local_path": source.path,
-            "original_url": source.provenance.original_uri,
-            "mime_type": media_mime(&source.path, has_video),
-            "content_sha256": source.sha256,
-            "size_bytes": fs::metadata(&source.path).map(|metadata| metadata.len() as i64).ok(),
-            "duration_us": source.probe.duration_us,
-            "status": "ready",
-            "probe": source.probe,
-            "provenance": source.provenance,
-        })).map_err(VideoServiceError::store)?;
+        let source_value = self
+            .store
+            .upsert_video_asset(&json!({
+                "id": source.id,
+                "project_id": project_id,
+                "kind": match source.kind {
+                    SourceAssetKind::SoundArSpeech => "speech",
+                    SourceAssetKind::SoundArMusic => "music",
+                    _ => "source",
+                },
+                "source_kind": match source.kind {
+                    SourceAssetKind::ImportedLink => "link",
+                    SourceAssetKind::SoundArSpeech
+                    | SourceAssetKind::SoundArMusic
+                    | SourceAssetKind::SoundArProject
+                    | SourceAssetKind::Generated => "generated",
+                    _ => "local",
+                },
+                "local_path": source.path,
+                "original_url": source.provenance.original_uri,
+                "mime_type": media_mime(&source.path, has_video),
+                "content_sha256": source.sha256,
+                "size_bytes": fs::metadata(&source.path).map(|metadata| metadata.len() as i64).ok(),
+                "duration_us": source.probe.duration_us,
+                "status": "ready",
+                "probe": source.probe,
+                "provenance": source.provenance,
+            }))
+            .map_err(VideoServiceError::store)?;
 
         let mut derived = Vec::new();
         if has_video {
@@ -8375,6 +13385,15 @@ impl VideoStudioService {
             );
         }
         let staging = sibling_staging_path(&output)?;
+        let _storage_lease = self.reserve_storage(
+            format!("{job_id}:proxy:{cache_key}"),
+            output.parent().unwrap_or(&self.video_root),
+            with_disk_headroom(
+                estimated_render_bytes(source.probe.duration_us, RenderProfile::Proxy)?,
+                1,
+            ),
+            "proxy_generation",
+        )?;
         let plan = build_proxy_command(
             ffmpeg,
             &source.path,
@@ -8528,7 +13547,14 @@ impl VideoStudioService {
             let mut plan = build_waveform_command(ffmpeg, &source.path, &staging, 1600, 320)?;
             force_image_codec(&mut plan, "png");
             self.execute_render_plan(
-                job_id, project_id, &plan, None, 0.65, 0.76, cancel, callback,
+                job_id,
+                project_id,
+                &plan,
+                Some(source.probe.duration_us),
+                0.65,
+                0.76,
+                cancel,
+                callback,
             )?;
             publish_atomic(&staging, &output, validate_image_file)?;
         } else {
