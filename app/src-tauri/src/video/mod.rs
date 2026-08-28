@@ -8,6 +8,7 @@ pub mod cache;
 pub mod contracts;
 pub mod intelligence;
 pub mod media;
+pub mod presentation;
 pub mod renderer;
 pub mod scheduler;
 pub mod timeline;
@@ -27,6 +28,9 @@ pub use media::{
     validate_import_url, CaptionCueInput, CaptionValidation, ImportProvider, MediaChapterProbe,
     MediaError, MediaProbe as RuntimeMediaProbe, MediaRuntimeStatus, MediaStreamProbe,
     MediaToolKind, MediaToolStatus, ValidatedImportUrl,
+};
+pub use presentation::{
+    present_runtime_tools, present_video_project, present_video_project_summary,
 };
 pub use renderer::{
     build_portrait_command, build_portrait_command_with_layout, build_proxy_command,
