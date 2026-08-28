@@ -317,7 +317,7 @@ fn present_source(
         "kind": match source.kind {
             SourceAssetKind::ImportedLink => "link",
             SourceAssetKind::LocalVideo => "local-video",
-            SourceAssetKind::SoundArSpeech | SourceAssetKind::SoundArMusic | SourceAssetKind::SoundArProject => "audio",
+            SourceAssetKind::LocalAudio | SourceAssetKind::SoundArSpeech | SourceAssetKind::SoundArMusic | SourceAssetKind::SoundArProject => "audio",
             SourceAssetKind::Generated => "prompt",
         },
         "exact_url": source.provenance.original_uri,
@@ -681,6 +681,7 @@ fn source_mime(source: &SourceAsset) -> &'static str {
 fn provenance_label(source: &SourceAsset) -> &'static str {
     match source.kind {
         SourceAssetKind::LocalVideo => "user-selected local media",
+        SourceAssetKind::LocalAudio => "user-selected local audio",
         SourceAssetKind::ImportedLink => "authorized exact-link import",
         SourceAssetKind::SoundArSpeech => "existing soundAr speech",
         SourceAssetKind::SoundArMusic => "existing soundAr music",

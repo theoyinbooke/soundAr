@@ -99,13 +99,18 @@ impl MediaToolKind {
 
     fn environment_keys(self) -> &'static [&'static str] {
         match self {
-            Self::Ffmpeg => &["SOUNDAR_FFMPEG_BIN", "FFMPEG_BIN"],
-            Self::Ffprobe => &["SOUNDAR_FFPROBE_BIN", "FFPROBE_BIN"],
-            Self::YtDlp => &["SOUNDAR_YT_DLP_BIN", "YT_DLP_BIN"],
-            Self::Node => &["SOUNDAR_NODE_BIN", "NODE_BIN"],
-            Self::Deno => &["SOUNDAR_DENO_BIN", "DENO_BIN"],
-            Self::FasterWhisper => &["SOUNDAR_FASTER_WHISPER_BIN", "FASTER_WHISPER_BIN"],
+            Self::Ffmpeg => &["SOUNDAR_FFMPEG_PATH", "SOUNDAR_FFMPEG_BIN", "FFMPEG_BIN"],
+            Self::Ffprobe => &["SOUNDAR_FFPROBE_PATH", "SOUNDAR_FFPROBE_BIN", "FFPROBE_BIN"],
+            Self::YtDlp => &["SOUNDAR_YT_DLP_PATH", "SOUNDAR_YT_DLP_BIN", "YT_DLP_BIN"],
+            Self::Node => &["SOUNDAR_NODE_PATH", "SOUNDAR_NODE_BIN", "NODE_BIN"],
+            Self::Deno => &["SOUNDAR_DENO_PATH", "SOUNDAR_DENO_BIN", "DENO_BIN"],
+            Self::FasterWhisper => &[
+                "SOUNDAR_FASTER_WHISPER_PATH",
+                "SOUNDAR_FASTER_WHISPER_BIN",
+                "FASTER_WHISPER_BIN",
+            ],
             Self::WhisperCpp => &[
+                "SOUNDAR_WHISPER_CPP_PATH",
                 "SOUNDAR_WHISPER_CPP_BIN",
                 "WHISPER_CPP_BIN",
                 "WHISPER_CLI_BIN",

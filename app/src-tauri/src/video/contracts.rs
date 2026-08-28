@@ -290,6 +290,7 @@ impl Validate for RationalRate {
 #[serde(rename_all = "snake_case")]
 pub enum SourceAssetKind {
     LocalVideo,
+    LocalAudio,
     ImportedLink,
     SoundArSpeech,
     SoundArMusic,
@@ -454,6 +455,7 @@ impl Validate for SourceAsset {
 pub enum TranscriptTimingSource {
     FasterWhisper,
     WhisperCpp,
+    SoundArWhisper,
     ValidatedExternal,
     Manual,
 }

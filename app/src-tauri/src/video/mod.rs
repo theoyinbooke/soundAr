@@ -4,6 +4,7 @@
 //! surface (Tauri commands, Codex tools, and any future CLI/HTTP adapter). Media execution,
 //! persistence, and transport deliberately sit outside this module.
 
+pub mod assembly;
 pub mod cache;
 pub mod contracts;
 pub mod intelligence;
@@ -11,8 +12,13 @@ pub mod media;
 pub mod presentation;
 pub mod renderer;
 pub mod scheduler;
+pub mod service;
 pub mod timeline;
 
+pub use assembly::{
+    build_ass_document, build_timeline_render_plan, write_ass_document_atomic, AssemblyOptions,
+    CaptionTheme,
+};
 pub use cache::{
     CacheArtifactInput, CacheKey, CacheKeyBuilder, CacheKeyInput, CacheStage, InvalidationPlan,
     ManifestChange,
@@ -42,6 +48,12 @@ pub use renderer::{
 pub use scheduler::{
     AdmissionBlock, AdmissionOutcome, ResourceCapacity, ResourceClass, ResourceLease,
     ResourceRequest, ResourceScheduler, ResourceUsage, RTX_4080_LAPTOP_VRAM_MB,
+};
+pub use service::{
+    CreateVideoProjectRequest as ServiceCreateVideoProjectRequest, LinkImportRequest, LinkPreview,
+    LinkRightsRequest, LocalImportRequest, PortraitRenderRequest, PortraitSourceLayout,
+    ProgressCallback, PublishPackageRequest, QueuedVideoJob, ReviseVideoManifestRequest,
+    ServiceResult, VideoJobResult, VideoServiceError, VideoServiceProgress, VideoStudioService,
 };
 pub use timeline::{
     frame_index_at, frame_time_us, map_source_to_timeline, map_timeline_to_source, partition_track,
