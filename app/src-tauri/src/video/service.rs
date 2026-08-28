@@ -793,6 +793,8 @@ struct DurableLocalImportRequest {
     title: Option<String>,
     #[serde(default)]
     origin: DurableLocalImportOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_job_id: Option<String>,
     #[serde(default = "default_normal_priority")]
     priority: String,
 }
@@ -821,6 +823,8 @@ pub struct VideoStudioService {
     gpu_admission_gate: Option<Arc<dyn SharedGpuAdmissionGate>>,
     cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
     runtime_cache: Mutex<Option<(Instant, MediaRuntimeStatus)>>,
+    #[cfg(test)]
+    package_test_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 impl VideoStudioService {
@@ -844,6 +848,15 @@ impl VideoStudioService {
             .store
             .create_job("video_publish_package", &durable)
             .map_err(VideoServiceError::store)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(job_id.clone(), Arc::clone(&cancel));
+        let _cancellation_registration = CancellationRegistration {
+            cancellations: &self.cancellations,
+            job_id: job_id.clone(),
+        };
         let status = self
             .store
             .start_job(&job_id)
@@ -851,13 +864,38 @@ impl VideoStudioService {
         if status == "cancelled" {
             return Err(VideoServiceError::cancelled());
         }
-        let cancel = AtomicBool::new(false);
-        let result = self.perform_publish_package(&job_id, &request, project, &cancel);
+        let result = self.perform_publish_package(&job_id, &request, project, cancel.as_ref());
         match result {
             Ok(result) => {
-                self.store
+                if cancel.load(Ordering::Acquire) {
+                    let _ = self.store.cancel_job(&job_id);
+                    return Err(VideoServiceError::cancelled());
+                }
+                let completed = self
+                    .store
                     .complete_job(&job_id)
                     .map_err(VideoServiceError::store)?;
+                if !completed {
+                    let job = self
+                        .store
+                        .get_job(&job_id)
+                        .map_err(VideoServiceError::store)?;
+                    return if job
+                        .as_ref()
+                        .and_then(|job| job.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("cancelled")
+                    {
+                        Err(VideoServiceError::cancelled())
+                    } else {
+                        Err(VideoServiceError::new(
+                            "video.job_state_failed",
+                            "The publish package finished locally but its durable completion was rejected",
+                        )
+                        .retryable(true)
+                        .details(json!({ "job": job })))
+                    };
+                }
                 Ok(json!({
                     "job_id": job_id,
                     "project_id": request.project_id,
@@ -866,6 +904,12 @@ impl VideoStudioService {
                     "archive_path": result.archive_path,
                     "export_path": result.export_path,
                 }))
+            }
+            Err(error) if error.code == "video.cancelled" => {
+                self.store
+                    .cancel_job(&job_id)
+                    .map_err(VideoServiceError::store)?;
+                Err(error)
             }
             Err(error) => match self.store.fail_job(&job_id, &error.stable_message()) {
                 Ok(()) => Err(error),
@@ -1004,6 +1048,19 @@ impl VideoStudioService {
             json!({ "master_output_id": master.get("id") }),
             None,
         )?;
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .package_test_barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            // One-shot deterministic boundary for the direct synchronous API
+            // cancellation regression. Production builds contain no hook.
+            barrier.wait();
+            barrier.wait();
+        }
+        self.ensure_not_cancelled(cancel)?;
         let package_parent = self.project_dir(&request.project_id)?.join("packages");
         self.secure_managed_directory(&package_parent)?;
         let package_path = package_parent.join(format!("publish-{}", &cache_key[..16]));
@@ -1443,6 +1500,41 @@ impl Drop for StorageLease<'_> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .active
             .remove(&self.id);
+    }
+}
+
+struct CancellationRegistration<'a> {
+    cancellations: &'a Mutex<HashMap<String, Arc<AtomicBool>>>,
+    job_id: String,
+}
+
+impl Drop for CancellationRegistration<'_> {
+    fn drop(&mut self) {
+        self.cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.job_id);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalSourceIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+}
+
+impl LocalSourceIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
     }
 }
 
@@ -2086,7 +2178,8 @@ fn extend_bounded(target: &mut Vec<u8>, chunk: &[u8], maximum: usize) {
 }
 
 fn copy_file_cancelable<F>(
-    source: &Path,
+    mut input: File,
+    expected_identity: LocalSourceIdentity,
     destination: &Path,
     cancel: &AtomicBool,
     mut progress: F,
@@ -2094,27 +2187,25 @@ fn copy_file_cancelable<F>(
 where
     F: FnMut(f64),
 {
-    let mut input = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(source)
-        .map_err(|error| {
-            VideoServiceError::io(
-                "video.source_not_found",
-                "The selected media could not be opened safely",
-                error,
-            )
-        })?;
-    let total = input
-        .metadata()
-        .map_err(|error| {
+    let opened_identity =
+        LocalSourceIdentity::from_metadata(&input.metadata().map_err(|error| {
             VideoServiceError::io(
                 "video.source_not_found",
                 "The selected media could not be inspected",
                 error,
             )
-        })?
-        .len();
+        })?);
+    if opened_identity != expected_identity {
+        return Err(VideoServiceError::new(
+            "video.source_changed",
+            "The selected local media changed after validation; choose it again",
+        )
+        .details(json!({
+            "expected": format!("{}:{}:{}", expected_identity.device, expected_identity.inode, expected_identity.size),
+            "actual": format!("{}:{}:{}", opened_identity.device, opened_identity.inode, opened_identity.size),
+        })));
+    }
+    let total = expected_identity.size;
     validate_source_size(total)?;
     let mut output = OpenOptions::new()
         .write(true)
@@ -2166,6 +2257,20 @@ where
                 progress(fraction);
                 last_fraction = fraction;
             }
+        }
+        let final_identity =
+            LocalSourceIdentity::from_metadata(&input.metadata().map_err(|error| {
+                VideoServiceError::io(
+                    "video.source_not_found",
+                    "The selected media could not be re-inspected after copying",
+                    error,
+                )
+            })?);
+        if copied != total || final_identity != expected_identity {
+            return Err(VideoServiceError::new(
+                "video.source_changed",
+                "The selected local media changed while it was being copied; choose it again",
+            ));
         }
         output.sync_all().map_err(|error| {
             VideoServiceError::io(
@@ -6023,7 +6128,7 @@ mod tests {
         let callback_parent_id = cancel_parent_job_id.clone();
         let callback_observed = Arc::clone(&cancellation_observed);
         let cancel_callback: ProgressCallback = Arc::new(move |progress| {
-            if progress.phase == "narration_take_ready"
+            if progress.phase == "narration_committing"
                 && !callback_observed.swap(true, Ordering::AcqRel)
             {
                 let _ = callback_service.cancel_job(&callback_parent_id);
@@ -6040,7 +6145,7 @@ mod tests {
         assert_eq!(cancelled_error.code, "video.cancelled");
         assert!(
             cancellation_observed.load(Ordering::Acquire),
-            "the test must cancel after the prepared take and before manifest commit"
+            "the test must cancel after the service precheck and at the atomic manifest boundary"
         );
         let after_cancel = workspace
             .service
@@ -6139,6 +6244,29 @@ mod tests {
         // Cancel exactly at the first durable progress event. This leaves the
         // queue-produced request available for a restart-style resume without
         // importing or duplicating the source first.
+        let prompt_parent_job = workspace
+            .service
+            .store
+            .create_job(
+                "video_create_from_prompt",
+                &json!({
+                    "project_id": project_id,
+                    "purpose": "prompt_to_video",
+                    "prompt": "Create a short narrated video",
+                }),
+            )
+            .expect("create prompt-to-video parent");
+        workspace
+            .service
+            .store
+            .start_job(&prompt_parent_job)
+            .expect("start prompt-to-video parent");
+        let local_request = LocalImportRequest {
+            project_id: project_id.clone(),
+            source_path: generated_audio.clone(),
+            actor: "service-test".to_string(),
+            title: Some("Prompt narration".to_string()),
+        };
         let cancel_service = Arc::clone(&workspace.service);
         let cancel_once = Arc::new(AtomicBool::new(false));
         let callback_once = Arc::clone(&cancel_once);
@@ -6149,13 +6277,9 @@ mod tests {
         });
         let queued = workspace
             .service
-            .queue_local_import(
-                LocalImportRequest {
-                    project_id: project_id.clone(),
-                    source_path: generated_audio.clone(),
-                    actor: "service-test".to_string(),
-                    title: Some("Prompt narration".to_string()),
-                },
+            .queue_local_import_idempotent(
+                local_request.clone(),
+                &prompt_parent_job,
                 Some(cancel_callback),
             )
             .expect("queue prompt-generated History import");
@@ -6166,44 +6290,31 @@ mod tests {
         assert_eq!(cancelled.code, "video.cancelled");
         assert!(cancel_once.load(Ordering::Acquire));
 
-        let (resumed_job, durable_value) = workspace
+        let resumed = workspace
             .service
-            .store
-            .resume_video_job(&queued.job_id, &["video_import_local"])
-            .expect("rearm durable generated import");
+            .queue_local_import_idempotent(local_request.clone(), &prompt_parent_job, None)
+            .expect("retry adopts and rearms the durable generated import");
         assert_eq!(
-            resumed_job.get("status").and_then(Value::as_str),
-            Some("preparing"),
-            "the durable queue presentation should return to its active initial phase"
+            resumed.job_id, queued.job_id,
+            "the parent-bound retry must reuse the exact child job"
         );
-        let durable: DurableLocalImportRequest =
-            serde_json::from_value(durable_value.clone()).expect("typed durable local import");
-        assert_eq!(durable.source_path, generated_audio);
-        assert_eq!(
-            durable.origin,
-            DurableLocalImportOrigin::SoundArHistory {
-                history_id: history_id.clone(),
-                generation_job_id: synthesis_job.clone(),
-                generation_kind: "speech".to_string(),
-                model_id: "test/prompt-voice-model".to_string(),
-                voice: "Prompt voice".to_string(),
-                engine: "service-test-prompt-engine".to_string(),
-            },
-            "the queue must persist immutable History identity in the durable request"
-        );
-        workspace
-            .service
-            .dispatch_resumed_job(
-                queued.job_id.clone(),
-                "video_import_local",
-                durable_value,
-                None,
-            )
-            .expect("dispatch restart-style local import");
         let imported = workspace
             .service
-            .wait_for_job(&queued.job_id, &project_id, Duration::from_secs(120))
+            .wait_for_job(&resumed.job_id, &project_id, Duration::from_secs(120))
             .expect("resumed generated import completes");
+        let adopted = workspace
+            .service
+            .queue_local_import_idempotent(local_request, &prompt_parent_job, None)
+            .expect("retry after child completion adopts without another import");
+        assert_eq!(adopted.job_id, queued.job_id);
+        assert_eq!(
+            workspace
+                .service
+                .store
+                .video_child_job(&prompt_parent_job, "video_import_local")
+                .expect("resolve parent-bound import child"),
+            Some((queued.job_id.clone(), "completed".to_string()))
+        );
         let manifest: VideoProjectManifest =
             serde_json::from_value(imported.project.get("manifest").cloned().expect("manifest"))
                 .expect("typed generated import manifest");
@@ -6245,6 +6356,30 @@ mod tests {
                 .and_then(Value::as_str),
             Some("Prompt voice")
         );
+        assert_eq!(
+            source
+                .provenance
+                .metadata
+                .get("video_parent_job_id")
+                .and_then(Value::as_str),
+            Some(prompt_parent_job.as_str())
+        );
+        assert_eq!(
+            source
+                .provenance
+                .metadata
+                .get("video_project_id")
+                .and_then(Value::as_str),
+            Some(project_id.as_str())
+        );
+        assert_eq!(
+            source
+                .provenance
+                .metadata
+                .get("purpose")
+                .and_then(Value::as_str),
+            Some("prompt_to_video")
+        );
         let assets = workspace
             .service
             .store
@@ -6278,8 +6413,22 @@ mod tests {
             .service
             .get_project(&tamper_project_id)
             .expect("tamper project baseline");
-        let mut tampered_request = durable;
-        tampered_request.project_id = tamper_project_id.clone();
+        let tampered_request = DurableLocalImportRequest {
+            project_id: tamper_project_id.clone(),
+            source_path: generated_audio.clone(),
+            actor: "service-test".to_string(),
+            title: Some("Tampered prompt narration".to_string()),
+            origin: DurableLocalImportOrigin::SoundArHistory {
+                history_id: history_id.clone(),
+                generation_job_id: synthesis_job.clone(),
+                generation_kind: "speech".to_string(),
+                model_id: "test/prompt-voice-model".to_string(),
+                voice: "Prompt voice".to_string(),
+                engine: "service-test-prompt-engine".to_string(),
+            },
+            parent_job_id: None,
+            priority: default_normal_priority(),
+        };
         let tampered_job_id = workspace
             .service
             .store
@@ -7187,6 +7336,75 @@ mod tests {
         assert!(primary_probe.primary_video_stream.is_some());
         assert!(primary_probe.primary_audio_stream.is_some());
 
+        let outputs_before_cancel = rendered
+            .project
+            .get("outputs")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .expect("output count before package cancellation");
+        let package_cancel_barrier = Arc::new(std::sync::Barrier::new(2));
+        *workspace
+            .service
+            .package_test_barrier
+            .lock()
+            .expect("package cancellation barrier") = Some(Arc::clone(&package_cancel_barrier));
+        let cancel_package_service = Arc::clone(&workspace.service);
+        let cancel_package_project = audio_project.clone();
+        let package_thread = thread::spawn(move || {
+            cancel_package_service.export_publish_package(PublishPackageRequest {
+                project_id: cancel_package_project,
+                expected_revision: None,
+                expected_version_id: None,
+                destination_dir: None,
+                actor: "service-test".to_string(),
+            })
+        });
+        package_cancel_barrier.wait();
+        let synchronous_package_job = workspace
+            .service
+            .cancellations
+            .lock()
+            .expect("registered synchronous package cancellation")
+            .keys()
+            .next()
+            .cloned()
+            .expect("synchronous package job is cancellation-addressable");
+        assert!(workspace
+            .service
+            .cancel_job(&synchronous_package_job)
+            .expect("cancel synchronous package"));
+        package_cancel_barrier.wait();
+        let package_cancelled = package_thread
+            .join()
+            .expect("synchronous package thread")
+            .expect_err("cancelled synchronous package must not return success");
+        assert_eq!(package_cancelled.code, "video.cancelled");
+        let after_package_cancel = workspace
+            .service
+            .get_project(&audio_project)
+            .expect("project after package cancellation");
+        assert_eq!(
+            after_package_cancel
+                .get("outputs")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(outputs_before_cancel),
+            "cancelling the direct package API before copy must publish no output"
+        );
+        assert!(!after_package_cancel
+            .get("outputs")
+            .and_then(Value::as_array)
+            .is_some_and(|outputs| outputs.iter().any(|output| {
+                output.get("job_id").and_then(Value::as_str)
+                    == Some(synchronous_package_job.as_str())
+            })));
+        assert!(!workspace
+            .service
+            .cancellations
+            .lock()
+            .expect("package cancellation registration cleanup")
+            .contains_key(&synchronous_package_job));
+
         let package = workspace
             .service
             .export_publish_package(PublishPackageRequest {
@@ -7584,6 +7802,62 @@ mod tests {
     }
 
     #[test]
+    fn local_copy_is_descriptor_bound_and_rejects_growth_after_admission() {
+        let workspace = TestWorkspace::new();
+        let source = workspace.root.join("mutable-local-source.bin");
+        let replacement = workspace.root.join("replacement-local-source.bin");
+        fs::write(&source, b"validated-source-bytes").expect("validated source");
+        fs::write(&replacement, b"different-path-bytes").expect("replacement source");
+        let identity = LocalSourceIdentity::from_metadata(
+            &fs::metadata(&source).expect("validated source metadata"),
+        );
+        let opened = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&source)
+            .expect("open validated source once");
+        fs::rename(&replacement, &source).expect("swap the external path after admission");
+        let copied = workspace.root.join("descriptor-bound-copy.bin");
+        copy_file_cancelable(opened, identity, &copied, &AtomicBool::new(false), |_| {})
+            .expect("copy remains bound to the admitted descriptor");
+        assert_eq!(
+            fs::read(&copied).expect("descriptor copy"),
+            b"validated-source-bytes"
+        );
+
+        let growing = workspace.root.join("growing-local-source.bin");
+        fs::write(&growing, b"small").expect("growing source");
+        let growing_identity = LocalSourceIdentity::from_metadata(
+            &fs::metadata(&growing).expect("growing source metadata"),
+        );
+        let growing_opened = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&growing)
+            .expect("open growing source");
+        OpenOptions::new()
+            .append(true)
+            .open(&growing)
+            .and_then(|mut file| file.write_all(b"-grew-after-admission"))
+            .expect("grow source after admission");
+        let rejected_copy = workspace.root.join("rejected-growing-copy.bin");
+        let error = copy_file_cancelable(
+            growing_opened,
+            growing_identity,
+            &rejected_copy,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .expect_err("growth beyond the admitted identity must fail closed");
+        assert_eq!(error.code, "video.source_changed");
+        assert!(!rejected_copy.exists());
+        assert!(
+            with_disk_headroom(MAX_SOURCE_BYTES, 1) >= MAX_SOURCE_BYTES,
+            "mutable local imports reserve the full 8 GiB copy budget, not the stale stat size"
+        );
+    }
+
+    #[test]
     fn long_publication_copy_observes_cancellation_and_removes_partial_output() {
         let workspace = TestWorkspace::new();
         let source = workspace.root.join("copy-source.bin");
@@ -7910,6 +8184,7 @@ mod tests {
 }
 
 impl VideoStudioService {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn commit_manifest_mutation<F>(
         &self,
@@ -7952,6 +8227,35 @@ impl VideoStudioService {
         status: Option<&str>,
         changed_paths: Vec<String>,
         invalidated_stages: BTreeSet<RevisionStage>,
+        mutate: F,
+    ) -> ServiceResult<Value>
+    where
+        F: FnOnce(&mut VideoProjectManifest) -> ServiceResult<()>,
+    {
+        self.commit_manifest_mutation_at_if_parent_active(
+            project_id,
+            expectation,
+            actor,
+            reason,
+            status,
+            changed_paths,
+            invalidated_stages,
+            None,
+            mutate,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_manifest_mutation_at_if_parent_active<F>(
+        &self,
+        project_id: &str,
+        expectation: &ProjectExpectation,
+        actor: &str,
+        reason: &str,
+        status: Option<&str>,
+        changed_paths: Vec<String>,
+        invalidated_stages: BTreeSet<RevisionStage>,
+        required_active_job_id: Option<&str>,
         mutate: F,
     ) -> ServiceResult<Value>
     where
@@ -8016,9 +8320,19 @@ impl VideoStudioService {
         });
         manifest.validate_strict()?;
         let manifest_value = serde_json::to_value(&manifest).map_err(json_error)?;
-        let result = self
-            .store
-            .commit_video_manifest(
+        let result = if let Some(required_active_job_id) = required_active_job_id {
+            self.store.commit_video_manifest_if_job_active(
+                project_id,
+                expected_revision,
+                &manifest_value,
+                actor,
+                reason,
+                &lock.token,
+                status,
+                required_active_job_id,
+            )
+        } else {
+            self.store.commit_video_manifest(
                 project_id,
                 expected_revision,
                 &manifest_value,
@@ -8027,7 +8341,8 @@ impl VideoStudioService {
                 &lock.token,
                 status,
             )
-            .map_err(VideoServiceError::store)?;
+        }
+        .map_err(VideoServiceError::store)?;
         let result_revision = value_i64(&result, "revision")?;
         let returned_manifest_revision = result
             .get("manifest")
@@ -8835,6 +9150,8 @@ impl VideoStudioService {
             gpu_admission_gate,
             cancellations: Mutex::new(HashMap::new()),
             runtime_cache: Mutex::new(None),
+            #[cfg(test)]
+            package_test_barrier: Mutex::new(None),
         })
     }
 
@@ -9198,6 +9515,48 @@ impl VideoStudioService {
         request: LocalImportRequest,
         callback: Option<ProgressCallback>,
     ) -> ServiceResult<QueuedVideoJob> {
+        self.queue_local_import_inner(request, None, callback)
+    }
+
+    /// Parent-bound form used by durable prompt/audio-to-video workflows. A
+    /// retry after queueing but before the parent checkpoint adopts the exact
+    /// same import job instead of copying/importing the History artifact twice.
+    pub fn queue_local_import_idempotent(
+        self: &Arc<Self>,
+        request: LocalImportRequest,
+        parent_job_id: &str,
+        callback: Option<ProgressCallback>,
+    ) -> ServiceResult<QueuedVideoJob> {
+        validate_safe_component(parent_job_id, "video.invalid_parent_job_id")?;
+        let parent = self
+            .store
+            .get_job(parent_job_id)
+            .map_err(VideoServiceError::store)?
+            .ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.parent_job_not_found",
+                    "The prompt-to-video parent task was not found",
+                )
+            })?;
+        match parent.get("status").and_then(Value::as_str) {
+            Some("queued" | "preparing" | "running") => {}
+            Some("cancelled") => return Err(VideoServiceError::cancelled()),
+            _ => {
+                return Err(VideoServiceError::new(
+                    "video.parent_job_inactive",
+                    "The prompt-to-video parent task is no longer active",
+                ))
+            }
+        }
+        self.queue_local_import_inner(request, Some(parent_job_id.to_string()), callback)
+    }
+
+    fn queue_local_import_inner(
+        self: &Arc<Self>,
+        request: LocalImportRequest,
+        parent_job_id: Option<String>,
+        callback: Option<ProgressCallback>,
+    ) -> ServiceResult<QueuedVideoJob> {
         self.get_project(&request.project_id)?;
         let source = fs::canonicalize(&request.source_path).map_err(|error| {
             VideoServiceError::io(
@@ -9232,16 +9591,57 @@ impl VideoStudioService {
             actor: request.actor.clone(),
             title: request.title.clone(),
             origin,
+            parent_job_id: parent_job_id.clone(),
             priority: default_normal_priority(),
         };
-        let job_id = self
-            .store
-            .create_job(
-                "video_import_local",
-                &serde_json::to_value(&durable_request).map_err(json_error)?,
+        let durable_value = serde_json::to_value(&durable_request).map_err(json_error)?;
+        let (job_id, created) = if let Some(parent_job_id) = parent_job_id.as_deref() {
+            self.store
+                .create_idempotent_job(
+                    "video_import_local",
+                    &format!("video-prompt-import:{parent_job_id}"),
+                    &durable_value,
+                )
+                .map_err(VideoServiceError::store)?
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.idempotency_conflict",
+                        "The prompt parent is already bound to a different local import request",
+                    )
+                })?
+        } else {
+            (
+                self.store
+                    .create_job("video_import_local", &durable_value)
+                    .map_err(VideoServiceError::store)?,
+                true,
             )
-            .map_err(VideoServiceError::store)?;
+        };
         let project_id = durable_request.project_id.clone();
+        if !created {
+            let job = self
+                .store
+                .get_job(&job_id)
+                .map_err(VideoServiceError::store)?
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.job_not_found",
+                        "The durable prompt import could not be reloaded",
+                    )
+                })?;
+            return match job.get("status").and_then(Value::as_str) {
+                Some("failed" | "cancelled") => self.resume_job(&job_id, callback),
+                Some("queued" | "preparing" | "running" | "completed") => Ok(QueuedVideoJob {
+                    job_id,
+                    project_id,
+                    kind: "video_import_local".to_string(),
+                }),
+                _ => Err(VideoServiceError::new(
+                    "video.job_state_invalid",
+                    "The durable prompt import has an unsupported state",
+                )),
+            };
+        }
         self.spawn_worker(
             job_id.clone(),
             project_id.clone(),
@@ -11098,7 +11498,17 @@ impl VideoStudioService {
         }
         self.ensure_not_cancelled(cancel)?;
         ensure_project_matches(&self.get_project(&request.project_id)?, &expectation)?;
-        let committed = self.commit_manifest_mutation_at(
+        emit_progress(
+            callback,
+            job_id,
+            &request.project_id,
+            "narration_committing",
+            0.9,
+            "Committing the revised narration to the current timeline",
+            None,
+            None,
+        );
+        let committed = self.commit_manifest_mutation_at_if_parent_active(
             &request.project_id,
             &expectation,
             &request.actor,
@@ -11116,6 +11526,7 @@ impl VideoStudioService {
                 RevisionStage::FinalRender,
                 RevisionStage::PublishPackage,
             ]),
+            request.parent_job_id.as_deref(),
             move |manifest| {
                 for replacement in &prepared {
                     let mut found = false;
@@ -12600,6 +13011,7 @@ impl VideoStudioService {
                 "The selected media must remain a regular local file",
             ));
         }
+        let initial_identity = LocalSourceIdentity::from_metadata(&source_metadata);
         self.verify_local_import_origin(&request.source_path, &request.origin)?;
         validate_source_size(source_metadata.len())?;
         ensure_disk_capacity(
@@ -12665,22 +13077,44 @@ impl VideoStudioService {
             cancel,
             callback,
         )?;
-        // Admission may wait behind another media workload. Recheck at the
-        // actual copy boundary so an earlier UX preflight cannot go stale.
-        let admitted_source_size = fs::symlink_metadata(&request.source_path)
+        // Admission may wait behind another media workload. Open once with
+        // O_NOFOLLOW, bind the copy to that descriptor, and require the exact
+        // inode/size/mtime that FFprobe validated before admission.
+        let source_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&request.source_path)
             .map_err(|error| {
                 VideoServiceError::io(
                     "video.source_not_found",
-                    "The selected local media could not be re-inspected after admission",
+                    "The selected local media could not be opened safely after admission",
                     error,
                 )
-            })?
-            .len();
-        validate_source_size(admitted_source_size)?;
+            })?;
+        let admitted_metadata = source_file.metadata().map_err(|error| {
+            VideoServiceError::io(
+                "video.source_not_found",
+                "The selected local media could not be re-inspected after admission",
+                error,
+            )
+        })?;
+        if !admitted_metadata.is_file()
+            || LocalSourceIdentity::from_metadata(&admitted_metadata) != initial_identity
+        {
+            return Err(VideoServiceError::new(
+                "video.source_changed",
+                "The selected local media changed after validation; choose it again",
+            ));
+        }
+        validate_source_size(admitted_metadata.len())?;
         let _storage_lease = self.reserve_storage(
             format!("{job_id}:local-import"),
             &self.video_root,
-            with_disk_headroom(admitted_source_size, 3),
+            // The descriptor-bound managed copy can consume at most the full
+            // 8 GiB source cap. Proxy/thumbnail/waveform builders acquire
+            // their own reservations, so do not double-count their headroom
+            // in this copy lease.
+            with_disk_headroom(MAX_SOURCE_BYTES, 1),
             "local_import",
         )?;
         let asset_id = new_id();
@@ -12689,6 +13123,8 @@ impl VideoStudioService {
             &request.project_id,
             &asset_id,
             &request.source_path,
+            source_file,
+            initial_identity,
             initial_probe,
             cancel,
             callback,
@@ -12756,6 +13192,20 @@ impl VideoStudioService {
                     .unwrap_or_else(|| display_name(&request.source_path)),
             ),
         );
+        if let Some(parent_job_id) = request.parent_job_id.as_deref() {
+            provenance_metadata.insert(
+                "video_parent_job_id".to_string(),
+                Value::String(parent_job_id.to_string()),
+            );
+            provenance_metadata.insert(
+                "video_project_id".to_string(),
+                Value::String(request.project_id.clone()),
+            );
+            provenance_metadata.insert(
+                "purpose".to_string(),
+                Value::String("prompt_to_video".to_string()),
+            );
+        }
         let source = ManagedSource {
             id: asset_id,
             path: managed.path,
@@ -12779,6 +13229,7 @@ impl VideoStudioService {
             &request.actor,
             source,
             &runtime,
+            request.parent_job_id.as_deref(),
             cancel,
             callback,
         )?;
@@ -13052,6 +13503,7 @@ impl VideoStudioService {
             &request.actor,
             source,
             &runtime,
+            None,
             cancel,
             callback,
         )?;
@@ -13075,6 +13527,8 @@ impl VideoStudioService {
         project_id: &str,
         asset_id: &str,
         source_path: &Path,
+        source_file: File,
+        source_identity: LocalSourceIdentity,
         initial_probe: RuntimeMediaProbe,
         cancel: &AtomicBool,
         callback: Option<&ProgressCallback>,
@@ -13092,20 +13546,21 @@ impl VideoStudioService {
         self.secure_managed_directory(&source_dir)?;
         let final_path = source_dir.join(format!("source-{asset_id}.{extension}"));
         let staging = sibling_staging_path(&final_path)?;
-        let checksum = copy_file_cancelable(source_path, &staging, cancel, |fraction| {
-            let progress = 0.05 + fraction * 0.18;
-            let _ = self.store.update_job(job_id, "running", progress);
-            emit_progress(
-                callback,
-                job_id,
-                project_id,
-                "copying",
-                progress,
-                "Copying media into managed storage",
-                None,
-                None,
-            );
-        })?;
+        let checksum =
+            copy_file_cancelable(source_file, source_identity, &staging, cancel, |fraction| {
+                let progress = 0.05 + fraction * 0.18;
+                let _ = self.store.update_job(job_id, "running", progress);
+                emit_progress(
+                    callback,
+                    job_id,
+                    project_id,
+                    "copying",
+                    progress,
+                    "Copying media into managed storage",
+                    None,
+                    None,
+                );
+            })?;
         let runtime = self.runtime_status(false);
         let ffprobe = required_tool_path(
             &runtime.ffprobe,
@@ -13132,6 +13587,7 @@ impl VideoStudioService {
         actor: &str,
         source: ManagedSource,
         runtime: &MediaRuntimeStatus,
+        required_active_job_id: Option<&str>,
         cancel: &AtomicBool,
         callback: Option<&ProgressCallback>,
     ) -> ServiceResult<Value> {
@@ -13243,8 +13699,10 @@ impl VideoStudioService {
         } else {
             TrackKind::Audio
         };
-        let committed = self.commit_manifest_mutation(
+        let expectation = project_expectation(&self.get_project(project_id)?)?;
+        let committed = self.commit_manifest_mutation_at_if_parent_active(
             project_id,
+            &expectation,
             actor,
             "Imported source media and prepared reusable preview assets",
             Some("ready"),
@@ -13265,6 +13723,7 @@ impl VideoStudioService {
                 RevisionStage::FinalRender,
                 RevisionStage::PublishPackage,
             ]),
+            required_active_job_id,
             move |manifest| {
                 let first_source = manifest.source_assets.is_empty();
                 if let Some(rights) = source_rights {
