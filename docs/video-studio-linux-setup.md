@@ -2,6 +2,26 @@
 
 Video Studio is local-first. FFmpeg performs media work, faster-whisper is the primary internal transcription runtime, and yt-dlp handles one explicitly authorized link at a time. None of the status or benchmark commands below downloads software, contacts a media URL, changes system packages, or requires `sudo`.
 
+## Headless agent mode
+
+The packaged `soundar-desktop` binary exposes the same authenticated Video Studio tools without starting Tauri or opening a window. This is the supported automation boundary for Codex and local scripts; it does not duplicate rendering or mutate the manifest directly.
+
+List the exact installed tool schemas:
+
+```bash
+soundar-desktop agent tools --pretty
+```
+
+Invoke one tool with a JSON request from an argument or standard input:
+
+```bash
+soundar-desktop agent video list_video_projects --request '{}'
+printf '%s\n' '{"project_id":"PROJECT_ID"}' \
+  | soundar-desktop agent video get_video_project --progress --pretty
+```
+
+Final structured results are written to standard output; concise high-level progress is written to standard error when `--progress` is present. Requests are limited to 1 MiB, use the same strict schemas, project locks, version checks, idempotency identifiers, approval boundaries, durable jobs, and registered artifact projection as the desktop UI and assistant. A headless caller must never set rights or `user_confirmed` flags on the user's behalf. User-selected image approval is valid only after a native/user-controlled selection; locally generated images instead carry exact producer and generation provenance through `add_visual_asset`.
+
 ## Check this machine first
 
 From the repository root:
