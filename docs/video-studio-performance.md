@@ -109,7 +109,29 @@ scripts/video/run-smoke-benchmark.sh \
 
 The gate fails if the transcription is empty, word timing is missing, the source-clock gap is collapsed, or VAD-disabled timing is not recorded. It also records model hash, device, precision, wall time, RTF, and VRAM.
 
-Do not infer that NVENC’s 339 MiB render delta makes arbitrary concurrent inference safe. Until measured with the installed model, Whisper remains a heavy/exclusive workload and must not overlap music, image generation, tracking, or another heavy render. A safe-overlap result requires three clean repetitions with no OOM, stable output contracts, peak total VRAM below the scheduler budget, and no stage exceeding its RTF gate.
+## Qualified Whisper/NVENC overlap
+
+Release-qualified overlap run: `20260828T054049Z-1146496`. The immutable `gpu-overlap.json` SHA-256 is `2456adc1bf5c26c16db6e2f3371e73adae397b2afbb812964d5a0904e71b5026`.
+
+The overlap gate starts a repeated 60-second 1080×1920 H.264 NVENC final render, waits until the encoder is active, then runs the exact managed `openai/whisper-tiny` CTranslate2 model on CUDA FP16. It continuously samples total VRAM, validates the rendered A/V through FFprobe and first-frame decode, and validates the timestamped transcript and its preserved source-clock gap. Three consecutive repetitions are mandatory.
+
+| Repetition | Process overlap | Render RTF | Transcription RTF | Peak total VRAM | Peak delta |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 2.169 s | 0.0861 | 0.2964 | 1,940 MiB | 676 MiB |
+| 2 | 2.069 s | 0.0868 | 0.2826 | 1,974 MiB | 710 MiB |
+| 3 | 2.019 s | 0.0854 | 0.2758 | 1,974 MiB | 710 MiB |
+
+All repetitions stayed far below the 11,514 MiB usable scheduler budget (12,282 MiB physical minus 768 MiB headroom), retained twelve timestamped words and the intentional gap, and observed 50% peak encoder utilization. Reproduce without network access:
+
+```bash
+scripts/video/qualify_gpu_overlap.py \
+  --output-dir evidence/video-studio-performance \
+  --fixture-dir evidence/video-studio-performance/20260828T051916Z-1130289/fixtures \
+  --transcription-model "$SOUNDAR_WHISPER_MODEL_PATH" \
+  --faster-whisper-python "$SOUNDAR_FASTER_WHISPER_PYTHON"
+```
+
+The production scheduler permits only this measured pairing: one `openai/whisper-tiny` transcription and one non-exclusive NVENC preview/final render reserving at most 2,048 MiB. Larger Whisper models, speech generation, music, image generation, tracking, multiple encoders, and exclusive GPU work remain serialized. A new model/runtime/driver or wider overlap policy requires a fresh three-run report; NVENC’s small standalone delta is never treated as blanket evidence of safety.
 
 ## Comparing runs
 

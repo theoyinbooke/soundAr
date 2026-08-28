@@ -110,6 +110,16 @@ from pathlib import Path
 script_dir = Path(sys.argv[1])
 sys.path.insert(0, str(script_dir))
 import benchmark_video_studio as benchmark
+import qualify_gpu_overlap as overlap
+
+assert overlap.DEFAULT_GPU_CAPACITY_MIB == 12_282
+assert overlap.DEFAULT_GPU_HEADROOM_MIB == 768
+try:
+    overlap.safe_output_root(Path("/"))
+except overlap.QualificationFailure:
+    pass
+else:
+    raise AssertionError("overlap evidence writer accepted the filesystem root")
 
 stage_names = (
     "probe_imported_source",

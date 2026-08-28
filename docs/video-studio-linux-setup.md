@@ -165,7 +165,7 @@ For a CPU fallback, build the official [whisper.cpp](https://github.com/ggml-org
 | Link import works in a shell but not the app | Desktop process may not inherit NVM paths | Persist absolute Node and yt-dlp paths shown by the checker |
 | `libcudnn.so.9` or `libcublas.so` cannot load | Managed wheel install and child `LD_LIBRARY_PATH` | Fix the child environment; never create global symlinks |
 | faster-whisper starts downloading | A model name was passed instead of a directory | Cancel and select an audited local model directory |
-| Media work exhausts VRAM | Per-stage peak/delta; concurrent heavy jobs | Keep Whisper heavy/exclusive until overlap is qualified |
+| Media work exhausts VRAM | Per-stage peak/delta; concurrent heavy jobs | Keep all workloads outside the documented Whisper-tiny + one-NVENC envelope serialized |
 | Cache hit is not faster than a miss | Key, checksum, FFprobe validation, publication mode | Treat it as a failed performance gate; do not bypass validation |
 
 ## Local smoke and release evidence
@@ -173,6 +173,11 @@ For a CPU fallback, build the official [whisper.cpp](https://github.com/ggml-org
 ```bash
 scripts/video/test-harness.sh
 scripts/video/run-smoke-benchmark.sh --output-dir evidence/video-studio-performance
+scripts/video/qualify_gpu_overlap.py \
+  --output-dir evidence/video-studio-performance \
+  --fixture-dir "$SOUNDAR_VIDEO_FIXTURE_DIR" \
+  --transcription-model "$SOUNDAR_WHISPER_MODEL_PATH" \
+  --faster-whisper-python "$SOUNDAR_FASTER_WHISPER_PYTHON"
 ```
 
 The harness synthesizes all media locally with FFmpeg lavfi, includes a two-second speech gap, validates every output through FFprobe and a first-frame decode, measures GPU/VRAM, verifies content-addressed cache reuse, and atomically publishes an immutable JSON report. See [video-studio-performance.md](video-studio-performance.md) for the exact-machine baseline and regression thresholds.
