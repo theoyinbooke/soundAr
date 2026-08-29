@@ -2,6 +2,9 @@
 
 ## 0.7.0 - 2026-08-29
 
+- Installed updates in place instead of sending you to the browser. The Debian package now downloads, verifies, and installs through `pkexec` and restarts itself, so an update is one click and one permission prompt. Previously only AppImage installs could self-update and the Debian build just opened the release page.
+- Dropped the AppImage. It was the only artifact that could self-update before, but nothing depended on it, it cost 2m34s of every build against 32s for the Debian package, and its bundled GStreamer stack was a recurring packaging fault. Everything now ships as one Debian package.
+- Cached Rust in CI and release. Neither workflow cached it while npm and pip both were, so every run compiled the whole dependency graph from scratch, twice per release.
 - Opened soundAr on a full-screen chat canvas instead of New generation: the greeting and composer sit high on an empty page, and sending hands the whole content column to the thread with the composer docked. Plans, activity, audio artifacts, video results, and approvals all surface inline.
 - Added a Chat/Classic toggle to the top bar. One assistant instance serves both layouts and is re-placed by the shell grid, so switching modes never remounts the pane and a live Codex conversation survives the switch; any sidebar destination leaves chat on its own.
 - Made Breeze TTS 2 the default voice model wherever speech is created without a named model, including the assistant's speech tools, and taught the expressive route to recognize Breeze's `cfg_scale` control. Fast, Clone, and Multilingual keep their existing engines because Breeze supports neither reference cloning nor preset voices.

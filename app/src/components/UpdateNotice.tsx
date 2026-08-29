@@ -17,7 +17,11 @@ export function UpdateNotice({
   const [isInstalling, setIsInstalling] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string>();
-  const canInstall = installKind === "appimage";
+  // tauri-plugin-updater installs a .deb through `pkexec dpkg -i` and an AppImage by replacing
+  // itself, so both update in place. Only an unpackaged development build has to fall back to
+  // opening the release page.
+  const canInstall = installKind === "appimage" || installKind === "deb";
+  const needsAuth = installKind === "deb";
 
   async function applyUpdate() {
     setError(undefined);
@@ -51,7 +55,7 @@ export function UpdateNotice({
       </div>
       <div className="app-update-copy">
         <strong>soundAr {update.version} is available</strong>
-        <span>{error ?? (isInstalling ? `Downloading signed update · ${progress}%` : canInstall ? "Ready to install and restart." : "Open the release to update the Debian package.")}</span>
+        <span>{error ?? (isInstalling ? `Downloading signed update · ${progress}%` : canInstall ? (needsAuth ? "Installs and restarts. Your system will ask for permission." : "Ready to install and restart.") : "Open the release to update this build.")}</span>
         {isInstalling ? <div className="app-update-meter"><i style={{ width: `${progress}%` }} /></div> : null}
       </div>
       <div className="app-update-actions">

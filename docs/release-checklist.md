@@ -16,18 +16,18 @@ the retained logs. A skipped required item blocks publication.
 
 ## Packages And Updates
 
-- [ ] CI produced signed Debian and AppImage artifacts from the candidate commit.
+- [ ] CI produced a signed Debian artifact from the candidate commit.
 - [ ] `./scripts/verify-linux-bundles.sh <version>` passes in signed mode.
 - [ ] SHA-256 checksums, updater signatures, updater JSON, and provenance point to the same bytes.
 - [ ] A clean downloaded copy verifies against published checksums.
-- [ ] AppImage update downloads, verifies, installs, restarts, and reports the new version.
+- [ ] In-app update downloads, verifies, installs through `pkexec`, restarts, and reports the new version.
 - [ ] Debian update opens the correct release and the package upgrade succeeds through the system package manager.
 - [ ] The package contains no credentials, voice references, generated user audio, or model weights.
 
 ## Clean User Journey
 
 - [ ] Debian installs on a clean supported Linux profile and launches from the desktop entry.
-- [ ] AppImage launches on a clean supported Linux profile.
+- [ ] The Debian package launches on a clean supported Linux profile.
 - [ ] First-time runtime setup succeeds without downloading any model weights.
 - [ ] A model download occurs only after explicit confirmation of source, revision, license, size, access, and hardware requirements.
 - [ ] The smoke model generates decodable audio; Play, seek, export, History replay, close/reopen, and delete work.
@@ -38,7 +38,7 @@ the retained logs. A skipped required item blocks publication.
 
 ## GPU And Stability
 
-- [x] Packaged GPU acceptance passes against the candidate AppImage resources on the RTX 4080 12 GB machine.
+- [x] Packaged GPU acceptance passes against the candidate Debian resources on the RTX 4080 12 GB machine.
 - [x] Cold and warm generations, parallel jobs, rolling batch, comparison, load/unload, cancellation, and worker-kill recovery pass.
 - [x] `SOUNDAR_SOAK_DURATION_SECONDS=1800 ./scripts/run-packaged-gpu-soak.sh` completes against the exact candidate without leaked workers or scheduler reservations; its JSON report passes validation.
 - [x] Peak VRAM, RTF, startup overhead, driver, runtime, and model revisions are retained as machine-readable evidence.
@@ -57,7 +57,7 @@ the retained logs. A skipped required item blocks publication.
 - [ ] “Change the voice” creates one durable idempotent speech replacement and invalidates only speech/render/package work; “render three variations” publishes one primary master plus variants from one frozen editorial version.
 - [ ] Video Studio, Projects, History, and the Assistant all play and download the registered assembled master; scene artifacts remain secondary and no result is only an opaque local path.
 - [ ] Responsive and accessibility checks pass with the Assistant open and closed at 800, 1024, 1180, and 1440 px, with no unintended overflow or automatic sidebar collapse.
-- [ ] Packaged Debian/AppImage runtime discovery reports the same managed FFmpeg, yt-dlp/EJS/Node, and faster-whisper readiness as the verified source candidate.
+- [ ] Packaged Debian runtime discovery reports the same managed FFmpeg, yt-dlp/EJS/Node, and faster-whisper readiness as the verified source candidate.
 
 ## Playback And Quality
 
@@ -75,4 +75,4 @@ the retained logs. A skipped required item blocks publication.
 - [ ] The prior stable package and rollback instructions are available.
 - [ ] Draft assets install and run before the release is published.
 - [ ] Published updater metadata resolves only after every required gate passes.
-- [ ] Post-publication update detection is confirmed from the prior stable AppImage.
+- [ ] Post-publication update detection and in-place install are confirmed from the prior stable Debian package.

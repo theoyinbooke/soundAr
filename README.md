@@ -60,7 +60,7 @@ To install a package built locally:
 
 - Managed Python runtimes: `${XDG_DATA_HOME:-$HOME/.local/share}/soundar/runtime`
 - Model weights, the SQLite library, and exports: `~/.soundAr`
-- AppImage builds can update and restart in place after signature verification.
+- Updates install and restart in place after signature verification. The Debian package installs through `pkexec`, so the system asks for permission once per update.
 - Debian builds show an update notice and continue through the system package installer.
 
 Installing, opening, or updating soundAr never downloads model weights. A model download starts only after you review its upstream source, pinned revision, license, access conditions, storage requirement, and hardware fit in Models.
@@ -129,7 +129,7 @@ MusicGen Small remains available for short instrumental drafts. Its weights are 
 
 The MIT License covers soundAr's original source and bundled brand assets, not third-party models, datasets, or generated content. A catalog entry means the model has a qualified local integration; it does not mean the model is open source or cleared for every use.
 
-- Model weights are never committed to this repository or bundled in a Debian/AppImage release.
+- Model weights are never committed to this repository or bundled in a Debian release.
 - Downloads are explicit, revision-pinned, and recorded with a file manifest.
 - Health checks validate installed files before an engine can use them.
 - Generated artifacts are registered with byte length and SHA-256 checksum.
@@ -247,7 +247,7 @@ Release evidence ownership and manual gates are documented in the [test matrix](
 
 ## Releases
 
-Version tags build signed Debian and AppImage artifacts in GitHub Actions. The release workflow runs source, UI, native, package, and clean-download checks; generates checksums and build provenance; and publishes only after those gates pass.
+Version tags build a signed Debian package in GitHub Actions. The release workflow runs source, UI, native, package, and clean-download checks; generates checksums and build provenance; and publishes only after those gates pass.
 
 - [Latest release](https://github.com/theoyinbooke/soundAr/releases/latest)
 - [Changelog](CHANGELOG.md)

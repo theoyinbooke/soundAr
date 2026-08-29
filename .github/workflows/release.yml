@@ -40,8 +40,7 @@ jobs:
       - name: Install Tauri build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf squashfs-tools xvfb ffmpeg \
-            libgstreamer1.0-0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf xvfb ffmpeg
       - name: Install frontend dependencies
         working-directory: app
         run: npm ci

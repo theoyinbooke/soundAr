@@ -27,14 +27,19 @@
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* data:; media-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$HOME/.soundAr/exports/*", "$HOME/.soundAr/exports/**"]
+        "scope": [
+          "$HOME/.soundAr/exports/*",
+          "$HOME/.soundAr/exports/**"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "targets": ["deb", "appimage"],
+    "targets": [
+      "deb"
+    ],
     "category": "Music",
     "shortDescription": "Local speech, music, and video studio",
     "longDescription": "Create speech, music, animated podcasts, portrait reels, and finished video locally with GPU-accelerated models and FFmpeg.",
@@ -112,7 +117,19 @@
         "bundleMediaFramework": true
       },
       "deb": {
-        "depends": ["curl", "ca-certificates", "python3", "util-linux", "build-essential", "ffmpeg", "libsndfile1", "libespeak-ng1", "gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good", "gstreamer1.0-libav"]
+        "depends": [
+          "curl",
+          "ca-certificates",
+          "python3",
+          "util-linux",
+          "build-essential",
+          "ffmpeg",
+          "libsndfile1",
+          "libespeak-ng1",
+          "gstreamer1.0-plugins-base",
+          "gstreamer1.0-plugins-good",
+          "gstreamer1.0-libav"
+        ]
       }
     }
   },
