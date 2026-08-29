@@ -371,7 +371,7 @@ export async function createComparison(request: {
     const preview = await previewBootstrap();
     const takes = await Promise.all(request.takes.map(async (take, position) => {
       const result = await synthesizeSpeech({
-        model_id: take.model_id ?? preview.installed[0]?.model_id ?? "hexgrad/Kokoro-82M",
+        model_id: take.model_id ?? preview.installed[0]?.model_id ?? "BreezeBlue/Breeze-TTS-2",
         text: request.script,
         speaker: take.speaker ?? "default",
         language: take.language ?? "en",

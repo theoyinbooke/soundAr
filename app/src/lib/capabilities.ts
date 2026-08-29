@@ -1,5 +1,20 @@
 import type { BootstrapState, EngineCapability, InstalledModel, RouteIntent, VoiceProfile } from "../types";
 
+// Breeze TTS 2 is the most expressive local voice model installed, so it is the default choice
+// wherever soundAr creates speech without the user naming a model. The fallbacks matter: Breeze
+// needs CUDA and ~7.9 GB of VRAM, so a machine without it must still land on a working engine.
+export const DEFAULT_TTS_ENGINE = "breeze";
+const DEFAULT_TTS_ENGINE_FALLBACKS = ["kokoro", "chatterbox", "fish-speech", "speecht5"];
+
+export function defaultTtsModel(bootstrap: BootstrapState): InstalledModel | undefined {
+  const models = qualifiedModels(bootstrap, "tts");
+  for (const engine of [DEFAULT_TTS_ENGINE, ...DEFAULT_TTS_ENGINE_FALLBACKS]) {
+    const match = models.find((model) => model.engine === engine);
+    if (match) return match;
+  }
+  return models[0];
+}
+
 export function capabilityForModel(
   bootstrap: BootstrapState,
   model: Pick<InstalledModel, "engine"> | undefined,
@@ -58,7 +73,7 @@ export function recommendModel(
   const candidates = qualifiedModels(bootstrap, "tts").filter((model) => {
     const capability = capabilityForModel(bootstrap, model);
     if (!capability) return false;
-    if (intent === "expressive") return Boolean(capability.controls.exaggeration || capability.controls.cfg_weight);
+    if (intent === "expressive") return Boolean(capability.controls.exaggeration || capability.controls.cfg_weight || capability.controls.cfg_scale);
     if (intent === "clone") return capability.voice_modes.includes("reference") && compatibleVoicesForModel(bootstrap, model, voices).length > 0;
     if (intent === "multilingual") return capability.languages.length > 2;
     return true;
@@ -76,7 +91,8 @@ export function recommendModel(
     return { model: measured[0], reason: `${intent[0].toUpperCase()}${intent.slice(1)} route selected from this machine's benchmark median (${rtf.toFixed(3)}x RTF).`, measured: true };
   }
 
-  const preferredEngine = intent === "fast" ? "kokoro" : intent === "expressive" ? "chatterbox" : intent === "multilingual" ? "coqui" : undefined;
+  // "Fast" stays with the small model on purpose — Breeze is 3.47B and is not the quick route.
+  const preferredEngine = intent === "fast" ? "kokoro" : intent === "expressive" ? DEFAULT_TTS_ENGINE : intent === "multilingual" ? "coqui" : undefined;
   const model = candidates.find((candidate) => candidate.engine === preferredEngine) ?? candidates[0];
   return { model, reason: `${intent[0].toUpperCase()}${intent.slice(1)} route selected from declared capabilities; run Benchmarks to replace this fallback with local evidence.`, measured: false };
 }

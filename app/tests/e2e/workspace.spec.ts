@@ -5,6 +5,13 @@ const routes = ["Generate", "Video Studio", "Projects", "Voices", "Models", "Com
 const allRoutes = [...routes, "Settings", "About"];
 const mobileDirectRoutes = new Set(["Generate", "Video Studio", "Projects", "History"]);
 
+// soundAr launches on the chat canvas. These specs exercise the classic studio surfaces, so each
+// one starts by switching modes rather than assuming a view is already mounted.
+async function openWorkspace(page: import("@playwright/test").Page) {
+  await page.goto("/");
+  await page.getByRole("banner").getByRole("button", { name: "Classic", exact: true }).click();
+}
+
 async function openRoute(page: import("@playwright/test").Page, route: string) {
   const mobile = page.viewportSize()!.width <= 820;
   if (mobile && route !== "Settings" && await page.locator(".settings-shell").count()) {
@@ -31,8 +38,49 @@ async function openRoute(page: import("@playwright/test").Page, route: string) {
   await expect(page.getByRole("heading", { name: heading }).first()).toBeVisible();
 }
 
-test("workspace is explicit about preview and native capability boundaries", async ({ page }) => {
+test("launches into the chat canvas and keeps the conversation across a mode toggle", async ({ page }) => {
   await page.goto("/");
+
+  // A blank canvas: greeting and composer only, no studio view and no floating rail launcher.
+  await expect(page.getByRole("heading", { name: "Hello" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "New generation" })).toHaveCount(0);
+  await expect(page.locator(".assistant-launcher")).toHaveCount(0);
+  await expect(page.locator(".sidebar")).toBeVisible();
+
+  await page.getByRole("textbox", { name: "Message soundAr assistant" }).fill("Create a short welcome line.");
+  await page.locator(".assistant-send").click();
+
+  // Sending retires the greeting and the thread takes the column.
+  await expect(page.locator(".assistant-message.is-user p")).toHaveText("Create a short welcome line.");
+  await expect(page.getByRole("heading", { name: "Hello" })).toHaveCount(0);
+  await expect(page.locator(".assistant-plan")).toBeVisible();
+  const scroll = await page.evaluate(() => ({ width: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+  expect(scroll.width).toBeLessThanOrEqual(scroll.client + 1);
+
+  await page.getByRole("banner").getByRole("button", { name: "Classic", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "New generation" })).toBeVisible();
+  // Classic returns to its own default: the rail is closed and its launcher is back.
+  await expect(page.locator(".assistant-pane")).toHaveCount(0);
+  await expect(page.locator(".assistant-launcher")).toBeVisible();
+
+  await page.locator(".assistant-launcher").click();
+  await expect(page.locator(".assistant-pane .assistant-message.is-user p")).toHaveText("Create a short welcome line.");
+
+  await page.getByRole("banner").getByRole("button", { name: "Chat", exact: true }).click();
+  await expect(page.locator(".assistant-canvas .assistant-message.is-user p")).toHaveText("Create a short welcome line.");
+});
+
+test("a sidebar destination leaves the chat canvas for the studio", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Hello" })).toBeVisible();
+
+  await page.locator(".sidebar").getByRole("button", { name: "Voices", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Voices" }).first()).toBeVisible();
+  await expect(page.locator(".assistant-canvas")).toHaveCount(0);
+});
+
+test("workspace is explicit about preview and native capability boundaries", async ({ page }) => {
+  await openWorkspace(page);
   await expect(page.locator(".topbar-status em")).toHaveText("Preview");
   await expect(page.getByRole("heading", { name: "New generation" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Transcribe", exact: true })).toHaveCount(0);
@@ -41,7 +89,7 @@ test("workspace is explicit about preview and native capability boundaries", asy
 });
 
 test("Settings and About expose manual update checks with explicit feedback", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Settings");
   await page.getByRole("button", { name: "Runtime & updates" }).click();
   await page.getByRole("button", { name: "Check for updates" }).click();
@@ -53,7 +101,7 @@ test("Settings and About expose manual update checks with explicit feedback", as
 });
 
 test("Music Studio previews the complete workflow without fabricating browser audio", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await page.getByRole("button", { name: "Music", exact: true }).click();
 
   await expect(page.getByRole("heading", { name: "New music generation" })).toBeVisible();
@@ -83,7 +131,7 @@ test("Music Studio previews the complete workflow without fabricating browser au
 });
 
 test("Video Studio keeps source intake deliberate and reaches an editable local project", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Video Studio");
 
   const starts = page.getByRole("group", { name: "Start a video project" });
@@ -112,14 +160,14 @@ test("Video Studio keeps source intake deliberate and reaches an editable local 
 });
 
 test("implemented routes remain usable at the target viewport", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   for (const route of ["Projects", "Voices", "Models", "Compare", "Benchmarks", "History"]) {
     await openRoute(page, route);
   }
 });
 
 test("workspace controls do not collide at the target viewport", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   for (const route of allRoutes) {
     await openRoute(page, route);
     const collisions = await page.locator("main").evaluate((main) => {
@@ -158,7 +206,7 @@ test("workspace controls do not collide at the target viewport", async ({ page }
 
 test("desktop navigation stays open and keeps unambiguous route names", async ({ page }) => {
   await page.setViewportSize({ width: 1024, height: 768 });
-  await page.goto("/");
+  await openWorkspace(page);
 
   await expect(page.locator(".app-shell")).not.toHaveClass(/is-sidebar-collapsed/);
   for (const route of routes) {
@@ -170,7 +218,7 @@ test("desktop navigation stays open and keeps unambiguous route names", async ({
 
 test("phone workspace never expands beyond the viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await openWorkspace(page);
 
   for (const route of allRoutes) {
     await openRoute(page, route);
@@ -192,7 +240,7 @@ test("phone workspace never expands beyond the viewport", async ({ page }) => {
 
 test("narrow phone keeps primary selectors and inspector text readable", async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 720 });
-  await page.goto("/");
+  await openWorkspace(page);
 
   const route = page.getByRole("group", { name: "Model route" });
   const routeBounds = await route.evaluate((element) => ({
@@ -213,7 +261,7 @@ test("narrow phone keeps primary selectors and inspector text readable", async (
 
 test("tablet model registry fits without horizontal scrolling", async ({ page }) => {
   await page.setViewportSize({ width: 768, height: 900 });
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Models");
 
   const bounds = await page.locator(".model-table-panel").evaluate((panel) => {
@@ -234,7 +282,7 @@ test("tablet model registry fits without horizontal scrolling", async ({ page })
 
 test("phone navigation never covers workspace controls", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await openWorkspace(page);
 
   for (const route of [...routes, "About"]) {
     await openRoute(page, route);
@@ -267,7 +315,7 @@ test("phone navigation never covers workspace controls", async ({ page }) => {
 
 test("compact model labels remain readable in the registry", async ({ page }) => {
   await page.setViewportSize({ width: 768, height: 900 });
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Models");
   const wavlmRow = page.locator(".model-table tbody tr").filter({ hasText: "wavlm-base-plus-sv" });
   await wavlmRow.click();
@@ -277,7 +325,7 @@ test("compact model labels remain readable in the registry", async ({ page }) =>
 
 test("phone voice consent dialog fits above the navigation", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Voices");
   await page.getByRole("button", { name: "Add voice profile", exact: true }).click();
 
@@ -294,7 +342,7 @@ test("phone voice consent dialog fits above the navigation", async ({ page }) =>
 });
 
 test("projects support create, edit, undo, redo, and local save", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Projects");
   await page.getByRole("button", { name: "New project" }).click();
   await page.getByLabel("Project name").fill("Responsive release narration");
@@ -317,7 +365,7 @@ test("projects support create, edit, undo, redo, and local save", async ({ page 
 });
 
 test("browser preview reports model installation boundary without a stranded dialog", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Models");
   await page.getByRole("button", { name: /More actions for chatterbox-turbo/i }).click();
   await page.getByRole("menuitem", { name: "Install model" }).click();
@@ -326,7 +374,7 @@ test("browser preview reports model installation boundary without a stranded dia
 });
 
 test("every route keeps controls inside its layout in both themes", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
 
   for (const theme of ["light", "dark"] as const) {
     const currentTheme = await page.locator("html").getAttribute("data-theme");
@@ -374,7 +422,7 @@ test("every route keeps controls inside its layout in both themes", async ({ pag
 });
 
 test("hostile runtime text wraps without covering actions", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   const hostile = "Could-not-start-the-Python-runtime-at-/home/a-user-with-an-extremely-long-name/.soundAr/runtimes/speaker-verification/bin/python-because-the-local-runtime-package-is-incomplete";
 
   for (const viewport of [{ width: 1220, height: 720 }, { width: 390, height: 844 }]) {
@@ -413,7 +461,7 @@ test("hostile runtime text wraps without covering actions", async ({ page }) => 
 });
 
 test("custom dropdowns stay compact and selectable", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   const model = page.getByRole("combobox", { name: "Model" });
   await model.click();
   const option = page.getByRole("option").first();
@@ -430,7 +478,7 @@ test("custom dropdowns stay compact and selectable", async ({ page }) => {
 
 test("mobile routes reset scroll and overlays stay above navigation", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await openWorkspace(page);
 
   const content = page.locator(".app-content");
   await content.evaluate((element) => { element.scrollTop = element.scrollHeight; });
@@ -465,7 +513,7 @@ test("mobile routes reset scroll and overlays stay above navigation", async ({ p
 });
 
 test("generate does not expose inert export controls", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await expect(page.getByRole("button", { name: "Open output" })).toBeDisabled();
   await expect(page.getByRole("button", { name: "Export audio" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Change" })).toHaveCount(0);
@@ -474,7 +522,7 @@ test("generate does not expose inert export controls", async ({ page }) => {
 });
 
 test("preview batch reaches a coherent completed state", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await page.getByRole("button", { name: "Batch" }).click();
   await page.getByLabel("Script").fill("First preview row.\nSecond preview row.");
   await page.getByRole("button", { name: "Start batch" }).click();
@@ -492,7 +540,7 @@ test("preview batch reaches a coherent completed state", async ({ page }) => {
 });
 
 test("queue priority is compact and remains visible on a batch", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await page.getByText("Advanced settings", { exact: true }).click();
   const priority = page.getByRole("combobox", { name: "Queue priority" });
   await expect(priority).toHaveCSS("font-size", "11px");
@@ -508,7 +556,7 @@ test("queue priority is compact and remains visible on a batch", async ({ page }
 });
 
 test("Voice Lab remains compact with the reference editor expanded", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Voices");
   await page.getByLabel("Selected voice details").getByRole("button", { name: "Edit" }).click();
   await expect(page.getByLabel("Reference waveform")).toBeVisible();
@@ -523,7 +571,7 @@ test("Voice Lab remains compact with the reference editor expanded", async ({ pa
 });
 
 test("voice table keeps preview primary and secondary actions in a compact menu", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Voices");
 
   const row = page.locator(".voice-table tbody tr").filter({ hasText: "Mara" }).first();
@@ -548,7 +596,7 @@ test("voice table keeps preview primary and secondary actions in a compact menu"
 });
 
 test("model health reports truthful worker lifecycle state without overflow", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Models");
   await page.getByRole("button", { name: "Health" }).click();
   await expect(page.getByText(/files ready.*preview on browser.*0 warm.*0 starts.*no failures/i)).toBeVisible();
@@ -557,7 +605,7 @@ test("model health reports truthful worker lifecycle state without overflow", as
 });
 
 test("benchmark evidence is explicit and cannot be fabricated in browser preview", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Benchmarks");
   await expect(page.getByText("Mean WER", { exact: true })).toBeVisible();
   await expect(page.getByText("Mean CER", { exact: true })).toBeVisible();
@@ -568,7 +616,7 @@ test("benchmark evidence is explicit and cannot be fabricated in browser preview
 });
 
 test("blind comparison matrix renders, reviews, reveals, and promotes without overflow", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await openRoute(page, "Compare");
   await page.getByRole("button", { name: "4 takes" }).click();
   await expect(page.getByRole("combobox", { name: "Take D" })).toBeVisible();
@@ -594,7 +642,7 @@ test("blind comparison matrix renders, reviews, reveals, and promotes without ov
 });
 
 test("sidebar history selects a detail-only generation workspace", async ({ page }) => {
-  await page.goto("/");
+  await openWorkspace(page);
   await page.getByLabel("Script").fill("History workbench browser proof.");
   await page.getByRole("button", { name: "Generate audio" }).click();
   await expect(page.getByText("History workbench browser proof", { exact: false }).first()).toBeVisible({ timeout: 10_000 });
@@ -618,7 +666,7 @@ test("sidebar history selects a detail-only generation workspace", async ({ page
 
 test("phone History keeps artifact actions visible without horizontal scrolling", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await openWorkspace(page);
   await page.getByLabel("Script").fill("Phone history controls stay visible.");
   await page.getByRole("button", { name: "Generate audio" }).click();
   await openRoute(page, "History");

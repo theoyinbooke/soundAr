@@ -2,7 +2,7 @@ import { ChevronDown, ChevronRight, FileInput, FolderOpen, Info, Pause, Play, Pl
 import { useEffect, useMemo, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { cancelBatchRun, cancelJob, clearFinishedJobs, createBatchRun, deleteHistoryItem, getSchedulerStatus, importBatchInput, listBatchRuns, listHistory, listJobs, loadGeneratedAudio, pauseBatchRun, pickBatchInputFile, queueBatchRun, queueSynthesis, resumeBatchRun, retryJob, saveGenerationPreset, synthesizeSpeech, updateBatchItem } from "../lib/bridge";
-import { capabilityForModel, compatibleVoicesForModel, qualifiedModels, recommendModel } from "../lib/capabilities";
+import { capabilityForModel, compatibleVoicesForModel, defaultTtsModel, qualifiedModels, recommendModel } from "../lib/capabilities";
 import type { BatchImportResult, BatchInputRow, BatchRunRecord, BootstrapState, HistoryItem, JobRecord, QueuePriority, RouteIntent, SynthesisRequest, SynthesisResult, VoiceProfile } from "../types";
 import { CompactField, Dropdown, MetricStrip, PageHeader, Panel, RowActionMenu, Segmented, SelectField, StatusText } from "../components/ui";
 import { VoiceProfileDialog } from "../components/VoiceProfileDialog";
@@ -40,7 +40,7 @@ export function GenerateView({
   const [generationKind, setGenerationKind] = useState<"speech" | "music">("speech");
   const [mode, setMode] = useState<"text" | "ssml" | "batch">("text");
   const [text, setText] = useState("The best voices feel present before they sound perfect.\nStart with clarity, then shape pace, warmth, and intent.");
-  const [modelId, setModelId] = useState(ttsModels.find((model) => model.engine === "kokoro")?.model_id ?? ttsModels[0]?.model_id ?? "");
+  const [modelId, setModelId] = useState(defaultTtsModel(bootstrap)?.model_id ?? "");
   const [voiceId, setVoiceId] = useState(voices[0]?.id ?? "");
   const [speed, setSpeed] = useState(1);
   const [exaggeration, setExaggeration] = useState(0.5);

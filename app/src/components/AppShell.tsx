@@ -129,6 +129,8 @@ export function AppShell({
   assistantOpen,
   onAssistantOpenChange,
   onAssistantStudioChanged,
+  chatMode,
+  onChatModeChange,
   children,
 }: {
   current: NavKey;
@@ -144,6 +146,8 @@ export function AppShell({
   assistantOpen: boolean;
   onAssistantOpenChange: (open: boolean) => void;
   onAssistantStudioChanged?: () => void;
+  chatMode: boolean;
+  onChatModeChange: (chat: boolean) => void;
   children: ReactNode;
 }) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -158,7 +162,7 @@ export function AppShell({
   const accountRef = useRef<HTMLDivElement>(null);
   const appMenuRef = useRef<HTMLDivElement>(null);
   const accountButtonRef = useRef<HTMLButtonElement>(null);
-  const { activeProjectId: activeVideoProjectId, onOpenProject: onOpenVideoProject } = useVideoIntegration();
+  const { activeProjectId: activeVideoProjectId, onOpenProject: onOpenVideoProject, onPreviewProject: onPreviewVideoProject } = useVideoIntegration();
   const { projects: videoProjects } = useVideoProjectSummaries();
   const availableVram = Math.max(0, system.vram_total_mb - system.vram_used_mb) / 1024;
   const settingsMode = current === "settings";
@@ -171,6 +175,9 @@ export function AppShell({
     .slice(0, 24);
 
   function navigateTo(key: NavKey) {
+    // Any destination is a classic-mode surface, so picking one leaves the chat canvas even when
+    // the requested view is already the selected one behind it.
+    if (chatMode) onChatModeChange(false);
     if (key === current) return;
     setBackStack((items) => [...items.slice(-24), current]);
     setForwardStack([]);
@@ -237,9 +244,10 @@ export function AppShell({
     const Icon = item.icon;
     const state = features[item.key] ?? "stable";
     const disabled = state === "disabled";
+    const active = current === item.key && !chatMode;
     return (
       <button
-        className={`nav-item ${current === item.key ? "is-active" : ""} ${disabled ? "is-disabled" : ""}`}
+        className={`nav-item ${active ? "is-active" : ""} ${disabled ? "is-disabled" : ""}`}
         key={item.key}
         aria-label={item.label}
         onClick={() => {
@@ -251,7 +259,7 @@ export function AppShell({
         type="button"
         title={disabled ? `${item.label} is not available in this build` : `${item.label}${state === "experimental" ? " (experimental)" : state === "beta" ? " (beta)" : ""}`}
         disabled={disabled}
-        aria-current={current === item.key ? "page" : undefined}
+        aria-current={active ? "page" : undefined}
       >
         <Icon aria-hidden="true" size={16} strokeWidth={1.75} />
         <span>{item.label}</span>
@@ -260,7 +268,7 @@ export function AppShell({
   };
 
   return (
-    <div className={`app-shell ${settingsMode ? "is-settings-mode" : ""} ${sidebarCollapsed ? "is-sidebar-collapsed" : ""} ${assistantOpen ? "is-assistant-open" : ""}`}>
+    <div className={`app-shell ${settingsMode ? "is-settings-mode" : ""} ${sidebarCollapsed ? "is-sidebar-collapsed" : ""} ${assistantOpen && !chatMode ? "is-assistant-open" : ""} ${chatMode ? "is-chat-mode" : ""}`}>
         <header className="app-topbar" data-tauri-drag-region>
           <div className="topbar-brand-cell" ref={appMenuRef}>
             <button className="topbar-command" type="button" aria-label={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"} title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"} onClick={() => setSidebarCollapsed((value) => !value)}><PanelLeft aria-hidden="true" size={14} /></button>
@@ -278,6 +286,10 @@ export function AppShell({
           </div>
           <div className="topbar-drag-region" data-tauri-drag-region aria-hidden="true" />
           <div className="topbar-status" data-tauri-drag-region>
+            <div className="mode-toggle" role="group" aria-label="Interface mode">
+              <button className={chatMode ? "is-active" : ""} type="button" aria-pressed={chatMode} title="Full-screen chat" onClick={() => onChatModeChange(true)}>Chat</button>
+              <button className={!chatMode ? "is-active" : ""} type="button" aria-pressed={!chatMode} title="Classic studio layout" onClick={() => onChatModeChange(false)}>Classic</button>
+            </div>
             <span className="runtime-indicator" title={`${system.gpu_name} · ${availableVram.toFixed(1)} GB available`}>
               <Activity aria-hidden="true" size={13} />
               {system.cuda_available ? "CUDA ready" : "CPU runtime"}
@@ -299,9 +311,11 @@ export function AppShell({
                 </div>
               ))}
               {history.length || videoProjects.length ? <div className="nav-group recent-work-group"><span className="nav-section-label">Recent</span><nav aria-label="Recent work">{recentItems.map((item) => {
-                const active = item.kind === "audio" ? current === "history" && selectedHistoryId === item.id : current === "video" && activeVideoProjectId === item.id;
+                const active = item.kind === "audio"
+                  ? current === "history" && selectedHistoryId === item.id
+                  : (current === "video" || current === "history") && activeVideoProjectId === item.id;
                 return <button className={`recent-work-item ${active ? "is-active" : ""}`} key={`${item.kind}-${item.id}`} type="button" title={item.title} aria-current={active ? "page" : undefined} onClick={() => {
-                  if (item.kind === "video") onOpenVideoProject?.(item.id);
+                  if (item.kind === "video") (onPreviewVideoProject ?? onOpenVideoProject)?.(item.id);
                   else { onSelectHistory?.(item.id); navigateTo("history"); }
                 }}><span>{item.title}</span><small>{item.detail}</small></button>;
               })}{!recentItems.length ? <small className="sidebar-history-empty">No matching work</small> : null}</nav></div> : null}
@@ -346,10 +360,12 @@ export function AppShell({
           </aside>
         ) : null}
 
-        <main className="app-content" ref={contentRef}>{children}</main>
+        <main className="app-content" ref={contentRef}>{chatMode ? null : children}</main>
 
-        <AssistantPane open={assistantOpen} onClose={() => onAssistantOpenChange(false)} onStudioChanged={onAssistantStudioChanged} />
-        {!assistantOpen ? <AssistantLauncher onClick={() => onAssistantOpenChange(true)} /> : null}
+        {/* One instance across both modes: the shell grid re-places it, so toggling never remounts
+            the pane and the live Codex thread survives the switch. */}
+        <AssistantPane open={chatMode || assistantOpen} variant={chatMode ? "canvas" : "rail"} onClose={() => onAssistantOpenChange(false)} onStudioChanged={onAssistantStudioChanged} />
+        {!chatMode && !assistantOpen ? <AssistantLauncher onClick={() => onAssistantOpenChange(true)} /> : null}
 
         {runtime === "tauri" ? <WindowResizeHandles /> : null}
 

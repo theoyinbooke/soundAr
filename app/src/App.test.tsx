@@ -6,11 +6,26 @@ import { fallbackBootstrap } from "./data";
 const bridge = vi.hoisted(() => ({
   loadBootstrapState: vi.fn(),
   listHistory: vi.fn(),
+  listJobs: vi.fn(),
+  listProjects: vi.fn(),
+  loadGeneratedAudio: vi.fn(),
+  loadJobPreview: vi.fn(),
+  exportHistoryItem: vi.fn(),
   saveApplicationSetting: vi.fn(),
 }));
 
 vi.mock("./lib/bridge", () => bridge);
 vi.mock("@tauri-apps/plugin-updater", () => ({ check: vi.fn() }));
+// The chat canvas is the launch surface, so App now mounts the assistant on every successful
+// bootstrap. Stubbing Codex keeps this test on the runtime boundary it is about.
+vi.mock("./lib/codexBridge", () => ({
+  refreshCodexConnection: vi.fn().mockResolvedValue({ available: false, connected: false, message: "Codex is not installed." }),
+  codexRequest: vi.fn(),
+  listenToCodex: vi.fn().mockResolvedValue(() => undefined),
+  loadCodexModels: vi.fn().mockResolvedValue([]),
+  loadAssistantVideoThreadLink: vi.fn().mockResolvedValue(undefined),
+  respondToCodex: vi.fn(),
+}));
 
 import App from "./App";
 
@@ -35,6 +50,8 @@ describe("App native bootstrap boundary", () => {
       .mockRejectedValueOnce(new Error("Database integrity check failed"))
       .mockResolvedValueOnce(nativeState);
     bridge.listHistory.mockResolvedValue([]);
+    bridge.listJobs.mockResolvedValue([]);
+    bridge.listProjects.mockResolvedValue([]);
     bridge.saveApplicationSetting.mockResolvedValue(nativeState.settings);
 
     render(<App />);
@@ -46,8 +63,11 @@ describe("App native bootstrap boundary", () => {
 
     await user.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(bridge.loadBootstrapState).toHaveBeenCalledTimes(2));
+    // A hydrated app lands on the chat canvas; the classic studio is one toggle away.
+    expect(await screen.findByRole("heading", { name: "Hello" })).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "New generation" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Classic" }));
     expect(await screen.findByRole("heading", { name: "New generation" })).toBeVisible();
-    expect(bridge.listHistory).toHaveBeenCalledOnce();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 

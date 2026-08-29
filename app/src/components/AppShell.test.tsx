@@ -6,6 +6,24 @@ import type { FeatureState } from "../types";
 import { VideoIntegrationProvider } from "./video/VideoIntegrationContext";
 import { createBrowserPreviewVideoService } from "../lib/videoBridge";
 
+// Chat mode mounts the assistant, so keep it offline and off the studio poller: these tests are
+// about how the shell places the pane, not about what Codex says back.
+vi.mock("../lib/codexBridge", () => ({
+  refreshCodexConnection: vi.fn().mockResolvedValue({ available: false, connected: false, message: "Codex is not installed." }),
+  codexRequest: vi.fn(),
+  listenToCodex: vi.fn().mockResolvedValue(() => undefined),
+  loadCodexModels: vi.fn().mockResolvedValue([]),
+  loadAssistantVideoThreadLink: vi.fn().mockResolvedValue(undefined),
+  respondToCodex: vi.fn(),
+}));
+vi.mock("../lib/bridge", () => ({
+  listHistory: vi.fn().mockResolvedValue([]),
+  listJobs: vi.fn().mockResolvedValue([]),
+  loadGeneratedAudio: vi.fn(),
+  loadJobPreview: vi.fn(),
+  exportHistoryItem: vi.fn(),
+}));
+
 const system = {
   gpu_name: "Test GPU",
   vram_total_mb: 12_288,
@@ -30,7 +48,7 @@ afterEach(cleanup);
 describe("AppShell capability navigation", () => {
   it("keeps page-specific headings and actions in the page while the desktop strip stays structural", () => {
     render(
-      <AppShell current="generate" onNavigate={vi.fn()} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
+      <AppShell current="generate" onNavigate={vi.fn()} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={vi.fn()}>
         <section className="page">
           <PageHeader title="Generate" subtitle="Create speech locally." actions={<button type="button">Queue audio</button>} />
         </section>
@@ -54,7 +72,7 @@ describe("AppShell capability navigation", () => {
   it("removes capture routes and keeps maturity details in native tooltips", () => {
     const navigate = vi.fn();
     render(
-      <AppShell current="generate" onNavigate={navigate} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
+      <AppShell current="generate" onNavigate={navigate} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={vi.fn()}>
         <div>Content</div>
       </AppShell>,
     );
@@ -68,7 +86,7 @@ describe("AppShell capability navigation", () => {
   it("provides desktop menus, navigation history, and a collapsible rail", () => {
     const navigate = vi.fn();
     render(
-      <AppShell current="generate" onNavigate={navigate} theme="light" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
+      <AppShell current="generate" onNavigate={navigate} theme="light" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={vi.fn()}>
         <div>Content</div>
       </AppShell>,
     );
@@ -92,7 +110,7 @@ describe("AppShell capability navigation", () => {
     });
 
     render(
-      <AppShell current="projects" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
+      <AppShell current="projects" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={vi.fn()}>
         <div>Content</div>
       </AppShell>,
     );
@@ -106,7 +124,7 @@ describe("AppShell capability navigation", () => {
   it("keeps secondary destinations available through compact navigation", () => {
     const navigate = vi.fn();
     render(
-      <AppShell current="generate" onNavigate={navigate} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
+      <AppShell current="generate" onNavigate={navigate} theme="dark" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={vi.fn()}>
         <div>Content</div>
       </AppShell>,
     );
@@ -119,11 +137,12 @@ describe("AppShell capability navigation", () => {
     expect(document.getElementById("mobile-more-menu")).toBeNull();
   });
 
-  it("merges video projects into Recent and opens the exact Studio project", async () => {
+  it("merges video projects into Recent and previews the exact project rather than opening the editor", async () => {
     const openProject = vi.fn();
+    const previewProject = vi.fn();
     render(
-      <VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={openProject}>
-        <AppShell current="generate" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features} history={[]} assistantOpen={false} onAssistantOpenChange={vi.fn()}>
+      <VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={openProject} onPreviewProject={previewProject}>
+        <AppShell current="generate" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features} history={[]} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={vi.fn()}>
           <div>Content</div>
         </AppShell>
       </VideoIntegrationProvider>,
@@ -133,6 +152,112 @@ describe("AppShell capability navigation", () => {
     const video = screen.getByTitle("Creator update · Reel master");
     expect(within(video).getByText("Video")).toBeInTheDocument();
     fireEvent.click(video);
+    // Finished work plays where it is selected; entering the editor stays a deliberate action.
+    expect(previewProject).toHaveBeenCalledWith("creator-update-master");
+    expect(openProject).not.toHaveBeenCalled();
+  });
+
+  it("marks the selected video as current while its master is showing in History", async () => {
+    render(
+      <VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={vi.fn()} onPreviewProject={vi.fn()} activeProjectId="creator-update-master">
+        <AppShell current="history" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features} history={[]} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={vi.fn()}>
+          <div>Content</div>
+        </AppShell>
+      </VideoIntegrationProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByRole("navigation", { name: "Recent work" })).toBeInTheDocument());
+    expect(screen.getByTitle("Creator update · Reel master")).toHaveAttribute("aria-current", "page");
+  });
+
+  it("still opens the editor when no preview handler is provided", async () => {
+    const openProject = vi.fn();
+    render(
+      <VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={openProject}>
+        <AppShell current="generate" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="browser" features={features} history={[]} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={vi.fn()}>
+          <div>Content</div>
+        </AppShell>
+      </VideoIntegrationProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByRole("navigation", { name: "Recent work" })).toBeInTheDocument());
+    fireEvent.click(screen.getByTitle("Creator update · Reel master"));
     expect(openProject).toHaveBeenCalledWith("creator-update-master");
+  });
+
+  it("hands the whole content cell to the chat canvas and keeps the classic views out of it", async () => {
+    render(
+      <AppShell current="generate" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode onChatModeChange={vi.fn()}>
+        <section className="page">
+          <PageHeader title="New generation" subtitle="Create speech locally." />
+        </section>
+      </AppShell>,
+    );
+
+    expect(await screen.findByRole("heading", { name: "Hello" })).toBeVisible();
+    expect(screen.getByLabelText("Message soundAr assistant")).toBeInTheDocument();
+    // The classic view is not merely hidden — it never renders, so its effects stay idle.
+    expect(screen.queryByRole("heading", { name: "New generation" })).not.toBeInTheDocument();
+    expect(document.querySelector(".app-shell")).toHaveClass("is-chat-mode");
+    expect(document.querySelector(".assistant-canvas")).toBeInTheDocument();
+    // The rail chrome and its floating launcher belong to classic mode only.
+    expect(document.querySelector(".assistant-pane")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open soundAr assistant" })).toBeNull();
+    // The left menu survives the redesign untouched.
+    expect(screen.getByRole("navigation", { name: "Create navigation" })).toBeInTheDocument();
+  });
+
+  it("leaves chat mode for any destination, including the view already selected behind the canvas", async () => {
+    const navigate = vi.fn();
+    const changeChatMode = vi.fn();
+    render(
+      <AppShell current="generate" onNavigate={navigate} theme="light" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode onChatModeChange={changeChatMode}>
+        <div>Content</div>
+      </AppShell>,
+    );
+
+    await screen.findByRole("heading", { name: "Hello" });
+    const create = within(screen.getByRole("navigation", { name: "Create navigation" }));
+    const library = within(screen.getByRole("navigation", { name: "Library navigation" }));
+    // Nothing in the rail is current while the canvas covers every view.
+    expect(create.getByRole("button", { name: "Generate" })).not.toHaveAttribute("aria-current");
+
+    fireEvent.click(create.getByRole("button", { name: "Generate" }));
+    expect(changeChatMode).toHaveBeenCalledWith(false);
+    expect(navigate).not.toHaveBeenCalled();
+
+    changeChatMode.mockClear();
+    fireEvent.click(library.getByRole("button", { name: "Voices" }));
+    expect(changeChatMode).toHaveBeenCalledWith(false);
+    expect(navigate).toHaveBeenCalledWith("voices");
+  });
+
+  it("switches modes from the top bar without unmounting the assistant", async () => {
+    const changeChatMode = vi.fn();
+    const { rerender } = render(
+      <AppShell current="generate" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen={false} onAssistantOpenChange={vi.fn()} chatMode onChatModeChange={changeChatMode}>
+        <div>Classic content</div>
+      </AppShell>,
+    );
+
+    await screen.findByRole("heading", { name: "Hello" });
+    fireEvent.click(screen.getByRole("button", { name: "Classic" }));
+    expect(changeChatMode).toHaveBeenCalledWith(false);
+
+    rerender(
+      <AppShell current="generate" onNavigate={vi.fn()} theme="light" onToggleTheme={vi.fn()} system={system} runtime="tauri" features={features} assistantOpen onAssistantOpenChange={vi.fn()} chatMode={false} onChatModeChange={changeChatMode}>
+        <div>Classic content</div>
+      </AppShell>,
+    );
+
+    // Same element, re-placed by the shell grid: the docked rail now owns the conversation.
+    expect(screen.getByText("Classic content")).toBeInTheDocument();
+    expect(document.querySelector(".assistant-pane")).toBeInTheDocument();
+    expect(document.querySelector(".assistant-canvas")).toBeNull();
+    expect(screen.getByLabelText("Message soundAr assistant")).toBeInTheDocument();
+    expect(document.querySelector(".app-shell")).toHaveClass("is-assistant-open");
+
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    expect(changeChatMode).toHaveBeenCalledWith(true);
   });
 });

@@ -34,6 +34,8 @@ export default function App() {
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckStatus>({ phase: "idle" });
   const [preferredVoiceId, setPreferredVoiceId] = useState<string>();
   const [assistantOpen, setAssistantOpen] = useState(false);
+  // soundAr opens on the chat canvas every launch; classic is a deliberate switch, never sticky.
+  const [chatMode, setChatMode] = useState(true);
   const [selectedVideoProjectId, setSelectedVideoProjectId] = useState<string>();
   const [videoRevision, setVideoRevision] = useState(0);
   const videoServiceRef = useRef<VideoStudioService | null>(null);
@@ -55,15 +57,28 @@ export default function App() {
     }
   }, []);
 
-  const navigate = useCallback((next: NavKey) => {
+  // Every view destination is a classic-mode surface, so showing one always leaves the chat canvas.
+  const showView = useCallback((next: NavKey) => {
+    setChatMode(false);
     setCurrent(next);
+  }, []);
+
+  const navigate = useCallback((next: NavKey) => {
+    showView(next);
     if (next === "projects" || next === "video") void refreshStudioData();
-  }, [refreshStudioData]);
+  }, [refreshStudioData, showView]);
 
   const openVideoProject = useCallback((projectId: string) => {
     setSelectedVideoProjectId(projectId);
-    setCurrent("video");
-  }, []);
+    showView("video");
+  }, [showView]);
+
+  // Selecting finished work should play it, not drop the user into the editor. History already
+  // holds the playable master, so preview focuses it there and leaves editing an explicit step.
+  const previewVideoProject = useCallback((projectId: string) => {
+    setSelectedVideoProjectId(projectId);
+    showView("history");
+  }, [showView]);
 
   const markVideoChanged = useCallback(() => {
     setVideoRevision((revision) => revision + 1);
@@ -129,15 +144,15 @@ export default function App() {
 
   function renderView(state: BootstrapState) {
     switch (current) {
-      case "generate": return <GenerateView bootstrap={state} voices={voices} onVoicesChange={setVoices} preferredVoiceId={preferredVoiceId} onOpenModels={() => setCurrent("models")} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
+      case "generate": return <GenerateView bootstrap={state} voices={voices} onVoicesChange={setVoices} preferredVoiceId={preferredVoiceId} onOpenModels={() => showView("models")} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "video": return <Suspense fallback={<div className="route-loading" role="status" aria-live="polite">Loading Video Studio…</div>}><VideoStudioView service={videoService} initialProjectId={selectedVideoProjectId} assistantOpen={assistantOpen} bootstrap={state} voices={voices} onProjectChanged={(project) => { setSelectedVideoProjectId(project.id); markVideoChanged(); }} onMasterPublished={() => { markVideoChanged(); void refreshStudioData(); }} /></Suspense>;
       case "projects": return <ProjectsView bootstrap={state} projects={projects} voices={voices} onChange={setProjects} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
-      case "voices": return <VoicesView bootstrap={state} voices={voices} onChange={setVoices} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} onUseVoice={(id) => { setPreferredVoiceId(id); setCurrent("generate"); }} />;
+      case "voices": return <VoicesView bootstrap={state} voices={voices} onChange={setVoices} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} onUseVoice={(id) => { setPreferredVoiceId(id); showView("generate"); }} />;
       case "models": return <ModelsView bootstrap={state} onChanged={refreshBootstrap} />;
       case "compare": return <CompareView bootstrap={state} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "benchmarks": return <BenchmarksView bootstrap={state} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "history": return <HistoryView history={history} onChange={setHistory} selectedId={selectedHistoryId} />;
-      case "settings": return <SettingsView bootstrap={state} settings={settings} onSetting={updateSetting} updateCheck={updateCheck} onCheckForUpdates={checkForUpdatesNow} onBack={() => setCurrent("generate")} />;
+      case "settings": return <SettingsView bootstrap={state} settings={settings} onSetting={updateSetting} updateCheck={updateCheck} onCheckForUpdates={checkForUpdatesNow} onBack={() => showView("generate")} />;
       case "about": return <AboutView bootstrap={state} updateCheck={updateCheck} onCheckForUpdates={checkForUpdatesNow} />;
     }
   }
@@ -184,8 +199,8 @@ export default function App() {
   }
 
   return (
-    <VideoIntegrationProvider service={videoService} revision={videoRevision} activeProjectId={selectedVideoProjectId} onOpenProject={openVideoProject}>
-      <AppShell current={current} onNavigate={navigate} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId} assistantOpen={assistantOpen} onAssistantOpenChange={setAssistantOpen} onAssistantStudioChanged={handleAssistantStudioChanged}>
+    <VideoIntegrationProvider service={videoService} revision={videoRevision} activeProjectId={selectedVideoProjectId} onOpenProject={openVideoProject} onPreviewProject={previewVideoProject}>
+      <AppShell current={current} onNavigate={navigate} theme={settings.theme} onToggleTheme={() => void updateSetting("theme", settings.theme === "dark" ? "light" : "dark")} system={bootstrap.system} runtime={bootstrap.runtime} features={bootstrap.features} history={history} selectedHistoryId={selectedHistoryId} onSelectHistory={setSelectedHistoryId} assistantOpen={assistantOpen} onAssistantOpenChange={setAssistantOpen} onAssistantStudioChanged={handleAssistantStudioChanged} chatMode={chatMode} onChatModeChange={setChatMode}>
         {runtimeNotice ? <div className="runtime-warning">Local operation failed: {runtimeNotice}</div> : null}
         {availableUpdate ? <UpdateNotice update={availableUpdate} installKind={bootstrap.install_kind} onDismiss={() => { void availableUpdate.close(); setAvailableUpdate(undefined); }} /> : null}
         {bootstrap.runtime === "tauri" && !bootstrap.system.python_ready ? <RuntimeSetupNotice onReady={refreshBootstrap} /> : null}

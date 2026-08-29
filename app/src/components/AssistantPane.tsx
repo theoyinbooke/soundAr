@@ -5,7 +5,7 @@ import { codexRequest, listenToCodex, loadAssistantVideoThreadLink, loadCodexMod
 import { exportHistoryItem, listHistory, listJobs, loadGeneratedAudio, loadJobPreview } from "../lib/bridge";
 import type { HistoryItem, JobRecord } from "../types";
 import type { VideoArtifact, VideoJobPhase, VideoProject } from "../types/video";
-import { useVideoIntegration, useVideoProjectSummaries } from "./video/VideoIntegrationContext";
+import { useArtifactSaver, useVideoIntegration, useVideoProjectSummaries } from "./video/VideoIntegrationContext";
 import { videoSourceForIdlePoster } from "../lib/videoPlayback";
 
 type Message = { id: string; role: "user" | "assistant" | "system"; text: string; pending?: boolean };
@@ -17,7 +17,7 @@ type VideoPhaseRun = { phase: VideoJobPhase; title: string; detail: string; stat
 
 const defaultMessages: Message[] = [{ id: "welcome", role: "assistant", text: "Tell me what you are building—even if the idea is unfinished. I can research and plan it, write the content, create speech or music, assemble projects and batches, and revise the result with you." }];
 
-export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolean; onClose: () => void; onStudioChanged?: () => void }) {
+export function AssistantPane({ open, onClose, onStudioChanged, variant = "rail" }: { open: boolean; onClose: () => void; onStudioChanged?: () => void; variant?: "rail" | "canvas" }) {
   const { onOpenProject: onOpenVideoProject, service: videoService } = useVideoIntegration();
   const { refresh: refreshVideoProjects } = useVideoProjectSummaries(open);
   const [status, setStatus] = useState<CodexStatus>({ available: true, connected: false });
@@ -359,57 +359,107 @@ export function AssistantPane({ open, onClose, onStudioChanged }: { open: boolea
   }
 
   if (!open) return null;
+
+  const canvas = variant === "canvas";
+  const idle = canvas && !messages.some((message) => message.role === "user");
+
+  function newConversation() {
+    setThreadId(undefined);
+    setMessages(defaultMessages);
+    setToolRuns([]);
+    setPlanSteps([]);
+    setArtifacts([]);
+    setActiveJobs([]);
+    setVideoPhases([]);
+    setVideoProject(undefined);
+    setVideoResult(undefined);
+    initialHistoryIds.current = undefined;
+    initialJobIds.current = undefined;
+  }
+
+  const threadMenu = threadMenuOpen ? <div className="assistant-thread-menu" role="menu" aria-label="Assistant conversations"><strong>Recent conversations</strong>{threads.length ? threads.map((thread) => <button role="menuitem" type="button" key={thread.id} onClick={() => void resumeThread(thread.id)}><span>{thread.name || thread.preview || "Untitled conversation"}</span><small>{thread.updatedAt ? new Date(thread.updatedAt * 1000).toLocaleDateString() : "Saved by Codex"}</small></button>) : <span>No saved conversations yet.</span>}</div> : null;
+
+  const banners = <>
+    {!connecting && !status.available ? <div className="assistant-banner is-warning"><CircleAlert size={17} /><div><strong>Codex CLI not detected</strong><p>{status.message}</p><button type="button" onClick={retryCodexConnection}>Scan again</button></div></div> : null}
+    {status.available && !status.connected && !connecting ? <div className="assistant-banner is-warning"><CircleAlert size={17} /><div><strong>Could not connect to Codex</strong><p>{error ?? "The detected Codex installation did not start."}</p><button type="button" onClick={retryCodexConnection}>Reconnect</button></div></div> : null}
+    {connecting ? <div className="assistant-loading"><LoaderCircle className="spin" size={18} /><span>Connecting to Codex…</span></div> : null}
+    {status.connected && !account && !connecting ? <div className="assistant-signin"><Bot size={25} /><strong>Connect your ChatGPT account</strong><p>soundAr uses the login managed by your existing Codex installation. Your credentials stay with Codex.</p><button className="primary-button" type="button" onClick={() => void startLogin()}>Sign in with ChatGPT <ExternalLink size={13} /></button></div> : null}
+  </>;
+
+  const conversation = account ? <>
+    {messages.map((message) => <article className={`assistant-message is-${message.role}`} key={message.id}><span>{message.role === "assistant" ? "Assistant" : message.role === "user" ? "You" : "soundAr"}</span><p>{message.text}{message.pending ? <i className="assistant-caret" /> : null}</p></article>)}
+    {planSteps.length ? <ol className="assistant-plan" aria-label="Current plan">{planSteps.map((step, index) => <li className={`is-${step.status}`} key={`${index}-${step.step}`}><span>{step.status === "completed" ? <Check size={12} /> : step.status === "inProgress" ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><strong>{step.step}</strong></li>)}</ol> : null}
+    {videoPhases.length ? <AssistantVideoPhaseSummary phases={videoPhases} /> : null}
+    {videoProject && videoResult ? <AssistantVideoResult artifact={videoResult} project={videoProject} onOpen={() => onOpenVideoProject?.(videoProject.id)} /> : null}
+    {toolRuns.length ? <ActivitySummary runs={toolRuns} /> : null}
+    {activeJobs.length ? <AssistantJobProgress jobs={activeJobs} mode={artifactMode} /> : null}
+    {artifacts.map((item) => <AudioArtifact key={item.id} item={item} onRevise={() => {
+      setDraft(`Revise “${item.title || (item.generation_kind === "music" ? "Generated music" : "Generated speech")}” (${item.id}): `);
+      window.setTimeout(() => composerRef.current?.focus(), 0);
+    }} />)}
+    {approval ? <div className="assistant-approval"><ShieldCheck size={18} /><div><strong>{approval.title}</strong><p>{approval.detail}</p><div><button type="button" onClick={() => void answerApproval(false)}>Deny</button><button className="primary-button" type="button" onClick={() => void answerApproval(true)}>Allow once</button></div></div></div> : null}
+  </> : null;
+
+  const inlineError = error && status.connected ? <div className="assistant-inline-error"><CircleAlert size={14} /><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError(undefined)}><X size={13} /></button></div> : null;
+
+  const composer = <>
+    <div className="assistant-composer">
+      <textarea ref={composerRef} aria-label="Message soundAr assistant" placeholder={account ? "Ask soundAr to create anything" : "Connect Codex to begin"} value={draft} disabled={!status.connected || !account || sending} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
+      <div className="assistant-composer-bar">
+        <div className="assistant-control-cluster is-context">
+          <div className="assistant-control-slot is-model">
+            <button type="button" className="assistant-control" aria-haspopup="menu" aria-expanded={menu === "model"} disabled={!models.length} onClick={() => setMenu(menu === "model" ? undefined : "model")}><span>{selectedModel?.displayName ?? "Model"}</span><ChevronDown size={12} /></button>
+            {menu === "model" ? <div className="assistant-picker picker-model" role="menu" aria-label="Model">{models.map((model) => <button type="button" role="menuitemradio" aria-checked={model.id === modelId} key={model.id} onClick={() => { setModelId(model.id); setEffort(model.defaultReasoningEffort); setMenu(undefined); }}><span><strong>{model.displayName}</strong><small>{model.description}</small></span>{model.id === modelId ? <Check size={14} /> : null}</button>)}</div> : null}
+          </div>
+          <div className="assistant-control-slot is-access">
+            <button type="button" className="assistant-control is-access" aria-haspopup="menu" aria-expanded={menu === "access"} onClick={() => setMenu(menu === "access" ? undefined : "access")}><ShieldCheck size={12} /><span>{access === "danger-full-access" ? "Full access" : access === "workspace-write" ? "Studio access" : "Read only"}</span><ChevronDown size={12} /></button>
+            {menu === "access" ? <div className="assistant-picker picker-access" role="menu" aria-label="Access level">{(["read-only", "workspace-write", "danger-full-access"] as AgentAccess[]).map((value) => <button type="button" role="menuitemradio" aria-checked={value === access} key={value} onClick={() => { setAccess(value); setMenu(undefined); }}><span><strong>{value === "danger-full-access" ? "Full access" : value === "workspace-write" ? "Studio access" : "Read only"}</strong><small>{value === "danger-full-access" ? "Can use the machine with approvals" : value === "workspace-write" ? "Can research and manage soundAr work" : "Can inspect and plan only"}</small></span>{value === access ? <Check size={14} /> : null}</button>)}</div> : null}
+          </div>
+        </div>
+        <div className="assistant-control-cluster is-actions">
+          <div className="assistant-control-slot is-effort">
+            <button type="button" className="assistant-control" aria-haspopup="menu" aria-expanded={menu === "effort"} disabled={!selectedModel} onClick={() => setMenu(menu === "effort" ? undefined : "effort")}><span>{humanize(effort)}</span><ChevronDown size={12} /></button>
+            {menu === "effort" ? <div className="assistant-picker picker-effort" role="menu" aria-label="Reasoning effort">{efforts.map((value) => <button type="button" role="menuitemradio" aria-checked={value === effort} key={value} onClick={() => { setEffort(value); setMenu(undefined); }}><span><strong>{humanize(value)}</strong><small>{effortDescription(value)}</small></span>{value === effort ? <Check size={14} /> : null}</button>)}</div> : null}
+          </div>
+          <button className="assistant-send" type="button" aria-label={sending ? "Stop response" : "Send message"} disabled={!sending && (!draft.trim() || !status.connected || !account)} onClick={() => sending ? void interrupt() : void send()}>{sending ? <CircleStop size={16} /> : <ArrowUp size={16} />}</button>
+        </div>
+      </div>
+    </div>
+    <span className="assistant-disclaimer">Codex can make mistakes. Review actions before approval.</span>
+  </>;
+
+  if (canvas) {
+    return <section className={`assistant-canvas ${idle ? "is-idle" : ""}`} aria-label="soundAr assistant">
+      <div className="assistant-canvas-controls">
+        <button type="button" aria-label="New conversation" title="New conversation" onClick={newConversation}><Plus size={16} /></button>
+        <button type="button" aria-label="Conversation history" title="Conversation history" aria-expanded={threadMenuOpen} onClick={() => setThreadMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button>
+        {threadMenu}
+      </div>
+      <div className="assistant-thread" ref={scrollRef}>
+        <div className="assistant-column">
+          {banners}
+          {idle ? <div className="assistant-hero"><h1>Hello</h1><p>Create something amazing.</p></div> : conversation}
+          {inlineError}
+        </div>
+      </div>
+      <footer className="assistant-composer-wrap">
+        <div className="assistant-column">{composer}</div>
+      </footer>
+    </section>;
+  }
+
   return <aside className="assistant-pane" aria-label="soundAr assistant">
     <header className="assistant-header">
       <div><strong>Assistant</strong><span>{account ? "Powered by your Codex login" : "Codex connection"}</span></div>
-      <div className="assistant-header-actions"><button type="button" aria-label="New conversation" title="New conversation" onClick={() => { setThreadId(undefined); setMessages(defaultMessages); setToolRuns([]); setPlanSteps([]); setArtifacts([]); setActiveJobs([]); setVideoPhases([]); setVideoProject(undefined); setVideoResult(undefined); initialHistoryIds.current = undefined; initialJobIds.current = undefined; }}><Plus size={16} /></button><button type="button" aria-label="Conversation history" title="Conversation history" aria-expanded={threadMenuOpen} onClick={() => setThreadMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button><button type="button" aria-label="Close assistant" title="Close assistant" onClick={onClose}><PanelRightClose size={16} /></button></div>
-      {threadMenuOpen ? <div className="assistant-thread-menu" role="menu" aria-label="Assistant conversations"><strong>Recent conversations</strong>{threads.length ? threads.map((thread) => <button role="menuitem" type="button" key={thread.id} onClick={() => void resumeThread(thread.id)}><span>{thread.name || thread.preview || "Untitled conversation"}</span><small>{thread.updatedAt ? new Date(thread.updatedAt * 1000).toLocaleDateString() : "Saved by Codex"}</small></button>) : <span>No saved conversations yet.</span>}</div> : null}
+      <div className="assistant-header-actions"><button type="button" aria-label="New conversation" title="New conversation" onClick={newConversation}><Plus size={16} /></button><button type="button" aria-label="Conversation history" title="Conversation history" aria-expanded={threadMenuOpen} onClick={() => setThreadMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button><button type="button" aria-label="Close assistant" title="Close assistant" onClick={onClose}><PanelRightClose size={16} /></button></div>
+      {threadMenu}
     </header>
     <div className="assistant-thread" ref={scrollRef}>
-      {!connecting && !status.available ? <div className="assistant-banner is-warning"><CircleAlert size={17} /><div><strong>Codex CLI not detected</strong><p>{status.message}</p><button type="button" onClick={retryCodexConnection}>Scan again</button></div></div> : null}
-      {status.available && !status.connected && !connecting ? <div className="assistant-banner is-warning"><CircleAlert size={17} /><div><strong>Could not connect to Codex</strong><p>{error ?? "The detected Codex installation did not start."}</p><button type="button" onClick={retryCodexConnection}>Reconnect</button></div></div> : null}
-      {connecting ? <div className="assistant-loading"><LoaderCircle className="spin" size={18} /><span>Connecting to Codex…</span></div> : null}
-      {status.connected && !account && !connecting ? <div className="assistant-signin"><Bot size={25} /><strong>Connect your ChatGPT account</strong><p>soundAr uses the login managed by your existing Codex installation. Your credentials stay with Codex.</p><button className="primary-button" type="button" onClick={() => void startLogin()}>Sign in with ChatGPT <ExternalLink size={13} /></button></div> : null}
-      {account ? <>
-        {messages.map((message) => <article className={`assistant-message is-${message.role}`} key={message.id}><span>{message.role === "assistant" ? "Assistant" : message.role === "user" ? "You" : "soundAr"}</span><p>{message.text}{message.pending ? <i className="assistant-caret" /> : null}</p></article>)}
-        {planSteps.length ? <ol className="assistant-plan" aria-label="Current plan">{planSteps.map((step, index) => <li className={`is-${step.status}`} key={`${index}-${step.step}`}><span>{step.status === "completed" ? <Check size={12} /> : step.status === "inProgress" ? <LoaderCircle className="spin" size={12} /> : index + 1}</span><strong>{step.step}</strong></li>)}</ol> : null}
-        {videoPhases.length ? <AssistantVideoPhaseSummary phases={videoPhases} /> : null}
-        {videoProject && videoResult ? <AssistantVideoResult artifact={videoResult} project={videoProject} onOpen={() => onOpenVideoProject?.(videoProject.id)} /> : null}
-        {toolRuns.length ? <ActivitySummary runs={toolRuns} /> : null}
-        {activeJobs.length ? <AssistantJobProgress jobs={activeJobs} mode={artifactMode} /> : null}
-        {artifacts.map((item) => <AudioArtifact key={item.id} item={item} onRevise={() => {
-          setDraft(`Revise “${item.title || (item.generation_kind === "music" ? "Generated music" : "Generated speech")}” (${item.id}): `);
-          window.setTimeout(() => composerRef.current?.focus(), 0);
-        }} />)}
-        {approval ? <div className="assistant-approval"><ShieldCheck size={18} /><div><strong>{approval.title}</strong><p>{approval.detail}</p><div><button type="button" onClick={() => void answerApproval(false)}>Deny</button><button className="primary-button" type="button" onClick={() => void answerApproval(true)}>Allow once</button></div></div></div> : null}
-      </> : null}
-      {error && status.connected ? <div className="assistant-inline-error"><CircleAlert size={14} /><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError(undefined)}><X size={13} /></button></div> : null}
+      {banners}
+      {conversation}
+      {inlineError}
     </div>
-    <footer className="assistant-composer-wrap">
-      <div className="assistant-composer">
-        <textarea ref={composerRef} aria-label="Message soundAr assistant" placeholder={account ? "Ask soundAr to create anything" : "Connect Codex to begin"} value={draft} disabled={!status.connected || !account || sending} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} />
-        <div className="assistant-composer-bar">
-          <div className="assistant-control-cluster is-context">
-            <div className="assistant-control-slot is-model">
-              <button type="button" className="assistant-control" aria-haspopup="menu" aria-expanded={menu === "model"} disabled={!models.length} onClick={() => setMenu(menu === "model" ? undefined : "model")}><span>{selectedModel?.displayName ?? "Model"}</span><ChevronDown size={12} /></button>
-              {menu === "model" ? <div className="assistant-picker picker-model" role="menu" aria-label="Model">{models.map((model) => <button type="button" role="menuitemradio" aria-checked={model.id === modelId} key={model.id} onClick={() => { setModelId(model.id); setEffort(model.defaultReasoningEffort); setMenu(undefined); }}><span><strong>{model.displayName}</strong><small>{model.description}</small></span>{model.id === modelId ? <Check size={14} /> : null}</button>)}</div> : null}
-            </div>
-            <div className="assistant-control-slot is-access">
-              <button type="button" className="assistant-control is-access" aria-haspopup="menu" aria-expanded={menu === "access"} onClick={() => setMenu(menu === "access" ? undefined : "access")}><ShieldCheck size={12} /><span>{access === "danger-full-access" ? "Full access" : access === "workspace-write" ? "Studio access" : "Read only"}</span><ChevronDown size={12} /></button>
-              {menu === "access" ? <div className="assistant-picker picker-access" role="menu" aria-label="Access level">{(["read-only", "workspace-write", "danger-full-access"] as AgentAccess[]).map((value) => <button type="button" role="menuitemradio" aria-checked={value === access} key={value} onClick={() => { setAccess(value); setMenu(undefined); }}><span><strong>{value === "danger-full-access" ? "Full access" : value === "workspace-write" ? "Studio access" : "Read only"}</strong><small>{value === "danger-full-access" ? "Can use the machine with approvals" : value === "workspace-write" ? "Can research and manage soundAr work" : "Can inspect and plan only"}</small></span>{value === access ? <Check size={14} /> : null}</button>)}</div> : null}
-            </div>
-          </div>
-          <div className="assistant-control-cluster is-actions">
-            <div className="assistant-control-slot is-effort">
-              <button type="button" className="assistant-control" aria-haspopup="menu" aria-expanded={menu === "effort"} disabled={!selectedModel} onClick={() => setMenu(menu === "effort" ? undefined : "effort")}><span>{humanize(effort)}</span><ChevronDown size={12} /></button>
-              {menu === "effort" ? <div className="assistant-picker picker-effort" role="menu" aria-label="Reasoning effort">{efforts.map((value) => <button type="button" role="menuitemradio" aria-checked={value === effort} key={value} onClick={() => { setEffort(value); setMenu(undefined); }}><span><strong>{humanize(value)}</strong><small>{effortDescription(value)}</small></span>{value === effort ? <Check size={14} /> : null}</button>)}</div> : null}
-            </div>
-            <button className="assistant-send" type="button" aria-label={sending ? "Stop response" : "Send message"} disabled={!sending && (!draft.trim() || !status.connected || !account)} onClick={() => sending ? void interrupt() : void send()}>{sending ? <CircleStop size={16} /> : <ArrowUp size={16} />}</button>
-          </div>
-        </div>
-      </div>
-      <span className="assistant-disclaimer">Codex can make mistakes. Review actions before approval.</span>
-    </footer>
+    <footer className="assistant-composer-wrap">{composer}</footer>
   </aside>;
 }
 
@@ -427,20 +477,22 @@ function AssistantVideoPhaseSummary({ phases }: { phases: VideoPhaseRun[] }) {
 }
 
 function AssistantVideoResult({ artifact, project, onOpen }: { artifact: VideoArtifact; project: VideoProject; onOpen: () => void }) {
+  const { save, saving } = useArtifactSaver();
   const isMaster = artifact.role === "master";
   const isPlayableVideo = artifact.playable && artifact.mime_type.startsWith("video/") && Boolean(artifact.url);
   const resultLabel = isMaster ? "Final video master" : artifact.role === "preview" ? "Video preview" : artifact.role.replaceAll("-", " ");
   const secondary = project.manifest.artifacts.filter((candidate) => candidate.id !== artifact.id && candidate.role !== "source");
   return <article className="assistant-video-master" aria-label={`${resultLabel}: ${artifact.title}`}>
     <div className="assistant-video-master-media">{isPlayableVideo ? <video aria-label={`Play ${artifact.title}`} controls playsInline preload={artifact.poster_url ?? project.poster_url ? "metadata" : "auto"} poster={artifact.poster_url ?? project.poster_url} src={videoSourceForIdlePoster(artifact.url, artifact.poster_url ?? project.poster_url)} /> : <div><FileVideo2 aria-hidden="true" size={22} /><span>{isMaster ? "Master" : resultLabel} stored locally</span></div>}</div>
-    <div className="assistant-video-master-copy"><span className="section-label">{isMaster ? "Final video master" : `Playable ${resultLabel.toLowerCase()}`}</span><strong>{artifact.title}</strong><small>{formatVideoDuration(artifact.duration_ms ?? project.duration_ms)} · {artifact.width && artifact.height ? `${artifact.width}×${artifact.height}` : artifact.format.toUpperCase()} · {artifact.codec ?? "Local render"}</small><div><button type="button" onClick={onOpen}><Clapperboard aria-hidden="true" size={12} />Open project</button>{artifact.url ? <a aria-label={`Download ${artifact.title}`} download={artifact.download_name ?? `${project.id}-${artifact.role}.${artifact.format}`} href={artifact.url}><Download aria-hidden="true" size={12} />Download</a> : null}</div></div>
+    <div className="assistant-video-master-copy"><span className="section-label">{isMaster ? "Final video master" : `Playable ${resultLabel.toLowerCase()}`}</span><strong>{artifact.title}</strong><small>{formatVideoDuration(artifact.duration_ms ?? project.duration_ms)} · {artifact.width && artifact.height ? `${artifact.width}×${artifact.height}` : artifact.format.toUpperCase()} · {artifact.codec ?? "Local render"}</small><div><button type="button" onClick={onOpen}><Clapperboard aria-hidden="true" size={12} />Open project</button>{artifact.local_path ? <button type="button" disabled={saving} aria-label={`Save ${artifact.title}`} onClick={() => void save(artifact.local_path, artifact.download_name ?? `${project.id}-${artifact.role}.${artifact.format}`).catch(() => undefined)}><Download aria-hidden="true" size={12} />Save</button> : null}</div></div>
     {secondary.length ? <details className="assistant-video-secondary"><summary><span>Project assets</span><small>{secondary.length} secondary</small><ChevronDown aria-hidden="true" size={12} /></summary><div>{secondary.slice(-6).map((candidate) => <AssistantVideoArtifactRow artifact={candidate} key={candidate.id} />)}</div></details> : null}
   </article>;
 }
 
 function AssistantVideoArtifactRow({ artifact }: { artifact: VideoArtifact }) {
+  const { save, saving } = useArtifactSaver();
   const label = artifact.role.replaceAll("-", " ");
-  return <div className="assistant-video-secondary-row"><span><FileVideo2 aria-hidden="true" size={11} /></span><strong>{artifact.title}</strong><small>{label}</small>{artifact.url ? <a href={artifact.url} download={artifact.download_name} aria-label={`Download secondary asset ${artifact.title}`}><Download aria-hidden="true" size={11} /></a> : null}</div>;
+  return <div className="assistant-video-secondary-row"><span><FileVideo2 aria-hidden="true" size={11} /></span><strong>{artifact.title}</strong><small>{label}</small>{artifact.local_path ? <button type="button" disabled={saving} aria-label={`Save secondary asset ${artifact.title}`} onClick={() => void save(artifact.local_path, artifact.download_name).catch(() => undefined)}><Download aria-hidden="true" size={11} /></button> : null}</div>;
 }
 
 function AudioArtifact({ item, onRevise }: { item: HistoryItem; onRevise: () => void }) {
