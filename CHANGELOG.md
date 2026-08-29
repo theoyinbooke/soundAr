@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0 - 2026-08-29
+
+- Opened soundAr on a full-screen chat canvas instead of New generation: the greeting and composer sit high on an empty page, and sending hands the whole content column to the thread with the composer docked. Plans, activity, audio artifacts, video results, and approvals all surface inline.
+- Added a Chat/Classic toggle to the top bar. One assistant instance serves both layouts and is re-placed by the shell grid, so switching modes never remounts the pane and a live Codex conversation survives the switch; any sidebar destination leaves chat on its own.
+- Made Breeze TTS 2 the default voice model wherever speech is created without a named model, including the assistant's speech tools, and taught the expressive route to recognize Breeze's `cfg_scale` control. Fast, Clone, and Multilingual keep their existing engines because Breeze supports neither reference cloning nor preset voices.
+- Fixed Linux Video Studio playback with a local media server and resolved media URLs, added caption presets and scene patching, and held opening-frame posters until playback starts across the preview player and master card.
+- Raised Fish Speech to torch 2.6.0 for CVE-2025-32434, where `torch.load` honors a pickled payload even with `weights_only=True`, and to hydra-core 1.3.4 for CVE-2026-68508.
+- Refused model installs whose configuration carries dynamic kernel fields, scanning nested sub-configs. Breeze, Fish Speech, and ACE-Step remain on their qualified Transformers 4.57.x pins, which resolve and execute remote kernel code named by a checkpoint config (CVE-2026-4372); this gate is the compensating control.
+- Held the new dependency floors and the config gate in the runtime dependency security policy so a later requirements edit cannot quietly reintroduce them.
+- Ran the Python suite with pytest in CI and release. `unittest discover` cannot collect bare test functions with fixtures and was silently skipping five tests, including the check that only the pinned ACE-Step code sync is trusted.
+
 ## 0.6.1 - 2026-08-28
 
 - Rebuilt Video Studio as a compact, resizable composition workspace with a larger centered portrait canvas, title-only scene rail, collapsible five-lane timeline, top-level export actions, responsive layouts, and exact project/history reopening.
