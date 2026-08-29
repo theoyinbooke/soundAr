@@ -1,7 +1,7 @@
 # Isolated compatibility stack qualified with Breeze source ca632ce6c4d05f7985da4eab29b1a5d445b43f7b.
 # Transformers 4.57.3 is required by qwen-tts 0.1.1; soundAr permits it only
 # inside this pinned, standalone, local-only model runtime.
-torch==2.9.1
+torch==2.13.0
 torchaudio==2.9.1
 qwen-tts==0.1.1
 transformers==4.57.3
