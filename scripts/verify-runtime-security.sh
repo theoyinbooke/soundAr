@@ -77,6 +77,29 @@ contains_fixed 'FISH_SOURCE_REVISION="58046eaa1a4cefb0c8cc3a3a667b34186ea02dde"'
 contains_fixed 'local_files_only=True' engines/tts/breeze_tts.py \
   || { printf 'Breeze must continue loading only verified local model assets.\n' >&2; exit 1; }
 
+# Fish Speech was the last engine left on torch 2.4.1, which honours pickled payloads through
+# torch.load even with weights_only=True (CVE-2025-32434), and on hydra-core 1.3.2, whose
+# instantiate() executes untrusted config (CVE-2026-68508). Hold both floors here so a future
+# requirements edit cannot quietly reintroduce them.
+[[ "$(grep -Ec '^torch==2\.(6|7|8|9|1[0-9])\.' requirements-engines/fish-speech.txt)" == "1" ]] \
+  || { printf 'Fish Speech must stay on torch 2.6.0 or newer (CVE-2025-32434).\n' >&2; exit 1; }
+[[ "$(grep -Ec '^hydra-core==1\.3\.(4|[5-9])$' requirements-engines/fish-speech.txt)" == "1" ]] \
+  || { printf 'Fish Speech must stay on hydra-core 1.3.4 or newer (CVE-2026-68508).\n' >&2; exit 1; }
+if search_regex '^torch==2\.[0-5]\.' requirements-engines requirements.txt requirements-runtime.txt; then
+  printf 'Runtime security policy rejected a torch pin below 2.6.0 (CVE-2025-32434).\n' >&2
+  exit 1
+fi
+
+# The isolated Breeze, Fish Speech, and ACE-Step runtimes stay on Transformers 4.57.x, which
+# resolves and executes remote kernel code named by a checkpoint config (CVE-2026-4372). The
+# download gate that refuses such a checkpoint is the compensating control, so require it.
+contains_fixed 'def unsafe_config_fields' core/model_assets.py \
+  || { printf 'The dynamic-kernel config gate is missing from core/model_assets.py.\n' >&2; exit 1; }
+contains_fixed 'unsafe_fields = unsafe_config_fields(target_dir)' core/model_manager.py \
+  || { printf 'The dynamic-kernel config gate is no longer called during model installs.\n' >&2; exit 1; }
+contains_fixed '_attn_implementation_internal' core/model_assets.py \
+  || { printf 'The dynamic-kernel config gate lost its CVE-2026-4372 field check.\n' >&2; exit 1; }
+
 if search_regex 'trust_remote_code[[:space:]]*=[[:space:]]*True' \
   requirements.txt requirements-runtime.txt requirements-engines core engines data; then
   printf 'Runtime security policy rejected executable model-supplied Python.\n' >&2

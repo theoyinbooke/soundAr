@@ -14,6 +14,7 @@ from core.model_assets import (
     ensure_speecht5_support_assets,
     infer_downloaded_at,
     model_integrity_report,
+    unsafe_config_fields,
     validate_local_model_files,
 )
 
@@ -532,6 +533,16 @@ class ModelManager:
 
         if model_id == "microsoft/speecht5_tts":
             ensure_speecht5_support_assets(target_dir)
+
+        unsafe_fields = unsafe_config_fields(target_dir)
+        if unsafe_fields:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            self.cleanup_partial_download(model_id)
+            raise RuntimeError(
+                f"Refusing to install {model_id}: its configuration carries dynamic kernel "
+                f"fields that Transformers would resolve and execute as remote code "
+                f"({', '.join(unsafe_fields)}). The download was discarded."
+            )
 
         integrity = model_integrity_report(
             model_id,

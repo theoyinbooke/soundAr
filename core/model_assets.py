@@ -207,6 +207,48 @@ def _required_model_files(path: Path, engine: str) -> tuple[list[str], list[list
     return [], [[]]
 
 
+# Transformers below 5.3.0 resolves `_attn_implementation_internal` out of a checkpoint's
+# config.json as a Hub repo id, then downloads and executes kernel code from it with the user's
+# privileges — bypassing `trust_remote_code` entirely (CVE-2026-4372). soundAr pins and verifies
+# every model revision, but a compromised pinned revision would still be honoured, so a checkpoint
+# that ships the field is refused before it is ever registered as installed. Most engines already
+# run the patched Transformers 5.5.0; the isolated Breeze, Fish Speech, and ACE-Step runtimes are
+# held at 4.57.x for upstream compatibility and depend on this gate.
+DYNAMIC_KERNEL_CONFIG_KEYS = frozenset({"_attn_implementation_internal"})
+_SCANNED_CONFIG_NAMES = frozenset({"config.json", "generation_config.json", "preprocessor_config.json"})
+
+
+def _config_keys_of_concern(payload: Any, path: str = "") -> list[str]:
+    """Walk a parsed config, including nested sub-configs, for dynamic-kernel keys."""
+    findings: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            where = f"{path}.{key}" if path else str(key)
+            if key in DYNAMIC_KERNEL_CONFIG_KEYS and value is not None:
+                findings.append(where)
+            findings.extend(_config_keys_of_concern(value, where))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            findings.extend(_config_keys_of_concern(value, f"{path}[{index}]"))
+    return findings
+
+
+def unsafe_config_fields(target_dir: Path) -> list[str]:
+    """Return `file:key` locations of dynamic-kernel config fields under a model directory."""
+    findings: list[str] = []
+    for config_path in sorted(Path(target_dir).rglob("*.json")):
+        if config_path.name not in _SCANNED_CONFIG_NAMES:
+            continue
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # An unreadable config is caught by the integrity report, not by this gate.
+            continue
+        relative = config_path.relative_to(target_dir)
+        findings.extend(f"{relative}:{key}" for key in _config_keys_of_concern(payload))
+    return findings
+
+
 def model_integrity_report(
     model_id: str,
     local_path: str | Path,

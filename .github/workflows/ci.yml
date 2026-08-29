@@ -66,9 +66,11 @@ jobs:
       - name: Compile Python runtime
         run: python3 -m compileall -q bridge.py model_cli.py config core engines
       - name: Test Python runtime contracts
+        # pytest, not `unittest discover`: several suites (model asset trust, settings) are written
+        # as bare test functions with fixtures, which unittest cannot collect and silently skipped.
         run: |
           python3 -m pip install --requirement requirements-test.txt
-          python3 -m unittest discover -s tests -v
+          python3 -m pytest tests -v
       - name: Test Linux Video Studio media harness
         run: scripts/video/test-harness.sh
       - name: Validate installer and package-verification scripts
