@@ -39,6 +39,7 @@ export function VideoTimeline({
   onHeightChange,
   mode = "compact",
   onModeChange,
+  onTransportHost,
 }: {
   timeline: VideoTimelineManifest;
   scenes: VideoScene[];
@@ -52,6 +53,8 @@ export function VideoTimeline({
   onHeightChange?: (height: number) => void;
   mode?: VideoTimelineMode;
   onModeChange?: (mode: VideoTimelineMode) => void;
+  /** Receives the toolbar slot the preview transport is rendered into. */
+  onTransportHost?: (element: HTMLDivElement | null) => void;
 }) {
   const duration = Math.max(1, timeline.duration_ms);
   const [zoom, setZoom] = useState(1);
@@ -220,6 +223,8 @@ export function VideoTimeline({
       <div className="video-timeline-resizer" role="separator" aria-label="Resize timeline" aria-orientation="horizontal" aria-valuemin={48} aria-valuemax={420} aria-valuenow={height ?? 210} tabIndex={onHeightChange ? 0 : -1} onPointerDown={beginHeightResize} onKeyDown={resizeHeightWithKeyboard}><GripHorizontal aria-hidden="true" size={14} /></div>
       <header className="video-timeline-toolbar">
         <div><button className="video-icon-button" type="button" aria-label="Split selected scene" disabled={!selectedSceneId || !onEditTimeline || editing} onClick={splitSelectedScene}><Scissors aria-hidden="true" size={14} /></button><button className="video-icon-button" type="button" aria-label="Zoom out timeline" disabled={zoom <= 0.75} onClick={() => setZoom((value) => Math.max(0.75, value - 0.25))}><Minus aria-hidden="true" size={14} /></button><button className="video-icon-button" type="button" aria-label="Zoom in timeline" disabled={zoom >= 2} onClick={() => setZoom((value) => Math.min(2, value + 0.25))}><Plus aria-hidden="true" size={14} /></button><Volume2 aria-hidden="true" size={14} /><span>{editing ? "Saving timeline…" : `Project timeline · ${Math.round(zoom * 100)}%`}</span></div>
+        {/* Transport lives here so the preview pane is nothing but the canvas. */}
+        <div className="video-timeline-transport" ref={onTransportHost} />
         <div><span>Source clock {formatVideoClock(timeline.source_clock_duration_ms, true)} · gaps preserved</span>{onModeChange ? <select aria-label="Timeline size" value={mode} onChange={(event) => onModeChange(event.target.value as VideoTimelineMode)}><option value="collapsed">Collapsed</option><option value="compact">Compact</option><option value="expanded">Expanded</option></select> : <span className="video-timeline-mode-label">Compact</span>}</div>
       </header>
       <div className="video-timeline-scroll">

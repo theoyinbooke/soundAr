@@ -141,16 +141,34 @@ describe("VideoStudioView", () => {
 
     expect(await screen.findByText("Exported")).toBeVisible();
     expect(screen.getByLabelText("Final video: Creator update · Portrait master")).toHaveAttribute("src", expect.stringMatching(/^data:video\/mp4;base64,/));
-    expect(screen.getByRole("link", { name: "Download" })).toHaveAttribute("download", "creator-update-portrait-master.mp4");
+    // Browser preview holds no local export, so saving is offered but unavailable.
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     expect(screen.queryByRole("heading", { name: "Export complete" })).not.toBeInTheDocument();
     const master = screen.getByRole("main", { name: "Final master" });
     expect(within(master).queryByRole("button")).not.toBeInTheDocument();
     expect(within(master).queryByRole("link")).not.toBeInTheDocument();
     expect(screen.getByText("Master export ready.").closest('[role="status"]')).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Publish package" }));
-    expect(await screen.findByRole("link", { name: "Download package" })).toHaveAttribute("download", "creator-update-publish-package.zip");
+    expect(await screen.findByRole("button", { name: "Save package" })).toBeDisabled();
     expect(screen.queryByText(/NVENC|Cache reuse|AAC · 48 kHz/i)).not.toBeInTheDocument();
     expect(screen.getByText("Publish package ready.").closest('[role="status"]')).toBeVisible();
+  });
+
+  it("gives the export screen a playable master without a duplicate meta strip", async () => {
+    const user = userEvent.setup();
+    render(<VideoStudioView service={createBrowserPreviewVideoService()} />);
+
+    await user.click(await screen.findByRole("button", { name: /Creator update · Reel master/i }));
+    const master = await screen.findByLabelText(/^Final video: /);
+    // The controls must be reachable: an overlay poster on top of the video hid them entirely.
+    expect(master).toHaveAttribute("controls");
+    expect(document.querySelector(".video-opening-poster")).toBeNull();
+    // The strip under the player repeated the export receipt beside it and cost the portrait height.
+    expect(document.querySelector(".video-master-card > footer")).toBeNull();
+    const receipt = screen.getByText("Export receipt").closest("aside")!;
+    expect(within(receipt).getByText("Revision")).toBeInTheDocument();
+    expect(within(receipt).getByText("Saved")).toBeInTheDocument();
+    expect(within(receipt).getByText("Checksum")).toBeInTheDocument();
   });
 
   it("keeps responsive export actions keyboard accessible in the top toolbar", async () => {
@@ -162,10 +180,13 @@ describe("VideoStudioView", () => {
     expect(trigger).not.toBeNull();
     trigger!.closest<HTMLElement>(".video-export-overflow")!.style.display = "block";
     await user.click(trigger!);
-    await waitFor(() => expect(screen.getByRole("menuitem", { name: "Download master" })).toHaveFocus());
+    // Browser preview owns no local export, so both filesystem actions stay disabled and focus
+    // lands on the first action that can actually run.
+    expect(screen.getByRole("menuitem", { name: "Save master" })).toBeDisabled();
     expect(screen.getByRole("menuitem", { name: "Open output folder" })).toBeDisabled();
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "Open project" })).toHaveFocus());
     fireEvent.keyDown(screen.getByRole("menu", { name: "More export actions" }), { key: "ArrowDown" });
-    expect(screen.getByRole("menuitem", { name: "Open project" })).toHaveFocus();
+    expect(screen.getByRole("menuitem", { name: "Publish package" })).toHaveFocus();
     await user.keyboard("{Escape}");
     expect(trigger).toHaveFocus();
     expect(screen.queryByRole("menu", { name: "More export actions" })).not.toBeInTheDocument();

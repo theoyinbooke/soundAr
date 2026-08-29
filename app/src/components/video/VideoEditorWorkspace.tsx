@@ -2,8 +2,9 @@ import { Captions, ImagePlus, LoaderCircle, Plus, Redo2, Save, Undo2 } from "luc
 import { useEffect, useId, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { capabilityForModel, compatibleVoicesForModel, qualifiedModels } from "../../lib/capabilities";
 import type { BootstrapState, InstalledModel, VoiceProfile } from "../../types";
-import type { VideoCanvasBounds, VideoCaptionStyle, VideoJob, VideoProject, VideoScene, VideoTimelineOperation, VideoVisualLayer } from "../../types/video";
+import type { VideoCanvasBounds, VideoCaptionPreset, VideoCaptionStyle, VideoJob, VideoProject, VideoScene, VideoTimelineOperation, VideoVisualLayer } from "../../types/video";
 import { formatVideoClock, formatVideoUpdatedAt, selectPreviewArtifact } from "../../lib/videoState";
+import { previewCaptionPresets } from "../../lib/captionPresets";
 import { VideoPreviewPlayer } from "./VideoPreviewPlayer";
 import { VideoProductionSteps } from "./VideoProductionSteps";
 import { millisecondsToMicroseconds, VideoTimeline, type VideoTimelineMode } from "./VideoTimeline";
@@ -24,6 +25,7 @@ export function VideoEditorWorkspace({
   onAddVisual,
   visualAdding,
   onEditTimeline,
+  presets,
   timelineEditing,
   timelineFeedback,
   canUndoTimeline,
@@ -47,6 +49,7 @@ export function VideoEditorWorkspace({
   onAddVisual: (sceneId?: string) => Promise<boolean>;
   visualAdding: boolean;
   onEditTimeline: (operations: VideoTimelineOperation[], label: string) => Promise<void>;
+  presets?: VideoCaptionPreset[];
   timelineEditing: boolean;
   timelineFeedback?: { tone: "status" | "error"; text: string };
   canUndoTimeline: boolean;
@@ -81,6 +84,9 @@ export function VideoEditorWorkspace({
   const [scenePaneWidth, setScenePaneWidth] = useState(190);
   const [inspectorPaneWidth, setInspectorPaneWidth] = useState(270);
   const [timelineMode, setTimelineMode] = useState<VideoTimelineMode>(() => readTimelineMode());
+  const [transportHost, setTransportHost] = useState<HTMLDivElement | null>(null);
+  // The renderer owns the catalog. The generated copy keeps the chips usable if it cannot be read.
+  const captionPresets = presets?.length ? presets : previewCaptionPresets;
   const [timelineHeight, setTimelineHeight] = useState(() => timelineHeightForMode(readTimelineMode()));
   const tabId = useId();
   const workspaceRef = useRef<HTMLDivElement>(null);
@@ -281,7 +287,7 @@ export function VideoEditorWorkspace({
 
         <div className="video-pane-resizer is-scenes" role="separator" aria-label="Resize scenes panel" aria-orientation="vertical" aria-valuemin={150} aria-valuemax={300} aria-valuenow={scenePaneWidth} tabIndex={0} onPointerDown={(event) => beginPaneResize("scenes", event)} onKeyDown={(event) => resizePaneWithKeyboard("scenes", event)} />
 
-        <VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} artifact={preview} posterUrl={project.poster_url} scene={draft} scenes={project.manifest.scenes} transcript={project.manifest.transcript} captionPages={project.manifest.caption_pages} visualAssets={project.manifest.visual_assets} visualLayers={project.manifest.visual_layers} projectDurationMs={project.duration_ms} playheadMs={playheadMs} onPlayheadChange={onPlayheadChange} onSelectCaption={() => setActiveTab("captions")} onCaptionBoundsChange={(caption_bounds) => { if (draft) updateDraft({ ...draft, caption_bounds }); }} selectedVisualLayerId={activeTab === "visuals" ? activeVisualLayer?.id : selectedVisualLayerId} onSelectVisual={(layerId) => { setSelectedVisualLayerId(layerId); setActiveTab("visuals"); }} onVisualBoundsChange={timelineEditing ? undefined : commitVisualBounds} />
+        <VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} artifact={preview} posterUrl={project.poster_url} scene={draft} scenes={project.manifest.scenes} transcript={project.manifest.transcript} captionPages={project.manifest.caption_pages} visualAssets={project.manifest.visual_assets} visualLayers={project.manifest.visual_layers} projectDurationMs={project.duration_ms} playheadMs={playheadMs} onPlayheadChange={onPlayheadChange} onSelectCaption={() => setActiveTab("captions")} onCaptionBoundsChange={(caption_bounds) => { if (draft) updateDraft({ ...draft, caption_bounds }); }} selectedVisualLayerId={activeTab === "visuals" ? activeVisualLayer?.id : selectedVisualLayerId} onSelectVisual={(layerId) => { setSelectedVisualLayerId(layerId); setActiveTab("visuals"); }} onVisualBoundsChange={timelineEditing ? undefined : commitVisualBounds} transportHost={transportHost} captionPresets={captionPresets} />
 
         <div className="video-pane-resizer is-inspector" role="separator" aria-label="Resize scene inspector" aria-orientation="vertical" aria-valuemin={230} aria-valuemax={380} aria-valuenow={inspectorPaneWidth} tabIndex={0} onPointerDown={(event) => beginPaneResize("inspector", event)} onKeyDown={(event) => resizePaneWithKeyboard("inspector", event)} />
 
@@ -300,7 +306,7 @@ export function VideoEditorWorkspace({
               <label><span>Focus Y <b>{Math.round(manualCrop.focusY)}%</b></span><input aria-label="Manual crop focus Y" type="range" min={0} max={100} step={1} value={manualCrop.focusY} onChange={(event) => updateDraft({ ...draft, crop_rect: manualCropRect(project, draft.layout, manualCrop.focusX, Number(event.target.value), manualCrop.zoom) })} /></label>
               <label><span>Zoom <b>{manualCrop.zoom.toFixed(1)}×</b></span><input aria-label="Manual crop zoom" type="range" min={1} max={3} step={0.1} value={manualCrop.zoom} onChange={(event) => updateDraft({ ...draft, crop_rect: manualCropRect(project, draft.layout, manualCrop.focusX, manualCrop.focusY, Number(event.target.value)) })} /></label>
             </> : null}</fieldset> : null}
-            {activeTab === "captions" ? <fieldset id={`${tabId}-captions-panel`} role="tabpanel" aria-labelledby={`${tabId}-captions-tab`}><legend>Captions</legend><label className="video-switch-row"><span>Show captions</span><input aria-label="Show captions" type="checkbox" checked={draft.captions_enabled} onChange={(event) => updateDraft({ ...draft, captions_enabled: event.target.checked })} /></label><div className="video-caption-presets" role="radiogroup" aria-label="Caption style">{captionStyles.map((style) => <button key={style.id} className={`video-caption-preset is-${style.id}`} role="radio" aria-checked={draft.caption_style === style.id} type="button" onClick={() => updateDraft({ ...draft, caption_style: style.id })}><span>{style.sample}</span><strong>{style.label}</strong></button>)}</div><div className="video-caption-geometry"><strong>Position &amp; size</strong><small>Drag on canvas or use exact controls.</small><label><span>Horizontal <b>{Math.round(captionBounds.x_bp / 100)}%</b></span><input aria-label="Caption horizontal position" type="range" min={0} max={Math.max(0, 10_000 - captionBounds.width_bp)} step={100} value={captionBounds.x_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, x_bp: Number(event.target.value) }) })} /></label><label><span>Vertical <b>{Math.round(captionBounds.y_bp / 100)}%</b></span><input aria-label="Caption vertical position" type="range" min={0} max={Math.max(0, 10_000 - captionBounds.height_bp)} step={100} value={captionBounds.y_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, y_bp: Number(event.target.value) }) })} /></label><label><span>Width <b>{Math.round(captionBounds.width_bp / 100)}%</b></span><input aria-label="Caption width" type="range" min={1600} max={10_000 - captionBounds.x_bp} step={100} value={captionBounds.width_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, width_bp: Number(event.target.value) }) })} /></label><label><span>Height <b>{Math.round(captionBounds.height_bp / 100)}%</b></span><input aria-label="Caption height" type="range" min={600} max={10_000 - captionBounds.y_bp} step={100} value={captionBounds.height_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, height_bp: Number(event.target.value) }) })} /></label></div></fieldset> : null}
+            {activeTab === "captions" ? <fieldset id={`${tabId}-captions-panel`} role="tabpanel" aria-labelledby={`${tabId}-captions-tab`}><legend>Captions</legend><label className="video-switch-row"><span>Show captions</span><input aria-label="Show captions" type="checkbox" checked={draft.captions_enabled} onChange={(event) => updateDraft({ ...draft, captions_enabled: event.target.checked })} /></label><div className="video-caption-presets" role="radiogroup" aria-label="Caption style">{captionPresets.map((preset) => <button key={preset.id} className={`video-caption-preset is-${preset.id}`} role="radio" aria-checked={draft.caption_style === preset.id} type="button" onClick={() => updateDraft({ ...draft, caption_style: preset.id })}><span style={captionChipStyle(preset)}>{captionSamples[preset.id] ?? "Aa"}</span><strong>{preset.label}</strong></button>)}</div><div className="video-caption-geometry"><strong>Position &amp; size</strong><small>Drag on canvas or use exact controls.</small><label><span>Horizontal <b>{Math.round(captionBounds.x_bp / 100)}%</b></span><input aria-label="Caption horizontal position" type="range" min={0} max={Math.max(0, 10_000 - captionBounds.width_bp)} step={100} value={captionBounds.x_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, x_bp: Number(event.target.value) }) })} /></label><label><span>Vertical <b>{Math.round(captionBounds.y_bp / 100)}%</b></span><input aria-label="Caption vertical position" type="range" min={0} max={Math.max(0, 10_000 - captionBounds.height_bp)} step={100} value={captionBounds.y_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, y_bp: Number(event.target.value) }) })} /></label><label><span>Width <b>{Math.round(captionBounds.width_bp / 100)}%</b></span><input aria-label="Caption width" type="range" min={1600} max={10_000 - captionBounds.x_bp} step={100} value={captionBounds.width_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, width_bp: Number(event.target.value) }) })} /></label><label><span>Height <b>{Math.round(captionBounds.height_bp / 100)}%</b></span><input aria-label="Caption height" type="range" min={600} max={10_000 - captionBounds.y_bp} step={100} value={captionBounds.height_bp} onChange={(event) => updateDraft({ ...draft, caption_bounds: normalizeCaptionBounds({ ...captionBounds, height_bp: Number(event.target.value) }) })} /></label></div></fieldset> : null}
             {activeTab === "audio" ? <div id={`${tabId}-audio-panel`} role="tabpanel" aria-labelledby={`${tabId}-audio-tab`}>
               <fieldset><legend>Narration route</legend>
                 {narrationModels.length ? <>
@@ -329,7 +335,7 @@ export function VideoEditorWorkspace({
         </aside>
       </div>
 
-      <VideoTimeline timeline={project.manifest.timeline} scenes={project.manifest.scenes} playheadMs={playheadMs} selectedSceneId={selectedScene?.id} onPlayheadChange={onPlayheadChange} onSelectScene={onSelectScene} onEditTimeline={onEditTimeline} editing={timelineEditing} height={timelineHeight} onHeightChange={resizeTimeline} mode={timelineMode} onModeChange={changeTimelineMode} />
+      <VideoTimeline timeline={project.manifest.timeline} scenes={project.manifest.scenes} playheadMs={playheadMs} selectedSceneId={selectedScene?.id} onPlayheadChange={onPlayheadChange} onSelectScene={onSelectScene} onEditTimeline={onEditTimeline} editing={timelineEditing} height={timelineHeight} onHeightChange={resizeTimeline} mode={timelineMode} onModeChange={changeTimelineMode} onTransportHost={setTransportHost} />
       <footer className="video-project-status"><span>Project duration <strong>{formatVideoClock(project.duration_ms)}</strong></span><span>Source <strong>{formatVideoClock(project.manifest.source.duration_ms)}</strong></span><span>Revision <strong>{project.revision}</strong></span><span>Saved <strong>{formatVideoUpdatedAt(project.updated_at)}</strong></span></footer>
     </div>
   );
@@ -383,16 +389,28 @@ function visualTransitionOptions(layer: VideoVisualLayer, edge: "in" | "out"): n
   return [...new Set([0, 150, 300, 600, current])].filter((value) => value >= 0 && value + other <= duration).sort((left, right) => left - right);
 }
 
-const captionStyles: Array<{ id: VideoCaptionStyle; label: string; sample: string }> = [
-  { id: "clean-white", label: "Clean", sample: "Aa" },
-  { id: "calm", label: "Calm", sample: "Aa" },
-  { id: "kinetic", label: "Kinetic", sample: "AA" },
-  { id: "bold-pop", label: "Bold pop", sample: "POP" },
-  { id: "highlight", label: "Highlight", sample: "Mark" },
-  { id: "karaoke", label: "Karaoke", sample: "Sing" },
-  { id: "typewriter", label: "Typewriter", sample: "Type" },
-  { id: "podcast", label: "Podcast", sample: "Talk" },
-];
+const captionSamples: Record<VideoCaptionStyle, string> = {
+  "clean-white": "Aa",
+  calm: "Aa",
+  kinetic: "AA",
+  "bold-pop": "POP",
+  highlight: "Mark",
+  karaoke: "Sing",
+  typewriter: "Type",
+  podcast: "Talk",
+};
+
+/** Paint a chip with the preset's own type and colour, so the swatch previews the real design. */
+function captionChipStyle(preset: VideoCaptionPreset): CSSProperties {
+  return {
+    fontFamily: preset.font_family,
+    fontWeight: preset.bold ? 800 : 500,
+    letterSpacing: `${preset.letter_spacing_em}em`,
+    color: preset.text_color,
+    background: preset.background_color ?? "#1c1c1c",
+    textTransform: preset.casing === "upper" ? "uppercase" : preset.casing === "lower" ? "lowercase" : "none",
+  } as CSSProperties;
+}
 
 function compatibleNarrationVoices(
   bootstrap: BootstrapState,

@@ -3,9 +3,12 @@ import type { VideoProject } from "../types/video";
 
 const tauri = vi.hoisted(() => ({
   invoke: vi.fn(),
-  convertFileSrc: vi.fn((path: string) => `asset://${path}`),
   open: vi.fn(),
 }));
+
+// The desktop shell injects this before any application script runs. WebKitGTK cannot decode media
+// from a custom URI scheme, so every local path is addressed through a loopback HTTP origin.
+const MEDIA_ENDPOINT = { origin: "http://127.0.0.1:45231", token: "a".repeat(32) };
 
 vi.mock("@tauri-apps/api/core", () => tauri);
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -19,12 +22,14 @@ describe("native Video Studio bridge", () => {
       configurable: true,
       value: {},
     });
+    window.__SOUNDAR_MEDIA__ = MEDIA_ENDPOINT;
     tauri.invoke.mockReset();
     tauri.open.mockReset();
   });
 
   afterEach(() => {
     delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    delete window.__SOUNDAR_MEDIA__;
   });
 
   it("forwards the complete narration route without renaming or stripping fields", async () => {
@@ -173,7 +178,10 @@ describe("native Video Studio bridge", () => {
 
     expect(tauri.invoke).toHaveBeenCalledWith("add_video_visual_asset", { request });
     expect(request).not.toHaveProperty("source_path");
-    expect(response.project.manifest.visual_assets?.[0].url).toBe("asset:///managed/project-1/visual-1.webp");
+    expect(response.project.manifest.visual_assets?.[0].url).toBe(
+      // The absolute path keeps its leading slash, so the encoded form carries a doubled separator.
+      `${MEDIA_ENDPOINT.origin}/media/${MEDIA_ENDPOINT.token}//managed/project-1/visual-1.webp`,
+    );
     expect(response).toMatchObject({ asset_id: "visual-1", layer_id: "layer-1", job_id: "visual-job-1", replayed: false });
   });
 });

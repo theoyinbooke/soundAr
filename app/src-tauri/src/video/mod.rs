@@ -10,6 +10,7 @@ pub mod contracts;
 pub mod editor;
 pub mod intelligence;
 pub mod media;
+pub mod media_server;
 pub mod presentation;
 pub mod renderer;
 pub mod scheduler;
@@ -19,8 +20,8 @@ pub mod visuals;
 
 pub use assembly::{
     build_ass_document, build_timeline_render_plan, plan_caption_preview_pages,
-    write_ass_document_atomic, AssemblyOptions, CaptionPreviewPage, CaptionPreviewWord,
-    CaptionTheme,
+    present_caption_presets, write_ass_document_atomic, AssemblyOptions, CaptionPreviewPage,
+    CaptionPreviewWord, CaptionTheme,
 };
 pub use cache::{
     CacheArtifactInput, CacheKey, CacheKeyBuilder, CacheKeyInput, CacheStage, InvalidationPlan,
@@ -44,6 +45,7 @@ pub use media::{
     MediaStreamProbe, MediaToolKind, MediaToolStatus, PublicHttpsProxy, ValidatedImportUrl,
     LOCAL_MEDIA_FORMAT_WHITELIST, LOCAL_MEDIA_PROTOCOL_WHITELIST,
 };
+pub use media_server::LocalMediaServer;
 pub use presentation::{
     present_runtime_tools, present_video_output, present_video_project,
     present_video_project_summary,

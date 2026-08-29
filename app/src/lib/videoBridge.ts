@@ -1,6 +1,8 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { toMediaUrl, toMediaUrlIfPath } from "./mediaUrl";
+import { previewCaptionPresets } from "./captionPresets";
 import type {
   AddVisualAssetRequest,
   AddVisualAssetResponse,
@@ -15,6 +17,7 @@ import type {
   VideoArtifact,
   VideoCanvasBounds,
   VideoCaptionPage,
+  VideoCaptionPreset,
   VideoExportRequest,
   VideoJob,
   VideoLinkPreview,
@@ -494,6 +497,12 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
   };
 
   return {
+    async captionPresets() {
+      return previewCaptionPresets;
+    },
+    async saveArtifact() {
+      throw new Error("Saving exports needs the soundAr desktop app.");
+    },
     async previewLink(exactUrl) {
       let parsed: URL;
       try { parsed = new URL(exactUrl); } catch { throw new Error("Enter a valid HTTP or HTTPS video URL."); }
@@ -822,8 +831,16 @@ async function nativeWithProgress<T>(projectId: string, command: string, payload
 function withNativeArtifactUrl(artifact: VideoArtifact): VideoArtifact {
   return {
     ...artifact,
-    url: artifact.url || !artifact.local_path ? artifact.url : convertFileSrc(artifact.local_path),
-    poster_url: artifact.poster_url?.startsWith("/") ? convertFileSrc(artifact.poster_url) : artifact.poster_url,
+    url: artifact.url || !artifact.local_path ? artifact.url : toMediaUrl(artifact.local_path),
+    poster_url: toMediaUrlIfPath(artifact.poster_url),
+  };
+}
+
+function withNativeLinkPreviewUrls(preview: VideoLinkPreview): VideoLinkPreview {
+  return {
+    ...preview,
+    preview_url: toMediaUrlIfPath(preview.preview_url),
+    poster_url: toMediaUrlIfPath(preview.poster_url),
   };
 }
 
@@ -833,19 +850,19 @@ function withNativeProjectUrls(project: VideoProject): VideoProject {
   const deliverables = project.deliverables?.map(withNativeArtifactUrl);
   return {
     ...project,
-    poster_url: project.poster_url?.startsWith("/") ? convertFileSrc(project.poster_url) : project.poster_url,
+    poster_url: toMediaUrlIfPath(project.poster_url),
     master,
     deliverables,
     manifest: {
       ...project.manifest,
       source: {
         ...project.manifest.source,
-        preview_url: project.manifest.source.preview_url ?? (project.manifest.source.local_path ? convertFileSrc(project.manifest.source.local_path) : undefined),
-        poster_url: project.manifest.source.poster_url?.startsWith("/") ? convertFileSrc(project.manifest.source.poster_url) : project.manifest.source.poster_url,
+        preview_url: project.manifest.source.preview_url ?? toMediaUrl(project.manifest.source.local_path),
+        poster_url: toMediaUrlIfPath(project.manifest.source.poster_url),
       },
       visual_assets: project.manifest.visual_assets?.map((asset) => ({
         ...asset,
-        url: asset.url || !asset.local_path ? asset.url : convertFileSrc(asset.local_path),
+        url: asset.url || !asset.local_path ? asset.url : toMediaUrl(asset.local_path),
       })),
       artifacts,
     },
@@ -855,7 +872,7 @@ function withNativeProjectUrls(project: VideoProject): VideoProject {
 function withNativeSummaryUrls(project: VideoProjectSummary): VideoProjectSummary {
   return {
     ...project,
-    poster_url: project.poster_url?.startsWith("/") ? convertFileSrc(project.poster_url) : project.poster_url,
+    poster_url: toMediaUrlIfPath(project.poster_url),
     master: project.master ? withNativeArtifactUrl(project.master) : undefined,
     deliverables: project.deliverables?.map(withNativeArtifactUrl),
   };
@@ -863,7 +880,10 @@ function withNativeSummaryUrls(project: VideoProjectSummary): VideoProjectSummar
 
 function createNativeVideoService(): VideoStudioService {
   return {
-    previewLink: (exactUrl) => invoke<VideoLinkPreview>("preview_video_link", { exactUrl }),
+    previewLink: (exactUrl) => invoke<VideoLinkPreview>("preview_video_link", { exactUrl }).then(withNativeLinkPreviewUrls),
+    captionPresets: () => invoke<VideoCaptionPreset[]>("video_caption_presets"),
+    saveArtifact: (localPath, suggestedName) =>
+      invoke<string | null>("save_media_artifact", { sourcePath: localPath, suggestedName }).then((path) => path ?? undefined),
     importLink: (request) => invoke<VideoProject>("import_video_link", { request }).then(withNativeProjectUrls),
     async pickLocalVideo(): Promise<LocalVideoSelection | undefined> {
       const selected = await open({ multiple: false, directory: false, filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "webm", "m4v"] }] });

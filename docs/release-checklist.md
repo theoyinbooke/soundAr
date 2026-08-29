@@ -11,6 +11,7 @@ the retained logs. A skipped required item blocks publication.
 - [ ] Production dependencies have no unresolved shipped-path high or critical issue.
 - [ ] Production boundary passes after a clean build: `npm run build --prefix app && ./scripts/verify-production-boundary.sh && npm run test:production --prefix app`.
 - [ ] Python 3.11 contracts, React tests, full Playwright matrix, Rust tests, formatting, and script syntax pass as listed in `docs/test-matrix.md`.
+- [ ] A real exported master decodes in the shipping webview: `npm run test:playback --prefix app`.
 - [ ] Release notes distinguish functional, beta, experimental, disabled, and known limitations.
 
 ## Packages And Updates

@@ -9649,7 +9649,7 @@ fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
-fn ensure_private_directory(path: &Path, label: &str) -> Result<(), String> {
+pub(crate) fn ensure_private_directory(path: &Path, label: &str) -> Result<(), String> {
     if !path.exists() {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true).mode(0o700);

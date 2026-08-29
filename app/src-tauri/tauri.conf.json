@@ -24,7 +24,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:",
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:*; img-src 'self' asset: http://asset.localhost http://127.0.0.1:* data:; media-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:",
       "assetProtocol": {
         "enable": true,
         "scope": ["$HOME/.soundAr/exports/*", "$HOME/.soundAr/exports/**"]
@@ -108,8 +108,11 @@
       "../../data/engine_manifests.json": "runtime/data/engine_manifests.json"
     },
     "linux": {
+      "appimage": {
+        "bundleMediaFramework": true
+      },
       "deb": {
-        "depends": ["curl", "ca-certificates", "python3", "util-linux", "build-essential", "ffmpeg", "libsndfile1", "libespeak-ng1"]
+        "depends": ["curl", "ca-certificates", "python3", "util-linux", "build-essential", "ffmpeg", "libsndfile1", "libespeak-ng1", "gstreamer1.0-plugins-base", "gstreamer1.0-plugins-good", "gstreamer1.0-libav"]
       }
     }
   },

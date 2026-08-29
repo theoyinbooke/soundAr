@@ -21,6 +21,7 @@ use super::timeline::{
     map_source_endpoint_to_timeline, partition_track, QuantizeMode, TimelineSpanKind,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
@@ -1186,6 +1187,87 @@ fn append_speaker_cards(document: &mut String, captions: &[CaptionCue]) -> Video
     Ok(())
 }
 
+/// Project every caption preset into a web-renderable spec.
+///
+/// The editor preview used to approximate these presets with hand-written CSS, which drifted from
+/// what the renderer burns in: presets grew pill backgrounds the export never drew, and the words
+/// themselves never changed weight, family, or casing. Deriving the preview from this table keeps
+/// the canvas honest — what the user picks is what FFmpeg renders.
+pub fn present_caption_presets() -> Vec<Value> {
+    CaptionPresetId::ALL
+        .iter()
+        .map(|id| {
+            let preset = caption_preset(*id);
+            json!({
+                "id": preset.id.public_id(),
+                "label": caption_preset_label(preset.id),
+                "font_family": web_font_stack(preset.font_name),
+                // Fraction of canvas height, matching the renderer's own sizing.
+                "relative_size": preset.relative_size,
+                "text_color": ass_color_to_css(preset.primary_color),
+                "active_color": ass_color_to_css(preset.active_color),
+                "outline_color": ass_color_to_css(preset.outline_color),
+                // libass paints the back colour only in opaque-box mode; anything else has no box.
+                "background_color": if preset.border_style == 3 { ass_color_to_css(preset.back_color) } else { Value::Null },
+                "bold": preset.bold,
+                "letter_spacing_em": f64::from(preset.spacing) * 0.02,
+                "outline_em": f64::from(preset.outline) * 0.02,
+                "casing": if preset.uppercase { "upper" } else if preset.lowercase { "lower" } else { "as-is" },
+                "reveal": match preset.reveal {
+                    CaptionRevealMode::Page => "page",
+                    CaptionRevealMode::ActiveWord => "active-word",
+                    CaptionRevealMode::Karaoke => "karaoke",
+                    CaptionRevealMode::Typewriter => "typewriter",
+                },
+                "max_words_per_page": preset.paging.max_words,
+                "max_lines": preset.paging.max_lines,
+            })
+        })
+        .collect()
+}
+
+fn caption_preset_label(id: CaptionPresetId) -> &'static str {
+    match id {
+        CaptionPresetId::CleanWhite => "Clean",
+        CaptionPresetId::Calm => "Calm",
+        CaptionPresetId::Kinetic => "Kinetic",
+        CaptionPresetId::BoldPop => "Bold pop",
+        CaptionPresetId::Highlight => "Highlight",
+        CaptionPresetId::Karaoke => "Karaoke",
+        CaptionPresetId::Typewriter => "Typewriter",
+        CaptionPresetId::Podcast => "Podcast",
+    }
+}
+
+/// The renderer names one font; the webview needs a stack that resolves to the same shape.
+fn web_font_stack(font_name: &str) -> &'static str {
+    match font_name {
+        "DejaVu Sans Mono" => "\"JetBrains Mono Variable\", \"DejaVu Sans Mono\", monospace",
+        _ => "\"Inter Variable\", Inter, system-ui, sans-serif",
+    }
+}
+
+/// Convert an ASS `&HAABBGGRR` literal to a CSS colour.
+///
+/// ASS stores the channels reversed and treats alpha as transparency, so `00` is fully opaque.
+fn ass_color_to_css(value: &str) -> Value {
+    let digits = value.trim_start_matches("&H").trim_end_matches('&');
+    let Ok(raw) = u32::from_str_radix(digits, 16) else {
+        return Value::Null;
+    };
+    let (alpha, blue, green, red) = (
+        (raw >> 24) & 0xFF,
+        (raw >> 16) & 0xFF,
+        (raw >> 8) & 0xFF,
+        raw & 0xFF,
+    );
+    let opacity = f64::from(255 - alpha) / 255.0;
+    Value::String(format!(
+        "rgba({red}, {green}, {blue}, {:.3})",
+        (opacity * 1000.0).round() / 1000.0
+    ))
+}
+
 fn caption_preset(id: CaptionPresetId) -> AssCaptionPreset {
     match id {
         CaptionPresetId::CleanWhite => AssCaptionPreset {
@@ -2293,6 +2375,105 @@ fn validate_output_path(path: &Path) -> VideoResult<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "prints the catalog for regenerating the browser-preview fixture"]
+    fn dump_caption_preset_catalog() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&present_caption_presets()).unwrap()
+        );
+    }
+
+    #[test]
+    fn ass_colours_become_css_with_inverted_alpha() {
+        // ASS stores &HAABBGGRR: channels reversed, and alpha is transparency, so 00 is opaque.
+        assert_eq!(
+            ass_color_to_css("&H00FFFFFF"),
+            json!("rgba(255, 255, 255, 1.000)")
+        );
+        assert_eq!(
+            ass_color_to_css("&H003DD9FF"),
+            json!("rgba(255, 217, 61, 1.000)")
+        );
+        assert_eq!(
+            ass_color_to_css("&H50000000"),
+            json!("rgba(0, 0, 0, 0.686)")
+        );
+        assert_eq!(
+            ass_color_to_css("&HFF000000"),
+            json!("rgba(0, 0, 0, 0.000)")
+        );
+        assert_eq!(ass_color_to_css("not-a-colour"), Value::Null);
+    }
+
+    #[test]
+    fn every_preset_is_presented_with_a_renderable_web_spec() {
+        let presets = present_caption_presets();
+        assert_eq!(presets.len(), CaptionPresetId::ALL.len());
+        for (preset, id) in presets.iter().zip(CaptionPresetId::ALL) {
+            assert_eq!(preset["id"], json!(id.public_id()));
+            assert!(preset["label"].as_str().is_some_and(|l| !l.is_empty()));
+            assert!(preset["text_color"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("rgba(")));
+            assert!(preset["active_color"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("rgba(")));
+            let size = preset["relative_size"].as_f64().expect("relative size");
+            assert!((0.02..0.10).contains(&size), "{id:?} size {size}");
+            assert!(["page", "active-word", "karaoke", "typewriter"]
+                .contains(&preset["reveal"].as_str().expect("reveal")));
+            assert!(
+                ["as-is", "upper", "lower"].contains(&preset["casing"].as_str().expect("casing"))
+            );
+        }
+    }
+
+    #[test]
+    fn only_opaque_box_presets_carry_a_background() {
+        let presets = present_caption_presets();
+        let background = |id: &str| {
+            presets
+                .iter()
+                .find(|preset| preset["id"] == json!(id))
+                .expect("preset")["background_color"]
+                .clone()
+        };
+        // libass paints back_color only in opaque-box mode (border_style 3). Presets that draw an
+        // outline instead must not grow a pill in the preview that the export never renders.
+        assert_ne!(background("typewriter"), Value::Null);
+        assert_ne!(background("podcast"), Value::Null);
+        for outlined in [
+            "clean-white",
+            "calm",
+            "kinetic",
+            "bold-pop",
+            "highlight",
+            "karaoke",
+        ] {
+            assert_eq!(
+                background(outlined),
+                Value::Null,
+                "{outlined} must not paint a box"
+            );
+        }
+    }
+
+    #[test]
+    fn presets_that_emphasise_words_expose_a_distinct_active_colour() {
+        let presets = present_caption_presets();
+        for preset in presets.iter().filter(|p| p["reveal"] != json!("page")) {
+            if preset["reveal"] == json!("typewriter") {
+                continue;
+            }
+            assert_ne!(
+                preset["active_color"], preset["text_color"],
+                "{} reveals words but cannot show which one is active",
+                preset["id"]
+            );
+        }
+    }
+
     use super::super::contracts::{
         default_caption_bounds, AudioMix, AudioMixTrack, CanvasSpec, GapReason, LayoutElement,
         LayoutPlan, MediaProbe, MediaReference, NormalizedRect, Provenance, ProvenanceKind,

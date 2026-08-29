@@ -1,9 +1,9 @@
-import { Maximize2, Minus, Pause, Play, Plus, SkipBack, SkipForward, Volume2 } from "lucide-react";
+import { Maximize2, Pause, Play, SkipBack, SkipForward, Volume2 } from "lucide-react";
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
-import type { VideoArtifact, VideoCanvasBounds, VideoCaptionPage, VideoScene, VideoTranscriptSegment, VideoVisualAsset, VideoVisualLayer } from "../../types/video";
+import { createPortal } from "react-dom";
+import type { VideoArtifact, VideoCanvasBounds, VideoCaptionPage, VideoCaptionPreset, VideoCaptionWord, VideoScene, VideoTranscriptSegment, VideoVisualAsset, VideoVisualLayer } from "../../types/video";
 import { formatVideoClock } from "../../lib/videoState";
 import { videoSourceWithFirstFrame } from "../../lib/videoPlayback";
-import { OpeningFrameVideo } from "./OpeningFrameVideo";
 
 export function VideoPreviewPlayer({
   sourceUrl,
@@ -15,6 +15,7 @@ export function VideoPreviewPlayer({
   captionPages,
   visualAssets = [],
   visualLayers = [],
+  captionPresets,
   projectDurationMs,
   playheadMs,
   onPlayheadChange,
@@ -23,6 +24,7 @@ export function VideoPreviewPlayer({
   selectedVisualLayerId,
   onSelectVisual,
   onVisualBoundsChange,
+  transportHost,
 }: {
   sourceUrl?: string;
   artifact?: VideoArtifact;
@@ -33,6 +35,8 @@ export function VideoPreviewPlayer({
   captionPages?: VideoCaptionPage[];
   visualAssets?: VideoVisualAsset[];
   visualLayers?: VideoVisualLayer[];
+  /** The renderer's caption designs, so the canvas shows what the export will burn in. */
+  captionPresets?: VideoCaptionPreset[];
   projectDurationMs: number;
   playheadMs: number;
   onPlayheadChange: (milliseconds: number) => void;
@@ -41,6 +45,8 @@ export function VideoPreviewPlayer({
   selectedVisualLayerId?: string;
   onSelectVisual?: (layerId: string) => void;
   onVisualBoundsChange?: (layerId: string, bounds: VideoCanvasBounds) => void;
+  /** Where the transport bar renders. The preview pane itself stays canvas-only. */
+  transportHost?: HTMLElement | null;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const progressCallbackRef = useRef(onPlayheadChange);
@@ -48,7 +54,6 @@ export function VideoPreviewPlayer({
   const [gapPlayback, setGapPlayback] = useState<{ startMs: number; endMs: number; startedAt: number; nextScene?: VideoScene }>();
   const [volume, setVolume] = useState(0.72);
   const [aspectRatio, setAspectRatio] = useState("9 / 16");
-  const [zoom, setZoom] = useState<"fit" | 50 | 75 | 100>("fit");
   const [captionSelected, setCaptionSelected] = useState(false);
   const [previewCaptionBounds, setPreviewCaptionBounds] = useState<VideoCanvasBounds>(DEFAULT_CAPTION_BOUNDS);
 
@@ -70,7 +75,12 @@ export function VideoPreviewPlayer({
     ? activeCaptionCue(activeScene, transcript, playheadMs)
     : undefined;
   const captionCue = authoritativeCaptionPage?.text ?? fallbackCaptionCue;
-  const captionStyle = authoritativeCaptionPage?.style_id ?? activeScene?.caption_style;
+  // The scene owns the chosen design. Renderer-authored pages carry the style that was current when
+  // they were planned, so preferring the page would freeze the canvas on the last render and make
+  // picking a preset look like it did nothing.
+  const captionStyle = activeScene?.caption_style ?? authoritativeCaptionPage?.style_id;
+  const captionPreset = captionPresets?.find((preset) => preset.id === captionStyle);
+  const captionWords = authoritativeCaptionPage?.words ?? [];
   const projectedCaptionBounds = authoritativeCaptionPage?.bounds ?? activeScene?.caption_bounds ?? DEFAULT_CAPTION_BOUNDS;
   const activeVisuals = artifact ? [] : projectVisualLayers(visualAssets, visualLayers, playheadMs);
   const previousSceneStartMs = mapping.kind === "gap"
@@ -282,15 +292,36 @@ export function VideoPreviewPlayer({
     bottom: "auto",
     width: `${previewCaptionBounds.width_bp / 100}%`,
     height: `${previewCaptionBounds.height_bp / 100}%`,
-    "--video-caption-font-size": authoritativeCaptionPage?.font_size_bp ?? 480,
+    // The renderer sizes captions as a fraction of canvas height, so the preview does the same
+    // against the frame's container height rather than the viewport.
+    "--video-caption-font-size": authoritativeCaptionPage?.font_size_bp
+      ?? (captionPreset ? Math.round(captionPreset.relative_size * 10_000) : 480),
+    ...(captionPreset ? {
+      "--video-caption-font": captionPreset.font_family,
+      "--video-caption-weight": captionPreset.bold ? 800 : 500,
+      "--video-caption-color": captionPreset.text_color,
+      "--video-caption-active-color": captionPreset.active_color,
+      "--video-caption-tracking": `${captionPreset.letter_spacing_em}em`,
+      "--video-caption-outline": captionPreset.outline_color,
+      "--video-caption-outline-width": `${captionPreset.outline_em}em`,
+      "--video-caption-background": captionPreset.background_color ?? "transparent",
+      "--video-caption-casing": captionPreset.casing === "upper" ? "uppercase" : captionPreset.casing === "lower" ? "lowercase" : "none",
+    } : {}),
   } as CSSProperties;
+
+  const transport = (
+    <div className="video-preview-controls">
+      <div><button className="video-icon-button" type="button" aria-label="Previous scene" onClick={() => seek(previousSceneStartMs)}><SkipBack aria-hidden="true" size={14} /></button><button className="video-icon-button" type="button" aria-label={playing || gapPlayback ? "Pause preview" : "Play preview"} onClick={() => void togglePlayback()}>{playing || gapPlayback ? <Pause aria-hidden="true" size={15} /> : <Play aria-hidden="true" size={15} />}</button><button className="video-icon-button" type="button" aria-label="Next scene" onClick={() => seek(mapping.kind === "gap" ? mapping.nextScene?.timeline_start_ms ?? projectDurationMs : timelineScenes.find((candidate) => candidate.timeline_start_ms >= (activeScene?.timeline_end_ms ?? playheadMs))?.timeline_start_ms ?? projectDurationMs)}><SkipForward aria-hidden="true" size={14} /></button></div>
+      <strong>{formatVideoClock(playheadMs, true)} <span>/ {formatVideoClock(projectDurationMs, true)}</span></strong>
+      <div><Volume2 aria-hidden="true" size={14} /><input aria-label="Preview volume" type="range" min={0} max={1} step={0.05} value={volume} onChange={(event) => setVolume(Number(event.target.value))} /><button className="video-icon-button" type="button" aria-label="Full screen preview" onClick={() => void enterFullscreen()}><Maximize2 aria-hidden="true" size={14} /></button></div>
+    </div>
+  );
 
   return (
     <section className="video-preview-player" aria-label="Fast video preview">
-      <header><select aria-label="Preview aspect ratio" value={aspectRatio} onChange={(event) => setAspectRatio(event.target.value)}><option value="9 / 16">9:16 Portrait</option><option value="16 / 9">16:9 Landscape</option><option value="1">1:1 Square</option></select><div className="video-preview-zoom" role="group" aria-label="Canvas zoom"><button type="button" aria-label="Zoom canvas out" disabled={zoom === 50} onClick={() => setZoom((value) => value === "fit" || value === 100 ? 75 : 50)}><Minus aria-hidden="true" size={12} /></button><button type="button" aria-label="Fit canvas" aria-pressed={zoom === "fit"} onClick={() => setZoom("fit")}>{zoom === "fit" ? "Fit" : `${zoom}%`}</button><button type="button" aria-label="Zoom canvas in" disabled={zoom === 100} onClick={() => setZoom((value) => value === 50 ? 75 : 100)}><Plus aria-hidden="true" size={12} /></button></div><span>{artifact ? "Rendered preview" : "Low-resolution proxy"}</span></header>
       <div className="video-preview-stage">
-        <div className="video-portrait-frame" style={{ aspectRatio, height: zoom === "fit" ? undefined : `${zoom}%` }} onDoubleClick={() => void enterFullscreen()}>
-          <OpeningFrameVideo ref={videoRef} src={posterUrl ? artifact?.url ?? sourceUrl : videoSourceWithFirstFrame(artifact?.url ?? sourceUrl)} poster={artifact?.poster_url ?? posterUrl} playsInline preload={artifact?.poster_url ?? posterUrl ? "metadata" : "auto"} aria-label={artifact?.title ?? "Project proxy preview"} onPlay={() => setPlaying(true)} onPause={() => { if (!gapPlayback) setPlaying(false); }} onTimeUpdate={(event) => {
+        <div className="video-portrait-frame" style={{ aspectRatio }} onDoubleClick={() => void enterFullscreen()}>
+          <video ref={videoRef} src={posterUrl ? artifact?.url ?? sourceUrl : videoSourceWithFirstFrame(artifact?.url ?? sourceUrl)} poster={artifact?.poster_url ?? posterUrl} playsInline preload={artifact?.poster_url ?? posterUrl ? "metadata" : "auto"} aria-label={artifact?.title ?? "Project proxy preview"} onPlay={() => setPlaying(true)} onPause={() => { if (!gapPlayback) setPlaying(false); }} onTimeUpdate={(event) => {
             if (!playing) return;
             const currentMs = event.currentTarget.currentTime * 1000;
             if (artifact) onPlayheadChange(Math.max(0, Math.min(projectDurationMs, currentMs)));
@@ -318,16 +349,50 @@ export function VideoPreviewPlayer({
             onKeyDown={(event) => moveVisualWithKeyboard(layer.id, bounds, event)}
             onClick={() => onSelectVisual?.(layer.id)}
           ><img src={asset.url} alt="" style={{ objectFit: layer.fit === "stretch" ? "fill" : layer.fit }} />{selectedVisualLayerId === layer.id ? <span className="video-visual-selection-handles" aria-hidden="true"><i data-visual-handle="nw" /><i data-visual-handle="ne" /><i data-visual-handle="se" /><i data-visual-handle="sw" /></span> : null}</button> : null)}
-          {captionCue && activeScene && captionStyle ? <button className={`video-caption-preview has-geometry is-${captionStyle} ${captionSelected ? "is-selected" : ""}`} type="button" style={captionGeometryStyle} data-caption-page-id={authoritativeCaptionPage?.id} data-editor-selection="caption" aria-label={`Select active caption: ${captionCue}`} aria-pressed={captionSelected} aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight" title="Drag to position. Drag a corner to resize. Arrow keys move; Alt+Arrow resizes; Shift uses larger steps. Save scene changes to persist." onPointerDown={beginCaptionPointerEdit} onKeyDown={moveCaptionWithKeyboard} onDoubleClick={(event) => event.stopPropagation()} onClick={() => { setCaptionSelected(true); onSelectCaption?.(); }}>{captionCue}{captionSelected ? <span className="video-caption-selection-handles" aria-hidden="true"><i data-caption-handle="nw" /><i data-caption-handle="ne" /><i data-caption-handle="se" /><i data-caption-handle="sw" /></span> : null}</button> : null}
+          {captionCue && activeScene && captionStyle ? <button className={`video-caption-preview has-geometry is-${captionStyle}${captionPreset ? " is-themed" : ""} reveal-${captionPreset?.reveal ?? "page"} ${captionSelected ? "is-selected" : ""}`} type="button" style={captionGeometryStyle} data-caption-page-id={authoritativeCaptionPage?.id} data-editor-selection="caption" aria-label={`Select active caption: ${captionCue}`} aria-pressed={captionSelected} aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight" title="Drag to position. Drag a corner to resize. Arrow keys move; Alt+Arrow resizes; Shift uses larger steps. Save scene changes to persist." onPointerDown={beginCaptionPointerEdit} onKeyDown={moveCaptionWithKeyboard} onDoubleClick={(event) => event.stopPropagation()} onClick={() => { setCaptionSelected(true); onSelectCaption?.(); }}><span className="video-caption-text">{renderCaptionContent(captionCue, captionWords, playheadMs, captionPreset)}</span>{captionSelected ? <span className="video-caption-selection-handles" aria-hidden="true"><i data-caption-handle="nw" /><i data-caption-handle="ne" /><i data-caption-handle="se" /><i data-caption-handle="sw" /></span> : null}</button> : null}
         </div>
       </div>
-      <footer className="video-preview-controls">
-        <div><button className="video-icon-button" type="button" aria-label="Previous scene" onClick={() => seek(previousSceneStartMs)}><SkipBack aria-hidden="true" size={14} /></button><button className="video-icon-button" type="button" aria-label={playing || gapPlayback ? "Pause preview" : "Play preview"} onClick={() => void togglePlayback()}>{playing || gapPlayback ? <Pause aria-hidden="true" size={15} /> : <Play aria-hidden="true" size={15} />}</button><button className="video-icon-button" type="button" aria-label="Next scene" onClick={() => seek(mapping.kind === "gap" ? mapping.nextScene?.timeline_start_ms ?? projectDurationMs : timelineScenes.find((candidate) => candidate.timeline_start_ms >= (activeScene?.timeline_end_ms ?? playheadMs))?.timeline_start_ms ?? projectDurationMs)}><SkipForward aria-hidden="true" size={14} /></button></div>
-        <strong>{formatVideoClock(playheadMs, true)} <span>/ {formatVideoClock(projectDurationMs, true)}</span></strong>
-        <div><Volume2 aria-hidden="true" size={14} /><input aria-label="Preview volume" type="range" min={0} max={1} step={0.05} value={volume} onChange={(event) => setVolume(Number(event.target.value))} /><button className="video-icon-button" type="button" aria-label="Full screen preview" onClick={() => void enterFullscreen()}><Maximize2 aria-hidden="true" size={14} /></button></div>
-      </footer>
+      {transportHost ? createPortal(transport, transportHost) : transport}
     </section>
   );
+}
+
+/**
+ * Render the caption page the way the preset reveals it.
+ *
+ * Page presets show the whole line at once. The word-timed modes need per-word markup so the
+ * canvas can show which word is being spoken, matching the karaoke and active-word effects the
+ * renderer writes into the ASS document.
+ */
+export function renderCaptionContent(
+  text: string,
+  words: VideoCaptionWord[],
+  playheadMs: number,
+  preset?: VideoCaptionPreset,
+) {
+  const reveal = preset?.reveal ?? "page";
+  if (reveal === "page" || !words.length) return text;
+
+  const spokenIndex = words.findIndex((word) => playheadMs >= word.start_ms && playheadMs < word.end_ms);
+  // Between words, keep the most recent one emphasised rather than flickering to nothing.
+  const activeIndex = spokenIndex >= 0
+    ? spokenIndex
+    : words.reduce((latest, word, index) => (playheadMs >= word.end_ms ? index : latest), -1);
+
+  return words.map((word, index) => {
+    const spoken = index <= activeIndex;
+    // Typewriter and word reveals hide what has not been spoken; karaoke shows the whole line and
+    // recolours it as it goes.
+    const hidden = (reveal === "typewriter" || reveal === "active-word") && !spoken;
+    const state = reveal === "karaoke"
+      ? (spoken ? "is-spoken" : "is-pending")
+      : index === activeIndex ? "is-active" : spoken ? "is-spoken" : "is-pending";
+    return (
+      <span key={`${word.start_ms}-${index}`} className={`video-caption-word ${state}`} style={hidden ? { opacity: 0 } : undefined}>
+        {word.text}{index < words.length - 1 ? " " : ""}
+      </span>
+    );
+  });
 }
 
 const DEFAULT_CAPTION_BOUNDS: VideoCanvasBounds = { x_bp: 800, y_bp: 7350, width_bp: 8400, height_bp: 1500 };

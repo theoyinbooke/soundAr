@@ -6345,16 +6345,154 @@ fn codex_agent_respond(
     state.codex_agent.respond(id, result)
 }
 
+/// Loopback origin that serves rendered media to the webview.
+///
+/// WebKitGTK cannot decode media delivered over a custom URI scheme, so `asset:` URLs fail every
+/// `<video>` element on Linux. Exported files are streamed from a real HTTP origin instead.
+struct MediaOrigin(video::LocalMediaServer);
+
+/// Guard against a navigation replacing the single-page app.
+///
+/// A cross-origin `<a download>` is not honoured by the webview: it navigates instead, and with
+/// `decorations: false` there is no chrome to navigate back with, so the window is left showing a
+/// blank media document. Downloads go through `save_media_artifact`; nothing else may navigate.
+fn navigation_is_allowed(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" => true,
+        "http" | "https" => matches!(url.host_str(), Some("tauri.localhost")) || cfg!(dev),
+        _ => false,
+    }
+}
+
+/// Report the media origin so the webview can recover if the injected global is missing.
+#[tauri::command]
+fn video_media_endpoint(app: tauri::AppHandle) -> Result<Value, String> {
+    let origin = app
+        .try_state::<MediaOrigin>()
+        .ok_or("media.origin_unavailable: The local media origin is not running")?;
+    Ok(json!({ "origin": origin.0.origin(), "token": origin.0.token() }))
+}
+
+/// Resolve a save request to a real export, refusing anything outside the export root.
+///
+/// The path arrives from the webview, so it is canonicalised before the prefix check: a symlink or
+/// `..` inside the export tree must not be able to reach the rest of the filesystem.
+fn resolve_saveable_export(source_path: &str, exports_root: &Path) -> Result<PathBuf, String> {
+    let source = fs::canonicalize(source_path)
+        .map_err(|_| "media.source_missing: That export is no longer on disk".to_string())?;
+    if !source.starts_with(exports_root) || !source.is_file() {
+        return Err("media.source_forbidden: Only soundAr exports can be saved".into());
+    }
+    Ok(source)
+}
+
+/// Pick the name to pre-fill in the save dialog, ignoring any suggestion carrying a path separator.
+fn saved_file_name(suggested: Option<&str>, source: &Path) -> String {
+    suggested
+        .map(str::trim)
+        .filter(|name| {
+            !name.is_empty() && !name.contains('/') && !name.contains('\\') && *name != ".."
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "soundar-export".to_string())
+}
+
+/// Copy an exported artifact to a location the user picks.
+///
+/// The webview cannot do this itself: an `<a download>` pointing at another origin is not honoured,
+/// so the click navigates the window to the file instead of saving it. Saving happens here, where
+/// the source path is checked against the export root before any bytes are copied.
+#[tauri::command]
+async fn save_media_artifact(
+    app: tauri::AppHandle,
+    source_path: String,
+    suggested_name: Option<String>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let exports_root = fs::canonicalize(home_dir().join(".soundAr/exports"))
+        .map_err(|error| format!("media.exports_unavailable: {error}"))?;
+    let source = resolve_saveable_export(&source_path, &exports_root)?;
+    let default_name = saved_file_name(suggested_name.as_deref(), &source);
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut builder = app
+            .dialog()
+            .file()
+            .set_title("Save export")
+            .set_file_name(&default_name);
+        if !extension.is_empty() {
+            builder = builder.add_filter(extension.to_uppercase(), &[extension.as_str()]);
+        }
+        let Some(destination) = builder.blocking_save_file() else {
+            return Ok(None);
+        };
+        let destination = destination
+            .into_path()
+            .map_err(|error| format!("media.destination_invalid: {error}"))?;
+        fs::copy(&source, &destination).map_err(|error| {
+            format!("media.save_failed: The export could not be saved: {error}")
+        })?;
+        Ok(Some(destination.to_string_lossy().to_string()))
+    })
+    .await
+    .map_err(|error| format!("media.save_worker_failed: {error}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The store creates this root, but only later in `setup`. Create it here so a first run still
+    // gets a media origin instead of silently losing every `<video>` until the next launch.
+    let exports_root = home_dir().join(".soundAr/exports");
+    let media_origin = store::ensure_private_directory(&exports_root, "artifact")
+        .map_err(|error| format!("the export directory is unavailable: {error}"))
+        .and_then(|()| {
+            video::LocalMediaServer::start(vec![exports_root])
+                .map_err(|error| format!("the local media origin could not start: {error}"))
+        })
+        .map_err(|error| {
+            eprintln!("soundAr: {error} Video and audio playback will be unavailable.");
+            error
+        })
+        .ok();
+    let media_init_script = media_origin.as_ref().map_or_else(
+        || "window.__SOUNDAR_MEDIA__ = null;".to_string(),
+        |origin| {
+            format!(
+                "window.__SOUNDAR_MEDIA__ = {{ origin: {}, token: {} }};",
+                serde_json::to_string(origin.origin()).unwrap_or_else(|_| "null".into()),
+                serde_json::to_string(origin.token()).unwrap_or_else(|_| "null".into()),
+            )
+        },
+    );
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("soundar-shell")
+                .js_init_script(media_init_script)
+                .on_navigation(|_webview, url| navigation_is_allowed(url))
+                .build(),
+        )
+        .setup(move |app| {
             let root = runtime_root(app.handle());
             app.manage(RuntimeState::new(root, python_path())?);
+            if let Some(origin) = media_origin {
+                app.manage(MediaOrigin(origin));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6438,7 +6576,10 @@ pub fn run() {
             install_model,
             cancel_model_install,
             remove_model,
+            video_media_endpoint,
+            save_media_artifact,
             video_commands::video_runtime_status,
+            video_commands::video_caption_presets,
             video_commands::preview_video_link,
             video_commands::import_video_link,
             video_commands::import_video_file,
@@ -6488,9 +6629,10 @@ mod tests {
     use super::{
         active_video_jobs_support_qualified_whisper_overlap, capture_audio_thread,
         cold_load_needs_idle_reclamation, foundation_runtime_ready_for_install, gpu_status,
-        home_dir, managed_cuda_library_path, new_inference_scheduler, parse_project_script,
-        read_batch_import, read_json, request_supports_qualified_video_overlap, resample_mono,
-        scheduler_rank, sha256_path, validate_model_argument, validate_revision,
+        home_dir, managed_cuda_library_path, navigation_is_allowed, new_inference_scheduler,
+        parse_project_script, read_batch_import, read_json,
+        request_supports_qualified_video_overlap, resample_mono, resolve_saveable_export,
+        saved_file_name, scheduler_rank, sha256_path, validate_model_argument, validate_revision,
         video_request_supports_qualified_whisper_overlap, write_json_atomically, ActivePlayback,
         ActiveRecording, GlobalVideoGpuGate, RuntimeState, SchedulerWaiter, VideoGpuReservation,
         VoiceActivityDetector, GPU_COLD_LOAD_HEADROOM_MB, MAX_RPC_REQUEST_BYTES,
@@ -6909,6 +7051,77 @@ for line in sys.stdin:
             .expect("playback lock")
             .is_none());
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn navigation_is_confined_to_the_application_shell() {
+        // A cross-origin `<a download>` is not honoured by the webview; it navigates instead, and
+        // with no window decorations that leaves a blank media document and no way back.
+        let blocked = [
+            "http://127.0.0.1:41234/media/token//home/user/.soundAr/exports/master.mp4",
+            "file:///home/user/.soundAr/exports/master.mp4",
+            "asset://localhost//home/user/.soundAr/exports/master.mp4",
+            "https://example.com/",
+        ];
+        for candidate in blocked {
+            let url = tauri::Url::parse(candidate).expect("parse candidate");
+            assert!(
+                !navigation_is_allowed(&url) || cfg!(dev),
+                "{candidate} must not replace the application shell"
+            );
+        }
+        assert!(navigation_is_allowed(
+            &tauri::Url::parse("tauri://localhost/index.html").expect("parse app url")
+        ));
+    }
+
+    #[test]
+    fn saving_is_restricted_to_files_inside_the_export_root() {
+        let root = std::env::temp_dir().join(format!("soundar-save-{}", Uuid::new_v4()));
+        let exports = root.join("exports");
+        let outside = root.join("elsewhere");
+        fs::create_dir_all(&exports).expect("exports");
+        fs::create_dir_all(&outside).expect("outside");
+        let export = exports.join("master.mp4");
+        fs::write(&export, b"master").expect("write export");
+        let secret = outside.join("secret.mp4");
+        fs::write(&secret, b"secret").expect("write secret");
+        let exports_root = fs::canonicalize(&exports).expect("canonicalize exports");
+
+        assert_eq!(
+            resolve_saveable_export(export.to_str().expect("path"), &exports_root),
+            Ok(fs::canonicalize(&export).expect("canonicalize export"))
+        );
+        assert!(resolve_saveable_export(secret.to_str().expect("path"), &exports_root).is_err());
+        assert!(resolve_saveable_export(
+            exports.join("missing.mp4").to_str().expect("path"),
+            &exports_root
+        )
+        .is_err());
+        // A symlink planted inside the export tree must not reach the rest of the filesystem.
+        let escape = exports.join("escape.mp4");
+        std::os::unix::fs::symlink(&secret, &escape).expect("symlink");
+        assert!(resolve_saveable_export(escape.to_str().expect("path"), &exports_root).is_err());
+        // Directories are not exports.
+        assert!(resolve_saveable_export(exports.to_str().expect("path"), &exports_root).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn suggested_save_names_cannot_carry_a_path() {
+        let source = Path::new("/home/user/.soundAr/exports/video/master.mp4");
+        assert_eq!(saved_file_name(Some("reel.mp4"), source), "reel.mp4");
+        assert_eq!(saved_file_name(Some("  reel.mp4  "), source), "reel.mp4");
+        // Anything with a separator falls back to the artifact's own file name.
+        assert_eq!(
+            saved_file_name(Some("../../etc/passwd"), source),
+            "master.mp4"
+        );
+        assert_eq!(saved_file_name(Some("a/b.mp4"), source), "master.mp4");
+        assert_eq!(saved_file_name(Some(""), source), "master.mp4");
+        assert_eq!(saved_file_name(None, source), "master.mp4");
+        assert_eq!(saved_file_name(None, Path::new("/")), "soundar-export");
     }
 
     #[test]

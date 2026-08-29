@@ -138,6 +138,32 @@ export interface VideoTranscriptSegment {
   source_clock: true;
 }
 
+/**
+ * A caption design exactly as the renderer defines it.
+ *
+ * The editor renders both its preset chips and the live canvas caption from this, so the design a
+ * user picks is the design FFmpeg burns into the export.
+ */
+export interface VideoCaptionPreset {
+  id: VideoCaptionStyle;
+  label: string;
+  font_family: string;
+  /** Font size as a fraction of canvas height. */
+  relative_size: number;
+  text_color: string;
+  active_color: string;
+  outline_color: string;
+  /** Only opaque-box presets paint a background; the rest draw an outline instead. */
+  background_color: string | null;
+  bold: boolean;
+  letter_spacing_em: number;
+  outline_em: number;
+  casing: "as-is" | "upper" | "lower";
+  reveal: "page" | "active-word" | "karaoke" | "typewriter";
+  max_words_per_page: number;
+  max_lines: number;
+}
+
 export interface VideoCaptionWord {
   text: string;
   start_ms: number;
@@ -515,6 +541,14 @@ export interface VideoExportRequest {
 
 export interface VideoStudioService {
   previewLink(exactUrl: string): Promise<VideoLinkPreview>;
+  /** The renderer's caption design catalog, used for the preset chips and the live preview. */
+  captionPresets(): Promise<VideoCaptionPreset[]>;
+  /**
+   * Copy an export to a location the user picks, returning the destination or `undefined` when the
+   * save is cancelled. A plain `<a download>` cannot do this: the media origin is cross-origin to
+   * the app, so the browser ignores `download` and navigates the window to the file instead.
+   */
+  saveArtifact(localPath: string, suggestedName?: string): Promise<string | undefined>;
   importLink(request: ImportLinkRequest): Promise<VideoProject>;
   pickLocalVideo?(): Promise<LocalVideoSelection | undefined>;
   pickLocalAudio?(): Promise<LocalAudioSelection | undefined>;

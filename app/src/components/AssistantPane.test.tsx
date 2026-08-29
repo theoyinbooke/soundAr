@@ -49,7 +49,7 @@ describe("AssistantPane", () => {
     expect(within(progress).getByText("Export")).toBeVisible();
     const master = await screen.findByRole("article", { name: "Final video master: Creator update · Portrait master" });
     expect(within(master).getByLabelText("Play Creator update · Portrait master")).toBeInstanceOf(HTMLVideoElement);
-    expect(within(master).getByRole("link", { name: "Download Creator update · Portrait master" })).toHaveAttribute("download", "creator-update-master-portrait-master.mp4");
+    expect(within(master).queryByRole("button", { name: /^Save / })).not.toBeInTheDocument();
     const secondaryAssets = within(master).getByText("Project assets").closest("details");
     expect(secondaryAssets).not.toHaveAttribute("open");
     await userEvent.click(within(master).getByRole("button", { name: "Open project" }));
@@ -73,8 +73,7 @@ describe("AssistantPane", () => {
       name: "Final video master: Creator update · Portrait master",
     });
     expect(within(master).getByLabelText("Play Creator update · Portrait master")).toBeInstanceOf(HTMLVideoElement);
-    expect(within(master).getByRole("link", { name: "Download Creator update · Portrait master" }))
-      .toHaveAttribute("download", "creator-update-master-portrait-master.mp4");
+    expect(within(master).queryByRole("button", { name: /^Save / })).not.toBeInTheDocument();
   });
 
   it("restores the exact playable preview when a saved task has no final master", async () => {
@@ -93,8 +92,7 @@ describe("AssistantPane", () => {
     });
     expect(within(preview).getByLabelText("Play Creator update · Reel draft preview"))
       .toBeInstanceOf(HTMLVideoElement);
-    expect(within(preview).getByRole("link", { name: "Download Creator update · Reel draft preview" }))
-      .toHaveAttribute("download", "creator-update-preview.mp4");
+    expect(within(preview).queryByRole("button", { name: /^Save / })).not.toBeInTheDocument();
     expect(screen.queryByText("Final video master")).not.toBeInTheDocument();
   });
 

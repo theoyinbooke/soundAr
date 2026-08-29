@@ -57,6 +57,9 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const COMMAND_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LINK_PREVIEW_TIMEOUT: Duration = Duration::from_secs(45);
+const LINK_THUMBNAIL_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_THUMBNAIL_CAPTURE_BYTES: usize = 64 * 1024;
+const THUMBNAIL_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
 const LINK_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_SOURCE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_PACKAGE_AGGREGATE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -734,6 +737,11 @@ pub struct LinkPreview {
     pub creator: Option<String>,
     pub duration_us: Option<i64>,
     pub thumbnail_url: Option<String>,
+    /// Locally cached copy of `thumbnail_url`. The webview cannot load the remote address: the
+    /// content security policy allows no external origins, so the poster has to come off disk.
+    pub thumbnail_path: Option<String>,
+    pub view_count: Option<u64>,
+    pub upload_date: Option<String>,
     pub extractor: Option<String>,
     pub has_video: bool,
     pub has_audio: bool,
@@ -2510,6 +2518,18 @@ fn stable_output_id(
 fn stable_import_asset_id(project_id: &str, job_id: &str, role: &str, key: &str) -> String {
     let identity = json!([project_id, job_id, role, key]).to_string();
     format!("video-asset-{}", sha256_bytes(identity.as_bytes()))
+}
+
+/// Locate a previously cached poster for `key`, whatever image format yt-dlp produced.
+fn find_cached_thumbnail(directory: &Path, key: &str) -> Option<PathBuf> {
+    THUMBNAIL_EXTENSIONS.iter().find_map(|extension| {
+        let candidate = directory.join(format!("{key}.{extension}"));
+        candidate
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file() && metadata.len() > 0)
+            .map(|_| candidate)
+    })
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -12743,6 +12763,56 @@ impl VideoStudioService {
         })
     }
 
+    /// Download the poster frame for `canonical_url` into the managed video root.
+    ///
+    /// The intake dialog cannot fetch the remote thumbnail itself — the webview's content security
+    /// policy permits no external origins — so the bytes are pulled here through the same protected
+    /// proxy that reads the link metadata, and served back over the local media origin.
+    fn cache_link_thumbnail(
+        &self,
+        canonical_url: &str,
+        yt_dlp: &Path,
+        proxy_url: &str,
+    ) -> Option<PathBuf> {
+        let directory = self.video_root.join("link-previews");
+        fs::create_dir_all(&directory).ok()?;
+        secure_private_directory(&directory).ok()?;
+        let key = hex_digest(canonical_url.as_bytes());
+        if let Some(existing) = find_cached_thumbnail(&directory, &key) {
+            return Some(existing);
+        }
+        let template = directory.join(format!("{key}.%(ext)s"));
+        let args = vec![
+            OsString::from("--ignore-config"),
+            OsString::from("--skip-download"),
+            OsString::from("--write-thumbnail"),
+            OsString::from("--no-playlist"),
+            OsString::from("--no-warnings"),
+            OsString::from("--socket-timeout"),
+            OsString::from("10"),
+            OsString::from("--proxy"),
+            OsString::from(proxy_url),
+            OsString::from("-o"),
+            template.into_os_string(),
+            OsString::from("--"),
+            OsString::from(canonical_url),
+        ];
+        let captured = run_captured_command(
+            yt_dlp,
+            &args,
+            LINK_THUMBNAIL_TIMEOUT,
+            None,
+            MAX_THUMBNAIL_CAPTURE_BYTES,
+            Some(proxy_url),
+            None,
+        )
+        .ok()?;
+        if !captured.status.success() {
+            return None;
+        }
+        find_cached_thumbnail(&directory, &key)
+    }
+
     pub fn preview_link(&self, raw_url: &str) -> ServiceResult<LinkPreview> {
         let validated = validate_import_url(raw_url)?;
         if validated.is_playlist {
@@ -12841,6 +12911,16 @@ impl VideoStudioService {
             .get("acodec")
             .and_then(Value::as_str)
             .is_some_and(|codec| codec != "none");
+        let thumbnail_url = metadata
+            .get("thumbnail")
+            .and_then(Value::as_str)
+            .filter(|url| url.starts_with("https://"))
+            .map(str::to_string);
+        // Best effort: a missing poster must never fail the preview the user is waiting on.
+        let thumbnail_path = thumbnail_url.as_ref().and_then(|_| {
+            self.cache_link_thumbnail(&validated.canonical, yt_dlp, proxy.url())
+                .map(|path| path.to_string_lossy().to_string())
+        });
         Ok(LinkPreview {
             canonical_url: validated.canonical,
             provider: format!("{:?}", validated.provider).to_ascii_lowercase(),
@@ -12852,10 +12932,13 @@ impl VideoStudioService {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             duration_us,
-            thumbnail_url: metadata
-                .get("thumbnail")
+            thumbnail_url,
+            thumbnail_path,
+            view_count: metadata.get("view_count").and_then(Value::as_u64),
+            upload_date: metadata
+                .get("upload_date")
                 .and_then(Value::as_str)
-                .filter(|url| url.starts_with("https://"))
+                .filter(|value| value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()))
                 .map(str::to_string),
             extractor: metadata
                 .get("extractor_key")

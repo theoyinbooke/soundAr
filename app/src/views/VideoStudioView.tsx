@@ -16,6 +16,7 @@ import type {
   ImportLinkRequest,
   ImportLocalVideoRequest,
   VideoArtifact,
+  VideoCaptionPreset,
   VideoLinkPreview,
   VideoProject,
   VideoScene,
@@ -54,6 +55,17 @@ export function VideoStudioView({
   const [timelineEditing, setTimelineEditing] = useState(false);
   const [visualAdding, setVisualAdding] = useState(false);
   const [timelineFeedback, setTimelineFeedback] = useState<{ tone: "status" | "error"; text: string }>();
+  const [captionPresets, setCaptionPresets] = useState<VideoCaptionPreset[]>([]);
+
+  // The renderer defines the caption designs, so the editor reads them from it rather than keeping
+  // its own copy that can drift from what the export burns in.
+  useEffect(() => {
+    let active = true;
+    void videoService.captionPresets()
+      .then((presets) => { if (active) setCaptionPresets(presets); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [videoService]);
   const [timelineUndo, setTimelineUndo] = useState<TimelineHistoryEntry[]>([]);
   const [timelineRedo, setTimelineRedo] = useState<TimelineHistoryEntry[]>([]);
   const operationGeneration = useRef(0);
@@ -305,29 +317,17 @@ export function VideoStudioView({
     if (!state.project) return;
     try {
       const savedScene = state.project.manifest.scenes.find((candidate) => candidate.id === scene.id);
-      const narrationRouteChanged = !savedScene || (["voice_id", "model_id", "speaker", "language"] as const)
-        .some((field) => savedScene[field] !== scene[field]);
+      const scenePatch = changedScenePatch(savedScene, scene);
+      if (!Object.keys(scenePatch).length) {
+        setStatusAnnouncement(`${scene.title} already matches the saved version.`);
+        return;
+      }
       const project = await videoService.reviseVideo({
         project_id: state.project.id,
         base_version_id: state.project.manifest.version_id,
-        instruction: `Update scene ${scene.position}: layout, crop, captions, audio mix, and narration route.`,
+        instruction: `Update scene ${scene.position}: ${Object.keys(scenePatch).join(", ")}.`,
         scene_id: scene.id,
-        scene_patch: {
-          layout: scene.layout,
-          crop_mode: scene.crop_mode,
-          crop_rect: scene.crop_mode === "manual" ? scene.crop_rect : undefined,
-          captions_enabled: scene.captions_enabled,
-          caption_style: scene.caption_style,
-          caption_bounds: scene.caption_bounds,
-          voice_gain_db: scene.voice_gain_db,
-          music_gain_db: scene.music_gain_db,
-          ...(narrationRouteChanged ? {
-            voice_id: scene.voice_id,
-            model_id: scene.model_id,
-            speaker: scene.speaker,
-            language: scene.language,
-          } : {}),
-        },
+        scene_patch: scenePatch,
       });
       dispatch({ type: "open-project", project });
       onProjectChanged?.(project);
@@ -536,7 +536,7 @@ export function VideoStudioView({
           <button className="video-button is-primary" type="button" onClick={() => void analyze(state.project!, "editor")}>Analyze source</button>
         </div>
       </section> : null}
-      {["editor", "rendering", "exporting"].includes(state.phase) && state.project && !needsAnalysis ? <VideoEditorWorkspace project={state.project} selectedSceneId={state.selectedSceneId} playheadMs={state.playheadMs} job={state.activeJob} working={state.phase === "rendering" ? "rendering" : state.phase === "exporting" ? "exporting" : undefined} onSelectScene={selectScene} onPlayheadChange={(playheadMs) => dispatch({ type: "set-playhead", playheadMs })} onRenderPreview={() => void renderPreview()} onExport={() => void exportVideo()} onSaveScene={saveScene} onAddVisual={addVisual} visualAdding={visualAdding} onEditTimeline={editTimeline} timelineEditing={timelineEditing} timelineFeedback={timelineFeedback} canUndoTimeline={Boolean(timelineUndo.length && timelineUndo.at(-1)?.expected_version_id === state.project.manifest.version_id)} canRedoTimeline={Boolean(timelineRedo.length && timelineRedo.at(-1)?.expected_version_id === state.project.manifest.version_id)} onUndoTimeline={() => void undoTimelineEdit()} onRedoTimeline={() => void redoTimelineEdit()} onCancelWorking={() => void cancelOperation()} bootstrap={bootstrap} voices={voices} /> : null}
+      {["editor", "rendering", "exporting"].includes(state.phase) && state.project && !needsAnalysis ? <VideoEditorWorkspace project={state.project} selectedSceneId={state.selectedSceneId} playheadMs={state.playheadMs} job={state.activeJob} working={state.phase === "rendering" ? "rendering" : state.phase === "exporting" ? "exporting" : undefined} onSelectScene={selectScene} onPlayheadChange={(playheadMs) => dispatch({ type: "set-playhead", playheadMs })} onRenderPreview={() => void renderPreview()} onExport={() => void exportVideo()} onSaveScene={saveScene} onAddVisual={addVisual} visualAdding={visualAdding} onEditTimeline={editTimeline} timelineEditing={timelineEditing} timelineFeedback={timelineFeedback} canUndoTimeline={Boolean(timelineUndo.length && timelineUndo.at(-1)?.expected_version_id === state.project.manifest.version_id)} canRedoTimeline={Boolean(timelineRedo.length && timelineRedo.at(-1)?.expected_version_id === state.project.manifest.version_id)} onUndoTimeline={() => void undoTimelineEdit()} onRedoTimeline={() => void redoTimelineEdit()} onCancelWorking={() => void cancelOperation()} bootstrap={bootstrap} voices={voices} presets={captionPresets} /> : null}
       {state.phase === "exported" && state.project ? <VideoExportComplete project={state.project} playheadMs={state.playheadMs} selectedSceneId={state.selectedSceneId} onPlayheadChange={(playheadMs) => dispatch({ type: "set-playhead", playheadMs })} onSelectScene={selectScene} onEdit={() => dispatch({ type: "preview-complete", project: state.project! })} onPublishPackage={publishPackage} /> : null}
       {state.phase === "error" ? <div className="video-error-state" role="alert"><h2>Video Studio needs attention</h2><p>{state.error}</p><button className="video-button is-primary" type="button" onClick={() => dispatch({ type: "dismiss-error" })}>Return to project</button></div> : null}
       {loadingProjects && !showHome ? <div className="video-corner-loading" role="status"><LoaderCircle className="video-spin" aria-hidden="true" size={14} />Refreshing projects</div> : null}
@@ -552,6 +552,46 @@ interface TimelineHistoryEntry {
   inverse: VideoTimelineOperation[];
   expected_revision: number;
   expected_version_id: string;
+}
+
+/**
+ * Build a scene patch containing only what the editor actually changed.
+ *
+ * Sending every field on every save made the backend re-apply settings that were already correct.
+ * On a project whose picture comes from images rather than timeline clips there is no croppable
+ * clip, so replaying an unchanged crop failed with `video.scene_not_renderable` and replaced the
+ * whole studio with an error screen — for a save that changed nothing about the crop.
+ */
+export function changedScenePatch(saved: VideoScene | undefined, scene: VideoScene): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  const changed = <K extends keyof VideoScene>(field: K) => !saved || !deepEqual(saved[field], scene[field]);
+
+  if (changed("layout")) patch.layout = scene.layout;
+  if (changed("crop_mode") || (scene.crop_mode === "manual" && changed("crop_rect"))) {
+    patch.crop_mode = scene.crop_mode;
+    // A manual crop is the only mode that carries a rectangle; the backend rejects it otherwise.
+    if (scene.crop_mode === "manual") patch.crop_rect = scene.crop_rect;
+  }
+  if (changed("captions_enabled")) patch.captions_enabled = scene.captions_enabled;
+  if (changed("caption_style")) patch.caption_style = scene.caption_style;
+  if (changed("caption_bounds")) patch.caption_bounds = scene.caption_bounds;
+  if (changed("voice_gain_db")) patch.voice_gain_db = scene.voice_gain_db;
+  if (changed("music_gain_db")) patch.music_gain_db = scene.music_gain_db;
+  // The narration route is only valid as a complete selection, so these four move together.
+  if ((["voice_id", "model_id", "speaker", "language"] as const).some(changed)) {
+    patch.voice_id = scene.voice_id;
+    patch.model_id = scene.model_id;
+    patch.speaker = scene.speaker;
+    patch.language = scene.language;
+  }
+  return patch;
+}
+
+function deepEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (left === undefined || right === undefined || left === null || right === null) return false;
+  if (typeof left !== "object" || typeof right !== "object") return false;
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function newVideoOperationId(prefix: "timeline" | "visual"): string {

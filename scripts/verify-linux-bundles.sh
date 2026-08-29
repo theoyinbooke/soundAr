@@ -70,6 +70,20 @@ for resource in "${required_resources[@]}"; do
     exit 1
   }
 done
+# WebKitGTK plays media through GStreamer, and the AppImage runs against its own bundled
+# libraries. Without these plugins it starts fine and then decodes nothing, which reads to a user
+# as "the video is broken" rather than as a packaging fault.
+for plugin in libgstapp.so libgstautodetect.so libgstcoreelements.so libgstplayback.so libgstisomp4.so libgstlibav.so libgstaudioconvert.so; do
+  grep -Fq "gstreamer-1.0/$plugin" <<<"$appimage_files" || {
+    printf 'AppImage is missing the GStreamer plugin %s needed for audio and video playback.\n' "$plugin" >&2
+    exit 1
+  }
+done
+grep -Fq "gstreamer-1.0/gst-plugin-scanner" <<<"$appimage_files" || {
+  printf 'AppImage is missing the GStreamer plugin scanner.\n' >&2
+  exit 1
+}
+
 grep -Eq '^-rwx[^ ]*[[:space:]].*developer/soundar_cli\.py$' <<<"$appimage_files" || {
   printf 'AppImage CLI is not executable.\n' >&2
   exit 1
@@ -129,9 +143,18 @@ magic="$(od -An -tx1 -N4 "$APPIMAGE" | tr -d ' \n')"
   exit 1
 }
 
-grep -Fq "media-src 'self' asset: http://asset.localhost blob:" \
-  < <(strings "$ROOT/app/src-tauri/target/release/soundar-desktop") || {
-    printf 'Packaged application does not allow generated blob audio playback.\n' >&2
+packaged_strings="$(strings "$ROOT/app/src-tauri/target/release/soundar-desktop")"
+
+grep -Fq "media-src 'self' asset: http://asset.localhost http://127.0.0.1:* blob:" \
+  <<< "$packaged_strings" || {
+    printf 'Packaged application does not allow generated blob audio and local media playback.\n' >&2
+    exit 1
+  }
+
+# WebKitGTK cannot decode media from a custom URI scheme, so rendered video reaches the webview
+# through a loopback origin. Without this the packaged app plays nothing on Linux.
+grep -Fq "window.__SOUNDAR_MEDIA__" <<< "$packaged_strings" || {
+    printf 'Packaged application does not expose the local media origin to the webview.\n' >&2
     exit 1
   }
 

@@ -503,6 +503,15 @@ pub(crate) fn dispatch_video_operation(
     }
 }
 
+/// The caption preset catalog, as the renderer defines it.
+///
+/// The editor renders its preview and its preset chips from this, so the design a user picks is the
+/// design FFmpeg burns in.
+#[tauri::command]
+pub(crate) fn video_caption_presets() -> Result<Vec<Value>, String> {
+    Ok(video::present_caption_presets())
+}
+
 #[tauri::command]
 pub(crate) fn video_runtime_status(
     state: tauri::State<'_, RuntimeState>,
@@ -2678,8 +2687,14 @@ fn set_scene_crop(
             }
         }
     }
-    if !found {
-        return Err("video.scene_not_renderable: The selected scene has no timeline clip".into());
+    // A prompt- or audio-driven project draws its picture from visual layers, not from timeline
+    // clips, so there is nothing to crop. That is a normal shape, not a broken project: only an
+    // explicit manual rectangle needs a clip to land on.
+    if !found && crop.is_some() {
+        return Err(
+            "video.scene_not_renderable: This scene has no video clip to apply a manual crop to"
+                .into(),
+        );
     }
     manifest.layout.elements.retain(|element| {
         !(element.scene_id.as_deref() == Some(scene_id)
@@ -3645,11 +3660,46 @@ fn preview_link_value(
         "title": preview.title,
         "creator": preview.creator.unwrap_or_else(|| "Unknown creator".into()),
         "duration_ms": preview.duration_us.unwrap_or_default() / 1_000,
-        "published_label": "Source metadata",
+        "published_label": preview
+            .upload_date
+            .as_deref()
+            .and_then(format_upload_date)
+            .unwrap_or_else(|| "Publish date unavailable".into()),
+        "view_label": preview.view_count.map(format_view_count),
+        // Link previews are metadata only; nothing is downloaded until the import is authorized,
+        // so there is no local media to play here. The poster carries the recognition.
         "preview_url": Value::Null,
-        "poster_url": preview.thumbnail_url,
+        // A managed local path. The webview turns this into a local media URL; the remote
+        // thumbnail address cannot be loaded under the app's content security policy.
+        "poster_url": preview.thumbnail_path,
         "is_single_source": true,
     }))
+}
+
+/// Render `20260828` as `28 Aug 2026`.
+fn format_upload_date(value: &str) -> Option<String> {
+    if value.len() != 8 || !value.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month: usize = value[4..6].parse().ok()?;
+    let day: u32 = value[6..8].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(format!("{day} {} {}", MONTHS[month - 1], &value[0..4]))
+}
+
+/// Render a view count compactly: `1.2M views`, `48K views`, `931 views`.
+fn format_view_count(views: u64) -> String {
+    match views {
+        0..=999 => format!("{views} views"),
+        1_000..=999_999 => format!("{:.0}K views", views as f64 / 1_000.0),
+        1_000_000..=999_999_999 => format!("{:.1}M views", views as f64 / 1_000_000.0),
+        _ => format!("{:.1}B views", views as f64 / 1_000_000_000.0),
+    }
 }
 
 fn import_link_project(
@@ -4757,6 +4807,40 @@ fn utc_now() -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn upload_dates_are_rendered_or_dropped_rather_than_shown_raw() {
+        assert_eq!(
+            format_upload_date("20260828").as_deref(),
+            Some("28 Aug 2026")
+        );
+        assert_eq!(
+            format_upload_date("20260101").as_deref(),
+            Some("1 Jan 2026")
+        );
+        assert_eq!(
+            format_upload_date("20261231").as_deref(),
+            Some("31 Dec 2026")
+        );
+        // Anything the extractor did not report in the expected shape is dropped, so the dialog
+        // never prints a raw eight-digit number at the user.
+        assert_eq!(format_upload_date("2026082"), None);
+        assert_eq!(format_upload_date("20261328"), None);
+        assert_eq!(format_upload_date("20260832"), None);
+        assert_eq!(format_upload_date("20260800"), None);
+        assert_eq!(format_upload_date(""), None);
+        assert_eq!(format_upload_date("abcdefgh"), None);
+    }
+
+    #[test]
+    fn view_counts_are_rendered_compactly() {
+        assert_eq!(format_view_count(0), "0 views");
+        assert_eq!(format_view_count(931), "931 views");
+        assert_eq!(format_view_count(48_000), "48K views");
+        assert_eq!(format_view_count(999_999), "1000K views");
+        assert_eq!(format_view_count(1_240_000), "1.2M views");
+        assert_eq!(format_view_count(2_500_000_000), "2.5B views");
+    }
 
     fn write_test_pcm_wav(path: &Path, duration_ms: u32) -> String {
         const SAMPLE_RATE: u32 = 8_000;
@@ -6320,6 +6404,47 @@ mod tests {
             set_scene_crop(&mut missing, "scene-opening", "manual", None)
                 .expect_err("manual framing needs exact normalized coordinates")
                 .starts_with("video.invalid_crop:")
+        );
+    }
+
+    #[test]
+    fn crop_on_a_scene_without_video_clips_is_accepted_unless_it_is_manual() {
+        // Prompt- and audio-driven projects draw their picture from visual layers, so their scenes
+        // own no croppable clip. Saving such a scene used to fail outright, which replaced the whole
+        // studio with an error screen for a save that changed nothing about the crop.
+        let mut manifest = revision_fixture();
+        manifest.tracks.retain(|track| {
+            !matches!(
+                track.kind,
+                video::TrackKind::Video | video::TrackKind::Overlay
+            )
+        });
+        assert!(manifest
+            .tracks
+            .iter()
+            .filter(|track| matches!(
+                track.kind,
+                video::TrackKind::Video | video::TrackKind::Overlay
+            ))
+            .flat_map(|track| &track.clips)
+            .all(|clip| clip.scene_id.as_deref() != Some("scene-opening")));
+
+        set_scene_crop(&mut manifest, "scene-opening", "auto-center", None)
+            .expect("a clip-less scene accepts a default crop mode");
+        set_scene_crop(&mut manifest, "scene-opening", "fit", None)
+            .expect("a clip-less scene accepts fit framing");
+
+        // An explicit manual rectangle still needs something to land on.
+        let rect = video::NormalizedRect {
+            x_bp: 1_000,
+            y_bp: 1_000,
+            width_bp: 5_000,
+            height_bp: 5_000,
+        };
+        assert!(
+            set_scene_crop(&mut manifest, "scene-opening", "manual", Some(rect))
+                .expect_err("a manual crop needs a clip")
+                .starts_with("video.scene_not_renderable:")
         );
     }
 

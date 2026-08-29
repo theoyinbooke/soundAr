@@ -83,7 +83,8 @@ describe("Projects batch rendering", () => {
     expect(player).toBeInstanceOf(HTMLVideoElement);
     const masterCard = player.closest("article");
     expect(masterCard).not.toBeNull();
-    expect(within(masterCard!).getByRole("link", { name: "Download Creator update · Portrait master" })).toHaveAttribute("download", "creator-update-master-portrait-master.mp4");
+    expect(within(masterCard!).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(masterCard!).queryByRole("button", { name: /^Save / })).not.toBeInTheDocument();
     await user.click(within(masterCard!).getByRole("button", { name: "Open in Video Studio" }));
     expect(onOpenProject).toHaveBeenCalledWith("creator-update-master");
   });

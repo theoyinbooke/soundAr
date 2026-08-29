@@ -51,9 +51,39 @@ describe("History artifact integrity", () => {
     const player = await screen.findByLabelText("Play Creator update · Portrait master");
     const card = player.closest("article");
     expect(card).not.toBeNull();
-    expect(within(card!).getByRole("link", { name: "Download Creator update · Portrait master" })).toHaveAttribute("href", expect.stringContaining("data:video/mp4"));
+    // Exports are saved through the shell, never through an anchor: a cross-origin `<a download>`
+    // navigates the window to the file rather than saving it.
+    expect(within(card!).queryByRole("link")).not.toBeInTheDocument();
+    // Browser preview has no filesystem, so there is nothing to save — and never an `<a download>`,
+    // which the desktop webview would follow as a navigation instead of a save.
+    expect(within(card!).queryByRole("button", { name: /^Save / })).not.toBeInTheDocument();
     await user.click(within(card!).getByRole("button", { name: "Open in Video Studio" }));
     expect(onOpenProject).toHaveBeenCalledWith("creator-update-master");
+  });
+
+  it("plays the selected master in place instead of sending the user to the editor", async () => {
+    // Choosing finished work from the sidebar lands here, on the master's own player. Opening the
+    // Video Studio editor stays an explicit, separate action on the card.
+    const onOpenProject = vi.fn();
+    Element.prototype.scrollIntoView = vi.fn();
+    const service = createBrowserPreviewVideoService();
+    const projects = await service.listVideoProjects();
+    const target = projects.find((project) => project.master);
+    expect(target).toBeDefined();
+
+    render(<VideoIntegrationProvider service={service} onOpenProject={onOpenProject} activeProjectId={target!.id}>
+      <HistoryView history={[]} onChange={vi.fn()} />
+    </VideoIntegrationProvider>);
+
+    const player = await screen.findByLabelText(`Play ${target!.master!.title}`);
+    expect(player).toBeInstanceOf(HTMLVideoElement);
+    expect(player).toHaveAttribute("controls");
+    const card = player.closest("article");
+    expect(card).toHaveClass("is-selected");
+    expect(card).toHaveAttribute("aria-current", "true");
+    expect(card!.scrollIntoView).toHaveBeenCalled();
+    // Reaching the player must not have opened the editor.
+    expect(onOpenProject).not.toHaveBeenCalled();
   });
 
   it("explains a modified artifact and disables playback and reveal", () => {

@@ -15,6 +15,43 @@ describe("VideoPreviewPlayer", () => {
     await waitFor(() => expect(video.currentTime).toBe(scene.source_start_ms / 1000));
   });
 
+  it("keeps the preview pane canvas-only and renders transport into the timeline toolbar", async () => {
+    const project = await createBrowserPreviewVideoService().getVideoProject("creator-update");
+    const scene = project.manifest.scenes[0];
+    const host = document.createElement("div");
+    document.body.append(host);
+    render(<VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} scene={scene} projectDurationMs={project.duration_ms} playheadMs={0} onPlayheadChange={vi.fn()} transportHost={host} />);
+
+    // The viewing aspect and canvas zoom duplicated the inspector's Layout controls and cost the
+    // canvas its height; the scene layout now decides the shape on its own.
+    expect(screen.queryByLabelText("Preview aspect ratio")).not.toBeInTheDocument();
+    expect(screen.queryByRole("group", { name: "Canvas zoom" })).not.toBeInTheDocument();
+
+    const stage = document.querySelector(".video-preview-player")!;
+    expect(stage.querySelector(".video-preview-controls")).toBeNull();
+    expect(host.querySelector(".video-preview-controls")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Play preview" })).toBeInTheDocument();
+    host.remove();
+  });
+
+  it("keeps the transport in place when no timeline toolbar hosts it", async () => {
+    const project = await createBrowserPreviewVideoService().getVideoProject("creator-update");
+    render(<VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} scene={project.manifest.scenes[0]} projectDurationMs={project.duration_ms} playheadMs={0} onPlayheadChange={vi.fn()} />);
+
+    expect(document.querySelector(".video-preview-player .video-preview-controls")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Play preview" })).toBeInTheDocument();
+  });
+
+  it("never covers the video with a poster image, which would hide the playback controls", async () => {
+    const project = await createBrowserPreviewVideoService().getVideoProject("creator-update");
+    render(<VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} posterUrl="/exports/poster.jpg" scene={project.manifest.scenes[0]} projectDurationMs={project.duration_ms} playheadMs={0} onPlayheadChange={vi.fn()} />);
+
+    const video = screen.getByLabelText("Project proxy preview") as HTMLVideoElement;
+    // Opening artwork belongs to the video's own poster attribute, never to an overlay on top of it.
+    expect(video).toHaveAttribute("poster", "/exports/poster.jpg");
+    expect(document.querySelector(".video-opening-poster")).toBeNull();
+  });
+
   it("shows only the active bounded transcript cue and never double-overlays a rendered preview", async () => {
     const project = await createBrowserPreviewVideoService().getVideoProject("creator-update");
     const scene = { ...project.manifest.scenes[0], transcript: "This entire scene transcript must never be dumped across the portrait canvas because it is far too long." };
@@ -49,7 +86,7 @@ describe("VideoPreviewPlayer", () => {
 
     const caption = screen.getByRole("button", { name: `Select active caption: ${page.text}` });
     expect(caption).toHaveAttribute("data-caption-page-id", page.id);
-    expect(caption).toHaveClass("is-bold-pop");
+    expect(caption).toHaveClass(`is-${scene.caption_style}`);
     expect(screen.queryByText(/fallback must not appear/i)).not.toBeInTheDocument();
     fireEvent.click(caption);
     expect(caption).toHaveAttribute("aria-pressed", "true");
@@ -63,6 +100,73 @@ describe("VideoPreviewPlayer", () => {
     fireEvent.pointerMove(window, { clientX: 70, clientY: 260 });
     fireEvent.pointerUp(window);
     expect(onCaptionBoundsChange).toHaveBeenLastCalledWith({ x_bp: 1_600, y_bp: 6_350, width_bp: 8_400, height_bp: 1_500 });
+  });
+
+  it("shows the design the user just picked, not the one baked into the last render", async () => {
+    const service = createBrowserPreviewVideoService();
+    const project = await service.getVideoProject("creator-update");
+    const presets = await service.captionPresets();
+    const scene = project.manifest.scenes[0];
+    const page = {
+      id: "page-1", cue_id: "cue", scene_id: scene.id,
+      start_ms: scene.timeline_start_ms, end_ms: scene.timeline_start_ms + 3_000,
+      text: "Words carry the design", style_id: "clean-white" as const,
+      words: [{ text: "Words", start_ms: scene.timeline_start_ms, end_ms: scene.timeline_start_ms + 900 }],
+    };
+    // The renderer stamped `clean-white` at plan time; the editor draft now selects `bold-pop`.
+    const draft = { ...scene, caption_style: "bold-pop" as const, captions_enabled: true };
+    render(<VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} scene={draft} captionPages={[page]} captionPresets={presets} projectDurationMs={project.duration_ms} playheadMs={scene.timeline_start_ms + 500} onPlayheadChange={vi.fn()} />);
+
+    const caption = screen.getByRole("button", { name: `Select active caption: ${page.text}` });
+    expect(caption).toHaveClass("is-bold-pop");
+    expect(caption).toHaveClass("is-themed");
+    const boldPop = presets.find((preset) => preset.id === "bold-pop")!;
+    // The words themselves must carry the design, not just a box behind them.
+    expect(caption.style.getPropertyValue("--video-caption-color")).toBe(boldPop.text_color);
+    expect(caption.style.getPropertyValue("--video-caption-casing")).toBe("uppercase");
+    expect(caption.style.getPropertyValue("--video-caption-weight")).toBe("800");
+    expect(caption.style.getPropertyValue("--video-caption-font")).toContain("Inter");
+  });
+
+  it("falls back to the page style when a scene predates caption designs", async () => {
+    const service = createBrowserPreviewVideoService();
+    const project = await service.getVideoProject("creator-update");
+    const presets = await service.captionPresets();
+    const scene = project.manifest.scenes[0];
+    const page = {
+      id: "page-1", cue_id: "cue", scene_id: scene.id,
+      start_ms: scene.timeline_start_ms, end_ms: scene.timeline_start_ms + 3_000,
+      text: "Legacy manifest", style_id: "karaoke" as const, words: [],
+    };
+    const legacy = { ...scene, captions_enabled: true, caption_style: undefined as unknown as typeof scene.caption_style };
+    render(<VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} scene={legacy} captionPages={[page]} captionPresets={presets} projectDurationMs={project.duration_ms} playheadMs={scene.timeline_start_ms + 500} onPlayheadChange={vi.fn()} />);
+
+    expect(screen.getByRole("button", { name: /Select active caption/ })).toHaveClass("is-karaoke");
+  });
+
+  it("emphasises the spoken word for designs that reveal word by word", async () => {
+    const service = createBrowserPreviewVideoService();
+    const project = await service.getVideoProject("creator-update");
+    const presets = await service.captionPresets();
+    const scene = project.manifest.scenes[0];
+    const start = scene.timeline_start_ms;
+    const page = {
+      id: "page-1", cue_id: "cue", scene_id: scene.id,
+      start_ms: start, end_ms: start + 3_000, text: "one two three", style_id: "karaoke" as const,
+      words: [
+        { text: "one", start_ms: start, end_ms: start + 1_000 },
+        { text: "two", start_ms: start + 1_000, end_ms: start + 2_000 },
+        { text: "three", start_ms: start + 2_000, end_ms: start + 3_000 },
+      ],
+    };
+    const draft = { ...scene, caption_style: "karaoke" as const, captions_enabled: true };
+    const { rerender } = render(<VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} scene={draft} captionPages={[page]} captionPresets={presets} projectDurationMs={project.duration_ms} playheadMs={start + 1_500} onPlayheadChange={vi.fn()} />);
+
+    const words = () => [...document.querySelectorAll(".video-caption-word")].map((word) => `${word.textContent?.trim()}:${word.className.split(" ").at(-1)}`);
+    expect(words()).toEqual(["one:is-spoken", "two:is-spoken", "three:is-pending"]);
+
+    rerender(<VideoPreviewPlayer sourceUrl={project.manifest.source.preview_url} scene={draft} captionPages={[page]} captionPresets={presets} projectDurationMs={project.duration_ms} playheadMs={start + 2_500} onPlayheadChange={vi.fn()} />);
+    expect(words()).toEqual(["one:is-spoken", "two:is-spoken", "three:is-spoken"]);
   });
 
   it("maps two cut scenes through a materialized editorial gap on the single project clock", () => {

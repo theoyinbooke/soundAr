@@ -31,6 +31,15 @@ function validUrl(value: string): boolean {
   try { return /^https?:$/.test(new URL(value).protocol); } catch { return false; }
 }
 
+/** Join the facts the source actually reported, so absent metadata leaves no empty separators. */
+function previewFacts(preview: VideoLinkPreview): string {
+  return [
+    preview.duration_ms > 0 ? formatVideoClock(preview.duration_ms) : undefined,
+    preview.view_label,
+    preview.published_label,
+  ].filter(Boolean).join(" · ");
+}
+
 function fileSelection(file: File): LocalVideoSelection {
   return { file, display_name: file.name, size_bytes: file.size };
 }
@@ -203,8 +212,12 @@ export function VideoIntakeDialog({
               <section className="video-source-preview" aria-label="Source preview">
                 <span className="video-section-label">Preview</span>
                 {previewing ? <div className="video-preview-loading" role="status"><LoaderCircle className="video-spin" aria-hidden="true" size={15} />Checking this exact URL…</div> : linkPreview ? <div className="video-link-preview">
-                  <video src={linkPreview.preview_url} muted playsInline preload="metadata" aria-label={`Preview of ${linkPreview.title}`} />
-                  <div><strong>{linkPreview.title}</strong><span>{linkPreview.creator}</span><small>{formatVideoClock(linkPreview.duration_ms)} · {linkPreview.view_label} · {linkPreview.published_label}</small></div>
+                  {linkPreview.preview_url
+                    ? <video src={linkPreview.preview_url} muted playsInline preload="metadata" aria-label={`Preview of ${linkPreview.title}`} />
+                    : linkPreview.poster_url
+                      ? <img src={linkPreview.poster_url} alt={`Thumbnail for ${linkPreview.title}`} />
+                      : <div className="video-link-preview-placeholder" aria-hidden="true"><FileVideo2 size={20} /></div>}
+                  <div><strong>{linkPreview.title}</strong><span>{linkPreview.creator}</span><small>{previewFacts(linkPreview)}</small></div>
                 </div> : <div className="video-preview-empty"><Link2 aria-hidden="true" size={17} /><span>Enter one exact video URL to preview it.</span></div>}
               </section>
               <label className="video-rights-check"><input type="checkbox" checked={rightsConfirmed} disabled={!linkPreview || linkPreview.exact_url !== url} onChange={(event) => setRightsConfirmed(event.target.checked)} /><span>I have the rights or permission to use this exact URL.</span></label>

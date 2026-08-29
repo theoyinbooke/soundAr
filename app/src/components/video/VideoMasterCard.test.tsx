@@ -1,7 +1,8 @@
 import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { VideoArtifact, VideoProjectSummary } from "../../types/video";
+import type { VideoArtifact, VideoProjectSummary, VideoStudioService } from "../../types/video";
+import { VideoIntegrationProvider } from "./VideoIntegrationContext";
 import { VideoMasterCard } from "./VideoMasterCard";
 
 afterEach(cleanup);
@@ -16,6 +17,7 @@ function artifact(id: string, role: VideoArtifact["role"], title: string, url: s
     mime_type: role === "publish-package" ? "application/zip" : "video/mp4",
     format: role === "publish-package" ? "zip" : "mp4",
     url,
+    local_path: `/exports/${id}.${role === "publish-package" ? "zip" : "mp4"}`,
     download_name: `${id}.${role === "publish-package" ? "zip" : "mp4"}`,
     duration_ms: role === "publish-package" ? undefined : 4_000,
     width: role === "publish-package" ? undefined : 1080,
@@ -43,7 +45,12 @@ describe("VideoMasterCard", () => {
       deliverables: [master, variation, publish],
     };
     const onOpen = vi.fn();
-    render(<VideoMasterCard project={project} variant="history" onOpen={onOpen} />);
+    const saveArtifact = vi.fn().mockResolvedValue("/home/creator/Videos/master.mp4");
+    render(
+      <VideoIntegrationProvider service={{ saveArtifact } as unknown as VideoStudioService} onOpenProject={onOpen}>
+        <VideoMasterCard project={project} variant="history" onOpen={onOpen} />
+      </VideoIntegrationProvider>,
+    );
 
     expect(screen.getByLabelText("Play Portrait master")).toBeInstanceOf(HTMLVideoElement);
     expect(screen.getByLabelText("Play Portrait master")).toHaveAttribute("src", "/master.mp4#t=0.001");
@@ -52,8 +59,15 @@ describe("VideoMasterCard", () => {
     expect(screen.queryByLabelText("Play Calm variation")).not.toBeInTheDocument();
     await userEvent.click(within(details!).getByText("2 additional deliverables"));
     expect(within(details!).getByLabelText("Play Calm variation")).toBeInstanceOf(HTMLVideoElement);
-    expect(within(details!).getByRole("link", { name: "Download Calm variation" })).toHaveAttribute("download", "variation.mp4");
-    expect(within(details!).getByRole("link", { name: "Download Publish package" })).toHaveAttribute("download", "publish.zip");
+    // Saving goes through the shell. A cross-origin `<a download>` would navigate the window to the
+    // file instead of saving it, leaving the app replaced by a blank media document.
+    expect(within(details!).queryByRole("link")).not.toBeInTheDocument();
+    await userEvent.click(within(details!).getByRole("button", { name: "Save Calm variation" }));
+    expect(saveArtifact).toHaveBeenCalledWith("/exports/variation.mp4", "variation.mp4");
+    await userEvent.click(within(details!).getByRole("button", { name: "Save Publish package" }));
+    expect(saveArtifact).toHaveBeenCalledWith("/exports/publish.zip", "publish.zip");
+    await userEvent.click(screen.getByRole("button", { name: "Save Portrait master" }));
+    expect(saveArtifact).toHaveBeenCalledWith("/exports/master.mp4", "master.mp4");
     await userEvent.click(screen.getByRole("button", { name: "Open in Video Studio" }));
     expect(onOpen).toHaveBeenCalledWith("project-1");
   });

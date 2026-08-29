@@ -292,7 +292,7 @@ export function CompareView({ bootstrap, onGenerated }: { bootstrap: BootstrapSt
 }
 
 export function HistoryView({ history, onChange, selectedId }: { history: HistoryItem[]; onChange: (history: HistoryItem[]) => void; selectedId?: string }) {
-  const { onOpenProject: onOpenVideoProject, service: videoService } = useVideoIntegration();
+  const { activeProjectId: activeVideoProjectId, onOpenProject: onOpenVideoProject, service: videoService } = useVideoIntegration();
   const { projects: videoProjects, loading: videoProjectsLoading, error: videoProjectsError } = useVideoProjectSummaries();
   const [activeId, setActiveId] = useState<string>();
   const [loadingId, setLoadingId] = useState<string>();
@@ -458,7 +458,7 @@ export function HistoryView({ history, onChange, selectedId }: { history: Histor
       <PageHeader title="History" subtitle="Reopen, audition, and export audio generations and final video masters." />
       {videoService ? <section className="video-history-library" aria-labelledby="video-history-library-title">
         <div className="video-library-heading"><div><h2 id="video-history-library-title">Video masters</h2><p>Completed MP4 exports remain playable and downloadable from their project record.</p></div>{videoMasters.length ? <span>{videoMasters.length} master{videoMasters.length === 1 ? "" : "s"}</span> : null}</div>
-        {videoProjectsLoading && !videoMasters.length ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Loading video masters</div> : videoMasters.length ? <div className="video-history-card-grid">{videoMasters.map((project) => <VideoMasterCard key={project.id} project={project} variant="history" onOpen={onOpenVideoProject} />)}</div> : <div className="video-library-empty"><span>{videoProjectsError ?? "Final Video Studio exports will appear here."}</span></div>}
+        {videoProjectsLoading && !videoMasters.length ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Loading video masters</div> : videoMasters.length ? <div className="video-history-card-grid">{videoMasters.map((project) => <VideoMasterCard key={project.id} project={project} variant="history" selected={project.id === activeVideoProjectId} onOpen={onOpenVideoProject} />)}</div> : <div className="video-library-empty"><span>{videoProjectsError ?? "Final Video Studio exports will appear here."}</span></div>}
       </section> : null}
       <Panel className={`history-workspace history-detail-only${selected ? "" : " is-empty"}`} ariaLabel="Generation history">
         <section className="history-detail" aria-label="Generation details">

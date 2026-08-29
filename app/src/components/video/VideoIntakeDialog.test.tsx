@@ -41,6 +41,47 @@ describe("VideoIntakeDialog", () => {
     await waitFor(() => expect(onPreviewLink).toHaveBeenLastCalledWith("https://example.com/video/two"));
   });
 
+  it("shows the cached poster when a link carries no playable preview", async () => {
+    const user = userEvent.setup();
+    // Link previews are metadata only — nothing is downloaded before the import is authorized — so
+    // the poster is the whole preview. It is served from disk because the content security policy
+    // permits no external image origins.
+    const onPreviewLink = vi.fn(async (exactUrl: string) => ({
+      exact_url: exactUrl,
+      title: "Authorized source",
+      creator: "Owner",
+      duration_ms: 612_000,
+      published_label: "20 May 2026",
+      view_label: "1.2M views",
+      poster_url: "http://127.0.0.1:39871/media/token//exports/video/link-previews/abc.jpg",
+      is_single_source: true,
+    }));
+    render(<VideoIntakeDialog {...props({ onPreviewLink })} />);
+
+    await user.type(screen.getByRole("textbox", { name: "Video URL" }), "https://example.com/video/one");
+    const poster = await screen.findByAltText("Thumbnail for Authorized source");
+    expect(poster).toHaveAttribute("src", expect.stringContaining("/media/token/"));
+    expect(screen.getByText("10:12 · 1.2M views · 20 May 2026")).toBeVisible();
+    expect(screen.getByRole("checkbox", { name: /rights or permission/i })).toBeEnabled();
+  });
+
+  it("omits separators for facts the source did not report", async () => {
+    const user = userEvent.setup();
+    const onPreviewLink = vi.fn(async (exactUrl: string) => ({
+      exact_url: exactUrl,
+      title: "Sparse source",
+      creator: "Owner",
+      duration_ms: 0,
+      published_label: "Publish date unavailable",
+      is_single_source: true,
+    }));
+    render(<VideoIntakeDialog {...props({ onPreviewLink })} />);
+
+    await user.type(screen.getByRole("textbox", { name: "Video URL" }), "https://example.com/video/two");
+    expect(await screen.findByText("Publish date unavailable")).toBeVisible();
+    expect(screen.queryByText(/·/)).not.toBeInTheDocument();
+  });
+
   it("closes on Escape and restores focus to the launcher", async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
