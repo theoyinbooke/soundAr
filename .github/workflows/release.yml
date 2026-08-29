@@ -69,6 +69,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
+          # tauri-action defaults to `--bundles deb,appimage` on Linux and that overrides the
+          # bundle targets in tauri.conf.json, so the AppImage has to be dropped here too.
+          args: --bundles deb
           projectPath: app
           tagName: v__VERSION__
           releaseName: soundAr v__VERSION__
