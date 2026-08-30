@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.8 - 2026-08-30
+
+- Put every production in one table. Video and audio work were listed on separate halves of the
+  Projects page, so finding something meant knowing which kind it was before looking for it. There
+  is now a single filterable table of everything made locally, and a row opens the workspace that
+  production belongs to - Video Studio for a video, the chapter composer for an audio project.
+- Gave Phase 12 a front door. Casts, scripts, pronunciation, score, sound design, and release
+  readiness were all reachable by the assistant and by the command line, but nowhere in the app, so
+  none of it could be seen without asking for it. A Shows view now lists saved formats and every
+  episode, and opening an episode reports its cast, how many lines are performed, drafted, and never
+  narrated, and what each release deliverable is still waiting on.
+
 ## 0.8.7 - 2026-08-30
 
 - Made a performed script renderable. A script written as dialogue has turns but no scenes, and

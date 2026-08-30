@@ -70,7 +70,7 @@ function batch(status: BatchRunRecord["status"] = "queued"): BatchRunRecord {
 }
 
 describe("Projects batch rendering", () => {
-  it("surfaces a playable primary video master and opens its shared Video Studio project", async () => {
+  it("lists every production in one table and opens each in its own workspace", async () => {
     const user = userEvent.setup();
     const onOpenProject = vi.fn();
     const service = createBrowserPreviewVideoService();
@@ -79,14 +79,33 @@ describe("Projects batch rendering", () => {
       <ProjectsView bootstrap={fallbackBootstrap} projects={[project]} voices={fallbackBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />
     </VideoIntegrationProvider>);
 
-    const player = await screen.findByLabelText("Play Creator update · Portrait master");
-    expect(player).toBeInstanceOf(HTMLVideoElement);
-    const masterCard = player.closest("article");
-    expect(masterCard).not.toBeNull();
-    expect(within(masterCard!).queryByRole("link")).not.toBeInTheDocument();
-    expect(within(masterCard!).queryByRole("button", { name: /^Save / })).not.toBeInTheDocument();
-    await user.click(within(masterCard!).getByRole("button", { name: "Open in Video Studio" }));
+    // A video production and an audio production are different experiences to open but the same
+    // thing to look for, so both appear in one table.
+    const videoRow = await screen.findByRole("button", { name: "Open Creator update · Reel master" });
+    expect(within(videoRow).getByText("Video")).toBeVisible();
+    const audioRow = screen.getByRole("button", { name: `Open ${project.name}` });
+    expect(within(audioRow).getByText("Audio")).toBeVisible();
+
+    // The whole row is the affordance, because the row is the project.
+    await user.click(videoRow);
     expect(onOpenProject).toHaveBeenCalledWith("creator-update-master");
+  });
+
+  it("filters the table by name and by production type", async () => {
+    const user = userEvent.setup();
+    render(<VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={vi.fn()}>
+      <ProjectsView bootstrap={fallbackBootstrap} projects={[project]} voices={fallbackBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />
+    </VideoIntegrationProvider>);
+
+    await screen.findByRole("button", { name: "Open Creator update · Reel master" });
+    await user.click(screen.getByRole("radio", { name: "Audio" }));
+    expect(screen.queryByRole("button", { name: "Open Creator update · Reel master" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: `Open ${project.name}` })).toBeVisible();
+
+    await user.click(screen.getByRole("radio", { name: "All" }));
+    await user.type(screen.getByLabelText("Filter projects by name"), "Reel master");
+    expect(screen.getByRole("button", { name: "Open Creator update · Reel master" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: `Open ${project.name}` })).not.toBeInTheDocument();
   });
 
   it("never links an older batch result to a chapter edited after submission", () => {

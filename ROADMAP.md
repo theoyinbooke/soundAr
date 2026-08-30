@@ -1268,6 +1268,25 @@ Slice 12.10 is implemented and locally verified.
   presents a corrected or predicted result as a measurement.
 - No draft or simulated artifact can reach a master or a release.
 
+### Where Phase 12 Lives in the Interface
+
+Phase 12 is authored through the assistant, which is what makes an episode worth making from a
+brief rather than from a form. That is a reason for the assistant to write, not a reason for the
+work to be invisible: a cast the user cannot see is a cast they cannot check.
+
+- **Shows** lists saved formats and every episode. Opening an episode reports its cast, how many
+  lines are performed, drafted, and never narrated, and what each release deliverable is still
+  waiting on - a blocked deliverable names its missing prerequisite rather than being omitted.
+- **The Cast tab in Video Studio** shows the same script line by line, with pronunciation rules,
+  cues, and sound placements, and can narrate, draft, and promote takes.
+- **Projects** is one filterable table of everything made locally; a row opens the workspace that
+  production belongs to.
+
+Authoring surfaces - creating a format, editing a lexicon entry or a cue by hand - are deliberately
+not built. They would duplicate the assistant's tools with a second, weaker way to reach the same
+revision-checked operations. If a user ever needs to make one of these changes without the
+assistant, that is the signal to build the surface, not before.
+
 ## Cross-Cutting Test Strategy
 
 ### Layer 1: Fast CI on Every Pull Request

@@ -1,6 +1,6 @@
 [package]
 name = "soundar-desktop"
-version = "0.8.7"
+version = "0.8.8"
 description = "Open-source local speech, music, and video studio"
 authors = ["soundAr"]
 edition = "2021"

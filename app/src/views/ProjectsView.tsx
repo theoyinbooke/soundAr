@@ -1,11 +1,22 @@
-import { ChevronDown, ChevronUp, Circle, CircleStop, Download, FileInput, FolderPlus, Layers3, LoaderCircle, Pause, Play, Plus, Redo2, RotateCcw, Save, Trash2, Undo2, X } from "lucide-react";
+import { AudioLines, ChevronDown, ChevronUp, Clapperboard, CircleStop, Download, FileInput, FolderPlus, Layers3, LoaderCircle, Pause, Play, Plus, Redo2, RotateCcw, Save, Search, Trash2, Undo2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { BatchInputRow, BatchRunRecord, BootstrapState, HistoryItem, ProjectChapter, ProjectMasterSettings, ProjectRecord, ProjectRenderBatch, SynthesisRequest, VoiceProfile } from "../types";
 import { cancelBatchRun, deleteProject, exportHistoryItem, exportProjectMaster, getBatchRun, importProjectScript, listHistory, loadGeneratedAudio, pauseBatchRun, pickProjectScript, queueBatchRun, resumeBatchRun, saveProject, synthesizeSpeech } from "../lib/bridge";
 import { capabilityForModel, compatibleVoicesForModel, qualifiedModels } from "../lib/capabilities";
 import { EmptyState, PageHeader, Panel, SelectField, StatusText } from "../components/ui";
 import { useVideoIntegration, useVideoProjectSummaries } from "../components/video/VideoIntegrationContext";
-import { sortVideoProjectsForLibrary, VideoMasterCard } from "../components/video/VideoMasterCard";
+import { sortVideoProjectsForLibrary, videoProjectStatusLabel } from "../components/video/VideoMasterCard";
+
+/** One production in the unified table, whichever workspace it opens in. */
+type ProjectTableRow = {
+  id: string;
+  kind: "video" | "audio";
+  name: string;
+  detail: string;
+  status: string;
+  updatedAt: string;
+  open: () => void;
+};
 
 function newChapter(position: number): ProjectChapter {
   return { id: crypto.randomUUID(), title: `Chapter ${position + 1}`, text: "", language: "en" };
@@ -135,6 +146,8 @@ export function ProjectsView({
   const [masterHistory, setMasterHistory] = useState<HistoryItem>();
   const [undoStack, setUndoStack] = useState<ProjectChapter[][]>([]);
   const [redoStack, setRedoStack] = useState<ProjectChapter[][]>([]);
+  const [search, setSearch] = useState("");
+  const [kindFilter, setKindFilter] = useState<"all" | "video" | "audio">("all");
   const [projectDialogMode, setProjectDialogMode] = useState<"create" | "rename">();
   const [chapterDialogOpen, setChapterDialogOpen] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -484,25 +497,82 @@ export function ProjectsView({
   const canMaster = Boolean(selectedId) && writtenChapters.length > 0 && writtenChapters.every((chapter) => chapter.history_id);
 
   const workspaceOpen = Boolean(selected || chapters.length || state === "New draft");
-  const visibleVideoProjects = sortVideoProjectsForLibrary(videoProjects).slice(0, 3);
+  // One table for everything the user has made. A video production and an audio production are
+  // different experiences to open, but they are the same thing to look for, so splitting them into
+  // separate lists made the page a place to hunt rather than a place to choose.
+  const allRows = useMemo<ProjectTableRow[]>(() => {
+    const audioRows = projects.map<ProjectTableRow>((project) => ({
+      id: project.id,
+      kind: "audio",
+      name: project.name,
+      detail: `${project.document.chapters.length} chapter${project.document.chapters.length === 1 ? "" : "s"} · ${project.document.chapters.filter((chapter) => chapter.history_id).length} rendered`,
+      status: project.document.master ? "Mastered" : project.document.chapters.some((chapter) => chapter.history_id) ? "In progress" : "Draft",
+      updatedAt: project.updated_at,
+      open: () => loadProject(project),
+    }));
+    const videoRows = sortVideoProjectsForLibrary(videoProjects).map<ProjectTableRow>((project) => ({
+      id: project.id,
+      kind: "video",
+      name: project.name,
+      detail: `${project.scene_count} scene${project.scene_count === 1 ? "" : "s"} · ${formatDuration(project.duration_ms / 1000)}`,
+      status: videoProjectStatusLabel(project),
+      updatedAt: project.updated_at,
+      // Video Studio is only wired up when its service is present; without it the row is inert
+      // rather than pretending it can open something.
+      open: () => onOpenVideoProject?.(project.id),
+    }));
+    return [...videoRows, ...audioRows].sort(
+      (left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
+    );
+  }, [projects, videoProjects, onOpenVideoProject]);
+
+  const filteredRows = allRows.filter((row) => {
+    if (kindFilter !== "all" && row.kind !== kindFilter) return false;
+    const term = search.trim().toLowerCase();
+    return !term || row.name.toLowerCase().includes(term);
+  });
 
   return <>
     <div className="page projects-page">
-      <PageHeader title="Projects" subtitle="Build long-form voice work and continue local video productions." actions={<button className="button button-primary" type="button" onClick={() => setProjectDialogMode("create")}><FolderPlus aria-hidden="true" size={14} />New project</button>} />
-      {videoService ? <section className="video-project-library" aria-labelledby="video-project-library-title">
-        <div className="video-library-heading"><div><h2 id="video-project-library-title">Video projects</h2><p>Final masters stay playable here; drafts reopen in the full timeline workspace.</p></div>{videoProjects.length ? <span>{videoProjects.length} project{videoProjects.length === 1 ? "" : "s"}</span> : null}</div>
-        {videoProjectsLoading && !visibleVideoProjects.length ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Loading video projects</div> : visibleVideoProjects.length ? <div className="video-project-card-grid">{visibleVideoProjects.map((project) => <VideoMasterCard key={project.id} project={project} onOpen={onOpenVideoProject} />)}</div> : <div className="video-library-empty"><span>{videoProjectsError ?? "Video projects created in Video Studio will appear here."}</span></div>}
-      </section> : null}
-      <div className="projects-layout">
-        <Panel className="project-list table-panel" ariaLabel="Project library">
-          <div className="project-list-heading"><span><strong>Library</strong><small>{projects.length + (!selectedId && chapters.length ? 1 : 0)} project{projects.length + (!selectedId && chapters.length ? 1 : 0) === 1 ? "" : "s"}</small></span></div>
-          <div className="project-rows">
-            {!selectedId && chapters.length ? <button className="project-row is-selected" type="button"><strong>{name}</strong><span className="project-row-meta"><span>{chapters.length} chapter{chapters.length === 1 ? "" : "s"} / new draft</span><span className="project-row-state" role="img" aria-label="Not saved yet" title="Not saved yet"><Circle aria-hidden="true" size={7} fill="currentColor" /></span></span></button> : null}
-            {projects.map((project) => <button className={`project-row ${project.id === selectedId ? "is-selected" : ""}`} key={project.id} type="button" onClick={() => loadProject(project)}><strong>{project.name}</strong><span className="project-row-meta"><span>{project.document.chapters.length} chapter{project.document.chapters.length === 1 ? "" : "s"} / {project.document.chapters.filter((chapter) => chapter.history_id).length} rendered</span><small>{new Date(project.updated_at).toLocaleDateString()}</small></span></button>)}
-            {!projects.length && !chapters.length ? <EmptyState title="No projects yet" detail="Use New project in the top-right when you are ready to begin." /> : null}
+      <PageHeader title="Projects" subtitle="Every local production in one place. Open a row to continue it in its own workspace." actions={<button className="button button-primary" type="button" onClick={() => setProjectDialogMode("create")}><FolderPlus aria-hidden="true" size={14} />New project</button>} />
+      <Panel className="table-panel" ariaLabel="All projects">
+        <div className="project-table-controls">
+          <label className="project-table-search">
+            <Search aria-hidden="true" size={13} />
+            <input aria-label="Filter projects by name" placeholder="Filter projects" value={search} onChange={(event) => setSearch(event.target.value)} />
+          </label>
+          <div className="project-table-filters" role="radiogroup" aria-label="Project type">
+            {(["all", "video", "audio"] as const).map((value) => <button key={value} type="button" role="radio" aria-checked={kindFilter === value} className={kindFilter === value ? "is-active" : ""} onClick={() => setKindFilter(value)}>{value === "all" ? "All" : value === "video" ? "Video" : "Audio"}</button>)}
           </div>
-        </Panel>
-
+          <span className="project-table-count">{filteredRows.length} of {allRows.length}</span>
+        </div>
+        {videoProjectsLoading && !allRows.length ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Loading projects</div>
+          : filteredRows.length ? <table className="project-table">
+            <thead><tr><th scope="col">Project</th><th scope="col">Type</th><th scope="col">Contents</th><th scope="col">Status</th><th scope="col">Updated</th></tr></thead>
+            <tbody>
+              {filteredRows.map((row) => <tr
+                key={`${row.kind}-${row.id}`}
+                className={row.kind === "audio" && row.id === selectedId ? "is-selected" : ""}
+                // The whole row opens the project, because the row is the project.
+                tabIndex={0}
+                role="button"
+                aria-label={`Open ${row.name}`}
+                onClick={row.open}
+                onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); row.open(); } }}
+              >
+                <td><strong>{row.name}</strong></td>
+                <td><span className={`project-kind is-${row.kind}`}>{row.kind === "video" ? <Clapperboard aria-hidden="true" size={12} /> : <AudioLines aria-hidden="true" size={12} />}{row.kind === "video" ? "Video" : "Audio"}</span></td>
+                <td>{row.detail}</td>
+                <td>{row.status}</td>
+                <td>{new Date(row.updatedAt).toLocaleDateString()}</td>
+              </tr>)}
+            </tbody>
+          </table>
+          : <EmptyState title={allRows.length ? "No projects match this filter" : "No projects yet"} detail={allRows.length ? "Clear the filter to see every local production." : videoProjectsError ?? "Use New project in the top-right, or start a video in Video Studio."} />}
+      </Panel>
+      {/* The composer opens beneath the table for the audio project the user chose, so the page is
+          a list until they pick something and a workspace afterwards. */}
+      <div className="projects-workspace">
         {workspaceOpen ? <Panel className="project-studio" ariaLabel="Project workspace">
           <header className="project-document-header">
             <button className="project-title-button" type="button" title="Rename project" onClick={() => setProjectDialogMode("rename")}><strong>{name}</strong></button>

@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   ArrowRight,
   AudioLines,
+  Drama,
   BookOpenText,
   Boxes,
   ChevronDown,
@@ -44,6 +45,7 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { key: "generate", label: "Generate", icon: AudioLines },
       { key: "video", label: "Video Studio", icon: Clapperboard },
+      { key: "shows", label: "Shows", icon: Drama },
       { key: "projects", label: "Projects", icon: BookOpenText },
     ],
   },

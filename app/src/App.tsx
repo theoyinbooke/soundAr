@@ -12,6 +12,7 @@ import { ModelsView } from "./views/ModelsView";
 import { AboutView, CompareView, HistoryView, SettingsView } from "./views/SecondaryViews";
 import { VoicesView } from "./views/VoicesView";
 import { ProjectsView } from "./views/ProjectsView";
+import { ShowsView } from "./views/ShowsView";
 import { createVideoStudioService } from "./lib/videoBridge";
 import { VideoIntegrationProvider } from "./components/video/VideoIntegrationContext";
 import type { VideoStudioService } from "./types/video";
@@ -146,6 +147,7 @@ export default function App() {
     switch (current) {
       case "generate": return <GenerateView bootstrap={state} voices={voices} onVoicesChange={setVoices} preferredVoiceId={preferredVoiceId} onOpenModels={() => showView("models")} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "video": return <Suspense fallback={<div className="route-loading" role="status" aria-live="polite">Loading Video Studio…</div>}><VideoStudioView service={videoService} initialProjectId={selectedVideoProjectId} assistantOpen={assistantOpen} bootstrap={state} voices={voices} onProjectChanged={(project) => { setSelectedVideoProjectId(project.id); markVideoChanged(); }} onMasterPublished={() => { markVideoChanged(); void refreshStudioData(); }} /></Suspense>;
+      case "shows": return <ShowsView />;
       case "projects": return <ProjectsView bootstrap={state} projects={projects} voices={voices} onChange={setProjects} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} />;
       case "voices": return <VoicesView bootstrap={state} voices={voices} onChange={setVoices} onGenerated={(item) => setHistory((items) => [item, ...items.filter((existing) => existing.id !== item.id)])} onUseVoice={(id) => { setPreferredVoiceId(id); showView("generate"); }} />;
       case "models": return <ModelsView bootstrap={state} onChanged={refreshBootstrap} />;

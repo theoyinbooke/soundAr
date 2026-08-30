@@ -6,6 +6,7 @@ export type GenerationKind = "speech" | "music";
 export type NavKey =
   | "generate"
   | "video"
+  | "shows"
   | "projects"
   | "voices"
   | "models"
