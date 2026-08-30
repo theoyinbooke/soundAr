@@ -485,6 +485,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "narration_bindings": narration_bindings,
             "cast": cast,
             "dialogue": dialogue,
+            "format_origin": manifest.format_origin,
             "lexicon": lexicon,
             "music_cues": music_cues,
             "sound_assets": sound_assets,

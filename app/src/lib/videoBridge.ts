@@ -32,6 +32,7 @@ import type {
   VideoPerformanceClock,
   VideoScene,
   VideoScriptResponse,
+  VideoShowFormat,
   VideoSoundAsset,
   VideoSoundLayer,
   VideoStudioService,
@@ -756,6 +757,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
   const cancelledJobs = new Set<string>();
   const timelineEditReplays = new Map<string, VideoTimelineEditResponse>();
   const scriptReplays = new Map<string, VideoScriptResponse>();
+  const showFormats = new Map<string, VideoShowFormat>();
   const visualAssetReplays = new Map<string, AddVisualAssetResponse>();
   const visualReceipts = new Map<string, VisualSourceReceipt & { consumed: boolean; localPath: string }>();
   let visualReceiptSequence = 1;
@@ -900,6 +902,40 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       rendered.status = "editing";
       rendered.manifest.artifacts.push({ id: `${projectId}-preview`, project_id: projectId, version_id: rendered.manifest.version_id, role: "preview", title: `${rendered.name} preview`, mime_type: "video/mp4", format: "mp4", url: FIXTURE_VIDEO_URL, download_name: `${projectId}-preview.mp4`, duration_ms: rendered.duration_ms, width: 540, height: 960, frame_rate: 30, codec: "H.264", file_size_bytes: 1_448, playable: true, created_at: FIXED_NOW });
       return store(rendered);
+    },
+    async listShowFormats() {
+      return [...showFormats.values()].map(clone);
+    },
+    async saveShowFormat(format) {
+      const existing = showFormats.get(format.id);
+      // soundAr owns the revision so two formats cannot claim the same provenance.
+      const saved: VideoShowFormat = {
+        ...clone(format),
+        revision: existing ? existing.revision + 1 : 1,
+        created_at: existing?.created_at ?? FIXED_NOW,
+        updated_at: FIXED_NOW,
+      };
+      showFormats.set(saved.id, saved);
+      return clone(saved);
+    },
+    async deleteShowFormat(formatId) {
+      if (!showFormats.delete(formatId)) throw new Error("video.show_format_not_found: That show format does not exist.");
+    },
+    async createEpisode(formatId, episodeName) {
+      const format = showFormats.get(formatId);
+      if (!format) throw new Error("video.show_format_not_found: That show format does not exist.");
+      // Instantiation copies: the episode never reads back through its format.
+      const episode = clone(await this.createVideoProject({ prompt: episodeName }));
+      episode.name = episodeName;
+      episode.manifest.cast = clone(format.cast);
+      episode.manifest.lexicon = clone(format.lexicon);
+      episode.manifest.dialogue = [];
+      episode.manifest.turn_beats = [];
+      episode.manifest.music_cues = [];
+      episode.manifest.format_origin = {
+        format_id: format.id, format_name: format.name, format_revision: format.revision, instantiated_at: FIXED_NOW,
+      };
+      return store(episode);
     },
     async writeVideoScript(request) {
       const replay = scriptReplays.get(request.operation_id);
@@ -1231,6 +1267,10 @@ function createNativeVideoService(): VideoStudioService {
     renderVideoPreview: (projectId, onProgress) => nativeWithProgress<VideoProject>(projectId, "render_video_preview", { projectId }, onProgress).then(withNativeProjectUrls),
     editVideoTimeline: (request) => invoke<VideoTimelineEditResponse>("edit_video_timeline", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),
     writeVideoScript: (request) => invoke<VideoScriptResponse>("write_video_script", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),
+    listShowFormats: () => invoke<VideoShowFormat[]>("list_show_formats"),
+    saveShowFormat: (format) => invoke<VideoShowFormat>("save_show_format", { format }),
+    deleteShowFormat: (formatId) => invoke<void>("delete_show_format", { formatId }),
+    createEpisode: (formatId, episodeName, brief) => invoke<VideoProject>("create_episode", { formatId, episodeName, brief }).then(withNativeProjectUrls),
     addVideoVisualAsset: (request) => invoke<AddVisualAssetResponse>("add_video_visual_asset", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),
     reviseVideo: (request: ReviseVideoRequest) => invoke<VideoProject>("revise_video", { request }).then(withNativeProjectUrls),
     exportVideo: (request: VideoExportRequest, onProgress) => nativeWithProgress<VideoProject>(request.project_id, "export_video", { request }, onProgress).then(withNativeProjectUrls),

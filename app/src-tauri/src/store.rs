@@ -305,6 +305,47 @@ impl Store {
         self.application_settings()
     }
 
+    /// Show formats are bounded reusable configuration, so they live as one validated document in
+    /// the durable settings table rather than in their own schema. That keeps them transactional
+    /// and restart-safe without a migration, and the service layer owns their contract.
+    pub fn show_formats(&self) -> Result<Value, String> {
+        let connection = self.lock()?;
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = 'show_formats'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Could not read show formats: {error}"))?;
+        drop(connection);
+        let Some(stored) = stored else {
+            return Ok(Value::Array(Vec::new()));
+        };
+        let parsed: Value = serde_json::from_str(&stored)
+            .map_err(|error| format!("The stored show formats are invalid: {error}"))?;
+        if !parsed.is_array() {
+            return Err("The stored show formats are not a list".to_string());
+        }
+        Ok(parsed)
+    }
+
+    /// Replace the complete show-format document. The caller has already validated every entry.
+    pub fn save_show_formats(&self, formats: &Value) -> Result<(), String> {
+        if !formats.is_array() {
+            return Err("Show formats must be saved as a list".to_string());
+        }
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('show_formats', ?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+                params![formats.to_string(), now()],
+            )
+            .map_err(|error| format!("Could not save show formats: {error}"))?;
+        Ok(())
+    }
+
     pub fn capture_path(&self) -> Result<PathBuf, String> {
         fs::create_dir_all(&self.transcription_sources_root)
             .map_err(|error| format!("Could not create capture storage: {error}"))?;

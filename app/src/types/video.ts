@@ -324,6 +324,8 @@ export interface VideoProjectManifest {
   lexicon?: VideoLexiconEntry[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
   music_cues?: VideoMusicCue[];
+  /** Set when this episode was started from a saved show format. */
+  format_origin?: VideoFormatOrigin | null;
   /** Present on current manifests; optional only for migration-era project compatibility. */
   sound_assets?: VideoSoundAsset[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
@@ -655,6 +657,56 @@ export interface VideoMusicCueInput {
   created_at: string;
 }
 
+/** A cue the format supplies for every episode, before there is a script to anchor it to. */
+export interface VideoCueTemplate {
+  id: string;
+  role: VideoCueRole;
+  target_duration_us: number;
+  direction: string;
+  gain_db_milli: number;
+  fade_in_us: number;
+  fade_out_us: number;
+}
+
+/**
+ * The reusable shape of a series. Instantiation copies, so editing a format never changes an
+ * episode that already exists.
+ */
+export interface VideoShowFormat {
+  id: string;
+  name: string;
+  /** Owned by soundAr and bumped on every save. */
+  revision: number;
+  cast: VideoCastMember[];
+  lexicon: VideoLexiconEntry[];
+  performance_clock: {
+    intra_exchange_us: number;
+    turn_of_thought_us: number;
+    pre_reveal_us: number;
+    scene_boundary_us: number;
+  };
+  caption_preset_id: string;
+  canvas_mode: "portrait" | "landscape" | "square" | "custom";
+  canvas: { width: number; height: number; pixel_aspect_numerator: number; pixel_aspect_denominator: number };
+  frame_rate: { numerator: number; denominator: number };
+  target_lufs_milli: number;
+  true_peak_db_milli: number;
+  target_duration_us: number;
+  opening?: VideoCueTemplate | null;
+  closing?: VideoCueTemplate | null;
+  show_notes_style?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Where an episode's inherited values came from. Provenance, not a live link. */
+export interface VideoFormatOrigin {
+  format_id: string;
+  format_name: string;
+  format_revision: number;
+  instantiated_at: string;
+}
+
 /** Precedence runs character, then project, then global: the most specific rule wins. */
 export type VideoLexiconScope = "character" | "project" | "global";
 
@@ -796,6 +848,10 @@ export interface VideoStudioService {
   renderVideoPreview(projectId: string, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;
   editVideoTimeline(request: VideoTimelineEditRequest): Promise<VideoTimelineEditResponse>;
   writeVideoScript(request: VideoScriptRequest): Promise<VideoScriptResponse>;
+  listShowFormats(): Promise<VideoShowFormat[]>;
+  saveShowFormat(format: VideoShowFormat): Promise<VideoShowFormat>;
+  deleteShowFormat(formatId: string): Promise<void>;
+  createEpisode(formatId: string, episodeName: string, brief?: string): Promise<VideoProject>;
   addVideoVisualAsset(request: AddVisualAssetRequest): Promise<AddVisualAssetResponse>;
   reviseVideo(request: ReviseVideoRequest): Promise<VideoProject>;
   exportVideo(request: VideoExportRequest, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;

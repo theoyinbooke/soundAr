@@ -11,8 +11,8 @@ use super::{
     build_waveform_command, discover_media_runtime, local_media_input_args,
     preflight_import_url_destination, probe_media, publish_atomic, sibling_staging_path,
     terminate_process_group, validate_import_url, write_ass_document_atomic, AdmissionOutcome,
-    AssemblyOptions, CacheKeyBuilder, CacheStage, CaptionTheme, CastMember, DialogueScriptRequest,
-    FfmpegProgressParser, LayoutRole,
+    instantiate_format, AssemblyOptions, CacheKeyBuilder, CacheStage, CaptionTheme, CastMember,
+    DialogueScriptRequest, FfmpegProgressParser, LayoutRole,
     MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance,
     ProvenanceKind, PublicHttpsProxy, PublicationState, RationalFrameRate, RationalRate,
     RenderArtifact, RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile,
@@ -20,8 +20,8 @@ use super::{
     RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, SourceAsset,
     SourceAssetKind, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder,
     VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_VISUAL_ASSET_BYTES,
-    MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
+    ShowFormat, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -6055,6 +6055,105 @@ mod tests {
                 created_at: utc_now(),
             },
         ]
+    }
+
+    fn show_format() -> ShowFormat {
+        use super::super::{CanvasMode, CanvasSpec, PerformanceClock};
+        ShowFormat {
+            id: "show-harmattan".to_string(),
+            name: "The Harmattan Letters".to_string(),
+            revision: 0,
+            cast: script_cast(),
+            lexicon: Vec::new(),
+            performance_clock: PerformanceClock::default(),
+            caption_preset_id: "podcast".to_string(),
+            canvas_mode: CanvasMode::Portrait,
+            canvas: CanvasSpec {
+                width: 1080,
+                height: 1920,
+                pixel_aspect_numerator: 1,
+                pixel_aspect_denominator: 1,
+            },
+            frame_rate: RationalFrameRate::FPS_30,
+            target_lufs_milli: -16_000,
+            true_peak_db_milli: -1_000,
+            target_duration_us: Microseconds(600_000_000),
+            opening: None,
+            closing: None,
+            show_notes_style: None,
+            created_at: utc_now(),
+            updated_at: utc_now(),
+        }
+    }
+
+    #[test]
+    fn a_show_format_is_durable_and_an_episode_inherits_it_by_copy() {
+        let workspace = TestWorkspace::new();
+
+        let saved = workspace
+            .service
+            .save_show_format(show_format())
+            .expect("save the show format");
+        // The service owns the revision so two formats cannot claim the same provenance.
+        assert_eq!(saved.revision, 1);
+        assert_eq!(workspace.service.list_show_formats().unwrap().len(), 1);
+
+        let episode = workspace
+            .service
+            .create_episode(&saved.id, "Episode 1", "service-test", None)
+            .expect("start the first episode");
+        let manifest: VideoProjectManifest =
+            serde_json::from_value(episode.get("manifest").cloned().expect("manifest"))
+                .expect("decode episode manifest");
+        assert_eq!(manifest.cast.len(), 2);
+        assert_eq!(manifest.audio_mix.target_lufs_milli, -16_000);
+        assert_eq!(
+            manifest
+                .format_origin
+                .as_ref()
+                .map(|origin| origin.format_revision),
+            Some(1)
+        );
+
+        // Recasting the show must not reach the episode that already exists.
+        let mut revised = saved.clone();
+        revised.cast[1].voice_id = "af-nova".to_string();
+        let revised = workspace
+            .service
+            .save_show_format(revised)
+            .expect("revise the show format");
+        assert_eq!(revised.revision, 2);
+        assert_eq!(revised.created_at, saved.created_at);
+
+        let reloaded = workspace.service.get_project(&manifest.project_id).unwrap();
+        let reloaded: VideoProjectManifest =
+            serde_json::from_value(reloaded.get("manifest").cloned().expect("manifest"))
+                .expect("decode reloaded manifest");
+        assert_eq!(reloaded.cast[1].voice_id, "af-bella");
+
+        // A new episode picks up the change.
+        let next = workspace
+            .service
+            .create_episode(&revised.id, "Episode 2", "service-test", None)
+            .expect("start the second episode");
+        let next: VideoProjectManifest =
+            serde_json::from_value(next.get("manifest").cloned().expect("manifest"))
+                .expect("decode second episode manifest");
+        assert_eq!(next.cast[1].voice_id, "af-nova");
+        assert_eq!(
+            next.format_origin.map(|origin| origin.format_revision),
+            Some(2)
+        );
+
+        workspace
+            .service
+            .delete_show_format(&saved.id)
+            .expect("delete the show format");
+        assert!(workspace.service.list_show_formats().unwrap().is_empty());
+        assert!(workspace
+            .service
+            .create_episode(&saved.id, "Episode 3", "service-test", None)
+            .is_err());
     }
 
     #[test]
@@ -12409,6 +12508,99 @@ impl VideoStudioService {
             },
             job_id: job_id.to_string(),
             replayed: false,
+        })
+    }
+
+    /// Every saved show format, validated on the way out so a corrupted document cannot reach a
+    /// project as if it were a usable format.
+    pub fn list_show_formats(&self) -> ServiceResult<Vec<ShowFormat>> {
+        let stored = self.store.show_formats().map_err(VideoServiceError::store)?;
+        let formats: Vec<ShowFormat> = serde_json::from_value(stored).map_err(json_error)?;
+        for format in &formats {
+            format.validate()?;
+        }
+        Ok(formats)
+    }
+
+    /// Create or replace one show format, advancing its revision.
+    ///
+    /// The revision is owned here rather than by the caller: an episode records the revision it
+    /// inherited from, and a caller that could choose its own number could make two different
+    /// formats claim the same provenance.
+    pub fn save_show_format(&self, mut format: ShowFormat) -> ServiceResult<ShowFormat> {
+        let mut formats = self.list_show_formats()?;
+        let existing = formats.iter().position(|saved| saved.id == format.id);
+        format.revision = existing
+            .and_then(|index| formats.get(index))
+            .map_or(1, |saved| saved.revision.saturating_add(1));
+        format.created_at = existing
+            .and_then(|index| formats.get(index))
+            .map_or_else(utc_now, |saved| saved.created_at.clone());
+        format.updated_at = utc_now();
+        format.validate()?;
+        match existing {
+            Some(index) => formats[index] = format.clone(),
+            None => {
+                if formats.len() >= MAX_SHOW_FORMATS {
+                    return Err(VideoServiceError::new(
+                        "video.too_many_show_formats",
+                        format!("soundAr keeps at most {MAX_SHOW_FORMATS} show formats"),
+                    ));
+                }
+                formats.push(format.clone());
+            }
+        }
+        let value = serde_json::to_value(&formats).map_err(json_error)?;
+        self.store
+            .save_show_formats(&value)
+            .map_err(VideoServiceError::store)?;
+        Ok(format)
+    }
+
+    pub fn delete_show_format(&self, format_id: &str) -> ServiceResult<()> {
+        let mut formats = self.list_show_formats()?;
+        let before = formats.len();
+        formats.retain(|format| format.id != format_id);
+        if formats.len() == before {
+            return Err(VideoServiceError::new(
+                "video.show_format_not_found",
+                "That show format does not exist",
+            ));
+        }
+        let value = serde_json::to_value(&formats).map_err(json_error)?;
+        self.store
+            .save_show_formats(&value)
+            .map_err(VideoServiceError::store)
+    }
+
+    /// Start a new episode of a show.
+    ///
+    /// The episode inherits the format's decisions by copy. Nothing links back, so editing the
+    /// format later cannot change this episode, and this episode reproduces what it was made from.
+    pub fn create_episode(
+        &self,
+        format_id: &str,
+        episode_name: &str,
+        actor: &str,
+        initial_intent: Option<String>,
+    ) -> ServiceResult<Value> {
+        let format = self
+            .list_show_formats()?
+            .into_iter()
+            .find(|format| format.id == format_id)
+            .ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.show_format_not_found",
+                    "That show format does not exist",
+                )
+            })?;
+        let project_id = format!("project-{}", new_id());
+        let manifest = instantiate_format(&format, &project_id, episode_name, &utc_now())?;
+        self.create_project(CreateVideoProjectRequest {
+            name: episode_name.to_string(),
+            manifest,
+            actor: actor.to_string(),
+            initial_intent,
         })
     }
 

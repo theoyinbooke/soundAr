@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createBrowserPreviewVideoService } from "./videoBridge";
-import type { VideoMusicCueInput, VideoSoundLayerInput } from "../types/video";
+import type { VideoMusicCueInput, VideoShowFormat, VideoSoundLayerInput } from "../types/video";
 import {
   initialVideoStudioState,
   phaseForProject,
@@ -287,6 +287,44 @@ describe("videoStudioReducer", () => {
     // Room tone near the dialogue reads as noise, and a one-shot cannot repeat.
     await rejected({ id: "loud", gain_db_milli: -6_000 }, /not registered|far under/i);
     await rejected({ id: "shot", kind: "one_shot", loop_to_fill: true }, /not registered|cannot loop/i);
+  });
+
+  it("starts episodes from a show format by copy, so editing the show never rewrites one", async () => {
+    const service = createBrowserPreviewVideoService();
+    const format: VideoShowFormat = {
+      id: "show-harmattan", name: "The Harmattan Letters", revision: 0,
+      cast: [
+        { id: "narrator", name: "NARRATOR", display_name: "Narrator", voice_id: "af-heart", model_id: "kokoro-82m", language: "en-US", delivery: { rate_milli: 1000, pitch_milli: 0, energy_milli: 1000 }, created_at: "2026-01-01T00:00:00Z" },
+        { id: "adaeze", name: "ADAEZE", display_name: "Adaeze", voice_id: "af-bella", model_id: "kokoro-82m", language: "en-US", delivery: { rate_milli: 1000, pitch_milli: 0, energy_milli: 1000 }, created_at: "2026-01-01T00:00:00Z" },
+      ],
+      lexicon: [], performance_clock: { intra_exchange_us: 220_000, turn_of_thought_us: 600_000, pre_reveal_us: 1_200_000, scene_boundary_us: 900_000 },
+      caption_preset_id: "podcast", canvas_mode: "portrait",
+      canvas: { width: 1080, height: 1920, pixel_aspect_numerator: 1, pixel_aspect_denominator: 1 },
+      frame_rate: { numerator: 30, denominator: 1 },
+      target_lufs_milli: -16_000, true_peak_db_milli: -1_000, target_duration_us: 600_000_000,
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    };
+
+    const saved = await service.saveShowFormat(format);
+    expect(saved.revision).toBe(1);
+    expect(await service.listShowFormats()).toHaveLength(1);
+
+    const first = await service.createEpisode(saved.id, "Episode 1");
+    expect(first.manifest.cast?.[1].voice_id).toBe("af-bella");
+    expect(first.manifest.format_origin?.format_revision).toBe(1);
+
+    // Recasting the show must not reach the episode that already exists.
+    const revised = await service.saveShowFormat({ ...saved, cast: saved.cast.map((member) => member.id === "adaeze" ? { ...member, voice_id: "af-nova" } : member) });
+    expect(revised.revision).toBe(2);
+    const reloaded = await service.getVideoProject(first.id);
+    expect(reloaded.manifest.cast?.[1].voice_id).toBe("af-bella");
+
+    const second = await service.createEpisode(saved.id, "Episode 2");
+    expect(second.manifest.cast?.[1].voice_id).toBe("af-nova");
+    expect(second.manifest.format_origin?.format_revision).toBe(2);
+
+    await service.deleteShowFormat(saved.id);
+    await expect(service.createEpisode(saved.id, "Episode 3")).rejects.toThrow(/does not exist/i);
   });
 
   it("moves a durable project through intake, analysis, review, render, and export", async () => {

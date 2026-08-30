@@ -1003,6 +1003,40 @@ Depends on: 12.1 through 12.5.
   inherited and can be overridden per episode without editing the format.
 - Editing a format never retroactively mutates a published episode.
 
+### Current Evidence
+
+Slice 12.6 is implemented and locally verified.
+
+- `video/format.rs` holds the `ShowFormat` contract: the cast, pronunciation rules, conversational
+  timing, caption preset, canvas, frame rate, loudness targets, usual episode length, show-notes
+  style, and opening and closing cue templates that do not change between episodes.
+- Instantiation copies. An episode never reads back through its format at render time, so editing a
+  format cannot retroactively change an episode that already shipped, and an episode rendered next
+  year reproduces what it was rendered from today. `format_origin` on the manifest records which
+  format and which revision the values came from - provenance, not a live link.
+- soundAr owns the format revision rather than the caller, because an episode records the revision
+  it inherited and a caller that could choose its own number could make two different formats claim
+  the same provenance. `created_at` is preserved across updates.
+- A format cannot store values the renderer would later reject: the loudness target is validated by
+  building the mix an episode would actually inherit, the caption preset must be one soundAr has, a
+  cast whose script names cannot be told apart is refused, and a rule cannot name a character
+  outside the format's own cast.
+- Cue templates carry no anchor, because an opening belongs to whatever the first line turns out to
+  be and a closing to whatever the last one is. `materialize_format_cues` resolves them against a
+  written script and returns nothing for an episode that has none, rather than inventing an anchor
+  at a moment the writer never chose. An opening cannot be an outro and a closing must be.
+- Formats persist as one validated document in the durable settings table, which keeps them
+  transactional and restart-safe without a schema migration, and they are validated on the way out
+  so a corrupted document cannot reach a project as if it were a usable format.
+- `save_show_format`, `list_show_formats`, and `create_episode` are exposed as assistant tools and
+  Tauri commands, and the producer prompt now directs recurring work through them.
+- The cast and lexicon tool schemas are shared between `write_video_script` and `save_show_format`
+  rather than duplicated.
+- Verified locally: 432 native tests including eight format cases and one durable service case
+  proving the revision is owned by soundAr, an episode inherits by copy, and recasting the show
+  leaves an existing episode untouched; plus 148 React tests including preview-bridge parity for the
+  same guarantee.
+
 ### Slice 12.7: Release Package
 
 Depends on: 12.6, the existing publish package and candidate analyst.

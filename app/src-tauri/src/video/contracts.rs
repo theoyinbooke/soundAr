@@ -10,6 +10,7 @@ use super::cast::{
 };
 use super::lexicon::{fingerprint_for_character, validate_lexicon, LexiconEntry};
 use super::performance::{index_turns, validate_turn_beats, PerformanceClock, TurnBeat};
+use super::format::FormatOrigin;
 use super::score::{validate_cue_sheet, MusicCue};
 use super::sound::{validate_sound_design, SoundAsset, SoundLayer};
 use super::visuals::{VisualAsset, VisualLayer, MAX_VISUAL_ASSETS, MAX_VISUAL_LAYERS};
@@ -49,6 +50,7 @@ pub enum VideoErrorCode {
     InvalidDialogue,
     InvalidLexicon,
     InvalidPerformance,
+    InvalidShowFormat,
     InvalidSoundPlacement,
     UnknownSpeaker,
     InvalidArtifact,
@@ -89,6 +91,7 @@ impl VideoErrorCode {
             Self::CueFitFailed => "video.cue_fit_failed",
             Self::InvalidDialogue => "video.invalid_dialogue",
             Self::InvalidLexicon => "video.invalid_lexicon",
+            Self::InvalidShowFormat => "video.invalid_show_format",
             Self::InvalidSoundPlacement => "video.invalid_sound_placement",
             Self::InvalidPerformance => "video.invalid_performance",
             Self::UnknownSpeaker => "video.unknown_speaker",
@@ -1511,6 +1514,10 @@ pub struct VideoProjectManifest {
     pub lexicon: Vec<LexiconEntry>,
     #[serde(default)]
     pub music_cues: Vec<MusicCue>,
+    /// Where this episode's inherited values came from. Provenance, not a live link: nothing reads
+    /// back through it, so editing the format cannot change an episode that already exists.
+    #[serde(default)]
+    pub format_origin: Option<FormatOrigin>,
     #[serde(default)]
     pub sound_assets: Vec<SoundAsset>,
     #[serde(default)]
@@ -1562,6 +1569,7 @@ impl VideoProjectManifest {
             dialogue: Vec::new(),
             lexicon: Vec::new(),
             music_cues: Vec::new(),
+            format_origin: None,
             sound_assets: Vec::new(),
             sound_layers: Vec::new(),
             performance_clock: PerformanceClock::default(),
@@ -1948,6 +1956,9 @@ impl Validate for VideoProjectManifest {
             .map(|member| member.id.as_str())
             .collect::<BTreeSet<_>>();
         validate_lexicon(&self.lexicon, &cast_ids)?;
+        if let Some(origin) = &self.format_origin {
+            origin.validate()?;
+        }
         let music_asset_ids = self
             .source_assets
             .iter()
@@ -2826,6 +2837,7 @@ mod tests {
             dialogue: vec![],
             lexicon: vec![],
             music_cues: vec![],
+            format_origin: None,
             sound_assets: vec![],
             sound_layers: vec![],
             performance_clock: PerformanceClock::default(),

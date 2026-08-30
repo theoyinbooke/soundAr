@@ -10,6 +10,7 @@ pub mod cast;
 pub mod contracts;
 pub mod dialogue;
 pub mod editor;
+pub mod format;
 pub mod intelligence;
 pub mod lexicon;
 pub mod media;
@@ -39,6 +40,10 @@ pub use cast::{
     MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
+pub use format::{
+    instantiate_format, materialize_format_cues, CueTemplate, FormatOrigin, ShowFormat,
+    MAX_SHOW_FORMATS,
+};
 pub use sound::{
     assets_matching_tag, SoundAsset, SoundLayer, SoundPlacementKind, MAX_SOUND_ASSETS,
     MAX_SOUND_LAYERS,

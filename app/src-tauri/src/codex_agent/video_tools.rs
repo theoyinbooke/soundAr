@@ -57,6 +57,9 @@ pub(crate) enum VideoAgentOperationKind {
     EditVideoTimeline,
     WriteVideoScript,
     GenerateCueMusic,
+    SaveShowFormat,
+    ListShowFormats,
+    CreateEpisode,
     RegisterGeneratedVisual,
     AddVisualAsset,
     RenderVideoPreview,
@@ -82,6 +85,9 @@ impl VideoAgentOperationKind {
             Self::EditVideoTimeline => "edit_video_timeline",
             Self::WriteVideoScript => "write_video_script",
             Self::GenerateCueMusic => "generate_cue_music",
+            Self::SaveShowFormat => "save_show_format",
+            Self::ListShowFormats => "list_show_formats",
+            Self::CreateEpisode => "create_episode",
             Self::RegisterGeneratedVisual => "register_generated_visual",
             Self::AddVisualAsset => "add_visual_asset",
             Self::RenderVideoPreview => "render_video_preview",
@@ -99,6 +105,7 @@ impl VideoAgentOperationKind {
             | Self::PreviewLink
             | Self::ImportLink
             | Self::CreateVideoProject
+            | Self::CreateEpisode
             | Self::RegisterGeneratedVisual => VideoProductionPhase::Source,
             Self::AnalyzeVideo => VideoProductionPhase::Analyze,
             Self::PlanVideo
@@ -111,6 +118,8 @@ impl VideoAgentOperationKind {
             Self::ExportVideo | Self::ExportPublishPackage => VideoProductionPhase::Export,
             Self::ListVideoProjects
             | Self::GetVideoProject
+            | Self::SaveShowFormat
+            | Self::ListShowFormats
             | Self::CancelVideoJob
             | Self::ResumeVideoJob => VideoProductionPhase::Project,
         }
@@ -131,6 +140,9 @@ pub(crate) enum VideoAgentOperation {
     EditVideoTimeline(video::VideoTimelineEditRequest),
     WriteVideoScript(video::VideoScriptRequest),
     GenerateCueMusic(GenerateCueMusicRequest),
+    SaveShowFormat(video::ShowFormat),
+    ListShowFormats(EmptyRequest),
+    CreateEpisode(CreateEpisodeRequest),
     RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
     AddVisualAsset(video::AddVisualAssetRequest),
     RenderVideoPreview(RenderVideoPreviewRequest),
@@ -155,6 +167,9 @@ impl VideoAgentOperation {
             Self::EditVideoTimeline(_) => VideoAgentOperationKind::EditVideoTimeline,
             Self::WriteVideoScript(_) => VideoAgentOperationKind::WriteVideoScript,
             Self::GenerateCueMusic(_) => VideoAgentOperationKind::GenerateCueMusic,
+            Self::SaveShowFormat(_) => VideoAgentOperationKind::SaveShowFormat,
+            Self::ListShowFormats(_) => VideoAgentOperationKind::ListShowFormats,
+            Self::CreateEpisode(_) => VideoAgentOperationKind::CreateEpisode,
             Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
             Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
             Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
@@ -180,6 +195,9 @@ impl VideoAgentOperation {
             "edit_video_timeline" => Self::EditVideoTimeline(decode(arguments)?),
             "write_video_script" => Self::WriteVideoScript(decode(arguments)?),
             "generate_cue_music" => Self::GenerateCueMusic(decode(arguments)?),
+            "save_show_format" => Self::SaveShowFormat(decode(arguments)?),
+            "list_show_formats" => Self::ListShowFormats(decode(arguments)?),
+            "create_episode" => Self::CreateEpisode(decode(arguments)?),
             "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
             "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
             "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
@@ -201,7 +219,15 @@ impl VideoAgentOperation {
 
     fn validate(&self) -> Result<(), VideoAgentToolError> {
         match self {
-            Self::VideoRuntimeStatus(_) | Self::ListVideoProjects(_) => Ok(()),
+            Self::VideoRuntimeStatus(_)
+            | Self::ListVideoProjects(_)
+            | Self::ListShowFormats(_) => Ok(()),
+            Self::SaveShowFormat(format) => video::Validate::validate(format)
+                .map_err(VideoAgentToolError::from),
+            Self::CreateEpisode(request) => {
+                require_text(&request.format_id, "format_id")?;
+                require_text(&request.episode_name, "episode_name")
+            }
             Self::PreviewLink(request) => {
                 require_text(&request.exact_url, "exact_url")?;
                 video::validate_import_url(&request.exact_url)
@@ -513,6 +539,15 @@ pub(crate) struct CreateVideoProjectRequest {
     pub audio_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateEpisodeRequest {
+    pub(crate) format_id: String,
+    pub(crate) episode_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) brief: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1105,6 +1140,9 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "edit_video_timeline" => VideoAgentOperationKind::EditVideoTimeline,
         "write_video_script" => VideoAgentOperationKind::WriteVideoScript,
         "generate_cue_music" => VideoAgentOperationKind::GenerateCueMusic,
+        "save_show_format" => VideoAgentOperationKind::SaveShowFormat,
+        "list_show_formats" => VideoAgentOperationKind::ListShowFormats,
+        "create_episode" => VideoAgentOperationKind::CreateEpisode,
         "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
         "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
         "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
@@ -1128,6 +1166,8 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::EditVideoTimeline
                 | VideoAgentOperationKind::WriteVideoScript
                 | VideoAgentOperationKind::GenerateCueMusic
+                | VideoAgentOperationKind::SaveShowFormat
+                | VideoAgentOperationKind::CreateEpisode
                 | VideoAgentOperationKind::RegisterGeneratedVisual
                 | VideoAgentOperationKind::AddVisualAsset
                 | VideoAgentOperationKind::RenderVideoPreview
@@ -1273,6 +1313,28 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
             "write_video_script",
             "Declare the cast and write the speaker-attributed script for one project version. Each character is bound to one voice, and each `NAME: line` becomes one durable dialogue turn. Re-applying a script keeps every turn whose words are unchanged, so revising one line re-reads only that line. Use one stable operation_id for retries. Requires Studio or Full access.",
             video_script_schema(),
+        ),
+        tool(
+            "save_show_format",
+            "Create or update the reusable shape of a series: its cast, pronunciation rules, conversational timing, caption preset, canvas, loudness targets, usual episode length, and opening and closing music. soundAr owns the revision number. Editing a format never changes an episode that already exists - instantiation copies, so a shipped episode reproduces what it was made from. Requires Studio or Full access.",
+            show_format_schema(),
+        ),
+        tool(
+            "list_show_formats",
+            "List saved show formats with their current revision. Read-only.",
+            object_schema(&[], Map::new()),
+        ),
+        tool(
+            "create_episode",
+            "Start a new episode of a saved show. The episode inherits the format's cast, pronunciation, timing, canvas, and mix by copy, and records which format revision it came from. Write its script next with write_video_script. Requires Studio or Full access.",
+            object_schema(
+                &["format_id", "episode_name"],
+                properties([
+                    ("format_id", string("A saved show format id")),
+                    ("episode_name", string("This episode's name")),
+                    ("brief", nullable_string("What this episode is about, recorded as its initial intent")),
+                ]),
+            ),
         ),
         tool(
             "generate_cue_music",
@@ -1452,30 +1514,10 @@ fn visual_motion_schema() -> Value {
 
 /// The cast is the route: a character names the voice, model, and language that perform every
 /// line it speaks, so the agent cannot leave a character's delivery implicit.
-fn video_script_schema() -> Value {
-    object_schema(
-        &[
-            "project_id",
-            "expected_revision",
-            "base_version_id",
-            "operation_id",
-            "cast",
-            "script",
-        ],
-        properties([
-            ("project_id", string("Video Studio project id")),
-            ("expected_revision", json!({"type":"integer","minimum":1})),
-            (
-                "base_version_id",
-                string("Exact current immutable version id"),
-            ),
-            (
-                "operation_id",
-                string("Stable idempotency key for this exact cast and script"),
-            ),
-            (
-                "cast",
-                json!({
+/// The cast shape shared by `write_video_script` and `save_show_format`. A character names the
+/// exact voice, model, and language that perform every line it speaks.
+fn cast_schema() -> Value {
+    json!({
                     "type": "array",
                     "minItems": 1,
                     "maxItems": video::MAX_CAST_MEMBERS,
@@ -1504,8 +1546,134 @@ fn video_script_schema() -> Value {
                             "created_at": {"type": "string", "description": "UTC RFC3339 timestamp"}
                         }
                     }
-                }),
+                })
+}
+
+/// One pronunciation rule, shared by the lexicon edit operation and `save_show_format`.
+fn lexicon_entry_schema() -> Value {
+    json!({
+                                        "type":"object",
+                                        "additionalProperties":false,
+                                        "required":["id","scope","match_text","replacement","matching","created_at"],
+                                        "properties":{
+                                            "id":{"type":"string","minLength":1},
+                                            "scope":{"type":"string","enum":["character","project","global"],"description":"Precedence runs character, then project, then global. A global entry in a project is a snapshot taken when it was imported, so the episode stays reproducible."},
+                                            "character_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for character scope and rejected for every other scope"},
+                                            "match_text":{"type":"string","minLength":1,"maxLength":200},
+                                            "replacement":{"type":"string","minLength":1,"maxLength":400,"description":"Ordinary respelled text, not a phoneme alphabet: engines differ in what notation they accept"},
+                                            "matching":{"type":"string","enum":["word","exact"],"description":"word is case-insensitive; exact is case-sensitive, for acronyms"},
+                                            "notes":{"oneOf":[{"type":"string"},{"type":"null"}]},
+                                            "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
+                                        }
+                                    })
+}
+
+fn cue_template_schema(role_note: &str) -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["id","role","target_duration_us","direction","gain_db_milli","fade_in_us","fade_out_us"],
+        "properties":{
+            "id":{"type":"string","minLength":1},
+            "role":{"type":"string","enum":["sting","bed","transition","outro"],"description":role_note},
+            "target_duration_us":{"type":"integer","minimum":500000,"maximum":900000000},
+            "direction":{"type":"string","minLength":1,"maxLength":2000},
+            "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000},
+            "fade_in_us":{"type":"integer","minimum":0},
+            "fade_out_us":{"type":"integer","minimum":0}
+        }
+    })
+}
+
+fn show_format_schema() -> Value {
+    object_schema(
+        &[
+            "id",
+            "name",
+            "revision",
+            "cast",
+            "lexicon",
+            "performance_clock",
+            "caption_preset_id",
+            "canvas_mode",
+            "canvas",
+            "frame_rate",
+            "target_lufs_milli",
+            "true_peak_db_milli",
+            "target_duration_us",
+            "created_at",
+            "updated_at",
+        ],
+        properties([
+            ("id", string("Stable show id, reused across episodes")),
+            ("name", string("The show's name")),
+            ("revision", json!({"type":"integer","minimum":0,"description":"Ignored on save; soundAr owns the revision so two formats cannot claim the same provenance"})),
+            ("cast", cast_schema()),
+            ("lexicon", json!({"type":"array","maxItems":500,"items":lexicon_entry_schema()})),
+            ("performance_clock", json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["intra_exchange_us","turn_of_thought_us","pre_reveal_us","scene_boundary_us"],
+                "properties":{
+                    "intra_exchange_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Between two characters trading lines: the fastest beat"},
+                    "turn_of_thought_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"When the same character continues"},
+                    "pre_reveal_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Before a line the script marks as landing"},
+                    "scene_boundary_us":{"type":"integer","minimum":0,"maximum":10000000}
+                }
+            })),
+            ("caption_preset_id", string("One of soundAr's caption presets")),
+            ("canvas_mode", json!({"type":"string","enum":["portrait","landscape","square","custom"]})),
+            ("canvas", json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["width","height","pixel_aspect_numerator","pixel_aspect_denominator"],
+                "properties":{
+                    "width":{"type":"integer","minimum":1},
+                    "height":{"type":"integer","minimum":1},
+                    "pixel_aspect_numerator":{"type":"integer","minimum":1},
+                    "pixel_aspect_denominator":{"type":"integer","minimum":1}
+                }
+            })),
+            ("frame_rate", json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["numerator","denominator"],
+                "properties":{"numerator":{"type":"integer","minimum":1},"denominator":{"type":"integer","minimum":1}}
+            })),
+            ("target_lufs_milli", json!({"type":"integer","minimum":-36000,"maximum":-5000,"description":"Integrated loudness target for the master"})),
+            ("true_peak_db_milli", json!({"type":"integer","description":"True-peak ceiling for the master"})),
+            ("target_duration_us", json!({"type":"integer","minimum":1,"description":"How long an episode usually runs: a planning target, never a hard limit"})),
+            ("opening", json!({"oneOf":[cue_template_schema("An opening cannot be an outro"),{"type":"null"}]})),
+            ("closing", json!({"oneOf":[cue_template_schema("A closing must be an outro"),{"type":"null"}]})),
+            ("show_notes_style", nullable_string("How show notes for this series are written")),
+            ("created_at", string("UTC RFC3339 timestamp; preserved from the saved format when updating")),
+            ("updated_at", string("UTC RFC3339 timestamp")),
+        ]),
+    )
+}
+
+fn video_script_schema() -> Value {
+    object_schema(
+        &[
+            "project_id",
+            "expected_revision",
+            "base_version_id",
+            "operation_id",
+            "cast",
+            "script",
+        ],
+        properties([
+            ("project_id", string("Video Studio project id")),
+            ("expected_revision", json!({"type":"integer","minimum":1})),
+            (
+                "base_version_id",
+                string("Exact current immutable version id"),
             ),
+            (
+                "operation_id",
+                string("Stable idempotency key for this exact cast and script"),
+            ),
+            ("cast", cast_schema()),
             (
                 "script",
                 string(
@@ -1663,21 +1831,7 @@ fn set_lexicon_entry_operation_schema() -> Value {
                                 "required":["type","entry"],
                                 "properties":{
                                     "type":{"const":"set_lexicon_entry"},
-                                    "entry":{
-                                        "type":"object",
-                                        "additionalProperties":false,
-                                        "required":["id","scope","match_text","replacement","matching","created_at"],
-                                        "properties":{
-                                            "id":{"type":"string","minLength":1},
-                                            "scope":{"type":"string","enum":["character","project","global"],"description":"Precedence runs character, then project, then global. A global entry in a project is a snapshot taken when it was imported, so the episode stays reproducible."},
-                                            "character_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for character scope and rejected for every other scope"},
-                                            "match_text":{"type":"string","minLength":1,"maxLength":200},
-                                            "replacement":{"type":"string","minLength":1,"maxLength":400,"description":"Ordinary respelled text, not a phoneme alphabet: engines differ in what notation they accept"},
-                                            "matching":{"type":"string","enum":["word","exact"],"description":"word is case-insensitive; exact is case-sensitive, for acronyms"},
-                                            "notes":{"oneOf":[{"type":"string"},{"type":"null"}]},
-                                            "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
-                                        }
-                                    }
+                                    "entry":lexicon_entry_schema()
                                 }
                             })
 }
@@ -2144,8 +2298,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 19);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 19);
+        assert_eq!(names.len(), 22);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 22);
         for required in [
             "preview_link",
             "import_link",
@@ -2157,6 +2311,9 @@ mod tests {
             "edit_video_timeline",
             "write_video_script",
             "generate_cue_music",
+            "save_show_format",
+            "list_show_formats",
+            "create_episode",
             "register_generated_visual",
             "add_visual_asset",
             "render_video_preview",

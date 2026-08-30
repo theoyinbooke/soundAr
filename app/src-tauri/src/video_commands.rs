@@ -373,6 +373,53 @@ pub(crate) fn dispatch_video_operation(
                 Some(result.job_id),
             )
         }
+        VideoAgentOperation::SaveShowFormat(format) => {
+            let saved = runtime
+                .video
+                .save_show_format(format)
+                .map_err(VideoAgentToolError::from)?;
+            let summary = format!(
+                "Saved show format {} at revision {}",
+                saved.name, saved.revision
+            );
+            Ok(VideoAgentResult::ready(
+                kind,
+                &summary,
+                json!({ "format": saved }),
+            ))
+        }
+        VideoAgentOperation::ListShowFormats(_) => {
+            let formats = runtime
+                .video
+                .list_show_formats()
+                .map_err(VideoAgentToolError::from)?;
+            Ok(VideoAgentResult::ready(
+                kind,
+                "Saved show formats",
+                json!({ "formats": formats }),
+            ))
+        }
+        VideoAgentOperation::CreateEpisode(request) => {
+            let record = runtime
+                .video
+                .create_episode(
+                    &request.format_id,
+                    &request.episode_name,
+                    "video-studio-producer",
+                    request.brief,
+                )
+                .map_err(VideoAgentToolError::from)?;
+            let project =
+                video::present_video_project(&record, &runtime.store.video_artifacts_root())
+                    .map_err(VideoAgentToolError::from)?;
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Ready,
+                "The episode inherits its show's cast, pronunciation, timing, canvas, and mix; write its script next",
+                project,
+                None,
+            )
+        }
         VideoAgentOperation::GenerateCueMusic(request) => {
             let record = generate_cue_music(
                 runtime,
@@ -787,6 +834,65 @@ pub(crate) async fn revise_video(
 /// Resolve exactly what a voice would say for a sample line, so one pronunciation rule can be
 /// auditioned without re-rendering the work around it. The caller synthesizes the returned text
 /// with the character's own voice through the ordinary speech queue.
+#[tauri::command]
+pub(crate) async fn list_show_formats(
+    state: tauri::State<'_, RuntimeState>,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let formats = service.list_show_formats().map_err(service_error)?;
+        serde_json::to_value(formats).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Show format worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn save_show_format(
+    state: tauri::State<'_, RuntimeState>,
+    format: video::ShowFormat,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let saved = service.save_show_format(format).map_err(service_error)?;
+        serde_json::to_value(saved).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Show format worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn delete_show_format(
+    state: tauri::State<'_, RuntimeState>,
+    format_id: String,
+) -> Result<(), String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        service.delete_show_format(&format_id).map_err(service_error)
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Show format worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn create_episode(
+    state: tauri::State<'_, RuntimeState>,
+    format_id: String,
+    episode_name: String,
+    brief: Option<String>,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let record = service
+            .create_episode(&format_id, &episode_name, "video-studio-producer", brief)
+            .map_err(service_error)?;
+        video::present_video_project(&record, &video_root).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Episode worker failed: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn generate_video_cue_music(
     state: tauri::State<'_, RuntimeState>,
