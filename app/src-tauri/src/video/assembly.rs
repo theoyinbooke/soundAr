@@ -2308,7 +2308,9 @@ fn ffmpeg_time(value: Microseconds) -> String {
     format!("{}.{:06}", value.0 / 1_000_000, value.0 % 1_000_000)
 }
 
-fn profile_dimensions(profile: RenderProfile, layout: &LayoutPlan) -> (u32, u32) {
+/// The canvas an episode renders on. Exposed so generated artwork is drawn at exactly the
+/// canvas it will be composited onto rather than at a size guessed alongside it.
+pub fn profile_dimensions(profile: RenderProfile, layout: &LayoutPlan) -> (u32, u32) {
     if matches!(layout.mode, CanvasMode::Custom) {
         return (layout.canvas.width, layout.canvas.height);
     }

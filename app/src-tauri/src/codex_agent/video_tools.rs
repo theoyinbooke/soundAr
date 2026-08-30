@@ -61,6 +61,7 @@ pub(crate) enum VideoAgentOperationKind {
     SaveShowFormat,
     ListShowFormats,
     CreateEpisode,
+    EnsureEpisodeCover,
     PlanEpisodeRelease,
     ExportEpisodeRelease,
     CheckEpisodeQuality,
@@ -95,6 +96,7 @@ impl VideoAgentOperationKind {
             Self::SaveShowFormat => "save_show_format",
             Self::ListShowFormats => "list_show_formats",
             Self::CreateEpisode => "create_episode",
+            Self::EnsureEpisodeCover => "ensure_episode_cover",
             Self::PlanEpisodeRelease => "plan_episode_release",
             Self::ExportEpisodeRelease => "export_episode_release",
             Self::CheckEpisodeQuality => "check_episode_quality",
@@ -125,6 +127,7 @@ impl VideoAgentOperationKind {
             | Self::EditVideoTimeline
             | Self::WriteVideoScript
             | Self::GenerateCueMusic
+            | Self::EnsureEpisodeCover
             | Self::NarrateTurns
             | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
@@ -163,6 +166,7 @@ pub(crate) enum VideoAgentOperation {
     SaveShowFormat(video::ShowFormat),
     ListShowFormats(EmptyRequest),
     CreateEpisode(CreateEpisodeRequest),
+    EnsureEpisodeCover(EnsureEpisodeCoverRequest),
     PlanEpisodeRelease(PlanEpisodeReleaseRequest),
     ExportEpisodeRelease(PlanEpisodeReleaseRequest),
     CheckEpisodeQuality(CheckEpisodeQualityRequest),
@@ -196,6 +200,7 @@ impl VideoAgentOperation {
             Self::SaveShowFormat(_) => VideoAgentOperationKind::SaveShowFormat,
             Self::ListShowFormats(_) => VideoAgentOperationKind::ListShowFormats,
             Self::CreateEpisode(_) => VideoAgentOperationKind::CreateEpisode,
+            Self::EnsureEpisodeCover(_) => VideoAgentOperationKind::EnsureEpisodeCover,
             Self::PlanEpisodeRelease(_) => VideoAgentOperationKind::PlanEpisodeRelease,
             Self::ExportEpisodeRelease(_) => VideoAgentOperationKind::ExportEpisodeRelease,
             Self::CheckEpisodeQuality(_) => VideoAgentOperationKind::CheckEpisodeQuality,
@@ -232,6 +237,7 @@ impl VideoAgentOperation {
             "save_show_format" => Self::SaveShowFormat(decode(arguments)?),
             "list_show_formats" => Self::ListShowFormats(decode(arguments)?),
             "create_episode" => Self::CreateEpisode(decode(arguments)?),
+            "ensure_episode_cover" => Self::EnsureEpisodeCover(decode(arguments)?),
             "plan_episode_release" => Self::PlanEpisodeRelease(decode(arguments)?),
             "export_episode_release" => Self::ExportEpisodeRelease(decode(arguments)?),
             "check_episode_quality" => Self::CheckEpisodeQuality(decode(arguments)?),
@@ -268,6 +274,7 @@ impl VideoAgentOperation {
                 require_text(&request.format_id, "format_id")?;
                 require_text(&request.episode_name, "episode_name")
             }
+            Self::EnsureEpisodeCover(request) => require_text(&request.project_id, "project_id"),
             Self::PlanEpisodeRelease(request) | Self::ExportEpisodeRelease(request) => {
                 require_text(&request.project_id, "project_id")
             }
@@ -638,6 +645,16 @@ pub(crate) struct PlanEpisodeReleaseRequest {
     /// Notes are written, not derived, so the caller says whether they exist.
     #[serde(default)]
     pub(crate) has_show_notes: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EnsureEpisodeCoverRequest {
+    pub(crate) project_id: String,
+    /// Draw a new card even though this episode already has a picture. Without it an episode that
+    /// has artwork keeps it, because a generated card is a floor and not an override.
+    #[serde(default)]
+    pub(crate) redraw: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1253,6 +1270,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "save_show_format" => VideoAgentOperationKind::SaveShowFormat,
         "list_show_formats" => VideoAgentOperationKind::ListShowFormats,
         "create_episode" => VideoAgentOperationKind::CreateEpisode,
+        "ensure_episode_cover" => VideoAgentOperationKind::EnsureEpisodeCover,
         "plan_episode_release" => VideoAgentOperationKind::PlanEpisodeRelease,
         "export_episode_release" => VideoAgentOperationKind::ExportEpisodeRelease,
         "check_episode_quality" => VideoAgentOperationKind::CheckEpisodeQuality,
@@ -1451,6 +1469,17 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                     ("format_id", string("A saved show format id")),
                     ("episode_name", string("This episode's name")),
                     ("brief", nullable_string("What this episode is about, recorded as its initial intent")),
+                ]),
+            ),
+        ),
+        tool(
+            "ensure_episode_cover",
+            "Draw this episode's cover so it can be packaged as video. A script performed by voices produces sound and nothing to look at, and every video deliverable needs a picture; this draws one from what the episode already knows about itself - its name, its cast, and its canvas - with no image model and no network. The card is derived, so the same episode always produces the same card, and it is always recorded as generated rather than as artwork the user supplied. An episode that already has a picture keeps it unless redraw is set. Requires Studio or Full access.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("redraw", json!({"type":"boolean","description":"Draw a new card even though this episode already has a picture"})),
                 ]),
             ),
         ),
@@ -2545,8 +2574,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 28);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 28);
+        assert_eq!(names.len(), 29);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 29);
         for required in [
             "preview_link",
             "import_link",
@@ -2562,6 +2591,7 @@ mod tests {
             "save_show_format",
             "list_show_formats",
             "create_episode",
+            "ensure_episode_cover",
             "plan_episode_release",
             "export_episode_release",
             "check_episode_quality",

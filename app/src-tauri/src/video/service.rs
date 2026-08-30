@@ -6,18 +6,19 @@
 
 use super::{
     apply_dialogue_script, apply_lexicon, apply_timeline_edit, build_ass_document,
-    build_audiogram_command, build_loudness_analysis_command, build_podcast_audio_command,
-    build_portrait_command_with_layout, build_proxy_command, build_report, build_thumbnail_command,
-    build_timeline_render_plan, build_trailer_command, build_waveform_command, diff_spoken_words,
-    discover_media_runtime, effective_entries, episode_transcript, ffmetadata_chapters,
-    findings_for_dead_air, findings_for_loudness, findings_for_turn, identify_clip_candidates,
-    instantiate_format, listen_to_episode, local_media_input_args, parse_loudness_analysis,
-    plan_release, preflight_import_url_destination, probe_media, publish_atomic,
+    build_audiogram_command, build_cover_image_command, build_loudness_analysis_command,
+    build_podcast_audio_command, build_portrait_command_with_layout, build_proxy_command,
+    build_report, build_thumbnail_command, build_timeline_render_plan, build_trailer_command,
+    build_waveform_command, cover_spec, diff_spoken_words, discover_media_runtime,
+    effective_entries, episode_transcript, ffmetadata_chapters, findings_for_dead_air,
+    findings_for_loudness, findings_for_turn, identify_clip_candidates, instantiate_format,
+    listen_to_episode, local_media_input_args, parse_loudness_analysis, plan_release,
+    preflight_import_url_destination, probe_media, profile_dimensions, publish_atomic,
     sibling_staging_path, terminate_process_group, validate_import_url, write_ass_document_atomic,
     AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme,
     CastMember, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser, GapReason,
     LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds,
-    NarrationBinding, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
+    NarrationBinding, NormalizedRect, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
     PublicationState, QcReport, RationalFrameRate, RationalRate, ReleaseMemberKind,
     ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole, RenderCommand,
     RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass, ResourceRequest,
@@ -25,9 +26,9 @@ use super::{
     RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
     TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate, VideoEncoder,
     VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_SHOW_FORMATS,
-    MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US,
-    TRAILER_MINIMUM_US, TRAILER_TARGET_US,
+    VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
+    TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -60,6 +61,9 @@ use uuid::Uuid;
 /// The track a performed line is placed on. Named rather than derived so dialogue never lands on
 /// an imported source's audio track.
 const DIALOGUE_TRACK_ID: &str = "dialogue";
+/// The scene soundAr builds for a performed script. Named so it can be recognised later as the one
+/// soundAr owns and may keep in step with the performance.
+const DIALOGUE_SCENE_ID: &str = "dialogue-scene";
 
 const SERVICE_VERSION: &str = "video-service-v1";
 const PROJECT_LOCK_SECONDS: i64 = 120;
@@ -80,6 +84,9 @@ const PACKAGE_METADATA_RESERVE_BYTES: u64 = 64 * 1024 * 1024;
 const DISK_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
+/// A cover is one frame with no encode. Anything slower than this is a stuck process, not a
+/// slow render.
+const COVER_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const SHAREABLE_FILE_MODE: u32 = 0o644;
 const MAX_RENDER_DURATION: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_MEDIA_DURATION_US: i64 = 6 * 60 * 60 * 1_000_000;
@@ -3138,6 +3145,61 @@ fn select_manifest_source<'a>(
     }
 }
 
+/// Whether this episode already has something to look at that soundAr did not draw for it.
+///
+/// Imported video counts, and so does any still the user supplied or generated deliberately. Only
+/// soundAr's own fallback card does not, because a card is what gets replaced once there is a real
+/// picture to replace it with.
+fn episode_has_own_picture(manifest: &VideoProjectManifest) -> bool {
+    if manifest
+        .source_assets
+        .iter()
+        .any(|source| source.probe.has_video)
+    {
+        return true;
+    }
+    manifest.visual_assets.iter().any(|asset| {
+        !matches!(asset.provenance.kind, ProvenanceKind::GeneratedLocally)
+            || !asset.id.starts_with("cover-")
+    })
+}
+
+/// Whether a scene with no imported source is exactly accounted for by the dialogue performed
+/// inside it.
+///
+/// The scene must begin where its first line begins and end where its last line ends, and every
+/// line inside it must have a published take. Silence between lines is the performance's own
+/// timing, not a hole in the scene, so beats are expected rather than treated as missing media.
+fn scene_is_covered_by_its_turns(manifest: &VideoProjectManifest, scene: &ReviewedScene) -> bool {
+    if scene.source_asset_id.is_some() || scene.source_range.is_some() {
+        return false;
+    }
+    let scene_start = scene.timeline_start_us.0;
+    let scene_end = scene_start + scene.timeline_duration_us.0;
+    let mut first = i64::MAX;
+    let mut last = i64::MIN;
+    let mut any = false;
+    for clip in manifest.tracks.iter().flat_map(|track| &track.clips) {
+        if clip.turn_id.is_none() {
+            continue;
+        }
+        let start = clip.timeline_start_us.0;
+        let end = start + clip.timeline_duration_us.0;
+        if start < scene_start || end > scene_end {
+            // A line outside the scene means the scene does not describe the performance.
+            return false;
+        }
+        // An unperformed line has nothing to render; it must not be counted as covering anything.
+        if clip.media.render_artifact_id.is_none() {
+            return false;
+        }
+        any = true;
+        first = first.min(start);
+        last = last.max(end);
+    }
+    any && first == scene_start && last == scene_end
+}
+
 fn validate_timeline_render_contract(
     manifest: &VideoProjectManifest,
     profile: TimelineRenderProfile,
@@ -3181,7 +3243,11 @@ fn validate_timeline_render_contract(
                         (None, None) => clip.media.render_artifact_id.is_some(),
                         _ => false,
                     }
-            });
+            })
+            // A performed scene is backed by the lines performed in it rather than by one clip.
+            // A conversation is many takes with beats between them, so requiring a single clip
+            // spanning the scene would mean no spoken scene could ever be rendered.
+            || scene_is_covered_by_its_turns(manifest, scene);
         if !aligned {
             return Err(VideoServiceError::new(
                 "video.timeline_scene_track_mismatch",
@@ -5882,6 +5948,127 @@ mod tests {
         .expect("valid empty manifest")
     }
 
+    fn performed_turn_clip(index: usize, start_us: i64, duration_us: i64) -> TimelineClip {
+        TimelineClip {
+            id: format!("dialogue-clip-{index}"),
+            scene_id: None,
+            turn_id: Some(format!("turn-{index:04}")),
+            media: MediaReference {
+                source_asset_id: None,
+                render_artifact_id: Some(format!("take-{index:04}")),
+            },
+            source_range: TimeRange::new(0, duration_us).expect("take range"),
+            timeline_start_us: Microseconds(start_us),
+            timeline_duration_us: Microseconds(duration_us),
+            playback_rate: RationalRate::ONE,
+            gain_db_milli: 0,
+            muted: false,
+            crop: None,
+        }
+    }
+
+    fn scene_for_dialogue() -> ReviewedScene {
+        ReviewedScene {
+            id: "dialogue-scene".to_string(),
+            candidate_id: None,
+            source_asset_id: None,
+            source_range: None,
+            timeline_start_us: Microseconds::ZERO,
+            timeline_duration_us: Microseconds(1),
+            title: "Episode".to_string(),
+            script: "A performed conversation".to_string(),
+            review_state: ReviewState::Approved,
+            revision: 1,
+        }
+    }
+
+    fn test_visual_asset(id: &str) -> VisualAsset {
+        VisualAsset {
+            id: id.to_string(),
+            managed_path: "cache/cover/card.png".to_string(),
+            sha256: "a".repeat(64),
+            mime_type: VisualMimeType::Png,
+            width: 1920,
+            height: 1080,
+            has_alpha: false,
+            size_bytes: 4_096,
+            provenance: Provenance {
+                kind: ProvenanceKind::GeneratedLocally,
+                original_uri: None,
+                imported_at: utc_now(),
+                producer: "soundAr cover".to_string(),
+                producer_version: None,
+                metadata: BTreeMap::new(),
+            },
+            created_at: utc_now(),
+        }
+    }
+
+    #[test]
+    fn a_conversation_backs_its_own_scene_even_though_it_is_many_takes() {
+        let mut manifest = empty_manifest("project-cover", "Episode");
+        // Two lines with a beat between them: the silence is the performance's timing, not a hole.
+        manifest.tracks = vec![TimelineTrack {
+            id: DIALOGUE_TRACK_ID.to_string(),
+            kind: TrackKind::Audio,
+            preserve_gaps: false,
+            clips: vec![
+                performed_turn_clip(0, 0, 4_000_000),
+                performed_turn_clip(1, 4_220_000, 3_000_000),
+            ],
+        }];
+        let scene = ReviewedScene {
+            timeline_start_us: Microseconds::ZERO,
+            timeline_duration_us: Microseconds(7_220_000),
+            ..scene_for_dialogue()
+        };
+        assert!(scene_is_covered_by_its_turns(&manifest, &scene));
+
+        // A scene claiming time past the last line is not accounted for by the performance.
+        let overlong = ReviewedScene {
+            timeline_duration_us: Microseconds(9_000_000),
+            ..scene.clone()
+        };
+        assert!(!scene_is_covered_by_its_turns(&manifest, &overlong));
+    }
+
+    #[test]
+    fn an_unperformed_line_does_not_back_a_scene() {
+        let mut unperformed = performed_turn_clip(1, 4_220_000, 3_000_000);
+        // A line with no take has nothing to render, so it cannot count as covering anything.
+        unperformed.media.render_artifact_id = None;
+        let mut manifest = empty_manifest("project-cover", "Episode");
+        manifest.tracks = vec![TimelineTrack {
+            id: DIALOGUE_TRACK_ID.to_string(),
+            kind: TrackKind::Audio,
+            preserve_gaps: false,
+            clips: vec![performed_turn_clip(0, 0, 4_000_000), unperformed],
+        }];
+        let scene = ReviewedScene {
+            timeline_start_us: Microseconds::ZERO,
+            timeline_duration_us: Microseconds(7_220_000),
+            ..scene_for_dialogue()
+        };
+        assert!(!scene_is_covered_by_its_turns(&manifest, &scene));
+    }
+
+    #[test]
+    fn a_drawn_card_never_counts_as_the_episode_having_a_picture() {
+        let mut manifest = empty_manifest("project-cover", "Episode");
+        assert!(!episode_has_own_picture(&manifest));
+
+        let mut card = test_visual_asset("cover-abcdef0123456789abcdef01");
+        card.provenance.kind = ProvenanceKind::GeneratedLocally;
+        manifest.visual_assets.push(card);
+        // Otherwise soundAr would treat its own fallback as a reason not to draw a better one.
+        assert!(!episode_has_own_picture(&manifest));
+
+        let mut chosen = test_visual_asset("still-abcdef0123456789abcdef01");
+        chosen.provenance.kind = ProvenanceKind::UserUpload;
+        manifest.visual_assets.push(chosen);
+        assert!(episode_has_own_picture(&manifest));
+    }
+
     fn test_png_bytes(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = vec![0_u8; 30];
         bytes[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -6133,6 +6320,185 @@ mod tests {
             created_at: utc_now(),
             updated_at: utc_now(),
         }
+    }
+
+    #[test]
+    fn a_generated_scene_tracks_the_performance_without_churning_a_matching_one() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        let mut manifest = empty_manifest(&project_id, "Episode");
+        let spoken_end = 7_220_000;
+        manifest.cast.push(crate::video::cast::CastMember {
+            id: "ch-mara".to_string(),
+            name: "MARA".to_string(),
+            display_name: "Mara".to_string(),
+            voice_id: "af_heart".to_string(),
+            model_id: "hexgrad/Kokoro-82M".to_string(),
+            language: "en-US".to_string(),
+            delivery: Default::default(),
+            consent_reference_id: None,
+            notes: None,
+            created_at: utc_now(),
+        });
+        for index in 0..2 {
+            manifest.render_artifacts.push(RenderArtifact {
+                id: format!("take-{index:04}"),
+                role: RenderArtifactRole::SceneSegment,
+                scene_id: None,
+                managed_path: format!("cache/narration/take-{index:04}.wav"),
+                sha256: format!("{index:064}"),
+                cache_key: format!("{index:064}"),
+                mime_type: "audio/wav".to_string(),
+                duration_us: Some(Microseconds(4_000_000)),
+                width: None,
+                height: None,
+                publication_state: PublicationState::Published,
+                created_at: utc_now(),
+            });
+            manifest.dialogue.push(crate::video::cast::DialogueTurn {
+                id: format!("turn-{index:04}"),
+                scene_id: None,
+                order: index,
+                character_id: "ch-mara".to_string(),
+                text: format!("Line {index}."),
+                direction: None,
+                source_line: index + 1,
+                revision: 1,
+            });
+        }
+        manifest.tracks = vec![TimelineTrack {
+            id: DIALOGUE_TRACK_ID.to_string(),
+            kind: TrackKind::Audio,
+            preserve_gaps: false,
+            clips: vec![
+                performed_turn_clip(0, 0, 4_000_000),
+                performed_turn_clip(1, 4_220_000, 3_000_000),
+            ],
+        }];
+        // An episode whose scene was built before the length rule existed carries its show
+        // format's planning target rather than what was actually performed.
+        manifest.reviewed_scenes.push(ReviewedScene {
+            timeline_duration_us: Microseconds(600_000_000),
+            ..scene_for_dialogue()
+        });
+        manifest.timeline_duration_us = Microseconds(600_000_000);
+        let created = workspace
+            .service
+            .create_project(CreateVideoProjectRequest {
+                name: "Episode".to_string(),
+                manifest,
+                actor: "service-test".to_string(),
+                initial_intent: None,
+            })
+            .expect("create the episode");
+
+        let corrected = workspace
+            .service
+            .ensure_dialogue_scene(&project_id, "service-test")
+            .expect("bring the scene back in step");
+        let after: VideoProjectManifest =
+            serde_json::from_value(corrected.get("manifest").cloned().expect("manifest"))
+                .expect("decode");
+        // The episode is as long as it was performed, not as long as the show usually runs.
+        assert_eq!(after.timeline_duration_us, Microseconds(spoken_end));
+        assert_eq!(after.reviewed_scenes.len(), 1);
+        assert_eq!(
+            after.reviewed_scenes[0].timeline_duration_us,
+            Microseconds(spoken_end)
+        );
+        assert!(
+            value_i64(&corrected, "revision").expect("revision")
+                > value_i64(&created, "revision").expect("revision")
+        );
+
+        // Asking again changes nothing, so a re-narration cannot churn the revision and invalidate
+        // every render that depends on it.
+        let again = workspace
+            .service
+            .ensure_dialogue_scene(&project_id, "service-test")
+            .expect("already in step");
+        assert_eq!(
+            value_i64(&again, "revision").expect("revision"),
+            value_i64(&corrected, "revision").expect("revision")
+        );
+    }
+
+    #[test]
+    fn a_cover_is_drawn_once_redrawn_on_request_and_replaced_when_its_file_goes_missing() {
+        let workspace = TestWorkspace::new();
+        // Drawing needs FFmpeg; without it there is nothing to assert about a drawn card.
+        if !workspace.service.runtime_status(false).ffmpeg.available {
+            return;
+        }
+        let project_id = format!("project-{}", new_id());
+        let mut manifest = empty_manifest(&project_id, "The Quiet Server");
+        // A card covers a performance, so the episode needs one to cover.
+        manifest.reviewed_scenes.push(ReviewedScene {
+            timeline_duration_us: Microseconds(17_580_000),
+            ..scene_for_dialogue()
+        });
+        manifest.timeline_duration_us = Microseconds(17_580_000);
+        workspace
+            .service
+            .create_project(CreateVideoProjectRequest {
+                name: "The Quiet Server".to_string(),
+                manifest,
+                actor: "service-test".to_string(),
+                initial_intent: None,
+            })
+            .expect("create the episode");
+
+        let first = workspace
+            .service
+            .ensure_episode_cover(&project_id, "service-test", false)
+            .expect("draw the cover");
+        let manifest: VideoProjectManifest =
+            serde_json::from_value(first.get("manifest").cloned().expect("manifest"))
+                .expect("decode manifest");
+        let card = manifest
+            .visual_assets
+            .iter()
+            .find(|asset| asset.id.starts_with("cover-"))
+            .expect("a card was drawn");
+        // Recorded as generated, so it is never mistaken for artwork the user supplied.
+        assert!(matches!(
+            card.provenance.kind,
+            ProvenanceKind::GeneratedLocally
+        ));
+        let card_path = workspace
+            .service
+            .resolve_managed_path(&card.managed_path)
+            .expect("resolve the card");
+        assert!(card_path.is_file());
+        let revision_after_first = value_i64(&first, "revision").expect("revision");
+
+        // Asking again for an unchanged episode must not churn the revision: the file would be
+        // byte-identical, and bumping it would invalidate every render that depends on it.
+        let second = workspace
+            .service
+            .ensure_episode_cover(&project_id, "service-test", false)
+            .expect("second request");
+        assert_eq!(
+            value_i64(&second, "revision").expect("revision"),
+            revision_after_first
+        );
+
+        // A manifest entry pointing at a file that is gone is not a picture, so it is drawn again
+        // rather than reported as present.
+        fs::remove_file(&card_path).expect("remove the card");
+        workspace
+            .service
+            .ensure_episode_cover(&project_id, "service-test", false)
+            .expect("redraw after the file went missing");
+        assert!(card_path.is_file(), "a missing card was not drawn again");
+
+        // An explicit redraw draws even when the card is present and unchanged.
+        fs::remove_file(&card_path).expect("remove the card again");
+        workspace
+            .service
+            .ensure_episode_cover(&project_id, "service-test", true)
+            .expect("explicit redraw");
+        assert!(card_path.is_file());
     }
 
     #[test]
@@ -12815,6 +13181,321 @@ impl VideoStudioService {
     ///
     /// Does nothing when the project already has scenes, so an author's own divisions are never
     /// replaced by a generated one.
+    /// The id a generated cover claims for one exact card, so regenerating an unchanged episode
+    /// finds its existing asset instead of stacking a second identical one.
+    fn cover_asset_id(cache_key: &str) -> String {
+        format!("cover-{}", &cache_key[..24])
+    }
+
+    /// Draw and attach this episode's cover, so an episode with nothing to look at still has a
+    /// picture and can therefore be packaged as video.
+    ///
+    /// The card is derived from the episode - its name, its cast, its canvas - so it is stable,
+    /// cacheable, and reproducible. It is registered as generated, never as user artwork, and it is
+    /// placed underneath everything else so a real image added later simply covers it.
+    pub fn ensure_episode_cover(
+        &self,
+        project_id: &str,
+        actor: &str,
+        redraw: bool,
+    ) -> ServiceResult<Value> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+
+        // An episode that already has something to look at is left alone. A drawn card is a floor
+        // for episodes that have no picture, never a replacement for one the user chose.
+        if !redraw && episode_has_own_picture(&manifest) {
+            return Ok(record);
+        }
+
+        // A card is drawn at the canvas it will be composited onto, so it is never upscaled.
+        let (width, height) = profile_dimensions(RenderProfile::Final, &manifest.layout);
+        let spec = cover_spec(project_id, &manifest.name, &manifest.cast, width, height);
+        let cache_key = spec.cache_key();
+        let asset_id = Self::cover_asset_id(&cache_key);
+        // An unchanged episode keeps the card it already has. Redrawing it would churn the
+        // revision and invalidate renders for a file that would be byte-identical. A card whose
+        // file has gone missing is not a card, so it is drawn again rather than left as a manifest
+        // entry pointing at nothing.
+        let existing = manifest
+            .visual_assets
+            .iter()
+            .find(|asset| asset.id == asset_id);
+        if !redraw {
+            if let Some(existing) = existing {
+                if self
+                    .resolve_managed_path(&existing.managed_path)
+                    .is_ok_and(|path| path.is_file())
+                {
+                    return Ok(record);
+                }
+            }
+        }
+
+        let span_us = self.episode_span_us(&manifest);
+        if span_us <= 0 {
+            return Err(VideoServiceError::new(
+                "video.cover_span_unknown",
+                "This episode has no duration yet, so a cover has nothing to cover",
+            ));
+        }
+
+        let runtime = self.runtime_status(false);
+        let ffmpeg = required_tool_path(
+            &runtime.ffmpeg,
+            "video.ffmpeg_unavailable",
+            "FFmpeg is required to draw a cover",
+        )?;
+
+        let output = self.cache_path("cover", &cache_key, "png")?;
+        if !output.is_file() {
+            let text_dir = self.video_root.join("cache").join("cover");
+            self.secure_managed_directory(&text_dir)?;
+            // Title and cast reach FFmpeg as files, never as filter arguments: a name containing a
+            // comma or a quote is text, and must not be able to become filter syntax.
+            let title_path = self.write_cover_text(&text_dir, &cache_key, "title", &spec.title)?;
+            let subtitle_path = if spec.subtitle.is_empty() {
+                None
+            } else {
+                Some(self.write_cover_text(&text_dir, &cache_key, "cast", &spec.subtitle)?)
+            };
+            let staging = sibling_staging_path(&output)?;
+            let plan = build_cover_image_command(
+                ffmpeg,
+                &spec,
+                &title_path,
+                subtitle_path.as_deref(),
+                &staging,
+            )?;
+            self.run_cover_plan(&plan)?;
+            publish_atomic(&staging, &output, validate_image_file)?;
+        } else {
+            validate_image_file(&output)?;
+        }
+
+        let size_bytes = fs::metadata(&output)
+            .map_err(|error| {
+                VideoServiceError::io(
+                    "video.cover_failed",
+                    "The generated cover could not be measured",
+                    error,
+                )
+            })?
+            .len();
+        let sha256 = sha256_file(&output)?;
+        let managed_path = self.relative_managed_path(&output)?;
+        let created_at = utc_now();
+        let asset = VisualAsset {
+            id: asset_id.clone(),
+            managed_path,
+            sha256,
+            mime_type: VisualMimeType::Png,
+            width,
+            height,
+            has_alpha: false,
+            size_bytes,
+            provenance: Provenance {
+                // Generated, and recorded as such: a drawn card must never be mistaken for
+                // artwork the user supplied.
+                kind: ProvenanceKind::GeneratedLocally,
+                original_uri: None,
+                imported_at: created_at.clone(),
+                producer: "soundAr cover".to_string(),
+                producer_version: Some(SERVICE_VERSION.to_string()),
+                metadata: BTreeMap::from([
+                    ("cache_key".to_string(), json!(cache_key)),
+                    ("title".to_string(), json!(spec.title)),
+                    ("cast_line".to_string(), json!(spec.subtitle)),
+                ]),
+            },
+            created_at: created_at.clone(),
+        };
+        asset.validate()?;
+
+        let full_canvas = NormalizedRect {
+            x_bp: 0,
+            y_bp: 0,
+            width_bp: 10_000,
+            height_bp: 10_000,
+        };
+        let layer = VisualLayer {
+            id: format!("cover-layer-{}", &cache_key[..16]),
+            asset_id,
+            scene_id: None,
+            range: TimeRange::new(0, span_us)?,
+            fit: VisualFit::Cover,
+            crop: None,
+            // Underneath everything: a generated card is a floor, not a decision about the frame.
+            z_index: -128,
+            motion: VisualMotion {
+                start_bounds: full_canvas,
+                end_bounds: full_canvas,
+                start_opacity_milli: 1_000,
+                end_opacity_milli: 1_000,
+                start_rotation_milli_degrees: 0,
+                end_rotation_milli_degrees: 0,
+                easing: VisualEasing::Linear,
+            },
+            transition_in_us: Microseconds::ZERO,
+            transition_out_us: Microseconds::ZERO,
+        };
+        layer.validate()?;
+
+        let expectation = project_expectation(&record)?;
+        self.commit_manifest_mutation_at_if_parent_active(
+            project_id,
+            &expectation,
+            actor,
+            "Draw a cover for an episode with no picture",
+            None,
+            vec!["/visual_assets".to_string(), "/visual_layers".to_string()],
+            BTreeSet::from([
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ]),
+            None,
+            move |manifest: &mut VideoProjectManifest| {
+                // Replace any previous generated cover rather than accumulating one per rename.
+                let stale = manifest
+                    .visual_assets
+                    .iter()
+                    .filter(|existing| existing.id.starts_with("cover-"))
+                    .map(|existing| existing.id.clone())
+                    .collect::<Vec<_>>();
+                manifest
+                    .visual_layers
+                    .retain(|existing| !stale.contains(&existing.asset_id));
+                manifest
+                    .visual_assets
+                    .retain(|existing| !existing.id.starts_with("cover-"));
+                manifest.visual_assets.push(asset.clone());
+                manifest.visual_layers.push(layer.clone());
+                Ok(())
+            },
+        )
+    }
+
+    /// How long this episode runs, measured from what has actually been placed on its clock.
+    fn episode_span_us(&self, manifest: &VideoProjectManifest) -> i64 {
+        let scene_end = manifest
+            .reviewed_scenes
+            .iter()
+            .map(|scene| scene.timeline_start_us.0 + scene.timeline_duration_us.0)
+            .max()
+            .unwrap_or_default();
+        let clip_end = manifest
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .map(|clip| clip.timeline_start_us.0 + clip.timeline_duration_us.0)
+            .max()
+            .unwrap_or_default();
+        scene_end.max(clip_end)
+    }
+
+    /// Stage one piece of cover text as its own managed file.
+    fn write_cover_text(
+        &self,
+        directory: &Path,
+        cache_key: &str,
+        role: &str,
+        value: &str,
+    ) -> ServiceResult<PathBuf> {
+        let path = directory.join(format!("{cache_key}.{role}.txt"));
+        if path.is_file() {
+            return Ok(path);
+        }
+        let staging = sibling_staging_path(&path)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(PRIVATE_FILE_MODE)
+            .open(&staging)
+            .map_err(|error| {
+                VideoServiceError::io(
+                    "video.cover_failed",
+                    "The cover text could not be staged",
+                    error,
+                )
+            })?;
+        file.write_all(value.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|error| {
+                VideoServiceError::io(
+                    "video.cover_failed",
+                    "The cover text could not be written",
+                    error,
+                )
+            })?;
+        secure_managed_file(&staging)?;
+        publish_atomic(&staging, &path, |candidate| {
+            if fs::metadata(candidate).is_ok_and(|metadata| metadata.len() > 0) {
+                Ok(())
+            } else {
+                Err(MediaError::new(
+                    "cover_text_empty",
+                    "The cover text was published empty",
+                ))
+            }
+        })?;
+        Ok(path)
+    }
+
+    /// Run a cover card render.
+    ///
+    /// A single frame with no encode has no progress to report and finishes in well under a
+    /// second, so it runs directly under a hard deadline rather than through the job and progress
+    /// machinery that exists for renders a user waits on.
+    fn run_cover_plan(&self, plan: &RenderCommandPlan) -> ServiceResult<()> {
+        let mut child = plan.primary.command().spawn().map_err(|error| {
+            VideoServiceError::io(
+                "video.cover_failed",
+                "The cover render could not start",
+                error,
+            )
+        })?;
+        let deadline = Instant::now() + COVER_RENDER_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(_)) => {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    return Err(VideoServiceError::new(
+                        "video.cover_failed",
+                        "The cover could not be drawn",
+                    )
+                    .details(json!({ "stderr": truncate_chars(stderr.trim(), 400) })));
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = terminate_process_group(&mut child, Duration::from_secs(2));
+                    return Err(VideoServiceError::new(
+                        "video.cover_failed",
+                        "The cover render exceeded its time budget",
+                    ));
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(error) => {
+                    return Err(VideoServiceError::io(
+                        "video.cover_failed",
+                        "The cover render could not be supervised",
+                        error,
+                    ))
+                }
+            }
+        }
+    }
+
     pub fn ensure_dialogue_scene(&self, project_id: &str, actor: &str) -> ServiceResult<Value> {
         let record = self.get_project(project_id)?;
         let manifest: VideoProjectManifest = serde_json::from_value(
@@ -12824,7 +13505,17 @@ impl VideoStudioService {
                 .ok_or_else(|| invalid_store_shape("manifest"))?,
         )
         .map_err(json_error)?;
-        if !manifest.reviewed_scenes.is_empty() || manifest.dialogue.is_empty() {
+        if manifest.dialogue.is_empty() {
+            return Ok(record);
+        }
+        // soundAr owns the scene it generated and keeps it matching the performance; it never
+        // rewrites divisions the author made. Once the episode has been divided deliberately, its
+        // shape is the author's, and a re-narration must not flatten it back into one scene.
+        let owns_the_only_scene = matches!(
+            manifest.reviewed_scenes.as_slice(),
+            [scene] if scene.id == DIALOGUE_SCENE_ID
+        );
+        if !manifest.reviewed_scenes.is_empty() && !owns_the_only_scene {
             return Ok(record);
         }
         let spoken_end = manifest
@@ -12841,6 +13532,16 @@ impl VideoStudioService {
                 "Narrate the script before building its scene",
             ));
         }
+        // A scene that already matches the performance is left exactly as it is. Committing an
+        // identical scene would bump the revision and invalidate every render that depends on it.
+        if manifest.reviewed_scenes.iter().any(|scene| {
+            scene.id == DIALOGUE_SCENE_ID
+                && scene.timeline_start_us == Microseconds::ZERO
+                && scene.timeline_duration_us == Microseconds(spoken_end)
+        }) && manifest.timeline_duration_us == Microseconds(spoken_end)
+        {
+            return Ok(record);
+        }
 
         let expectation = project_expectation(&record)?;
         let script = manifest
@@ -12856,7 +13557,10 @@ impl VideoStudioService {
             actor,
             "Build the scene for a performed script",
             Some("ready"),
-            vec!["/reviewed_scenes".to_string()],
+            vec![
+                "/reviewed_scenes".to_string(),
+                "/timeline_duration_us".to_string(),
+            ],
             BTreeSet::from([
                 RevisionStage::Plan,
                 RevisionStage::Captions,
@@ -12868,8 +13572,13 @@ impl VideoStudioService {
             ]),
             None,
             move |manifest: &mut VideoProjectManifest| {
+                // Replace rather than append: re-narrating a script must leave one scene that
+                // matches the performance, not a second one stacked on the first.
+                manifest
+                    .reviewed_scenes
+                    .retain(|scene| scene.id != DIALOGUE_SCENE_ID);
                 manifest.reviewed_scenes.push(ReviewedScene {
-                    id: "dialogue-scene".to_string(),
+                    id: DIALOGUE_SCENE_ID.to_string(),
                     candidate_id: None,
                     source_asset_id: None,
                     source_range: None,
@@ -12880,6 +13589,11 @@ impl VideoStudioService {
                     review_state: ReviewState::Approved,
                     revision: 1,
                 });
+                // An episode is as long as it was performed. Until now it carried the show
+                // format's planning target, which is how long an episode of this show usually
+                // runs - a target, never a measurement - so a 17-second conversation rendered as
+                // ten minutes of silence with a picture held over it.
+                manifest.timeline_duration_us = Microseconds(spoken_end);
                 Ok(())
             },
         )

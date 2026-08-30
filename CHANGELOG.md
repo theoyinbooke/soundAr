@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.1.2 - 2026-08-30
+
+- Drew a picture for episodes that have none. A script performed by voices produces sound and
+  nothing to look at, and every video deliverable needs a picture, so an audio-only episode could
+  not be rendered or packaged at all. soundAr now draws a cover from what the episode already knows
+  about itself - its name, its cast, and its canvas - using FFmpeg alone, with no image model and no
+  network. The card is derived, so the same episode always produces the same card; it is recorded as
+  generated rather than as artwork the user supplied; and an episode that already has a picture
+  keeps it. It is drawn automatically once a script has been performed, and can be drawn or redrawn
+  from the Shows episode screen, the `ensure_episode_cover` agent tool, and the headless CLI.
+- Let a performed conversation back its own scene. A conversation is many takes with beats between
+  them, and the render contract demanded a single clip spanning the scene, so no spoken scene could
+  ever be rendered. A scene now counts as backed when it begins where its first line begins, ends
+  where its last line ends, and contains only lines that have a published take.
+- Made an episode as long as it was performed. An episode carried its show format's planning target
+  as its actual length, so a seventeen-second conversation rendered as ten minutes of silence held
+  under a picture.
+- Removed a flaky test that would have failed roughly one run in five. Several media tests write a
+  small script and then execute it, and a sibling test forking in that window inherits the still-open
+  write descriptor, so the exec fails with `ETXTBSY`. Making an executable in a test now waits until
+  it can actually be run. Forty consecutive suite runs pass where the previous arrangement failed
+  eight times in seventy.
+- Kept a generated scene in step with its performance. The scene soundAr builds for a performed
+  script was only ever built once, so an episode narrated again kept whatever length it was first
+  given. soundAr now keeps the scene it owns matching the performance while never rewriting
+  divisions the author made, and leaves a matching scene untouched rather than bumping the revision
+  and invalidating every render that depends on it.
+- Made a generated cover's address cover how it is drawn, not only what it is drawn from. Type
+  sizes are derived from the canvas, so hashing the inputs alone let a change to the drawing rules
+  keep serving cards drawn by the old ones - silently, and for good.
+- Fixed generated stills being written in the wrong format. FFmpeg picked the image encoder from the
+  output filename, and a card is written to a staging name with no extension, so a file named `.png`
+  was actually a JPEG - which then failed to load as a still layer during assembly.
+
 ## 0.1.1 - 2026-08-30
 
 The version line restarts here. Everything below this entry shipped under the numbers `0.3.0`

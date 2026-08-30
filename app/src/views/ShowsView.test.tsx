@@ -47,6 +47,19 @@ describe("ShowsView", () => {
     expect(await screen.findByRole("button", { name: /^Inspect Creator update · Reel master$/ })).toBeVisible();
   });
 
+  it("says an episode has no picture and therefore cannot be packaged", async () => {
+    const user = userEvent.setup();
+    renderShows();
+
+    await user.click(await screen.findByRole("button", { name: /^Inspect Creator update · Reel master$/ }));
+    const picture = await screen.findByRole("region", { name: "Picture" });
+
+    // Without a picture the episode cannot render at all, so the surface says that rather than
+    // leaving an empty panel that reads as "nothing to do here".
+    expect(within(picture).getByText(/cannot be rendered or packaged as video/i)).toBeVisible();
+    expect(within(picture).getByRole("button", { name: /Draw cover/ })).toBeEnabled();
+  });
+
   it("hands a selected episode to the editor rather than opening a second one", async () => {
     const user = userEvent.setup();
     const onOpenProject = vi.fn();

@@ -1066,6 +1066,11 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
     async listShowFormats() {
       return [...showFormats.values()].map(clone);
     },
+    async ensureEpisodeCover() {
+      // Browser preview has no FFmpeg to draw with, so it says so rather than pretending a card
+      // was produced.
+      throw new Error("Cover art is drawn by the soundAr desktop app.");
+    },
     async saveShowFormat(format) {
       const existing = showFormats.get(format.id);
       // soundAr owns the revision so two formats cannot claim the same provenance.
@@ -1431,6 +1436,7 @@ function createNativeVideoService(): VideoStudioService {
     saveShowFormat: (format) => invoke<VideoShowFormat>("save_show_format", { format }),
     deleteShowFormat: (formatId) => invoke<void>("delete_show_format", { formatId }),
     createEpisode: (formatId, episodeName, brief) => invoke<VideoProject>("create_episode", { formatId, episodeName, brief }).then(withNativeProjectUrls),
+    ensureEpisodeCover: (projectId, redraw) => invoke<VideoProject>("ensure_episode_cover", { projectId, redraw: redraw ?? false }),
     planEpisodeRelease: (projectId, hasShowNotes) => invoke<VideoReleasePlan>("plan_episode_release", { projectId, hasShowNotes }),
     exportEpisodeRelease: (projectId, hasShowNotes) =>
       invoke<VideoReleaseExportResult>("export_episode_release", { projectId, hasShowNotes }).then((result) => ({ ...result, project: withNativeProjectUrls(result.project) })),

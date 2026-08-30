@@ -427,6 +427,22 @@ pub(crate) fn dispatch_video_operation(
                 None,
             )
         }
+        VideoAgentOperation::EnsureEpisodeCover(request) => {
+            let record = runtime
+                .video
+                .ensure_episode_cover(&request.project_id, "video-studio-producer", request.redraw)
+                .map_err(VideoAgentToolError::from)?;
+            let project =
+                video::present_video_project(&record, &runtime.store.video_artifacts_root())
+                    .map_err(VideoAgentToolError::from)?;
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Ready,
+                "The episode has a picture, so it can be rendered and packaged as video",
+                project,
+                None,
+            )
+        }
         VideoAgentOperation::ListenToEpisode(request) => {
             let loudness = match (request.integrated_lufs_milli, request.true_peak_db_milli) {
                 (Some(integrated_lufs_milli), Some(true_peak_db_milli)) => {
@@ -1179,6 +1195,29 @@ pub(crate) async fn export_episode_release(
 }
 
 #[tauri::command]
+pub(crate) async fn ensure_episode_cover(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    redraw: Option<bool>,
+) -> Result<Value, String> {
+    let runtime = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let record = runtime
+            .video
+            .ensure_episode_cover(
+                &project_id,
+                "video-studio-producer",
+                redraw.unwrap_or(false),
+            )
+            .map_err(service_error)?;
+        video::present_video_project(&record, &runtime.store.video_artifacts_root())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Cover worker failed: {error}"))?
+}
+
+#[tauri::command]
 pub(crate) async fn plan_episode_release(
     state: tauri::State<'_, RuntimeState>,
     project_id: String,
@@ -1694,9 +1733,17 @@ pub(crate) fn narrate_turns(
 
     // A script written as dialogue has no scenes, and rendering, captions, and chapters are all
     // scene-shaped. Building one once the lines are performed is what makes the episode renderable.
-    let record = runtime
+    runtime
         .video
         .ensure_dialogue_scene(project_id, "video-studio-performer")
+        .map_err(service_error)?;
+
+    // Voices produce sound and nothing to look at, and every video deliverable needs a picture.
+    // Drawing one here means a performed episode is packageable without the user having to know
+    // that a picture was the missing piece. An episode that already has one keeps it.
+    let record = runtime
+        .video
+        .ensure_episode_cover(project_id, "video-studio-performer", false)
         .map_err(service_error)?;
 
     video::present_video_project(&record, &runtime.store.video_artifacts_root())
