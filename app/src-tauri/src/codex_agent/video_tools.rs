@@ -63,6 +63,7 @@ pub(crate) enum VideoAgentOperationKind {
     PlanEpisodeRelease,
     ExportEpisodeRelease,
     CheckEpisodeQuality,
+    TranscribeAndCheckEpisode,
     ListenToEpisode,
     RegisterGeneratedVisual,
     AddVisualAsset,
@@ -95,6 +96,7 @@ impl VideoAgentOperationKind {
             Self::PlanEpisodeRelease => "plan_episode_release",
             Self::ExportEpisodeRelease => "export_episode_release",
             Self::CheckEpisodeQuality => "check_episode_quality",
+            Self::TranscribeAndCheckEpisode => "transcribe_and_check_episode",
             Self::ListenToEpisode => "listen_to_episode",
             Self::RegisterGeneratedVisual => "register_generated_visual",
             Self::AddVisualAsset => "add_visual_asset",
@@ -127,7 +129,8 @@ impl VideoAgentOperationKind {
             | Self::ExportPublishPackage
             | Self::PlanEpisodeRelease
             | Self::ExportEpisodeRelease
-            | Self::CheckEpisodeQuality => VideoProductionPhase::Export,
+            | Self::CheckEpisodeQuality
+            | Self::TranscribeAndCheckEpisode => VideoProductionPhase::Export,
             Self::ListVideoProjects
             | Self::GetVideoProject
             | Self::SaveShowFormat
@@ -159,6 +162,7 @@ pub(crate) enum VideoAgentOperation {
     PlanEpisodeRelease(PlanEpisodeReleaseRequest),
     ExportEpisodeRelease(PlanEpisodeReleaseRequest),
     CheckEpisodeQuality(CheckEpisodeQualityRequest),
+    TranscribeAndCheckEpisode(TranscribeAndCheckEpisodeRequest),
     ListenToEpisode(ListenToEpisodeRequest),
     RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
     AddVisualAsset(video::AddVisualAssetRequest),
@@ -190,6 +194,9 @@ impl VideoAgentOperation {
             Self::PlanEpisodeRelease(_) => VideoAgentOperationKind::PlanEpisodeRelease,
             Self::ExportEpisodeRelease(_) => VideoAgentOperationKind::ExportEpisodeRelease,
             Self::CheckEpisodeQuality(_) => VideoAgentOperationKind::CheckEpisodeQuality,
+            Self::TranscribeAndCheckEpisode(_) => {
+                VideoAgentOperationKind::TranscribeAndCheckEpisode
+            }
             Self::ListenToEpisode(_) => VideoAgentOperationKind::ListenToEpisode,
             Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
             Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
@@ -222,6 +229,7 @@ impl VideoAgentOperation {
             "plan_episode_release" => Self::PlanEpisodeRelease(decode(arguments)?),
             "export_episode_release" => Self::ExportEpisodeRelease(decode(arguments)?),
             "check_episode_quality" => Self::CheckEpisodeQuality(decode(arguments)?),
+            "transcribe_and_check_episode" => Self::TranscribeAndCheckEpisode(decode(arguments)?),
             "listen_to_episode" => Self::ListenToEpisode(decode(arguments)?),
             "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
             "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
@@ -258,6 +266,10 @@ impl VideoAgentOperation {
                 require_text(&request.project_id, "project_id")
             }
             Self::CheckEpisodeQuality(request) => require_text(&request.project_id, "project_id"),
+            Self::TranscribeAndCheckEpisode(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.model_id, "model_id")
+            }
             Self::ListenToEpisode(request) => require_text(&request.project_id, "project_id"),
             Self::PreviewLink(request) => {
                 require_text(&request.exact_url, "exact_url")?;
@@ -580,6 +592,13 @@ pub(crate) struct ListenToEpisodeRequest {
     pub(crate) integrated_lufs_milli: Option<i32>,
     #[serde(default)]
     pub(crate) true_peak_db_milli: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TranscribeAndCheckEpisodeRequest {
+    pub(crate) project_id: String,
+    pub(crate) model_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1210,6 +1229,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "plan_episode_release" => VideoAgentOperationKind::PlanEpisodeRelease,
         "export_episode_release" => VideoAgentOperationKind::ExportEpisodeRelease,
         "check_episode_quality" => VideoAgentOperationKind::CheckEpisodeQuality,
+        "transcribe_and_check_episode" => VideoAgentOperationKind::TranscribeAndCheckEpisode,
         "listen_to_episode" => VideoAgentOperationKind::ListenToEpisode,
         "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
         "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
@@ -1243,6 +1263,7 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::ExportVideo
                 | VideoAgentOperationKind::ExportPublishPackage
                 | VideoAgentOperationKind::ExportEpisodeRelease
+                | VideoAgentOperationKind::TranscribeAndCheckEpisode
                 | VideoAgentOperationKind::CancelVideoJob
                 | VideoAgentOperationKind::ResumeVideoJob
         )
@@ -1414,6 +1435,17 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                     ("project_id", string("Video Studio project id")),
                     ("integrated_lufs_milli", json!({"type":["integer","null"],"description":"Measured integrated loudness of the master, in milli-LUFS. Never estimate this."})),
                     ("true_peak_db_milli", json!({"type":["integer","null"],"description":"Measured true peak of the master, in milli-dBTP"})),
+                ]),
+            ),
+        ),
+        tool(
+            "transcribe_and_check_episode",
+            "Listen back to every narrated line with an installed local transcription model, measure the master's loudness, and check both against what the episode was asked to be. This is the measuring half of quality control: prefer it over check_episode_quality, which requires you to supply what was heard yourself. A line whose take cannot be transcribed is reported as unchecked rather than as passed. Requires Studio or Full access.",
+            object_schema(
+                &["project_id", "model_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("model_id", string("An installed local transcription model id")),
                 ]),
             ),
         ),
@@ -2473,8 +2505,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 26);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 26);
+        assert_eq!(names.len(), 27);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 27);
         for required in [
             "preview_link",
             "import_link",
@@ -2492,6 +2524,7 @@ mod tests {
             "plan_episode_release",
             "export_episode_release",
             "check_episode_quality",
+            "transcribe_and_check_episode",
             "listen_to_episode",
             "register_generated_visual",
             "add_visual_asset",

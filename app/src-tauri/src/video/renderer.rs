@@ -524,6 +524,53 @@ pub fn build_podcast_audio_command(
     })
 }
 
+/// Measure a master's loudness without producing a file.
+///
+/// `loudnorm` in analysis mode writes its measurement to stderr and decodes to null, so this
+/// reads the same numbers a platform's own normalizer will read rather than approximating them.
+pub fn build_loudness_analysis_command(
+    ffmpeg: &Path,
+    input: &Path,
+) -> Result<RenderCommand, MediaError> {
+    let ffmpeg = fs::canonicalize(ffmpeg).map_err(|error| {
+        MediaError::new("ffmpeg_unavailable", "FFmpeg could not be resolved")
+            .detail(error.to_string())
+    })?;
+    if !is_executable_file(&ffmpeg) {
+        return Err(MediaError::new(
+            "ffmpeg_unavailable",
+            "The configured FFmpeg path is not executable",
+        ));
+    }
+    let input = fs::canonicalize(input).map_err(|error| {
+        MediaError::new(
+            "render_input_not_found",
+            "The measured media could not be opened",
+        )
+        .detail(error.to_string())
+    })?;
+
+    let mut args = vec![OsString::from("-hide_banner"), OsString::from("-nostdin")];
+    args.extend(local_media_input_args(&input)?);
+    args.extend([
+        OsString::from("-map"),
+        OsString::from("0:a:0"),
+        OsString::from("-af"),
+        OsString::from("loudnorm=print_format=json"),
+        OsString::from("-f"),
+        OsString::from("null"),
+        OsString::from("-"),
+    ]);
+    Ok(RenderCommand {
+        program: ffmpeg,
+        args,
+        // Analysis writes no file; the measurement is the output.
+        output: PathBuf::from("/dev/null"),
+        encoder: VideoEncoder::AudioOnly,
+        emits_progress: false,
+    })
+}
+
 /// Cut a short vertical trailer out of the finished master.
 ///
 /// The range is placed before the input so FFmpeg seeks rather than decoding to the cut point,
@@ -1301,6 +1348,35 @@ mod tests {
             Some("Act 2; the reveal")
         );
         assert_eq!(probe.chapters[1].start_us, 2_000_000);
+    }
+
+    #[test]
+    fn loudness_is_measured_from_the_media_rather_than_assumed() {
+        let Some(ffmpeg) = find_in_path("ffmpeg") else {
+            return;
+        };
+        let root = TestDirectory::new("loudness");
+        let master = root.0.join("master.mp4");
+        assert!(
+            fixture_media(&ffmpeg, &master, "3"),
+            "the fixture master could not be rendered"
+        );
+
+        let command = build_loudness_analysis_command(&ffmpeg, &master).expect("build analysis");
+        let output = command.command().output().expect("run loudness analysis");
+        assert!(output.status.success());
+        // Analysis writes its measurement to stderr and produces no file.
+        let measured = crate::video::quality::parse_loudness_analysis(&String::from_utf8_lossy(
+            &output.stderr,
+        ))
+        .expect("a measurement from real media");
+        // A 440 Hz tone is loud and well above silence; the exact value is the tone's, not ours.
+        assert!(
+            measured.integrated_lufs_milli > -40_000 && measured.integrated_lufs_milli < 0,
+            "implausible integrated loudness: {}",
+            measured.integrated_lufs_milli
+        );
+        assert!(measured.true_peak_db_milli < 12_000);
     }
 
     #[test]

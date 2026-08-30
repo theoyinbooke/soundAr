@@ -995,6 +995,11 @@ export interface VideoStudioService {
     integratedLufsMilli?: number,
     truePeakDbMilli?: number,
   ): Promise<VideoEpisodeListening>;
+  /**
+   * Listen back to every narrated line with an installed local model and check what was heard
+   * against the script. Prefer this over supplying `heard` yourself.
+   */
+  transcribeAndCheckEpisode(projectId: string, modelId: string): Promise<VideoQcReport>;
   checkEpisodeQuality(
     projectId: string,
     heard: Record<string, string>,

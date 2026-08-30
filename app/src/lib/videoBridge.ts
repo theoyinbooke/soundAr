@@ -989,6 +989,10 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
           : null,
       };
     },
+    async transcribeAndCheckEpisode(projectId) {
+      // Browser preview has no local recognizer, so nothing was heard and nothing is claimed.
+      return this.checkEpisodeQuality(projectId, {});
+    },
     async checkEpisodeQuality(projectId, heard, integratedLufsMilli, truePeakDbMilli) {
       const project = projects.get(projectId);
       if (!project) throw new Error("Video project was not found.");
@@ -1419,6 +1423,8 @@ function createNativeVideoService(): VideoStudioService {
       invoke<VideoReleaseExportResult>("export_episode_release", { projectId, hasShowNotes }).then((result) => ({ ...result, project: withNativeProjectUrls(result.project) })),
     listenToEpisode: (projectId, integratedLufsMilli, truePeakDbMilli) =>
       invoke<VideoEpisodeListening>("listen_to_episode", { projectId, integratedLufsMilli, truePeakDbMilli }),
+    transcribeAndCheckEpisode: (projectId, modelId) =>
+      invoke<VideoQcReport>("transcribe_and_check_episode_quality", { projectId, modelId }),
     checkEpisodeQuality: (projectId, heard, integratedLufsMilli, truePeakDbMilli) =>
       invoke<VideoQcReport>("check_episode_quality", { projectId, heard, integratedLufsMilli, truePeakDbMilli }),
     addVideoVisualAsset: (request) => invoke<AddVisualAssetResponse>("add_video_visual_asset", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),

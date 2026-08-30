@@ -6,27 +6,27 @@
 
 use super::{
     apply_dialogue_script, apply_lexicon, apply_timeline_edit, build_ass_document,
-    build_audiogram_command, build_podcast_audio_command, build_portrait_command_with_layout,
-    build_proxy_command, build_report, build_thumbnail_command, build_timeline_render_plan,
-    build_trailer_command, build_waveform_command, diff_spoken_words, discover_media_runtime,
-    effective_entries, episode_transcript, ffmetadata_chapters, findings_for_dead_air,
-    findings_for_loudness, findings_for_turn, identify_clip_candidates, instantiate_format,
-    listen_to_episode, local_media_input_args, plan_release, preflight_import_url_destination,
-    probe_media, publish_atomic, sibling_staging_path, terminate_process_group,
-    validate_import_url, write_ass_document_atomic, AdmissionOutcome, AssemblyOptions,
-    CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme, CastMember, DialogueScriptRequest,
-    EpisodeListening, FfmpegProgressParser, LayoutRole, LoudnessMeasurement, MediaError,
-    MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance, ProvenanceKind,
-    PublicHttpsProxy, PublicationState, QcReport, RationalFrameRate, RationalRate,
-    ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole,
-    RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass,
-    ResourceRequest, ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis,
-    RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
-    TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder, VideoError,
-    VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest, VisualAsset,
-    VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES,
-    MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US,
-    TRAILER_TARGET_US,
+    build_audiogram_command, build_loudness_analysis_command, build_podcast_audio_command,
+    build_portrait_command_with_layout, build_proxy_command, build_report, build_thumbnail_command,
+    build_timeline_render_plan, build_trailer_command, build_waveform_command, diff_spoken_words,
+    discover_media_runtime, effective_entries, episode_transcript, ffmetadata_chapters,
+    findings_for_dead_air, findings_for_loudness, findings_for_turn, identify_clip_candidates,
+    instantiate_format, listen_to_episode, local_media_input_args, parse_loudness_analysis,
+    plan_release, preflight_import_url_destination, probe_media, publish_atomic,
+    sibling_staging_path, terminate_process_group, validate_import_url, write_ass_document_atomic,
+    AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme,
+    CastMember, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser, LayoutRole,
+    LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding,
+    PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy, PublicationState, QcReport,
+    RationalFrameRate, RationalRate, ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan,
+    RenderArtifact, RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile,
+    RenderWorkloadClass, ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord,
+    RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset,
+    SourceAssetKind, TakeFidelity, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate,
+    VideoEncoder, VideoError, VideoProjectManifest, VideoTimelineChangeReceipt,
+    VideoTimelineEditRequest, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
+    TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -12798,6 +12798,55 @@ impl VideoStudioService {
         Ok(listen_to_episode(&manifest, loudness)?)
     }
 
+    /// Measure the finished master's loudness.
+    ///
+    /// Returns `None` when there is no published master to measure or the analysis produced no
+    /// usable number, so an unmeasured episode is never reported as being within target.
+    pub fn measure_master_loudness(
+        &self,
+        project_id: &str,
+    ) -> ServiceResult<Option<LoudnessMeasurement>> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        let Some(master) = manifest.render_artifacts.iter().find(|artifact| {
+            matches!(artifact.role, RenderArtifactRole::FinalMaster)
+                && matches!(artifact.publication_state, PublicationState::Published)
+        }) else {
+            return Ok(None);
+        };
+        let master_path =
+            self.resolve_absolute_managed_path(&self.video_root.join(&master.managed_path))?;
+        let runtime = self.runtime_status(false);
+        let ffmpeg = required_tool_path(
+            &runtime.ffmpeg,
+            "video.ffmpeg_unavailable",
+            "FFmpeg is required to measure the master",
+        )?;
+        let command = build_loudness_analysis_command(ffmpeg, &master_path)?;
+        let output = command.command().output().map_err(|error| {
+            VideoServiceError::io(
+                "video.loudness_analysis_failed",
+                "The master could not be measured",
+                error,
+            )
+        })?;
+        if !output.status.success() {
+            return Err(VideoServiceError::new(
+                "video.loudness_analysis_failed",
+                "The loudness analysis did not complete",
+            ));
+        }
+        Ok(parse_loudness_analysis(&String::from_utf8_lossy(
+            &output.stderr,
+        )))
+    }
+
     /// Check a rendered episode against the script it was asked to speak.
     ///
     /// `heard` maps a turn id to what a local recognizer actually heard in that turn's take. A turn
@@ -12812,6 +12861,12 @@ impl VideoStudioService {
         heard: &BTreeMap<String, String>,
         loudness: Option<LoudnessMeasurement>,
     ) -> ServiceResult<QcReport> {
+        // Measuring the master here is what turns "unchecked" into a real answer. A caller may
+        // still supply a measurement it made itself; nothing is invented when neither exists.
+        let loudness = match loudness {
+            Some(measured) => Some(measured),
+            None => self.measure_master_loudness(project_id).unwrap_or(None),
+        };
         let record = self.get_project(project_id)?;
         let manifest: VideoProjectManifest = serde_json::from_value(
             record

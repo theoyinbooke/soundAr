@@ -1110,9 +1110,7 @@ Depends on: 12.1, Phase 9 transcription and alignment evidence.
 
 ### Current Evidence
 
-Slice 12.8 is implemented and locally verified. The remaining work is the runtime that transcribes
-the rendered narration and measures the master's loudness and true peak; the checks themselves take
-those measurements as input.
+Slice 12.8 is implemented and locally verified, end to end.
 
 - `video/quality.rs` compares what a take was asked to say with what a local recognizer actually
   heard. Comparison is on normalized words, because a recognizer does not reproduce punctuation or
@@ -1133,11 +1131,23 @@ those measurements as input.
 - Severity is assigned by consequence: a misstated script and an off-target master block, because
   the episode does not say what it was asked to say or a platform will change how it sounds after it
   leaves soundAr. Caption drift and dead air warn.
-- `check_episode_quality` is exposed as an assistant tool and a Tauri command, and the producer
-  prompt now directs the assistant to transcribe the rendered narration and run it before declaring
-  an episode finished.
-- Verified locally: 451 native tests including thirteen quality cases covering alignment, severity,
-  and the unchecked-is-not-passed rule; plus 150 React tests.
+- `measure_master_loudness` runs FFmpeg's `loudnorm` in analysis mode and reads the numbers it
+  prints, because those are the numbers a platform's own normalizer will read and approximating them
+  would report a different episode than the one that ships. Silence measures as negative infinity,
+  which is a real answer but not one this contract can carry, so it is reported as unmeasured rather
+  than clamped to a value. An unreadable analysis is unmeasured too, never a default.
+- `transcribe_and_check_episode` is the measuring half: it listens back to every narrated line with
+  an installed local model, measures the master, and checks both. A line whose take cannot be
+  transcribed is left out of what was heard, which the report then states as unchecked - a failed
+  recognition must never read as a clean line.
+- `check_episode_quality`, `transcribe_and_check_episode`, and their Tauri commands are exposed to
+  the assistant, and the producer prompt now directs it to the measuring one before declaring an
+  episode finished.
+- Verified locally with real FFmpeg: a loudness analysis is run against generated media and its
+  measurement read back, alongside sixteen quality cases covering alignment, severity, the
+  unchecked-is-not-passed rule, and the refusal to turn silence or an unreadable analysis into a
+  number.
+- Verified locally: 474 native tests and 152 React tests.
 
 ### Slice 12.9: Assistant Listening and Director's Pass
 

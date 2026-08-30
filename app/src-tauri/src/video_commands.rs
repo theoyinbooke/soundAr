@@ -454,6 +454,34 @@ pub(crate) fn dispatch_video_operation(
                 })?,
             ))
         }
+        VideoAgentOperation::TranscribeAndCheckEpisode(request) => {
+            let report =
+                transcribe_and_check_episode(runtime, &request.project_id, &request.model_id)
+                    .map_err(VideoAgentToolError::from)?;
+            let blocking = report
+                .get("findings")
+                .and_then(Value::as_array)
+                .map(|findings| {
+                    findings
+                        .iter()
+                        .filter(|finding| {
+                            finding.get("severity").and_then(Value::as_str) == Some("blocking")
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            let unchecked = report
+                .get("unchecked_turns")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            let summary = if blocking == 0 && unchecked == 0 {
+                "Every narrated line matches its script".to_string()
+            } else {
+                format!("{blocking} blocking finding(s), {unchecked} unchecked line(s)")
+            };
+            Ok(VideoAgentResult::ready(kind, &summary, report))
+        }
         VideoAgentOperation::CheckEpisodeQuality(request) => {
             // A partial measurement is no measurement: reporting loudness without its true peak
             // would let half a check read as a whole one.
@@ -982,6 +1010,84 @@ pub(crate) async fn listen_to_episode(
     })
     .await
     .map_err(|error| format!("video.worker_failed: Listening worker failed: {error}"))?
+}
+
+/// Listen back to every narrated line with a local recognizer, then check what was heard against
+/// the script each take was asked to speak.
+///
+/// This is the measuring half of quality control. A line whose take cannot be transcribed is left
+/// out of `heard`, which the check then reports as unchecked rather than as passed - a failed
+/// recognition must never read as a clean line.
+pub(crate) fn transcribe_and_check_episode(
+    runtime: &RuntimeState,
+    project_id: &str,
+    model_id: &str,
+) -> Result<Value, String> {
+    let record = runtime
+        .video
+        .get_project(project_id)
+        .map_err(service_error)?;
+    let manifest: video::VideoProjectManifest = serde_json::from_value(
+        record
+            .get("manifest")
+            .cloned()
+            .ok_or("video.invalid_manifest: Project manifest is missing")?,
+    )
+    .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+
+    let artifact_paths = manifest
+        .render_artifacts
+        .iter()
+        .map(|artifact| (artifact.id.as_str(), artifact.managed_path.as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let video_root = runtime.store.video_artifacts_root();
+    let mut heard = std::collections::BTreeMap::new();
+    for binding in &manifest.narration_bindings {
+        let Some(turn_id) = binding.turn_id.as_deref() else {
+            continue;
+        };
+        let Some(relative) = artifact_paths.get(binding.render_artifact_id.as_str()) else {
+            continue;
+        };
+        let audio_path = video_root.join(relative);
+        if !audio_path.is_file() {
+            continue;
+        }
+        let transcribed = runtime.request(json!({
+            "operation": "transcribe",
+            "model_id": model_id,
+            "audio_path": audio_path,
+            "original_audio_path": audio_path,
+            "processing": { "schema_version": 1, "algorithm": "none" },
+        }));
+        // A recognizer that could not read this take leaves the line unchecked, which the report
+        // states explicitly. Substituting the script here would make every line pass by default.
+        if let Ok(result) = transcribed {
+            if let Some(text) = result.get("text").and_then(Value::as_str) {
+                heard.insert(turn_id.to_string(), text.to_string());
+            }
+        }
+    }
+
+    let report = runtime
+        .video
+        .check_episode_quality(project_id, &heard, None)
+        .map_err(service_error)?;
+    serde_json::to_value(report).map_err(|error| format!("video.invalid_request: {error}"))
+}
+
+#[tauri::command]
+pub(crate) async fn transcribe_and_check_episode_quality(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    model_id: String,
+) -> Result<Value, String> {
+    let runtime = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        transcribe_and_check_episode(&runtime, &project_id, &model_id)
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Quality worker failed: {error}"))?
 }
 
 #[tauri::command]

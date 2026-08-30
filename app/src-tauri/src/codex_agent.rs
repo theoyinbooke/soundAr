@@ -1844,7 +1844,7 @@ mod tests {
             .expect("tool catalog")
             .iter()
             .all(|tool| tool.get("type").and_then(serde_json::Value::as_str) == Some("function")));
-        assert_eq!(names.len(), 34);
+        assert_eq!(names.len(), 35);
         assert!(names.contains(&"get_studio_state"));
         assert!(names.contains(&"queue_speech_generation"));
         assert!(names.contains(&"queue_music_generation"));
@@ -1860,6 +1860,7 @@ mod tests {
         assert!(names.contains(&"plan_episode_release"));
         assert!(names.contains(&"export_episode_release"));
         assert!(names.contains(&"check_episode_quality"));
+        assert!(names.contains(&"transcribe_and_check_episode"));
         assert!(names.contains(&"listen_to_episode"));
         assert!(names.contains(&"register_generated_visual"));
         assert!(names.contains(&"add_visual_asset"));

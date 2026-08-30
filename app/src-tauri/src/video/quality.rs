@@ -399,6 +399,36 @@ pub fn findings_for_dead_air(
     findings
 }
 
+/// Read a loudness measurement out of FFmpeg's `loudnorm` analysis output.
+///
+/// `loudnorm` prints a JSON object to stderr in analysis mode. It is parsed rather than recomputed
+/// because these are the numbers a platform's own normalizer will read, and approximating them here
+/// would report a different episode than the one that ships.
+///
+/// Returns `None` when the output carries no usable measurement. An unparsed run is reported as
+/// unmeasured rather than as a default, which is the difference between "not checked" and "fine".
+pub fn parse_loudness_analysis(output: &str) -> Option<LoudnessMeasurement> {
+    // The JSON block is the last one printed; earlier braces belong to FFmpeg's own diagnostics.
+    let start = output.rfind('{')?;
+    let end = output[start..].find('}')? + start + 1;
+    let parsed: serde_json::Value = serde_json::from_str(&output[start..end]).ok()?;
+
+    let read = |key: &str| -> Option<i32> {
+        let raw = parsed.get(key)?.as_str()?;
+        // `loudnorm` reports `-inf` for silence, which is a real answer but not a number this
+        // contract can carry, so it is treated as unmeasured rather than clamped to a value.
+        let value = raw.parse::<f64>().ok()?;
+        if !value.is_finite() {
+            return None;
+        }
+        Some((value * 1000.0).round() as i32)
+    };
+    Some(LoudnessMeasurement {
+        integrated_lufs_milli: read("input_i")?,
+        true_peak_db_milli: read("input_tp")?,
+    })
+}
+
 /// Assemble one report. Findings are ordered by severity so the worst is read first.
 pub fn build_report(
     mut findings: Vec<QcFinding>,
@@ -504,6 +534,43 @@ mod tests {
             "{}",
             findings[0].detail
         );
+    }
+
+    #[test]
+    fn a_loudness_analysis_is_read_rather_than_recomputed() {
+        // The shape `loudnorm` actually prints in analysis mode.
+        let output = r#"[Parsed_loudnorm_0 @ 0x55] 
+{
+	"input_i" : "-18.42",
+	"input_tp" : "-1.75",
+	"input_lra" : "7.20",
+	"input_thresh" : "-28.61",
+	"output_i" : "-16.00"
+}
+"#;
+        let measured = parse_loudness_analysis(output).expect("a measurement");
+        assert_eq!(measured.integrated_lufs_milli, -18_420);
+        assert_eq!(measured.true_peak_db_milli, -1_750);
+    }
+
+    #[test]
+    fn silence_is_reported_as_unmeasured_rather_than_as_a_number() {
+        // `loudnorm` reports -inf for silence. That is a real answer, but not one this contract
+        // can carry, and clamping it would report a loudness the episode does not have.
+        let output = r#"{"input_i" : "-inf", "input_tp" : "-inf"}"#;
+        assert_eq!(parse_loudness_analysis(output), None);
+    }
+
+    #[test]
+    fn an_unreadable_analysis_is_unmeasured_rather_than_defaulted() {
+        assert_eq!(parse_loudness_analysis(""), None);
+        assert_eq!(parse_loudness_analysis("ffmpeg failed"), None);
+        assert_eq!(
+            parse_loudness_analysis(r#"{"input_i" : "not a number"}"#),
+            None
+        );
+        // A measurement missing its true peak is only half a check.
+        assert_eq!(parse_loudness_analysis(r#"{"input_i" : "-18.0"}"#), None);
     }
 
     #[test]
