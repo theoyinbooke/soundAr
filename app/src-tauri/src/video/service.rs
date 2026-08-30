@@ -11,7 +11,8 @@ use super::{
     build_waveform_command, discover_media_runtime, local_media_input_args,
     preflight_import_url_destination, probe_media, publish_atomic, sibling_staging_path,
     terminate_process_group, validate_import_url, write_ass_document_atomic, AdmissionOutcome,
-    instantiate_format, AssemblyOptions, CacheKeyBuilder, CacheStage, CaptionTheme, CastMember,
+    episode_transcript, identify_clip_candidates, instantiate_format, plan_release, AssemblyOptions,
+    CandidatePolicy, CacheKeyBuilder, CacheStage, CaptionTheme, CastMember,
     DialogueScriptRequest, FfmpegProgressParser, LayoutRole,
     MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance,
     ProvenanceKind, PublicHttpsProxy, PublicationState, RationalFrameRate, RationalRate,
@@ -20,8 +21,9 @@ use super::{
     RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, SourceAsset,
     SourceAssetKind, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder,
     VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    ShowFormat, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    ReleasePlan, ShowFormat, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
     MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
+    TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -12509,6 +12511,45 @@ impl VideoStudioService {
             job_id: job_id.to_string(),
             replayed: false,
         })
+    }
+
+    /// What this episode's release would contain, and what is still missing.
+    ///
+    /// The trailer moment is chosen by pointing soundAr's existing candidate analyst at the
+    /// episode's own narration, so generated work is reviewed by the same deterministic rules as
+    /// imported source rather than by a second, unproven selector.
+    pub fn plan_episode_release(
+        &self,
+        project_id: &str,
+        has_show_notes: bool,
+    ) -> ServiceResult<ReleasePlan> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+
+        let trailer_range = match episode_transcript(&manifest)? {
+            Some(transcript) => identify_clip_candidates(
+                &transcript,
+                &CandidatePolicy {
+                    minimum_duration_us: Microseconds(TRAILER_MINIMUM_US),
+                    target_duration_us: Microseconds(TRAILER_TARGET_US),
+                    maximum_duration_us: Microseconds(TRAILER_MAXIMUM_US),
+                    maximum_candidates: 4,
+                },
+                &BTreeSet::new(),
+            )?
+            .candidates
+            .first()
+            .map(|candidate| candidate.source_range),
+            None => None,
+        };
+        Ok(plan_release(&manifest, trailer_range, has_show_notes)?)
     }
 
     /// Every saved show format, validated on the way out so a corrupted document cannot reach a

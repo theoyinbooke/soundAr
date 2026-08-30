@@ -327,6 +327,23 @@ describe("videoStudioReducer", () => {
     await expect(service.createEpisode(saved.id, "Episode 3")).rejects.toThrow(/does not exist/i);
   });
 
+  it("names every release member that is still blocked", async () => {
+    const service = createBrowserPreviewVideoService();
+    const project = await service.getVideoProject("creator-update");
+
+    const plan = await service.planEpisodeRelease(project.id, false);
+    expect(plan.members.map((member) => member.kind)).toEqual([
+      "podcast_audio", "video_master", "trailer", "transcript", "show_notes",
+    ]);
+    // A blocked member always says why rather than being quietly omitted.
+    for (const member of plan.members.filter((entry) => !entry.ready)) {
+      expect(member.blocked_reason).toBeTruthy();
+    }
+    expect(plan.members.find((member) => member.kind === "show_notes")?.ready).toBe(false);
+    // Scenes are the episode's chapters.
+    expect(plan.chapters).toHaveLength(project.manifest.scenes.length);
+  });
+
   it("moves a durable project through intake, analysis, review, render, and export", async () => {
     const service = createBrowserPreviewVideoService();
     let state: VideoStudioState = initialVideoStudioState;

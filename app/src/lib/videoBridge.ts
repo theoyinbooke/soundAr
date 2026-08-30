@@ -32,6 +32,9 @@ import type {
   VideoPerformanceClock,
   VideoScene,
   VideoScriptResponse,
+  VideoReleaseMemberKind,
+  VideoReleaseMemberPlan,
+  VideoReleasePlan,
   VideoShowFormat,
   VideoSoundAsset,
   VideoSoundLayer,
@@ -903,6 +906,31 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       rendered.manifest.artifacts.push({ id: `${projectId}-preview`, project_id: projectId, version_id: rendered.manifest.version_id, role: "preview", title: `${rendered.name} preview`, mime_type: "video/mp4", format: "mp4", url: FIXTURE_VIDEO_URL, download_name: `${projectId}-preview.mp4`, duration_ms: rendered.duration_ms, width: 540, height: 960, frame_rate: 30, codec: "H.264", file_size_bytes: 1_448, playable: true, created_at: FIXED_NOW });
       return store(rendered);
     },
+    async planEpisodeRelease(projectId, hasShowNotes) {
+      const project = projects.get(projectId);
+      if (!project) throw new Error("Video project was not found.");
+      // A turn reaches the transcript only when it has a take, so an unperformed script blocks the
+      // members that describe audio.
+      const narrated = (project.manifest.dialogue ?? []).some((turn) => turn.narrated);
+      const hasMaster = Boolean(project.master);
+      const trailer = narrated ? { start_us: 0, end_us: 30_000_000 } : null;
+      const member = (kind: VideoReleaseMemberKind, ready: boolean, reason: string): VideoReleaseMemberPlan =>
+        ({ kind, ready, blocked_reason: ready ? null : reason });
+      return {
+        members: [
+          member("podcast_audio", narrated, "No line has been narrated yet, so there is no audio episode to publish"),
+          member("video_master", hasMaster, "Render a final master for the current timeline first"),
+          member("trailer", Boolean(trailer), "No narrated moment is long enough to cut a trailer from"),
+          member("transcript", narrated, "No line has been narrated yet, so there is nothing to transcribe"),
+          member("show_notes", hasShowNotes, "Write the episode's show notes first"),
+        ],
+        chapters: project.manifest.scenes.map((scene) => ({
+          id: `chapter-${scene.id}`, title: scene.title,
+          start_us: scene.timeline_start_ms * 1000, end_us: scene.timeline_end_ms * 1000,
+        })),
+        trailer_range: trailer,
+      };
+    },
     async listShowFormats() {
       return [...showFormats.values()].map(clone);
     },
@@ -1271,6 +1299,7 @@ function createNativeVideoService(): VideoStudioService {
     saveShowFormat: (format) => invoke<VideoShowFormat>("save_show_format", { format }),
     deleteShowFormat: (formatId) => invoke<void>("delete_show_format", { formatId }),
     createEpisode: (formatId, episodeName, brief) => invoke<VideoProject>("create_episode", { formatId, episodeName, brief }).then(withNativeProjectUrls),
+    planEpisodeRelease: (projectId, hasShowNotes) => invoke<VideoReleasePlan>("plan_episode_release", { projectId, hasShowNotes }),
     addVideoVisualAsset: (request) => invoke<AddVisualAssetResponse>("add_video_visual_asset", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),
     reviseVideo: (request: ReviseVideoRequest) => invoke<VideoProject>("revise_video", { request }).then(withNativeProjectUrls),
     exportVideo: (request: VideoExportRequest, onProgress) => nativeWithProgress<VideoProject>(request.project_id, "export_video", { request }, onProgress).then(withNativeProjectUrls),

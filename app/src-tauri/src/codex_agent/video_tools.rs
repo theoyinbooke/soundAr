@@ -60,6 +60,7 @@ pub(crate) enum VideoAgentOperationKind {
     SaveShowFormat,
     ListShowFormats,
     CreateEpisode,
+    PlanEpisodeRelease,
     RegisterGeneratedVisual,
     AddVisualAsset,
     RenderVideoPreview,
@@ -88,6 +89,7 @@ impl VideoAgentOperationKind {
             Self::SaveShowFormat => "save_show_format",
             Self::ListShowFormats => "list_show_formats",
             Self::CreateEpisode => "create_episode",
+            Self::PlanEpisodeRelease => "plan_episode_release",
             Self::RegisterGeneratedVisual => "register_generated_visual",
             Self::AddVisualAsset => "add_visual_asset",
             Self::RenderVideoPreview => "render_video_preview",
@@ -115,7 +117,9 @@ impl VideoAgentOperationKind {
             | Self::GenerateCueMusic
             | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
-            Self::ExportVideo | Self::ExportPublishPackage => VideoProductionPhase::Export,
+            Self::ExportVideo | Self::ExportPublishPackage | Self::PlanEpisodeRelease => {
+                VideoProductionPhase::Export
+            }
             Self::ListVideoProjects
             | Self::GetVideoProject
             | Self::SaveShowFormat
@@ -143,6 +147,7 @@ pub(crate) enum VideoAgentOperation {
     SaveShowFormat(video::ShowFormat),
     ListShowFormats(EmptyRequest),
     CreateEpisode(CreateEpisodeRequest),
+    PlanEpisodeRelease(PlanEpisodeReleaseRequest),
     RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
     AddVisualAsset(video::AddVisualAssetRequest),
     RenderVideoPreview(RenderVideoPreviewRequest),
@@ -170,6 +175,7 @@ impl VideoAgentOperation {
             Self::SaveShowFormat(_) => VideoAgentOperationKind::SaveShowFormat,
             Self::ListShowFormats(_) => VideoAgentOperationKind::ListShowFormats,
             Self::CreateEpisode(_) => VideoAgentOperationKind::CreateEpisode,
+            Self::PlanEpisodeRelease(_) => VideoAgentOperationKind::PlanEpisodeRelease,
             Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
             Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
             Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
@@ -198,6 +204,7 @@ impl VideoAgentOperation {
             "save_show_format" => Self::SaveShowFormat(decode(arguments)?),
             "list_show_formats" => Self::ListShowFormats(decode(arguments)?),
             "create_episode" => Self::CreateEpisode(decode(arguments)?),
+            "plan_episode_release" => Self::PlanEpisodeRelease(decode(arguments)?),
             "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
             "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
             "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
@@ -228,6 +235,7 @@ impl VideoAgentOperation {
                 require_text(&request.format_id, "format_id")?;
                 require_text(&request.episode_name, "episode_name")
             }
+            Self::PlanEpisodeRelease(request) => require_text(&request.project_id, "project_id"),
             Self::PreviewLink(request) => {
                 require_text(&request.exact_url, "exact_url")?;
                 video::validate_import_url(&request.exact_url)
@@ -539,6 +547,15 @@ pub(crate) struct CreateVideoProjectRequest {
     pub audio_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanEpisodeReleaseRequest {
+    pub(crate) project_id: String,
+    /// Notes are written, not derived, so the caller says whether they exist.
+    #[serde(default)]
+    pub(crate) has_show_notes: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1143,6 +1160,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "save_show_format" => VideoAgentOperationKind::SaveShowFormat,
         "list_show_formats" => VideoAgentOperationKind::ListShowFormats,
         "create_episode" => VideoAgentOperationKind::CreateEpisode,
+        "plan_episode_release" => VideoAgentOperationKind::PlanEpisodeRelease,
         "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
         "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
         "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
@@ -1333,6 +1351,17 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                     ("format_id", string("A saved show format id")),
                     ("episode_name", string("This episode's name")),
                     ("brief", nullable_string("What this episode is about, recorded as its initial intent")),
+                ]),
+            ),
+        ),
+        tool(
+            "plan_episode_release",
+            "Report what this episode's release would contain and what is still missing: the audio episode with its chapters, the video master, a short vertical trailer, the transcript, and show notes. The trailer moment is chosen by running soundAr's existing candidate analyst over the episode's own narration, so generated work is reviewed by the same deterministic rules as imported source. A blocked member always names its missing prerequisite instead of being quietly omitted. Read-only.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode. Notes are written, not derived."})),
                 ]),
             ),
         ),
@@ -2298,8 +2327,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 22);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 22);
+        assert_eq!(names.len(), 23);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 23);
         for required in [
             "preview_link",
             "import_link",
@@ -2314,6 +2343,7 @@ mod tests {
             "save_show_format",
             "list_show_formats",
             "create_episode",
+            "plan_episode_release",
             "register_generated_visual",
             "add_visual_asset",
             "render_video_preview",

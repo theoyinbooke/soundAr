@@ -17,6 +17,7 @@ pub mod media;
 pub mod media_server;
 pub mod performance;
 pub mod presentation;
+pub mod release;
 pub mod renderer;
 pub mod scheduler;
 pub mod score;
@@ -40,6 +41,10 @@ pub use cast::{
     MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
+pub use release::{
+    episode_chapters, episode_transcript, plan_release, ReleaseChapter, ReleaseMemberKind,
+    ReleaseMemberPlan, ReleasePlan, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
+};
 pub use format::{
     instantiate_format, materialize_format_cues, CueTemplate, FormatOrigin, ShowFormat,
     MAX_SHOW_FORMATS,

@@ -1050,6 +1050,31 @@ Depends on: 12.6, the existing publish package and candidate analyst.
 - Every release member is checksum-registered and playable in the application, never
   presented only as a filesystem path.
 
+### Current Evidence
+
+Slice 12.7's planning layer is implemented and locally verified. The remaining work is the FFmpeg
+rendering of the audio episode with embedded chapters, the vertical trailer cut, and the audiogram.
+
+- `video/release.rs` holds the release contract. A blocked member always names its missing
+  prerequisite, because a release that quietly omits its trailer looks identical to one that never
+  wanted a trailer.
+- `episode_transcript` builds a source-clock transcript from the episode's own narration. A turn
+  appears only when it has a published take with a measured duration and a clip placing it on the
+  timeline, so the result is a measurement rather than an estimate and a moment chosen from it is
+  the same moment in the finished file. An unperformed script yields no transcript at all rather
+  than one describing audio that does not exist, and the timing source is recorded as written
+  rather than claiming a recognizer produced it.
+- That transcript is fed to soundAr's existing candidate analyst, so the trailer is chosen from
+  generated work by the same deterministic rules already used on imported source, rather than by a
+  second, unproven selector. This is the loop the original design called for: the moment-finder
+  built for imported video, pointed at soundAr's own output.
+- Scenes are the episode's chapters, because they are the author's own divisions. An episode with
+  no scenes has no chapters rather than one invented per line.
+- `plan_episode_release` is exposed as an assistant tool and a Tauri command, and the producer
+  prompt now directs the assistant to call it before declaring an episode finished.
+- Verified locally: 438 native tests including six release cases - one proving the existing analyst
+  picks a bounded, on-clock moment from generated narration - plus 149 React tests.
+
 ### Slice 12.8: Production Quality Control
 
 Depends on: 12.1, Phase 9 transcription and alignment evidence.

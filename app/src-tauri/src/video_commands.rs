@@ -420,6 +420,30 @@ pub(crate) fn dispatch_video_operation(
                 None,
             )
         }
+        VideoAgentOperation::PlanEpisodeRelease(request) => {
+            let plan = runtime
+                .video
+                .plan_episode_release(&request.project_id, request.has_show_notes)
+                .map_err(VideoAgentToolError::from)?;
+            let summary = if plan.is_ready() {
+                "Every release member can be produced".to_string()
+            } else {
+                format!(
+                    "{} release member(s) are still blocked",
+                    plan.blocked().len()
+                )
+            };
+            Ok(VideoAgentResult::ready(
+                kind,
+                &summary,
+                serde_json::to_value(&plan).map_err(|error| {
+                    VideoAgentToolError::new(
+                        "video.agent_result_encode_failed",
+                        format!("The release plan could not be encoded: {error}"),
+                    )
+                })?,
+            ))
+        }
         VideoAgentOperation::GenerateCueMusic(request) => {
             let record = generate_cue_music(
                 runtime,
@@ -834,6 +858,23 @@ pub(crate) async fn revise_video(
 /// Resolve exactly what a voice would say for a sample line, so one pronunciation rule can be
 /// auditioned without re-rendering the work around it. The caller synthesizes the returned text
 /// with the character's own voice through the ordinary speech queue.
+#[tauri::command]
+pub(crate) async fn plan_episode_release(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    has_show_notes: bool,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan = service
+            .plan_episode_release(&project_id, has_show_notes)
+            .map_err(service_error)?;
+        serde_json::to_value(plan).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Release worker failed: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn list_show_formats(
     state: tauri::State<'_, RuntimeState>,

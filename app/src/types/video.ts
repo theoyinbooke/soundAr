@@ -657,6 +657,36 @@ export interface VideoMusicCueInput {
   created_at: string;
 }
 
+/** What a finished release contains. */
+export type VideoReleaseMemberKind =
+  | "podcast_audio"
+  | "video_master"
+  | "trailer"
+  | "transcript"
+  | "show_notes";
+
+/** A blocked member always names its missing prerequisite rather than being quietly omitted. */
+export interface VideoReleaseMemberPlan {
+  kind: VideoReleaseMemberKind;
+  ready: boolean;
+  blocked_reason?: string | null;
+}
+
+export interface VideoReleaseChapter {
+  id: string;
+  title: string;
+  start_us: number;
+  end_us: number;
+}
+
+/** Everything a release would contain, and what is still missing. */
+export interface VideoReleasePlan {
+  members: VideoReleaseMemberPlan[];
+  chapters: VideoReleaseChapter[];
+  /** The moment the trailer would be cut from, chosen from the episode's own narration. */
+  trailer_range?: { start_us: number; end_us: number } | null;
+}
+
 /** A cue the format supplies for every episode, before there is a script to anchor it to. */
 export interface VideoCueTemplate {
   id: string;
@@ -852,6 +882,7 @@ export interface VideoStudioService {
   saveShowFormat(format: VideoShowFormat): Promise<VideoShowFormat>;
   deleteShowFormat(formatId: string): Promise<void>;
   createEpisode(formatId: string, episodeName: string, brief?: string): Promise<VideoProject>;
+  planEpisodeRelease(projectId: string, hasShowNotes: boolean): Promise<VideoReleasePlan>;
   addVideoVisualAsset(request: AddVisualAssetRequest): Promise<AddVisualAssetResponse>;
   reviseVideo(request: ReviseVideoRequest): Promise<VideoProject>;
   exportVideo(request: VideoExportRequest, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;
