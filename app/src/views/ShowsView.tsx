@@ -1,4 +1,4 @@
-import { CircleCheck, CircleDashed, Clapperboard, LoaderCircle, Plus, TriangleAlert, UsersRound } from "lucide-react";
+import { ArrowLeft, CircleCheck, CircleDashed, Clapperboard, LoaderCircle, Plus, TriangleAlert, UsersRound } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { EmptyState, PageHeader, Panel } from "../components/ui";
 import { useVideoIntegration, useVideoProjectSummaries } from "../components/video/VideoIntegrationContext";
@@ -72,6 +72,65 @@ export function ShowsView() {
     </div>;
   }
 
+  // An episode gets its own screen. Reading a cast and a script against a table of other episodes
+  // is reading two things at once, and the episode is the one being looked at.
+  if (selectedId) return <div className="page episode-page">
+    <PageHeader
+      title={episode?.name ?? "Episode"}
+      subtitle={episode?.manifest.format_origin
+        ? `From ${episode.manifest.format_origin.format_name} revision ${episode.manifest.format_origin.format_revision}`
+        : "Not started from a saved format"}
+      actions={<>
+        <button className="button button-secondary" type="button" onClick={() => { setSelectedId(undefined); setEpisode(undefined); setRelease(undefined); }}>
+          <ArrowLeft aria-hidden="true" size={14} />All shows
+        </button>
+        <button className="button button-primary" type="button" onClick={() => onOpenProject?.(selectedId)}>
+          <Clapperboard aria-hidden="true" size={13} />Open in Video Studio
+        </button>
+      </>}
+    />
+    {busy ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Reading the episode</div> : null}
+    {error ? <p className="shows-error" role="alert">{error}</p> : null}
+    {!busy && !error ? <div className="episode-screen">
+      <Panel ariaLabel="Cast">
+        <h3 className="shows-section-heading"><UsersRound aria-hidden="true" size={13} />Cast</h3>
+        {cast.length ? <ul className="video-cast-list">
+          {cast.map((member) => <li key={member.id}><strong>{member.display_name}</strong><small>{member.voice_id} · {member.language}</small></li>)}
+        </ul> : <p className="shows-panel-empty">No cast yet. Ask the assistant for a multi-character script.</p>}
+      </Panel>
+
+      <Panel ariaLabel="Script">
+        <h3 className="shows-section-heading">Script</h3>
+        {dialogue.length ? <>
+          {/* The three line states are what decide what to do next. */}
+          <p className="shows-counts">
+            <span><CircleCheck aria-hidden="true" size={12} />{performed} performed</span>
+            <span><TriangleAlert aria-hidden="true" size={12} />{drafts} draft</span>
+            <span><CircleDashed aria-hidden="true" size={12} />{dialogue.length - performed - drafts} not narrated</span>
+          </p>
+          <ol className="video-dialogue-list">
+            {dialogue.map((turn) => <li key={turn.id} className={`is-${turn.draft ? "draft" : turn.narrated ? "final" : "pending"}`}>
+              <span className="video-dialogue-speaker">{cast.find((member) => member.id === turn.character_id)?.display_name ?? turn.character_id}</span>
+              <span className="video-dialogue-text">{turn.text}</span>
+            </li>)}
+          </ol>
+        </> : <p className="shows-panel-empty">No script yet.</p>}
+      </Panel>
+
+      <Panel ariaLabel="Release">
+        <h3 className="shows-section-heading">Release</h3>
+        {release ? <ul className="shows-release-list">
+          {release.members.map((member) => <li key={member.kind} className={member.ready ? "is-ready" : ""}>
+            <span>{member.ready ? <CircleCheck aria-hidden="true" size={12} /> : <CircleDashed aria-hidden="true" size={12} />}</span>
+            <strong>{member.kind.replace(/_/g, " ")}</strong>
+            {/* A blocked member names its missing prerequisite rather than being quietly absent. */}
+            {member.blocked_reason ? <small>{member.blocked_reason}</small> : null}
+          </li>)}
+        </ul> : <p className="shows-panel-empty">Release readiness is unavailable for this episode.</p>}
+      </Panel>
+    </div> : null}
+  </div>;
+
   return <div className="page shows-page">
     <PageHeader
       title="Shows"
@@ -128,62 +187,6 @@ export function ShowsView() {
         </table>
         : <p className="shows-panel-empty">No episodes yet. Start one in Video Studio, or ask the assistant to create an episode from a saved format.</p>}
     </Panel>
-
-    {selectedId ? <Panel className="shows-detail" ariaLabel="Episode detail">
-      <header className="shows-detail-header">
-        <div>
-          <strong>{episode?.name ?? "Episode"}</strong>
-          {episode?.manifest.format_origin
-            ? <small>From {episode.manifest.format_origin.format_name} revision {episode.manifest.format_origin.format_revision}</small>
-            : <small>Not started from a saved format</small>}
-        </div>
-        <button className="button button-secondary" type="button" onClick={() => onOpenProject?.(selectedId)}>
-          <Clapperboard aria-hidden="true" size={13} />Open in Video Studio
-        </button>
-      </header>
-
-      {busy ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Reading the episode</div> : null}
-      {error ? <p className="shows-error" role="alert">{error}</p> : null}
-
-      {!busy && !error ? <div className="shows-detail-grid">
-        <section aria-label="Cast">
-          <h3><UsersRound aria-hidden="true" size={13} />Cast</h3>
-          {cast.length ? <ul className="video-cast-list">
-            {cast.map((member) => <li key={member.id}><strong>{member.display_name}</strong><small>{member.voice_id} · {member.language}</small></li>)}
-          </ul> : <p className="shows-empty">No cast yet. Ask the assistant for a multi-character script.</p>}
-        </section>
-
-        <section aria-label="Script">
-          <h3>Script</h3>
-          {dialogue.length ? <>
-            {/* The three line states are what decide what to do next. */}
-            <p className="shows-counts">
-              <span><CircleCheck aria-hidden="true" size={12} />{performed} performed</span>
-              <span><TriangleAlert aria-hidden="true" size={12} />{drafts} draft</span>
-              <span><CircleDashed aria-hidden="true" size={12} />{dialogue.length - performed - drafts} not narrated</span>
-            </p>
-            <ol className="video-dialogue-list">
-              {dialogue.map((turn) => <li key={turn.id} className={`is-${turn.draft ? "draft" : turn.narrated ? "final" : "pending"}`}>
-                <span className="video-dialogue-speaker">{cast.find((member) => member.id === turn.character_id)?.display_name ?? turn.character_id}</span>
-                <span className="video-dialogue-text">{turn.text}</span>
-              </li>)}
-            </ol>
-          </> : <p className="shows-empty">No script yet.</p>}
-        </section>
-
-        <section aria-label="Release">
-          <h3>Release</h3>
-          {release ? <ul className="shows-release-list">
-            {release.members.map((member) => <li key={member.kind} className={member.ready ? "is-ready" : ""}>
-              <span>{member.ready ? <CircleCheck aria-hidden="true" size={12} /> : <CircleDashed aria-hidden="true" size={12} />}</span>
-              <strong>{member.kind.replace(/_/g, " ")}</strong>
-              {/* A blocked member names its missing prerequisite rather than being quietly absent. */}
-              {member.blocked_reason ? <small>{member.blocked_reason}</small> : null}
-            </li>)}
-          </ul> : <p className="shows-empty">Release readiness is unavailable for this episode.</p>}
-        </section>
-      </div> : null}
-    </Panel> : null}
 
     <p className="shows-footnote">
       <Plus aria-hidden="true" size={12} />

@@ -31,6 +31,22 @@ describe("ShowsView", () => {
     expect(blocked).toBeVisible();
   });
 
+  it("replaces the show list with the episode rather than appending it below", async () => {
+    const user = userEvent.setup();
+    renderShows();
+
+    await user.click(await screen.findByRole("button", { name: /^Inspect Creator update · Reel master$/ }));
+
+    // The episode owns the screen: the tables that led here are gone, not scrolled past.
+    await screen.findByRole("region", { name: "Release" });
+    expect(screen.queryByRole("button", { name: /^Inspect Creator update · Reel master$/ })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Shows" })).toBeNull();
+
+    // And going back restores the list rather than stranding the user on the episode.
+    await user.click(screen.getByRole("button", { name: /All shows/ }));
+    expect(await screen.findByRole("button", { name: /^Inspect Creator update · Reel master$/ })).toBeVisible();
+  });
+
   it("hands a selected episode to the editor rather than opening a second one", async () => {
     const user = userEvent.setup();
     const onOpenProject = vi.fn();

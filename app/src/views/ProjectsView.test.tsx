@@ -69,6 +69,26 @@ function batch(status: BatchRunRecord["status"] = "queued"): BatchRunRecord {
   };
 }
 
+describe("Projects library and project screens", () => {
+  it("opens an audio project on its own screen and returns to the library", async () => {
+    const user = userEvent.setup();
+    bridge.listHistory.mockResolvedValue([]);
+    render(<ProjectsView bootstrap={fallbackBootstrap} projects={[project]} voices={fallbackBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />);
+
+    // The library is a library on arrival: no project is opened for the user.
+    expect(screen.queryByRole("region", { name: "Project workspace" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: `Open ${project.name}` }));
+
+    // The project owns the screen; the table it was chosen from is gone, not pushed down.
+    expect(await screen.findByRole("region", { name: "Project workspace" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: `Open ${project.name}` })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /All projects/ }));
+    expect(await screen.findByRole("button", { name: `Open ${project.name}` })).toBeVisible();
+  });
+});
+
 describe("Projects batch rendering", () => {
   it("lists every production in one table and opens each in its own workspace", async () => {
     const user = userEvent.setup();
@@ -154,6 +174,7 @@ describe("Projects batch rendering", () => {
     bridge.listHistory.mockResolvedValue([]);
 
     render(<ProjectsView bootstrap={nativeBootstrap} projects={[project]} voices={nativeBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: `Open ${project.name}` }));
     await user.click(screen.getByText("Production and export"));
     await user.click(screen.getByRole("button", { name: "Render changed (2)" }));
 
@@ -189,6 +210,7 @@ describe("Projects batch rendering", () => {
     bridge.listHistory.mockResolvedValue([]);
 
     render(<ProjectsView bootstrap={nativeBootstrap} projects={[linkedProject]} voices={nativeBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: `Open ${linkedProject.name}` }));
     await user.click(await screen.findByRole("button", { name: "Retry failed" }));
 
     await waitFor(() => expect(bridge.resumeBatchRun).toHaveBeenCalledWith("batch-1", 2, true));
@@ -234,6 +256,7 @@ describe("Projects batch rendering", () => {
     bridge.saveProject.mockImplementation(async (value: ProjectRecord) => ({ ...masteredProject, ...value }));
 
     render(<ProjectsView bootstrap={nativeBootstrap} projects={[masteredProject]} voices={nativeBootstrap.voices} onChange={vi.fn()} onGenerated={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: `Open ${masteredProject.name}` }));
     await user.click(screen.getByText("Production and export"));
     expect(await screen.findByText("Release narration master")).toBeInTheDocument();
     expect(screen.getByText(/Project master · 1:32 · WAV 48 kHz/)).toBeInTheDocument();

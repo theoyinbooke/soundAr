@@ -1419,6 +1419,10 @@ Release channels should be:
 
 ## Immediate Next Release Sequence
 
+The numbers in this list are the ones each milestone shipped under before the version line was
+reset to `0.1.1`; see Version Numbering. They are kept as a record of what was delivered in what
+order, not as a plan for what the next release will be called.
+
 1. **`0.3.0` - Honest Core:** Phase 0, feature-state labels, and first-party test
    infrastructure.
 2. **`0.4.0` - Durable Studio:** Phase 1 persistence, real History, and recoverable
@@ -1466,19 +1470,31 @@ which is existing Video Studio behavior.
 
 ## Version Numbering
 
-soundAr advances one patch at a time: `0.8.0`, then `0.8.1`, `0.8.2`, `0.8.3`, and so on. Each
-shipped slice of work is its own patch release with its own changelog entry, so a user can see what
-changed between any two builds and can roll back to a specific one.
+The version line was reset to `0.1.1` on 2026-08-30. Work had reached `0.8.8` in a few weeks, which
+made the minor digit a measure of elapsed effort rather than of reaching anything, and left almost
+no room below `1.0.0` for the work still ahead. Releases before the reset keep the numbers they
+shipped under; `CHANGELOG.md` records the restart in place rather than renumbering history.
 
-- A patch bump is the default for every release, including new features. Phase 12 slices, UI
-  surfaces, and fixes all ship as patches.
-- A minor bump is reserved for a milestone that completes a roadmap phase's exit gate, and is
-  decided deliberately rather than reached by accumulation.
+From `0.1.1`, soundAr advances one patch at a time: `0.1.2`, `0.1.3`, and so on. Each shipped slice
+of work is its own patch release with its own changelog entry, so a user can see what changed
+between any two builds and can roll back to a specific one.
+
+- A patch bump is the default for every release, including new features. Phase slices, UI surfaces,
+  and fixes all ship as patches.
+- The minor moves only after the patch number has run a long way - on the order of `0.1.80` - and
+  the next series starts at `.1`, so `0.1.x` is followed by `0.2.1`. It marks distance travelled,
+  not the importance of any one release.
 - Never skip a number to signal size. A large release is still the next patch.
+- Never reset the line again to make room. The point of a long patch series is that it does not
+  need to be reset.
 
 Every release bumps `app/package.json`, `app/package-lock.json`, `app/src-tauri/tauri.conf.json`,
 and `app/src-tauri/Cargo.toml` together; `scripts/check-release-version.sh` enforces that they
 match and CI runs it on every pull request.
+
+Because `0.1.1` sorts below `0.8.8`, installing over a pre-reset build is a downgrade to every tool
+that compares versions: `dpkg` needs `--force-downgrade`, and the updater will not offer a
+post-reset build to a pre-reset install. This affects only machines that ran a pre-reset build.
 
 ## Roadmap Maintenance
 
