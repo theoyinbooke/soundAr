@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.1 - 2026-08-30
+
+The version line restarts here. Everything below this entry shipped under the numbers `0.3.0`
+through `0.8.8`; that history is kept exactly as it was rather than renumbered, because those are
+the numbers those builds were released under. What changes is the pace from here: patches advance
+one at a time within `0.1.x` and the minor moves only when the patch number has run a long way,
+not whenever a release feels significant.
+
+Because 0.1.1 sorts below 0.8.8, package managers and the updater treat this as a downgrade rather
+than an upgrade. Installing over an existing 0.8.8 needs `dpkg -i --force-downgrade`.
+
+- Gave a project its own screen. Opening an audio production used to reveal a composer beneath the
+  table it was chosen from, so the library and the work competed for the same page. A project now
+  replaces the library with a dedicated screen and returns to it explicitly, and the library no
+  longer opens whichever project happened to sort first.
+- Gave an episode its own screen. Cast, script, and release readiness were a panel appended under
+  the Shows tables; reading them meant reading past the list of every other episode. An episode is
+  now a screen of its own, reached by opening its row and left by going back.
+
 ## 0.8.8 - 2026-08-30
 
 - Put every production in one table. Video and audio work were listed on separate halves of the

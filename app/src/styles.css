@@ -2701,3 +2701,14 @@ input[type="checkbox"]:checked::before { transform: translateX(12px); }
   .assistant-video-secondary > summary svg { transition: none; }
   .video-library-deliverables > summary svg { transition: none; }
 }
+
+/* A project and an episode each own the whole screen, so their sections stack at full width
+   instead of competing with the table that led to them. */
+.project-page .project-studio { width: 100%; }
+.projects-workspace { display: none; }
+
+.episode-screen { display: grid; gap: 16px; grid-template-columns: minmax(220px, 1fr) minmax(320px, 1.6fr) minmax(260px, 1fr); align-items: start; }
+.episode-screen > .panel { padding: 16px; }
+.shows-section-heading { display: flex; align-items: center; gap: 6px; margin: 0 0 12px; font-size: 13px; font-weight: 600; }
+
+@media (max-width: 1100px) { .episode-screen { grid-template-columns: 1fr; } }

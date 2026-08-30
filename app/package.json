@@ -1,7 +1,7 @@
 {
   "name": "soundar-desktop",
   "private": true,
-  "version": "0.8.8",
+  "version": "0.1.1",
   "license": "MIT",
   "repository": "github:theoyinbooke/soundAr",
   "type": "module",

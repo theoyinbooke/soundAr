@@ -8,7 +8,9 @@ test("Shows is reachable and reports what an episode's release is waiting on", a
   await expect(page.getByRole("heading", { name: "Shows" })).toBeVisible();
 
   await page.getByRole("button", { name: /^Inspect Creator update · Reel master$/ }).click();
-  await expect(page.getByRole("heading", { name: "Release" })).toBeVisible();
+  // The episode opens on its own screen rather than as a panel under the tables.
+  await expect(page.getByRole("region", { name: "Release" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /^Inspect Creator update · Reel master$/ })).toHaveCount(0);
   // A blocked member names its missing prerequisite rather than being quietly absent.
   await expect(page.getByText(/No line has been narrated yet, so there is no audio episode/i)).toBeVisible();
   await expect(page.getByRole("button", { name: "Open in Video Studio" })).toBeVisible();

@@ -11,9 +11,12 @@ test("every production is in one table that opens its own workspace", async ({ p
   await expect(page.getByRole("button", { name: /^Open Creator update · Reel master$/ })).toBeVisible();
   await expect(page.getByRole("button", { name: /^Open Local AI, Close to Home$/ })).toBeVisible();
 
-  // Opening an audio production reveals its chapter composer beneath the table.
+  // Opening an audio production replaces the library with that project's own screen.
   await page.getByRole("button", { name: /^Open Local AI, Close to Home$/ }).click();
   await expect(page.getByRole("region", { name: "Project workspace" })).toBeVisible();
+  await expect(page.getByRole("table")).toHaveCount(0);
+  await page.getByRole("button", { name: /All projects/ }).click();
+  await expect(page.getByRole("table")).toBeVisible();
 
   // Filtering narrows the same table rather than switching to a different surface.
   await page.getByRole("radio", { name: "Video" }).click();
