@@ -51,6 +51,7 @@ pub enum VideoErrorCode {
     InvalidLexicon,
     InvalidPerformance,
     InvalidQualityReport,
+    DraftNotPromoted,
     InvalidRelease,
     InvalidShowFormat,
     InvalidSoundPlacement,
@@ -94,6 +95,7 @@ impl VideoErrorCode {
             Self::InvalidDialogue => "video.invalid_dialogue",
             Self::InvalidLexicon => "video.invalid_lexicon",
             Self::InvalidQualityReport => "video.invalid_quality_report",
+            Self::DraftNotPromoted => "video.draft_not_promoted",
             Self::InvalidRelease => "video.invalid_release",
             Self::InvalidShowFormat => "video.invalid_show_format",
             Self::InvalidSoundPlacement => "video.invalid_sound_placement",
@@ -1372,6 +1374,22 @@ impl Validate for RenderArtifact {
 /// Binds the active generated narration for a scene to both its soundAr History
 /// provenance and the immutable managed artifact used by the canonical timeline.
 ///
+/// Whether a take is the finished performance or a fast stand-in.
+///
+/// Draft mode exists so a whole episode can be heard in about a minute with the fastest installed
+/// voice, and only the lines that survive that listen are re-read with the expensive one. The
+/// fidelity travels with the take because a draft that could not be told apart from a final take
+/// would eventually be published as one.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeFidelity {
+    /// A fast stand-in. Never exportable as a master, never a release member.
+    Draft,
+    /// The performance as intended.
+    #[default]
+    Final,
+}
+
 /// The generation route is stored explicitly so a later voice revision can be
 /// reproduced without guessing which model, speaker, or consent-backed voice was
 /// used. `script_sha256` prevents a narration take from silently surviving a
@@ -1390,6 +1408,10 @@ pub struct NarrationBinding {
     /// existed carries, so those takes stay valid.
     #[serde(default)]
     pub lexicon_fingerprint: Option<String>,
+    /// Whether this is the finished performance or a fast stand-in. Takes recorded before draft
+    /// mode existed decode as final, which is what they were.
+    #[serde(default)]
+    pub fidelity: TakeFidelity,
     pub render_artifact_id: String,
     pub history_id: String,
     pub generation_job_id: String,
@@ -1539,6 +1561,18 @@ pub struct VideoProjectManifest {
 }
 
 impl VideoProjectManifest {
+    /// Turns still standing in with a draft take.
+    ///
+    /// An episode with any of these is unfinished by definition: something in it is a stand-in the
+    /// author has not yet replaced.
+    pub fn draft_turn_ids(&self) -> Vec<&str> {
+        self.narration_bindings
+            .iter()
+            .filter(|binding| matches!(binding.fidelity, TakeFidelity::Draft))
+            .filter_map(|binding| binding.turn_id.as_deref())
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_id: impl Into<String>,
@@ -2009,6 +2043,22 @@ impl Validate for VideoProjectManifest {
                 .map(|asset| asset.id.as_str())
                 .collect::<BTreeSet<_>>(),
         )?;
+
+        // A master assembled from stand-ins would be published as the finished episode. The
+        // fidelity is recorded on the take precisely so this can be refused rather than noticed
+        // later by a listener.
+        if !self.draft_turn_ids().is_empty()
+            && self.render_artifacts.iter().any(|artifact| {
+                matches!(artifact.role, RenderArtifactRole::FinalMaster)
+                    && matches!(artifact.publication_state, PublicationState::Published)
+            })
+        {
+            return Err(VideoError::new(
+                VideoErrorCode::DraftNotPromoted,
+                "a final master cannot be published while any line is still a draft take",
+            )
+            .at("narration_bindings.fidelity"));
+        }
 
         // A bed that does not duck buries the dialogue it is supposed to support. The mix contract
         // can already express the envelope, so the only thing missing was refusing to render a bed
@@ -3146,6 +3196,7 @@ mod tests {
             scene_id: None,
             turn_id: Some("turn-1".into()),
             lexicon_fingerprint: None,
+            fidelity: TakeFidelity::Final,
             render_artifact_id: "turn-audio".into(),
             history_id: "history-turn".into(),
             generation_job_id: "job-turn".into(),
@@ -3413,6 +3464,7 @@ mod tests {
             scene_id: Some("scene-narration".into()),
             turn_id: None,
             lexicon_fingerprint: None,
+            fidelity: TakeFidelity::Final,
             render_artifact_id: "narration-audio".into(),
             history_id: "history-narration".into(),
             generation_job_id: "job-narration".into(),

@@ -1165,6 +1165,27 @@ Depends on: 12.1, the existing preview renderer and segment cache.
 - Draft artifacts are visibly labelled draft, are never exportable as a master, and
   are never registered as a final release member.
 
+### Current Evidence
+
+Slice 12.10 is implemented and locally verified.
+
+- `TakeFidelity` travels with each take, because a draft that could not be told apart from a final
+  take would eventually be published as one. Takes recorded before draft mode existed decode as
+  final, which is what they were.
+- A final master cannot be published while any line is still a stand-in. The manifest refuses it
+  outright rather than leaving it to be noticed later by a listener, and the release plan blocks the
+  audio episode and the video master with a reason naming how many lines are left to re-read.
+- `promote_turns_to_final` drops the stand-in takes for exactly the named lines, so promoting one
+  line never re-reads the rest of the episode. That is the whole point of drafting: the expensive
+  voice is spent only on what survived the listen. A line that is already final cannot be promoted,
+  because that would read as a promotion that did something.
+- The listening report and the presented project both name the draft lines, so an unfinished
+  episode is visibly unfinished in the UI and to the assistant.
+- The producer prompt now describes the draft-then-promote route explicitly.
+- Verified locally: 461 native tests including three draft cases covering selective promotion, the
+  already-final rejection, and the refusal to publish a master built on stand-ins, plus a release
+  case proving a stand-in cannot leave soundAr as the finished episode; and 151 React tests.
+
 ### Required Tests
 
 - Parse representative, malformed, and very large speaker-attributed scripts,

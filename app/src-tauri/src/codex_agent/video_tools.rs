@@ -1364,7 +1364,7 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "edit_video_timeline",
-            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, set or remove a pronunciation rule, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line; changing a pronunciation rule re-reads only the lines that rule governs; a music bed placed on a track always ducks against the speech beneath it; sound-design placements reference audio the user already registered and never introduce new files. Use one stable operation_id for retries. Requires Studio or Full access.",
+            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, set or remove a pronunciation rule, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line; changing a pronunciation rule re-reads only the lines that rule governs; a music bed placed on a track always ducks against the speech beneath it; sound-design placements reference audio the user already registered and never introduce new files; promoting a draft line re-reads only that line. Use one stable operation_id for retries. Requires Studio or Full access.",
             timeline_edit_schema(),
         ),
         tool(
@@ -1833,6 +1833,7 @@ fn timeline_operation_schemas() -> Vec<Value> {
         place_music_cue_operation_schema(),
         register_sound_asset_operation_schema(),
         remove_sound_asset_operation_schema(),
+        promote_turns_to_final_operation_schema(),
         set_sound_layer_operation_schema(),
         remove_sound_layer_operation_schema(),
         update_visual_layer_operation_schema(),
@@ -2026,6 +2027,22 @@ fn place_music_cue_operation_schema() -> Value {
             "type":{"const":"place_music_cue"},
             "cue_id":{"type":"string","minLength":1},
             "source_asset_id":{"type":"string","minLength":1,"description":"Registered soundAr music already imported into this project. Prefer generate_cue_music, which composes and places in one durable job."}
+        }
+    })
+}
+
+fn promote_turns_to_final_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","turn_ids"],
+        "properties":{
+            "type":{"const":"promote_turns_to_final"},
+            "turn_ids":{
+                "type":"array","minItems":1,"maxItems":500,
+                "items":{"type":"string","minLength":1},
+                "description":"Draft lines to re-read at final fidelity. Only these lose their stand-in takes, so promoting one line never re-reads the rest of the episode."
+            }
         }
     })
 }
@@ -2480,7 +2497,7 @@ mod tests {
             schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(16)
+            Some(17)
         );
 
         // Retiming a conversation goes through the same version-bound batch as every other edit.

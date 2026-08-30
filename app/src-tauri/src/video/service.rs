@@ -19,6 +19,7 @@ use super::{
     MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance,
     ProvenanceKind, PublicHttpsProxy, PublicationState, RationalFrameRate, RationalRate,
     RenderArtifact, RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile,
+    TakeFidelity,
     RenderWorkloadClass, ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord,
     RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, SourceAsset,
     SourceAssetKind, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder,
@@ -895,6 +896,10 @@ pub struct TimelineRenderBatchRequest {
 pub struct NarrationReplacement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_id: Option<String>,
+    /// Whether this take is the finished performance or a fast stand-in. Draft takes let a whole
+    /// episode be heard quickly; only the lines that survive that listen are re-read for real.
+    #[serde(default)]
+    pub fidelity: TakeFidelity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene_id: Option<String>,
     /// Target one dialogue turn. Turn-scoped replacement is the multi-character path: it
@@ -7849,6 +7854,7 @@ mod tests {
             parent_job_id: Some(parent_job_id),
             replacements: vec![NarrationReplacement {
                 binding_id: None,
+                fidelity: TakeFidelity::Final,
                 scene_id: Some(scene_id.clone()),
                 turn_id: None,
                 clip_id: None,
@@ -7973,6 +7979,7 @@ mod tests {
             parent_job_id: Some(cancel_parent_job_id.clone()),
             replacements: vec![NarrationReplacement {
                 binding_id: None,
+                fidelity: TakeFidelity::Final,
                 scene_id: Some(scene_id.clone()),
                 turn_id: None,
                 clip_id: None,
@@ -15873,6 +15880,7 @@ impl VideoStudioService {
                 scene_id: scene_id.clone(),
                 turn_id: turn_id.clone(),
                 lexicon_fingerprint: lexicon_fingerprint.clone(),
+                fidelity: replacement.fidelity,
                 render_artifact_id: artifact.id.clone(),
                 history_id: replacement.history_id.clone(),
                 generation_job_id,

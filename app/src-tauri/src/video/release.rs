@@ -243,6 +243,13 @@ pub fn plan_release(
             )
     });
     let narrated = transcript.is_some();
+    // A stand-in take must never leave soundAr as the finished episode.
+    let drafts = manifest.draft_turn_ids();
+    let no_drafts = drafts.is_empty();
+    let draft_reason = format!(
+        "{} line(s) are still draft takes; promote them to final first",
+        drafts.len()
+    );
 
     let member = |kind: ReleaseMemberKind, ready: bool, reason: &str| ReleaseMemberPlan {
         kind,
@@ -257,13 +264,21 @@ pub fn plan_release(
     let members = vec![
         member(
             ReleaseMemberKind::PodcastAudio,
-            narrated,
-            "No line has been narrated yet, so there is no audio episode to publish",
+            narrated && no_drafts,
+            if narrated {
+                &draft_reason
+            } else {
+                "No line has been narrated yet, so there is no audio episode to publish"
+            },
         ),
         member(
             ReleaseMemberKind::VideoMaster,
-            has_master,
-            "Render a final master for the current timeline first",
+            has_master && no_drafts,
+            if has_master {
+                &draft_reason
+            } else {
+                "Render a final master for the current timeline first"
+            },
         ),
         member(
             ReleaseMemberKind::Trailer,
@@ -501,6 +516,59 @@ mod tests {
         // An episode with no scenes has no chapters rather than one invented per line.
         let bare = manifest();
         assert!(episode_chapters(&bare).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stand_in_take_can_never_leave_soundar_as_the_finished_episode() {
+        use crate::video::contracts::TakeFidelity;
+
+        let mut manifest = manifest();
+        narrate(&mut manifest, 8);
+        // Bind every performed line to a take, then mark one of them a stand-in.
+        for index in 0..8usize {
+            manifest
+                .narration_bindings
+                .push(crate::video::contracts::NarrationBinding {
+                    id: format!("binding-{index}"),
+                    scene_id: None,
+                    turn_id: Some(format!("turn-{index}")),
+                    lexicon_fingerprint: None,
+                    fidelity: if index == 3 {
+                        TakeFidelity::Draft
+                    } else {
+                        TakeFidelity::Final
+                    },
+                    render_artifact_id: format!("take-{index}"),
+                    history_id: format!("history-{index}"),
+                    generation_job_id: format!("job-{index}"),
+                    voice_id: "af-heart".into(),
+                    model_id: "hexgrad/Kokoro-82M".into(),
+                    speaker: if index % 2 == 0 { "NARRATOR" } else { "ADAEZE" }.into(),
+                    language: "en-US".into(),
+                    script_sha256: format!(
+                        "{:x}",
+                        <sha2::Sha256 as sha2::Digest>::digest(
+                            format!("This is line number {index} of the episode.").as_bytes()
+                        )
+                    ),
+                    created_at: NOW.into(),
+                });
+        }
+        manifest.validate_strict().unwrap();
+
+        let trailer = TimeRange::new(0, TRAILER_TARGET_US).unwrap();
+        let plan = plan_release(&manifest, Some(trailer), true).unwrap();
+        let blocked = plan
+            .blocked()
+            .into_iter()
+            .map(|member| member.kind)
+            .collect::<Vec<_>>();
+        assert!(blocked.contains(&ReleaseMemberKind::PodcastAudio));
+        // The reason names the count so the author knows how much is left to re-read.
+        assert!(plan.members[0]
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("1 line(s)")));
     }
 
     #[test]

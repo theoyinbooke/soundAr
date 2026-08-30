@@ -7,8 +7,8 @@
 
 use super::contracts::{
     validate_identifier, AudioMixTrack, CaptionCue, Microseconds, ReviewedScene, RevisionStage,
-    SourceAssetKind, TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate,
-    VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
+    SourceAssetKind, TakeFidelity, TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind,
+    Validate, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
 };
 use super::lexicon::{fingerprint_for_character, LexiconEntry};
 use super::score::{bed_ducking, fit_cue, MusicCue};
@@ -93,6 +93,12 @@ pub enum VideoTimelineOperation {
     },
     /// Removes one sound-design asset and every placement that used it.
     RemoveSoundAsset { asset_id: String },
+    /// Marks draft lines for re-reading at final fidelity by dropping their stand-in takes.
+    ///
+    /// Only the named turns lose their takes, so promoting one line never re-reads the rest of the
+    /// episode. That is the whole point of drafting: the expensive voice is spent only on what
+    /// survived the listen.
+    PromoteTurnsToFinal { turn_ids: Vec<String> },
     /// Adds or replaces one sound-design placement. The assistant may propose a placement from a
     /// stage direction, but it only ever takes effect through this revision-checked path.
     SetSoundLayer { layer: SoundLayer },
@@ -194,6 +200,9 @@ pub fn apply_timeline_edit(
             } => register_sound_asset(&mut edited, asset_id, source_asset_id, name, tags)?,
             VideoTimelineOperation::RemoveSoundAsset { asset_id } => {
                 remove_sound_asset(&mut edited, asset_id)?
+            }
+            VideoTimelineOperation::PromoteTurnsToFinal { turn_ids } => {
+                promote_turns_to_final(&mut edited, turn_ids)?
             }
             VideoTimelineOperation::SetSoundLayer { layer } => set_sound_layer(&mut edited, layer)?,
             VideoTimelineOperation::RemoveSoundLayer { layer_id } => {
@@ -339,6 +348,18 @@ fn validate_request(
             }
             VideoTimelineOperation::RemoveSoundAsset { asset_id } => {
                 validate_identifier(asset_id, "operations.asset_id")?
+            }
+            VideoTimelineOperation::PromoteTurnsToFinal { turn_ids } => {
+                if turn_ids.is_empty() {
+                    return Err(edit_error(
+                        VideoErrorCode::InvalidPerformance,
+                        "name at least one draft line to re-read",
+                        "operations.turn_ids",
+                    ));
+                }
+                for turn_id in turn_ids {
+                    validate_identifier(turn_id, "operations.turn_ids")?;
+                }
             }
             VideoTimelineOperation::SetSoundLayer { layer } => layer.validate()?,
             VideoTimelineOperation::RemoveSoundLayer { layer_id } => {
@@ -880,6 +901,35 @@ fn remove_sound_asset(manifest: &mut VideoProjectManifest, asset_id: &str) -> Vi
     manifest
         .sound_layers
         .retain(|layer| layer.asset_id != asset_id);
+    Ok(())
+}
+
+fn promote_turns_to_final(
+    manifest: &mut VideoProjectManifest,
+    turn_ids: &[String],
+) -> VideoResult<()> {
+    let wanted = turn_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let draft_turns = manifest
+        .draft_turn_ids()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    // Naming a line that is already final would read as a promotion that did something.
+    if let Some(missing) = wanted.iter().find(|id| !draft_turns.contains(*id)) {
+        return Err(edit_error(
+            VideoErrorCode::InvalidPerformance,
+            format!("dialogue turn {missing} does not have a draft take to promote"),
+            "operations.turn_ids",
+        ));
+    }
+    manifest.narration_bindings.retain(|binding| {
+        !binding
+            .turn_id
+            .as_deref()
+            .is_some_and(|turn_id| wanted.contains(turn_id))
+    });
     Ok(())
 }
 
@@ -3016,6 +3066,7 @@ mod tests {
                 scene_id: None,
                 turn_id: Some(turn.id.clone()),
                 lexicon_fingerprint: fingerprint_for_character(&manifest.lexicon, &member.id),
+                fidelity: TakeFidelity::Final,
                 render_artifact_id: artifact_id,
                 history_id: format!("history-{}", turn.id),
                 generation_job_id: format!("job-{}", turn.id),
@@ -3667,6 +3718,77 @@ mod tests {
     }
 
     #[test]
+    fn promoting_a_draft_line_re_reads_only_that_line() {
+        let mut manifest = with_takes(&with_dialogue(&manifest()));
+        // Hear the whole episode with stand-ins first.
+        for binding in &mut manifest.narration_bindings {
+            binding.fidelity = TakeFidelity::Draft;
+        }
+        manifest.validate_strict().unwrap();
+        assert_eq!(manifest.draft_turn_ids().len(), 2);
+
+        let promoted = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::PromoteTurnsToFinal {
+                turn_ids: vec!["turn-b".into()],
+            }]),
+        )
+        .unwrap();
+
+        // Only the promoted line loses its take, so only it is re-read.
+        let surviving = promoted
+            .manifest
+            .narration_bindings
+            .iter()
+            .map(|binding| binding.turn_id.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(surviving, vec!["turn-a".to_string()]);
+        assert!(promoted
+            .receipt
+            .invalidated_stages
+            .contains(&RevisionStage::Speech));
+    }
+
+    #[test]
+    fn a_line_that_is_already_final_cannot_be_promoted() {
+        let manifest = with_takes(&with_dialogue(&manifest()));
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::PromoteTurnsToFinal {
+                turn_ids: vec!["turn-a".into()],
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidPerformance);
+    }
+
+    #[test]
+    fn a_master_cannot_be_published_while_a_line_is_still_a_stand_in() {
+        use super::super::contracts::{PublicationState, RenderArtifact, RenderArtifactRole};
+
+        let mut manifest = with_takes(&with_dialogue(&manifest()));
+        manifest.render_artifacts.push(RenderArtifact {
+            id: "master".into(),
+            role: RenderArtifactRole::FinalMaster,
+            scene_id: None,
+            managed_path: "renders/master.mp4".into(),
+            sha256: "9".repeat(64),
+            cache_key: "8".repeat(64),
+            mime_type: "video/mp4".into(),
+            duration_us: Some(Microseconds(3_000_000)),
+            width: Some(1080),
+            height: Some(1920),
+            publication_state: PublicationState::Published,
+            created_at: NOW.into(),
+        });
+        manifest.validate_strict().unwrap();
+
+        manifest.narration_bindings[0].fidelity = TakeFidelity::Draft;
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::DraftNotPromoted);
+    }
+
+    #[test]
     fn a_beat_edit_must_name_a_turn_that_exists() {
         let manifest = with_dialogue(&manifest());
         let error = apply_timeline_edit(
@@ -3747,6 +3869,7 @@ mod tests {
             scene_id: Some(scene_id.into()),
             turn_id: None,
             lexicon_fingerprint: None,
+            fidelity: TakeFidelity::Final,
             render_artifact_id: artifact_id,
             history_id: format!("history-{suffix}"),
             generation_job_id: format!("job-{suffix}"),

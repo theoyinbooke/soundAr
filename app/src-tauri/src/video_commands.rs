@@ -153,6 +153,9 @@ struct DurablePlanRequest {
 struct DurableNarrationRevisionRequest {
     project_id: String,
     scene_id: String,
+    /// Whether this re-read is the finished performance or a fast stand-in.
+    #[serde(default)]
+    fidelity: video::TakeFidelity,
     /// Set when the revision re-reads one dialogue turn rather than a whole scene.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     turn_id: Option<String>,
@@ -1355,6 +1358,7 @@ fn revise_project(
         let durable = DurableNarrationRevisionRequest {
             project_id: request.project_id.clone(),
             scene_id: scene.id.clone(),
+            fidelity: video::TakeFidelity::Final,
             // This command revises a whole scene's narration. Turn-scoped re-reads arrive
             // through the dialogue path, which resolves its own binding.
             turn_id: None,
@@ -1789,6 +1793,7 @@ fn narration_replacement_request(
         actor: request.actor.clone(),
         replacements: vec![video::service::NarrationReplacement {
             binding_id: request.binding_id.clone(),
+            fidelity: request.fidelity,
             // A turn-scoped revision must not also claim its scene, or the service would
             // resolve two competing narration targets for one take.
             scene_id: if request.turn_id.is_some() {
@@ -5963,6 +5968,7 @@ mod tests {
         let durable = DurableNarrationRevisionRequest {
             project_id: "project-1".into(),
             scene_id: "scene-opening".into(),
+            fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: "A reviewed opening.".into(),
@@ -6042,6 +6048,7 @@ mod tests {
             scene_id: Some("scene-opening".into()),
             turn_id: None,
             lexicon_fingerprint: None,
+            fidelity: video::TakeFidelity::Final,
             render_artifact_id: artifact.id.clone(),
             history_id: "history-exact".into(),
             generation_job_id: "synthesis-exact".into(),
@@ -6072,6 +6079,7 @@ mod tests {
         let request = DurableNarrationRevisionRequest {
             project_id: manifest.project_id.clone(),
             scene_id: "scene-opening".into(),
+            fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: script.clone(),
@@ -6218,6 +6226,7 @@ mod tests {
         let request = DurableNarrationRevisionRequest {
             project_id: project_id.clone(),
             scene_id: "scene-opening".into(),
+            fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: script.clone(),
@@ -6353,6 +6362,7 @@ mod tests {
                 scene_id: Some("scene-opening".into()),
                 turn_id: None,
                 lexicon_fingerprint: None,
+                fidelity: video::TakeFidelity::Final,
                 render_artifact_id: artifact_id.into(),
                 history_id: "narration-post-manifest-history".into(),
                 generation_job_id: synthesis_job_id.clone(),
@@ -7357,6 +7367,7 @@ mod tests {
             scene_id: Some("scene-opening".into()),
             turn_id: None,
             lexicon_fingerprint: None,
+            fidelity: video::TakeFidelity::Final,
             render_artifact_id: "speech-opening".into(),
             history_id: "history-opening".into(),
             generation_job_id: "synthesis-opening".into(),

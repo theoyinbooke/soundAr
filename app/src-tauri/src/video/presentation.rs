@@ -243,6 +243,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "script_sha256": binding.script_sha256,
                 "created_at": binding.created_at,
                 "turn_id": binding.turn_id,
+                "fidelity": binding.fidelity,
             })
         })
         .collect::<Vec<_>>();
@@ -266,6 +267,10 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             })
         })
         .collect::<Vec<_>>();
+    let draft_turn_ids = manifest
+        .draft_turn_ids()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
     let narrated_turn_ids = manifest
         .narration_bindings
         .iter()
@@ -287,6 +292,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 // Whether this line has a valid take is the one thing a reader most needs and
                 // cannot derive without cross-referencing the bindings themselves.
                 "narrated": narrated_turn_ids.contains(turn.id.as_str()),
+                "draft": draft_turn_ids.contains(turn.id.as_str()),
             })
         })
         .collect::<Vec<_>>();

@@ -64,6 +64,8 @@ pub struct EpisodeListening {
     pub music_cues_placed: usize,
     pub music_cues_planned: usize,
     pub sound_placements: usize,
+    /// Lines still standing in with a draft take. An episode with any of these is unfinished.
+    pub draft_turns: Vec<String>,
     /// Present only when the runtime measured it. Absent means unmeasured, never "fine".
     #[serde(default)]
     pub loudness: Option<LoudnessMeasurement>,
@@ -230,6 +232,11 @@ pub fn listen_to_episode(
             .filter(|cue| cue.needs_generation())
             .count(),
         sound_placements: manifest.sound_layers.len(),
+        draft_turns: manifest
+            .draft_turn_ids()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         loudness,
     })
 }

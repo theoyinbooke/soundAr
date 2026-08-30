@@ -658,6 +658,16 @@ function applyBrowserTimelineOperations(project: VideoProject, request: VideoTim
         if (!cues.some((existing) => existing.id === operation.cue_id)) throw new Error("video.missing_reference: The music cue no longer exists.");
         edited.manifest.music_cues = cues.filter((existing) => existing.id !== operation.cue_id);
       }
+    } else if (operation.type === "promote_turns_to_final") {
+      const drafts = new Set((edited.manifest.narration_bindings ?? []).filter((binding) => binding.fidelity === "draft").map((binding) => binding.turn_id));
+      // Naming a line that is already final would read as a promotion that did something.
+      const alreadyFinal = operation.turn_ids.find((turnId) => !drafts.has(turnId));
+      if (alreadyFinal) throw new Error(`video.invalid_performance: Dialogue turn ${alreadyFinal} does not have a draft take to promote.`);
+      // Only the named lines lose their stand-ins, so the rest are never re-read.
+      const promoted = new Set(operation.turn_ids);
+      edited.manifest.narration_bindings = (edited.manifest.narration_bindings ?? []).filter((binding) => !binding.turn_id || !promoted.has(binding.turn_id));
+      edited.manifest.dialogue = (edited.manifest.dialogue ?? []).map((turn) =>
+        promoted.has(turn.id) ? { ...turn, narrated: false, draft: false } : turn);
     } else if (operation.type === "set_sound_layer" || operation.type === "remove_sound_layer") {
       const layers = edited.manifest.sound_layers ?? [];
       if (operation.type === "set_sound_layer") {
@@ -971,6 +981,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
         music_cues_placed: (project.manifest.music_cues ?? []).filter((cue) => !cue.needs_generation).length,
         music_cues_planned: (project.manifest.music_cues ?? []).filter((cue) => cue.needs_generation).length,
         sound_placements: (project.manifest.sound_layers ?? []).length,
+        draft_turns: turns.filter((turn) => turn.draft).map((turn) => turn.id),
         // Absent means unmeasured, never "fine".
         loudness: integratedLufsMilli !== undefined && truePeakDbMilli !== undefined
           ? { integrated_lufs_milli: integratedLufsMilli, true_peak_db_milli: truePeakDbMilli }

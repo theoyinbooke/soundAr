@@ -242,6 +242,8 @@ export interface VideoNarrationBinding {
   turn_id?: string | null;
   /** Fingerprint of the pronunciation rules this take was produced under. */
   lexicon_fingerprint?: string | null;
+  /** A draft take is a fast stand-in and can never be exported as a master. */
+  fidelity?: VideoTakeFidelity;
 }
 
 export interface VideoTimelineItem {
@@ -319,7 +321,7 @@ export interface VideoProjectManifest {
   /** Present on current manifests; optional only for migration-era project compatibility. */
   cast?: VideoCastMember[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
-  dialogue?: (VideoDialogueTurn & { narrated: boolean })[];
+  dialogue?: (VideoDialogueTurn & { narrated: boolean; draft?: boolean })[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
   lexicon?: VideoLexiconEntry[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
@@ -511,6 +513,7 @@ export type VideoTimelineOperation =
   | { type: "place_music_cue"; cue_id: string; source_asset_id: string }
   | { type: "register_sound_asset"; asset_id: string; source_asset_id: string; name: string; tags: string[] }
   | { type: "remove_sound_asset"; asset_id: string }
+  | { type: "promote_turns_to_final"; turn_ids: string[] }
   | { type: "set_sound_layer"; layer: VideoSoundLayerInput }
   | { type: "remove_sound_layer"; layer_id: string }
   | {
@@ -657,6 +660,9 @@ export interface VideoMusicCueInput {
   created_at: string;
 }
 
+/** Whether a take is the finished performance or a fast stand-in. */
+export type VideoTakeFidelity = "draft" | "final";
+
 /** How much of the episode one character actually speaks, measured from their takes. */
 export interface VideoSpeakerShare {
   character_id: string;
@@ -701,6 +707,8 @@ export interface VideoEpisodeListening {
   music_cues_placed: number;
   music_cues_planned: number;
   sound_placements: number;
+  /** Lines still standing in with a draft take. An episode with any of these is unfinished. */
+  draft_turns: string[];
   loudness?: { integrated_lufs_milli: number; true_peak_db_milli: number } | null;
 }
 

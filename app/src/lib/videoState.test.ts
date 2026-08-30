@@ -359,6 +359,18 @@ describe("videoStudioReducer", () => {
     expect(untouched.loudness_checked).toBe(false);
   });
 
+  it("refuses to promote a line that is not a draft", async () => {
+    const service = createBrowserPreviewVideoService();
+    const project = await service.getVideoProject("creator-update");
+    // Naming a line with no stand-in would read as a promotion that did something.
+    await expect(
+      service.editVideoTimeline({
+        project_id: project.id, expected_revision: project.revision, base_version_id: project.manifest.version_id,
+        operation_id: "promote-final", operations: [{ type: "promote_turns_to_final", turn_ids: ["turn-absent"] }],
+      }),
+    ).rejects.toThrow(/does not have a draft take/i);
+  });
+
   it("moves a durable project through intake, analysis, review, render, and export", async () => {
     const service = createBrowserPreviewVideoService();
     let state: VideoStudioState = initialVideoStudioState;
