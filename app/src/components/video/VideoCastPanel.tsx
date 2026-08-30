@@ -36,12 +36,18 @@ export function VideoCastPanel({
   const pending = dialogue.filter((turn) => !turn.narrated).map((turn) => turn.id);
   const drafts = dialogue.filter((turn) => turn.draft).map((turn) => turn.id);
 
+  const lexicon = project.manifest.lexicon ?? [];
+  const cues = project.manifest.music_cues ?? [];
+  const soundLayers = project.manifest.sound_layers ?? [];
+  const soundAssets = project.manifest.sound_assets ?? [];
+  const origin = project.manifest.format_origin;
+
   if (!cast.length) {
     return (
       <div id={panelId} role="tabpanel" aria-labelledby={labelledBy} className="video-cast-panel">
         <p className="video-cast-empty">
-          This project has no cast yet. Ask the assistant to write a speaker-attributed script and
-          it will bind each character to its own voice.
+          This episode has no cast yet. Ask the assistant for a multi-character script and it will
+          bind each character to its own voice, time the conversation, and list every line here.
         </p>
       </div>
     );
@@ -49,6 +55,12 @@ export function VideoCastPanel({
 
   return (
     <div id={panelId} role="tabpanel" aria-labelledby={labelledBy} className="video-cast-panel">
+      {origin ? (
+        <p className="video-cast-notice">
+          From <strong>{origin.format_name}</strong> revision {origin.format_revision}. These values
+          were copied when the episode started, so editing the show will not change this episode.
+        </p>
+      ) : null}
       <section aria-label="Cast">
         <h4>Cast</h4>
         <ul className="video-cast-list">
@@ -100,6 +112,71 @@ export function VideoCastPanel({
           })}
         </ol>
       </section>
+
+      {lexicon.length ? (
+        <section aria-label="Pronunciation">
+          <h4>
+            Pronunciation <small>{lexicon.length} rule(s)</small>
+          </h4>
+          <ul className="video-cast-list">
+            {lexicon.map((entry) => (
+              <li key={entry.id}>
+                <strong>
+                  {entry.match_text} → {entry.replacement}
+                </strong>
+                {/* Scope is what decides which lines a change re-reads. */}
+                <small>
+                  {entry.scope === "character"
+                    ? characters.get(entry.character_id ?? "")?.display_name ?? entry.character_id
+                    : entry.scope}
+                  {entry.matching === "exact" ? " · case-sensitive" : ""}
+                </small>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {cues.length ? (
+        <section aria-label="Score">
+          <h4>
+            Score <small>{cues.length} cue(s)</small>
+          </h4>
+          <ul className="video-cast-list">
+            {cues.map((cue) => (
+              <li key={cue.id}>
+                <strong>
+                  {cue.role} · {Math.round(cue.target_duration_ms / 1000)}s
+                </strong>
+                <small>
+                  {cue.needs_generation ? "Not composed yet" : "Composed and placed"} · {cue.direction}
+                </small>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {soundLayers.length ? (
+        <section aria-label="Sound design">
+          <h4>
+            Sound design <small>{soundLayers.length} placement(s)</small>
+          </h4>
+          <ul className="video-cast-list">
+            {soundLayers.map((layer) => (
+              <li key={layer.id}>
+                <strong>
+                  {soundAssets.find((asset) => asset.id === layer.asset_id)?.name ?? layer.asset_id}
+                </strong>
+                <small>
+                  {layer.kind.replace("_", " ")} · {Math.round(layer.start_ms / 1000)}s–
+                  {Math.round(layer.end_ms / 1000)}s
+                </small>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       <div className="video-cast-actions">
         <button

@@ -1424,6 +1424,22 @@ and dialogue is the first, because performance timing, the score, sound design,
 formats, releases, quality control, and the assistant's listening pass all depend on
 turn-scoped narration existing first.
 
+## Version Numbering
+
+soundAr advances one patch at a time: `0.8.0`, then `0.8.1`, `0.8.2`, `0.8.3`, and so on. Each
+shipped slice of work is its own patch release with its own changelog entry, so a user can see what
+changed between any two builds and can roll back to a specific one.
+
+- A patch bump is the default for every release, including new features. Phase 12 slices, UI
+  surfaces, and fixes all ship as patches.
+- A minor bump is reserved for a milestone that completes a roadmap phase's exit gate, and is
+  decided deliberately rather than reached by accumulation.
+- Never skip a number to signal size. A large release is still the next patch.
+
+Every release bumps `app/package.json`, `app/package-lock.json`, `app/src-tauri/tauri.conf.json`,
+and `app/src-tauri/Cargo.toml` together; `scripts/check-release-version.sh` enforces that they
+match and CI runs it on every pull request.
+
 ## Roadmap Maintenance
 
 - Update this file when a milestone enters development, changes scope, or passes

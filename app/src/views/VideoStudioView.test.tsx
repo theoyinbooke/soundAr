@@ -35,9 +35,22 @@ describe("VideoStudioView", () => {
       },
     };
 
+    // Pronunciation, score, and sound design are shown beside the script so an episode's state is
+    // in one place rather than spread across surfaces the user has to know to look for.
+    project.manifest.lexicon = [
+      { id: "rule-adaeze", scope: "project", match_text: "Adaeze", replacement: "Ah-DAH-eh-zeh", matching: "word", created_at: "2026-01-01T00:00:00Z" },
+    ];
+    project.manifest.music_cues = [
+      { id: "cue-outro", role: "outro", anchor: { kind: "after_final_turn" }, target_duration_ms: 20_000, direction: "warm, resolving", gain_db: -6, fade_in_ms: 500, fade_out_ms: 2_000, needs_generation: true, created_at: "2026-01-01T00:00:00Z" },
+    ];
+
     render(<VideoStudioView service={service} />);
     await user.click(await screen.findByRole("button", { name: /From interview source/i }));
     await user.click(await screen.findByRole("tab", { name: "Cast" }));
+
+    expect(await screen.findByText(/Adaeze → Ah-DAH-eh-zeh/)).toBeVisible();
+    // A cue that has not been composed says so rather than looking finished.
+    expect(screen.getByText(/Not composed yet/)).toBeVisible();
 
     // The three states are named rather than left for the reader to infer.
     expect(await screen.findByText("Not narrated")).toBeVisible();

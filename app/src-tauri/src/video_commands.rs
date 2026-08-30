@@ -152,7 +152,10 @@ struct DurablePlanRequest {
 #[serde(deny_unknown_fields)]
 struct DurableNarrationRevisionRequest {
     project_id: String,
-    scene_id: String,
+    /// Absent for a turn-scoped narration. A line belongs to its turn, not to a scene, and naming
+    /// a scene it does not have would fail the identity check the job runs before synthesizing.
+    #[serde(default)]
+    scene_id: Option<String>,
     /// Whether this re-read is the finished performance or a fast stand-in.
     #[serde(default)]
     fidelity: video::TakeFidelity,
@@ -362,15 +365,16 @@ pub(crate) fn dispatch_video_operation(
                 &runtime.store.video_artifacts_root(),
             )
             .map_err(VideoAgentToolError::from)?;
-            let retained = result.receipt.retained_turn_ids.len();
+            let unchanged = result.receipt.retained_turn_ids.len();
             let fresh = result.receipt.new_turn_ids.len();
+            let dropped = result.receipt.dropped_binding_ids.len();
             VideoAgentResult::project(
                 kind,
                 VideoAgentResultStatus::Completed,
-                // Saying which turns survived is what stops the agent re-reading lines that
-                // already have a valid take.
+                // A retained line kept its identity, which is not the same as having a take.
+                // Reporting it as a valid take would tell the agent work exists that does not.
                 format!(
-                    "Cast and script committed: {fresh} turn(s) need narration, {retained} existing take(s) remain valid"
+                    "Cast and script committed: {fresh} new line(s), {unchanged} unchanged, {dropped} take(s) dropped. Narrate the lines that have no take yet."
                 ),
                 project,
                 Some(result.job_id),
@@ -1550,7 +1554,7 @@ fn revise_project(
             .map(|binding| binding.id.clone());
         let durable = DurableNarrationRevisionRequest {
             project_id: request.project_id.clone(),
-            scene_id: scene.id.clone(),
+            scene_id: Some(scene.id.clone()),
             fidelity: video::TakeFidelity::Final,
             // This command revises a whole scene's narration. Turn-scoped re-reads arrive
             // through the dialogue path, which resolves its own binding.
@@ -1649,10 +1653,8 @@ pub(crate) fn narrate_turns(
             project_id: project_id.to_string(),
             // A turn-scoped take belongs to its line, not to a scene, so the scene is only carried
             // for progress reporting and is never used as a second narration target.
-            scene_id: turn
-                .scene_id
-                .clone()
-                .unwrap_or_else(|| "dialogue".to_string()),
+            // A turn-scoped narration has no scene; the line is its own identity.
+            scene_id: None,
             fidelity,
             turn_id: Some(turn.id.clone()),
             binding_id: None,
@@ -1770,11 +1772,9 @@ fn run_narration_revision_job(
     manifest
         .validate_strict()
         .map_err(|error| error.to_string())?;
-    let scene = selected_revision_scene(&manifest, Some(&request.scene_id))?;
-    if scene.script.trim() != request.script
-        || sha256_text(scene.script.trim()) != request.script_sha256
-    {
-        return Err("video.narration_script_changed: The reviewed scene script changed after this durable narration task was queued".into());
+    let source_text = durable_narration_source_text(&manifest, request)?;
+    if source_text != request.script || sha256_text(&source_text) != request.script_sha256 {
+        return Err("video.narration_script_changed: The script changed after this durable narration task was queued".into());
     }
     let resolved = resolve_voice_revision_route(
         runtime,
@@ -2113,7 +2113,7 @@ fn narration_replacement_request(
             scene_id: if request.turn_id.is_some() {
                 None
             } else {
-                Some(request.scene_id.clone())
+                request.scene_id.clone()
             },
             turn_id: request.turn_id.clone(),
             clip_id: None,
@@ -2159,11 +2159,12 @@ fn validate_committed_narration_result(
                 .into(),
         );
     }
-    let scene = selected_revision_scene(&manifest, Some(&request.scene_id))?;
-    if scene.script.trim() != request.script
-        || sha256_text(scene.script.trim()) != request.script_sha256
-    {
-        return Err("video.narration_result_changed: The completed narration no longer matches the reviewed scene script".into());
+    let source_text = durable_narration_source_text(&manifest, request)?;
+    if source_text != request.script || sha256_text(&source_text) != request.script_sha256 {
+        return Err(
+            "video.narration_result_changed: The completed narration no longer matches its script"
+                .into(),
+        );
     }
     let binding = manifest.narration_bindings.iter().find(|binding| {
         request
@@ -2171,12 +2172,16 @@ fn validate_committed_narration_result(
             .as_deref()
             .is_some_and(|id| binding.id == id)
             || (request.binding_id.is_none()
-                && binding.scene_id.as_deref() == Some(request.scene_id.as_str()))
+                && match request.turn_id.as_deref() {
+                    Some(turn_id) => binding.turn_id.as_deref() == Some(turn_id),
+                    None => binding.scene_id.as_deref() == request.scene_id.as_deref(),
+                })
     });
     let binding = binding.ok_or(
         "video.narration_result_missing: The completed narration binding is not present in the current timeline",
     )?;
-    if binding.scene_id.as_deref() != Some(request.scene_id.as_str())
+    if binding.scene_id.as_deref() != request.scene_id.as_deref()
+        || binding.turn_id.as_deref() != request.turn_id.as_deref()
         || binding.voice_id != request.voice_id
         || binding.model_id != request.model_id
         || binding.speaker != request.speaker
@@ -2469,7 +2474,8 @@ fn narration_stage_checkpoint(
             stage.get("version_id").and_then(Value::as_str)
                 == Some(request.expected_version_id.as_str())
                 && stage.get("stage_key").and_then(Value::as_str) == Some("narration_regeneration")
-                && stage.get("scope_key").and_then(Value::as_str) == Some(request.scene_id.as_str())
+                && stage.get("scope_key").and_then(Value::as_str)
+                    == Some(narration_scope_key(request).as_str())
                 && stage.get("job_id").and_then(Value::as_str) == Some(parent_job_id)
         })
         .and_then(|stage| stage.get("checkpoint").cloned())
@@ -2498,7 +2504,7 @@ fn checkpoint_narration_stage(
         "project_id": request.project_id,
         "version_id": request.expected_version_id,
         "stage_key": "narration_regeneration",
-        "scope_key": request.scene_id,
+        "scope_key": narration_scope_key(request),
         "job_id": parent_job_id,
         "status": status,
         "resource_class": "heavy",
@@ -3107,6 +3113,47 @@ fn narration_route_matches_manifest(
             && binding.language == selection.language
             && binding.script_sha256 == script_sha256
     })
+}
+
+/// The exact words this durable narration was queued to speak.
+///
+/// A turn-scoped request follows its line - after its pronunciation rules, which is what the engine
+/// was actually asked to say - and a scene-scoped one follows its scene script. Resolving the wrong
+/// one would either reject a valid narration or let a stale one through.
+/// The unit this narration belongs to: its line when turn-scoped, otherwise its scene.
+///
+/// Checkpoints are scoped by this, so two lines in the same scene never adopt each other's
+/// in-flight work.
+fn narration_scope_key(request: &DurableNarrationRevisionRequest) -> String {
+    request
+        .turn_id
+        .clone()
+        .or_else(|| request.scene_id.clone())
+        .unwrap_or_else(|| "project".to_string())
+}
+
+fn durable_narration_source_text(
+    manifest: &video::VideoProjectManifest,
+    request: &DurableNarrationRevisionRequest,
+) -> Result<String, String> {
+    if let Some(turn_id) = request.turn_id.as_deref() {
+        let turn = manifest
+            .dialogue
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .ok_or("video.turn_not_found: The narrated line is no longer in this version")?;
+        return Ok(video::apply_lexicon(
+            turn.spoken_text(),
+            &video::effective_entries(&manifest.lexicon, &turn.character_id),
+        )
+        .spoken_text);
+    }
+    Ok(
+        selected_revision_scene(manifest, request.scene_id.as_deref())?
+            .script
+            .trim()
+            .to_string(),
+    )
 }
 
 fn selected_revision_scene<'a>(
@@ -6288,7 +6335,7 @@ mod tests {
     fn durable_narration_request_binds_route_script_reference_and_parent_child_payload() {
         let durable = DurableNarrationRevisionRequest {
             project_id: "project-1".into(),
-            scene_id: "scene-opening".into(),
+            scene_id: Some("scene-opening".into()),
             fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),
@@ -6399,7 +6446,7 @@ mod tests {
             .expect("valid exact narration result");
         let request = DurableNarrationRevisionRequest {
             project_id: manifest.project_id.clone(),
-            scene_id: "scene-opening".into(),
+            scene_id: Some("scene-opening".into()),
             fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),
@@ -6546,7 +6593,7 @@ mod tests {
         let script = base_manifest.reviewed_scenes[0].script.clone();
         let request = DurableNarrationRevisionRequest {
             project_id: project_id.clone(),
-            scene_id: "scene-opening".into(),
+            scene_id: Some("scene-opening".into()),
             fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),

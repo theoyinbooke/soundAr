@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.8.1 - 2026-08-30
+
+- Made the episode surface findable. The Video Studio inspector now always offers a Cast tab
+  instead of hiding it until a cast already existed, and it shows the whole episode in one place:
+  every line as performed, standing in with a draft, or not yet read, plus the pronunciation rules,
+  music cues, and sound design placements that govern it. An episode started from a show format says
+  which format and revision it inherited from.
+- Fixed narrating a line. A turn-scoped narration was still being checked against a scene it does
+  not have, so performing a script failed outright with `video.scene_not_found`. A line's identity
+  is now its own text after its pronunciation rules, and its durable checkpoint is scoped to the
+  line rather than to a scene, so two lines in one scene cannot adopt each other's in-flight work.
+- Stopped reporting unchanged lines as valid takes. Committing a revised script said "N existing
+  takes remain valid" while counting lines that had never been performed; it now reports new,
+  unchanged, and dropped counts separately.
+
+## 0.8.0 - 2026-08-30
+
+- Added a cast. A character is bound to one voice, model, language, and delivery, and a
+  speaker-attributed script - `NARRATOR: line` - becomes ordered dialogue turns. A turn's identity
+  is its character and its words, so re-applying a revised script keeps every unchanged line's
+  existing take: reordering costs nothing, and fixing a typo on line 40 of a 200-line script
+  re-reads exactly that line. An unknown speaker or an unclosed stage direction is reported against
+  its source line rather than narrated by whichever voice happened to be selected.
+- Gave dialogue a performance clock. Beats are derived from the script - a reply is faster than the
+  same character continuing a thought, a line that trails off or carries a pause direction earns
+  silence, and an `(interrupting)` direction overlaps the previous line instead of waiting. A beat
+  you set by hand survives every later edit that leaves its own line alone. Retiming reassembles the
+  episode without re-reading any line.
+- Added a pronunciation lexicon with character, project, and global scopes. Fix an invented name
+  once and every take of every character says it correctly. A take records the exact rules that
+  produced it, so changing a rule re-reads only the lines that rule governs, and a project's rules
+  can never reach another project.
+- Added a score cue sheet. A cue's role - sting, bed, transition, or outro - decides where it sits
+  and how it is mixed. A bed placed on the timeline is given its ducking envelope automatically,
+  sidechained to the track that actually carries narration, because a bed that does not duck is the
+  most common way a mix buries its own dialogue. Generated music that runs long is trimmed with a
+  musical tail rather than cut off; music that falls well short is reported for regeneration rather
+  than padded with silence.
+- Added sound design from your own audio. Room tone runs under a whole scene, which is what removes
+  the digital silence between takes that makes an episode sound assembled. One-shots anchor to the
+  line they punctuate so a later edit cannot move them away from it. Nothing here generates audio:
+  placements label media you registered through the ordinary import path.
+- Added show formats. A format holds the decisions that do not change between episodes - cast,
+  pronunciation, timing, captions, canvas, loudness, usual length, opening and closing music - so a
+  new episode starts as a brief. Instantiation copies, so editing a format never changes an episode
+  that already shipped.
+- Added release export. One episode produces the audio episode carrying its chapter marks, a short
+  vertical trailer, and a square audiogram, each registered as checksummed playable media. The
+  trailer moment is chosen by running soundAr's existing candidate analyst over the episode's own
+  narration, so generated work is reviewed by the rules already proven on imported source.
+- Added production quality control. soundAr listens back to every narrated line with a local model
+  and compares it to the script that take was asked to speak, so a skipped word or a mispronounced
+  name is reported per line rather than discovered by a listener. It measures the master's loudness
+  and true peak against the format's target. It reports only: it never rewrites a script, re-renders
+  a take, or adjusts a mix. A line nobody listened back to is reported as unchecked, never as
+  passed.
+- Gave the assistant ears. `listen_to_episode` reports the episode as rendered - which lines were
+  performed, how long each runs, how speaking time divides between characters, where the silences
+  fall - so a judgment about pacing responds to something measured rather than to the plan the
+  assistant wrote. Every number comes from a published take with a measured duration; nothing is
+  estimated from word counts.
+- Added draft mode. Hear a long episode quickly with the fastest installed voice, then promote only
+  the lines worth keeping, which re-reads just those lines. A draft take can never be exported as a
+  master or published as a release member, and the new Cast tab shows each line as performed,
+  standing in, or not yet read.
+
 ## 0.7.0 - 2026-08-29
 
 - Installed updates in place instead of sending you to the browser. The Debian package now downloads, verifies, and installs through `pkexec` and restarts itself, so an update is one click and one permission prompt. Previously only AppImage installs could self-update and the Debian build just opened the release page.

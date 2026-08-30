@@ -37,6 +37,10 @@ for managed Linux runtime setup.
 - Add or update tests when behavior changes.
 - Run the frontend build, Rust tests, and Python compile check.
 - Update `CHANGELOG.md` for release-facing changes.
+- Releases advance one patch at a time - `0.8.1`, `0.8.2`, `0.8.3` - including for new features.
+  Bump `app/package.json`, `app/package-lock.json`, `app/src-tauri/tauri.conf.json`, and
+  `app/src-tauri/Cargo.toml` together, and run `./scripts/check-release-version.sh`. A minor bump is
+  reserved for completing a roadmap phase's exit gate. See Version Numbering in `ROADMAP.md`.
 - Never include generated packages, caches, local exports, or downloaded models.
 
 By contributing, you agree that your contribution is licensed under the MIT

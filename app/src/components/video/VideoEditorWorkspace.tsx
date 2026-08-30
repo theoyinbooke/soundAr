@@ -79,14 +79,13 @@ export function VideoEditorWorkspace({
   ));
   const activeVisualLayer = selectedVisualLayer ?? fallbackVisualLayer;
   const activeVisualAsset = (project.manifest.visual_assets ?? []).find((asset) => asset.id === activeVisualLayer?.asset_id);
-  // Cast only appears once a project has one, so an imported-video project is not given a tab
-  // that could never say anything.
-  const hasCast = Boolean(project.manifest.cast?.length);
+  // Cast is always offered, so a user can find where a multi-character episode is authored rather
+  // than having to already have one before the surface appears.
   const inspectorTabs: readonly VideoInspectorTab[] = [
     "layout" as const,
     "captions" as const,
     "audio" as const,
-    ...(hasCast ? (["cast"] as const) : []),
+    "cast" as const,
     ...(activeVisualLayer ? (["visuals"] as const) : []),
   ];
   const [activeTab, setActiveTab] = useState<VideoInspectorTab>("captions");
