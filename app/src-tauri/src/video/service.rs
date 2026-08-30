@@ -21,13 +21,13 @@ use super::{
     PublicationState, QcReport, RationalFrameRate, RationalRate, ReleaseMemberKind,
     ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole, RenderCommand,
     RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass, ResourceRequest,
-    ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis, RightsConfirmation,
-    RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity, TimeRange,
-    TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate, VideoEncoder, VideoError,
-    VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest, VisualAsset,
-    VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES,
-    MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US,
-    TRAILER_TARGET_US,
+    ResourceScheduler, ReviewState, ReviewedScene, RevisionRecord, RevisionStage, RightsBasis,
+    RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
+    TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate, VideoEncoder,
+    VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
+    VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_SHOW_FORMATS,
+    MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US,
+    TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -12804,6 +12804,85 @@ impl VideoStudioService {
         .map_err(json_error)?;
         manifest.validate_strict()?;
         Ok(listen_to_episode(&manifest, loudness)?)
+    }
+
+    /// Give a dialogue-only episode the scene it needs to be rendered.
+    ///
+    /// A scene is the author's division of an episode, and a script written as dialogue has none
+    /// yet. Rendering, captions, and chapters are all scene-shaped, so an episode performed from a
+    /// script would otherwise be unrenderable. One scene spanning the performed dialogue is the
+    /// honest default: it is the whole episode until the author divides it.
+    ///
+    /// Does nothing when the project already has scenes, so an author's own divisions are never
+    /// replaced by a generated one.
+    pub fn ensure_dialogue_scene(&self, project_id: &str, actor: &str) -> ServiceResult<Value> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        if !manifest.reviewed_scenes.is_empty() || manifest.dialogue.is_empty() {
+            return Ok(record);
+        }
+        let spoken_end = manifest
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .filter(|clip| clip.turn_id.is_some())
+            .map(|clip| clip.timeline_start_us.0 + clip.timeline_duration_us.0)
+            .max()
+            .unwrap_or_default();
+        if spoken_end <= 0 {
+            return Err(VideoServiceError::new(
+                "video.dialogue_not_performed",
+                "Narrate the script before building its scene",
+            ));
+        }
+
+        let expectation = project_expectation(&record)?;
+        let script = manifest
+            .dialogue
+            .iter()
+            .map(|turn| turn.spoken_text())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let title = manifest.name.clone();
+        self.commit_manifest_mutation_at_if_parent_active(
+            project_id,
+            &expectation,
+            actor,
+            "Build the scene for a performed script",
+            Some("ready"),
+            vec!["/reviewed_scenes".to_string()],
+            BTreeSet::from([
+                RevisionStage::Plan,
+                RevisionStage::Captions,
+                RevisionStage::Tracking,
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ]),
+            None,
+            move |manifest: &mut VideoProjectManifest| {
+                manifest.reviewed_scenes.push(ReviewedScene {
+                    id: "dialogue-scene".to_string(),
+                    candidate_id: None,
+                    source_asset_id: None,
+                    source_range: None,
+                    timeline_start_us: Microseconds::ZERO,
+                    timeline_duration_us: Microseconds(spoken_end),
+                    title: title.clone(),
+                    script: script.chars().take(90_000).collect(),
+                    review_state: ReviewState::Approved,
+                    revision: 1,
+                });
+                Ok(())
+            },
+        )
     }
 
     /// Measure the finished master's loudness.

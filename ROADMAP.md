@@ -1424,6 +1424,27 @@ and dialogue is the first, because performance timing, the score, sound design,
 formats, releases, quality control, and the assistant's listening pass all depend on
 turn-scoped narration existing first.
 
+## Known Boundary: Picture for an Audio-Only Episode
+
+An episode written entirely as dialogue has no imported video, so it has no picture. Narration
+builds it a scene and the audio path runs end to end - script, cast, beats, takes, listening,
+quality control, and release planning are all verified against real local speech - but the video
+renderer assembles scenes from canonical timeline clips and refuses one that has no visual source:
+`video.timeline_scene_track_mismatch`.
+
+Because `export_episode_release` derives all three deliverables from the finished master, an
+audio-only episode currently cannot export a release even though its audio exists.
+
+This is not a Phase 12 gap so much as an open product question: what should an audio-only episode
+look like? Video Studio already has the pieces - registered visual assets with pan-and-zoom motion,
+cards, waveform motion, and the audiogram renderer added in 12.7 - and the honest resolutions are
+either to give a dialogue episode a default visual treatment from those, or to let the release
+export derive the audio episode and audiogram from the assembled dialogue rather than from a video
+master. Both change what a release means, so neither is chosen here.
+
+Until it is resolved, an audio-only episode should be given a visual asset or card before rendering,
+which is existing Video Studio behavior.
+
 ## Version Numbering
 
 soundAr advances one patch at a time: `0.8.0`, then `0.8.1`, `0.8.2`, `0.8.3`, and so on. Each

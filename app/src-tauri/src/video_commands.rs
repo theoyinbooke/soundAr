@@ -1692,6 +1692,13 @@ pub(crate) fn narrate_turns(
         record = run_narration_revision_job_guarded(runtime, &parent_job_id, durable, progress)?;
     }
 
+    // A script written as dialogue has no scenes, and rendering, captions, and chapters are all
+    // scene-shaped. Building one once the lines are performed is what makes the episode renderable.
+    let record = runtime
+        .video
+        .ensure_dialogue_scene(project_id, "video-studio-performer")
+        .map_err(service_error)?;
+
     video::present_video_project(&record, &runtime.store.video_artifacts_root())
         .map_err(|error| error.to_string())
 }

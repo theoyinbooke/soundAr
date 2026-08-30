@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.7 - 2026-08-30
+
+- Made a performed script renderable. A script written as dialogue has turns but no scenes, and
+  rendering, captions, and chapters are all scene-shaped, so an episode narrated from a script could
+  not be previewed or exported at all. Narration now builds one scene spanning the performed
+  dialogue - the whole episode until the author divides it - and never replaces divisions the author
+  already made.
+
 ## 0.8.6 - 2026-08-30
 
 - Reported which character performed a take. The take records it, but the project view left it out,
