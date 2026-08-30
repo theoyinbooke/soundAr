@@ -571,6 +571,37 @@ pub(crate) fn dispatch_video_operation(
                 })?,
             ))
         }
+        VideoAgentOperation::NarrateTurns(request) => {
+            let fidelity = if request.draft {
+                video::TakeFidelity::Draft
+            } else {
+                video::TakeFidelity::Final
+            };
+            let project = narrate_turns(
+                runtime,
+                &request.project_id,
+                &request.turn_ids,
+                fidelity,
+                progress.as_ref(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            let summary = format!(
+                "Performed {} line(s){}",
+                request.turn_ids.len(),
+                if request.draft {
+                    " as draft stand-ins"
+                } else {
+                    ""
+                }
+            );
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                &summary,
+                project,
+                None,
+            )
+        }
         VideoAgentOperation::GenerateCueMusic(request) => {
             let record = generate_cue_music(
                 runtime,
@@ -1551,6 +1582,127 @@ fn revise_project(
     let project = video::present_video_project(&record, &runtime.store.video_artifacts_root())
         .map_err(|error| error.to_string())?;
     Ok(ProjectOperationResult { project, job_id })
+}
+
+/// Perform the named lines with their characters' own voices.
+///
+/// Each line is one durable narration job, so a long episode narrates through the same GPU-aware
+/// scheduler as every other generation and an interrupted run resumes line by line rather than
+/// starting over. Turns are performed in script order because a partly narrated episode should read
+/// from the top rather than in whatever order the caller happened to list.
+///
+/// The text handed to the engine is the line after its pronunciation rules are applied; the take
+/// still records the words the writer actually wrote.
+pub(crate) fn narrate_turns(
+    runtime: &RuntimeState,
+    project_id: &str,
+    turn_ids: &[String],
+    fidelity: video::TakeFidelity,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<Value, String> {
+    if turn_ids.is_empty() {
+        return Err("video.invalid_request: Name at least one line to narrate".into());
+    }
+    let wanted = turn_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut record = runtime
+        .video
+        .get_project(project_id)
+        .map_err(service_error)?;
+
+    // Resolved fresh from the committed manifest on every line, because each narration commits a
+    // revision and the next one must build on it rather than on a stale copy.
+    loop {
+        let manifest: video::VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or("video.invalid_manifest: Project manifest is missing")?,
+        )
+        .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+        let narrated = manifest
+            .narration_bindings
+            .iter()
+            .filter_map(|binding| binding.turn_id.clone())
+            .collect::<BTreeSet<_>>();
+        let Some(turn) = manifest
+            .dialogue
+            .iter()
+            .find(|turn| wanted.contains(&turn.id) && !narrated.contains(&turn.id))
+            .cloned()
+        else {
+            break;
+        };
+        let member = manifest
+            .cast
+            .iter()
+            .find(|member| member.id == turn.character_id)
+            .cloned()
+            .ok_or("video.unknown_speaker: That line's character is not in the cast")?;
+
+        // What the voice is actually asked to say.
+        let spoken = video::apply_lexicon(
+            turn.spoken_text(),
+            &video::effective_entries(&manifest.lexicon, &member.id),
+        )
+        .spoken_text;
+        let durable = DurableNarrationRevisionRequest {
+            project_id: project_id.to_string(),
+            // A turn-scoped take belongs to its line, not to a scene, so the scene is only carried
+            // for progress reporting and is never used as a second narration target.
+            scene_id: turn
+                .scene_id
+                .clone()
+                .unwrap_or_else(|| "dialogue".to_string()),
+            fidelity,
+            turn_id: Some(turn.id.clone()),
+            binding_id: None,
+            script_sha256: sha256_text(&spoken),
+            script: spoken,
+            voice_id: member.voice_id.clone(),
+            model_id: member.model_id.clone(),
+            speaker: member.name.clone(),
+            language: member.language.clone(),
+            voice_name: member.display_name.clone(),
+            reference_audio_path: None,
+            expected_revision: record
+                .get("revision")
+                .and_then(Value::as_i64)
+                .ok_or("video.invalid_project: Project revision is missing")?,
+            expected_version_id: project_version_id(&record)?.to_string(),
+            actor: "video-studio-performer".to_string(),
+            priority: "normal".into(),
+            title: format!("{} · {}", member.display_name, turn.id),
+        };
+        let durable_value = serde_json::to_value(&durable)
+            .map_err(|error| format!("video.invalid_request: {error}"))?;
+        let parent_job_id = runtime
+            .store
+            .create_job("video_regenerate_narration", &durable_value)?;
+        record = run_narration_revision_job_guarded(runtime, &parent_job_id, durable, progress)?;
+    }
+
+    video::present_video_project(&record, &runtime.store.video_artifacts_root())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn narrate_video_turns(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    turn_ids: Vec<String>,
+    draft: Option<bool>,
+) -> Result<Value, String> {
+    let runtime = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let fidelity = if draft.unwrap_or(false) {
+            video::TakeFidelity::Draft
+        } else {
+            video::TakeFidelity::Final
+        };
+        narrate_turns(&runtime, &project_id, &turn_ids, fidelity, None)
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Narration worker failed: {error}"))?
 }
 
 fn run_narration_revision_job_guarded(

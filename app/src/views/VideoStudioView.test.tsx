@@ -12,6 +12,46 @@ afterEach(() => {
 });
 
 describe("VideoStudioView", () => {
+  it("shows each line's take state and narrates only the lines that need it", async () => {
+    const user = userEvent.setup();
+    const base = createBrowserPreviewVideoService();
+    const narrated: { turnIds: string[]; draft?: boolean }[] = [];
+    const project = await base.getVideoProject("creator-update");
+    // One performed line, one still standing in, one never read.
+    project.manifest.cast = [
+      { id: "narrator", name: "NARRATOR", display_name: "Narrator", voice_id: "af-heart", model_id: "kokoro-82m", language: "en-US", delivery: { rate_milli: 1000, pitch_milli: 0, energy_milli: 1000 }, created_at: "2026-01-01T00:00:00Z" },
+    ];
+    project.manifest.dialogue = [
+      { id: "turn-a", scene_id: null, order: 0, character_id: "narrator", text: "The harmattan came early.", direction: null, source_line: 1, revision: 1, narrated: true, draft: false },
+      { id: "turn-b", scene_id: null, order: 1, character_id: "narrator", text: "She waited.", direction: null, source_line: 2, revision: 1, narrated: true, draft: true },
+      { id: "turn-c", scene_id: null, order: 2, character_id: "narrator", text: "She said nothing at all.", direction: "quiet", source_line: 3, revision: 1, narrated: false, draft: false },
+    ];
+    const service: VideoStudioService = {
+      ...base,
+      getVideoProject: async () => project,
+      narrateTurns: async (_projectId, turnIds, draft) => {
+        narrated.push({ turnIds, draft });
+        return project;
+      },
+    };
+
+    render(<VideoStudioView service={service} />);
+    await user.click(await screen.findByRole("button", { name: /From interview source/i }));
+    await user.click(await screen.findByRole("tab", { name: "Cast" }));
+
+    // The three states are named rather than left for the reader to infer.
+    expect(await screen.findByText("Not narrated")).toBeVisible();
+    expect(screen.getByText("Draft take")).toBeVisible();
+    expect(screen.getByText("Performed")).toBeVisible();
+    // A stand-in blocks publication, and the panel says so.
+    expect(screen.getByText(/still draft takes/i)).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: /Narrate 1 remaining/i }));
+    await waitFor(() => expect(narrated).toHaveLength(1));
+    // Only the unperformed line is read; the finished and draft lines are left alone.
+    expect(narrated[0]).toEqual({ turnIds: ["turn-c"], draft: false });
+  });
+
   it("routes a stale downstream preview failure back to source analysis", async () => {
     const user = userEvent.setup();
     render(<VideoStudioView service={createBrowserPreviewVideoService()} />);

@@ -57,6 +57,7 @@ pub(crate) enum VideoAgentOperationKind {
     EditVideoTimeline,
     WriteVideoScript,
     GenerateCueMusic,
+    NarrateTurns,
     SaveShowFormat,
     ListShowFormats,
     CreateEpisode,
@@ -90,6 +91,7 @@ impl VideoAgentOperationKind {
             Self::EditVideoTimeline => "edit_video_timeline",
             Self::WriteVideoScript => "write_video_script",
             Self::GenerateCueMusic => "generate_cue_music",
+            Self::NarrateTurns => "narrate_turns",
             Self::SaveShowFormat => "save_show_format",
             Self::ListShowFormats => "list_show_formats",
             Self::CreateEpisode => "create_episode",
@@ -123,6 +125,7 @@ impl VideoAgentOperationKind {
             | Self::EditVideoTimeline
             | Self::WriteVideoScript
             | Self::GenerateCueMusic
+            | Self::NarrateTurns
             | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
             Self::ExportVideo
@@ -156,6 +159,7 @@ pub(crate) enum VideoAgentOperation {
     EditVideoTimeline(video::VideoTimelineEditRequest),
     WriteVideoScript(video::VideoScriptRequest),
     GenerateCueMusic(GenerateCueMusicRequest),
+    NarrateTurns(NarrateTurnsRequest),
     SaveShowFormat(video::ShowFormat),
     ListShowFormats(EmptyRequest),
     CreateEpisode(CreateEpisodeRequest),
@@ -188,6 +192,7 @@ impl VideoAgentOperation {
             Self::EditVideoTimeline(_) => VideoAgentOperationKind::EditVideoTimeline,
             Self::WriteVideoScript(_) => VideoAgentOperationKind::WriteVideoScript,
             Self::GenerateCueMusic(_) => VideoAgentOperationKind::GenerateCueMusic,
+            Self::NarrateTurns(_) => VideoAgentOperationKind::NarrateTurns,
             Self::SaveShowFormat(_) => VideoAgentOperationKind::SaveShowFormat,
             Self::ListShowFormats(_) => VideoAgentOperationKind::ListShowFormats,
             Self::CreateEpisode(_) => VideoAgentOperationKind::CreateEpisode,
@@ -223,6 +228,7 @@ impl VideoAgentOperation {
             "edit_video_timeline" => Self::EditVideoTimeline(decode(arguments)?),
             "write_video_script" => Self::WriteVideoScript(decode(arguments)?),
             "generate_cue_music" => Self::GenerateCueMusic(decode(arguments)?),
+            "narrate_turns" => Self::NarrateTurns(decode(arguments)?),
             "save_show_format" => Self::SaveShowFormat(decode(arguments)?),
             "list_show_formats" => Self::ListShowFormats(decode(arguments)?),
             "create_episode" => Self::CreateEpisode(decode(arguments)?),
@@ -420,6 +426,16 @@ impl VideoAgentOperation {
                     return Err(VideoAgentToolError::invalid_field(
                         "cast",
                         "Declare between one and thirty-two characters before writing a script",
+                    ));
+                }
+                Ok(())
+            }
+            Self::NarrateTurns(request) => {
+                require_text(&request.project_id, "project_id")?;
+                if request.turn_ids.is_empty() || request.turn_ids.len() > 5_000 {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "turn_ids",
+                        "Name between one and five thousand lines to narrate",
                     ));
                 }
                 Ok(())
@@ -631,6 +647,16 @@ pub(crate) struct CreateEpisodeRequest {
     pub(crate) episode_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) brief: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NarrateTurnsRequest {
+    pub(crate) project_id: String,
+    pub(crate) turn_ids: Vec<String>,
+    /// Perform these lines as fast stand-ins so the whole episode can be heard quickly.
+    #[serde(default)]
+    pub(crate) draft: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1223,6 +1249,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "edit_video_timeline" => VideoAgentOperationKind::EditVideoTimeline,
         "write_video_script" => VideoAgentOperationKind::WriteVideoScript,
         "generate_cue_music" => VideoAgentOperationKind::GenerateCueMusic,
+        "narrate_turns" => VideoAgentOperationKind::NarrateTurns,
         "save_show_format" => VideoAgentOperationKind::SaveShowFormat,
         "list_show_formats" => VideoAgentOperationKind::ListShowFormats,
         "create_episode" => VideoAgentOperationKind::CreateEpisode,
@@ -1254,6 +1281,7 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::EditVideoTimeline
                 | VideoAgentOperationKind::WriteVideoScript
                 | VideoAgentOperationKind::GenerateCueMusic
+                | VideoAgentOperationKind::NarrateTurns
                 | VideoAgentOperationKind::SaveShowFormat
                 | VideoAgentOperationKind::CreateEpisode
                 | VideoAgentOperationKind::RegisterGeneratedVisual
@@ -1481,6 +1509,18 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                 properties([
                     ("project_id", string("Video Studio project id")),
                     ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode. Notes are written, not derived."})),
+                ]),
+            ),
+        ),
+        tool(
+            "narrate_turns",
+            "Perform the named dialogue lines with their characters' own voices. Each line is one durable job through soundAr's GPU-aware scheduler, so an interrupted run resumes line by line rather than starting over, and a line that already has a take is skipped rather than re-read. Pronunciation rules are applied to what the engine is asked to say while the take still records the words as written. Set draft to hear a long episode quickly with a fast stand-in, then promote the lines worth keeping. Requires Studio or Full access.",
+            object_schema(
+                &["project_id", "turn_ids"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("turn_ids", json!({"type":"array","minItems":1,"maxItems":5000,"items":{"type":"string","minLength":1},"description":"Dialogue turn ids, usually the new_turn_ids write_video_script reported"})),
+                    ("draft", json!({"type":"boolean","description":"Perform as fast stand-ins rather than as the finished performance"})),
                 ]),
             ),
         ),
@@ -2505,8 +2545,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 27);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 27);
+        assert_eq!(names.len(), 28);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 28);
         for required in [
             "preview_link",
             "import_link",
@@ -2518,6 +2558,7 @@ mod tests {
             "edit_video_timeline",
             "write_video_script",
             "generate_cue_music",
+            "narrate_turns",
             "save_show_format",
             "list_show_formats",
             "create_episode",

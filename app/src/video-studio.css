@@ -345,6 +345,31 @@ button.video-project-row:hover, button.video-project-row:focus-visible { backgro
 .video-visual-inspector dt, .video-visual-inspector dd { margin: 0; }
 .video-visual-inspector dd { overflow: hidden; color: var(--text); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
 .video-visual-inspector > p { margin: 2px 0 0; color: var(--muted); font-size: 7px; line-height: 1.45; }
+/* Cast and script. The three line states - performed, standing in, not yet read - are what decide
+   what to do next, so each carries its own colour rather than only a word. */
+.video-cast-panel { display: grid; gap: 13px; align-content: start; min-width: 0; padding: 0 13px 11px; }
+.video-cast-panel h4 { display: flex; align-items: baseline; gap: 6px; margin: 0; font-size: 10px; }
+.video-cast-panel h4 small { color: var(--muted); font-size: 8px; font-weight: 400; }
+.video-cast-empty { margin: 11px 13px; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.video-cast-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.video-cast-list li { display: grid; gap: 1px; padding: 6px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); min-width: 0; }
+.video-cast-list strong { font-size: 9px; }
+.video-cast-list small { color: var(--muted); font-size: 8px; overflow-wrap: anywhere; }
+.video-dialogue-list { display: grid; gap: 4px; max-height: 260px; overflow-y: auto; margin: 0; padding: 0; list-style: none; }
+.video-dialogue-list button { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 3px 6px; width: 100%; padding: 6px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: inherit; text-align: left; cursor: pointer; }
+.video-dialogue-list button[aria-pressed="true"] { border-color: var(--accent); }
+.video-dialogue-state { grid-row: 1 / span 2; color: var(--muted); }
+.video-dialogue-list li.is-final .video-dialogue-state { color: var(--positive, #16a34a); }
+.video-dialogue-list li.is-draft .video-dialogue-state { color: var(--warning, #d97706); }
+.video-dialogue-speaker { font-size: 8px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.video-dialogue-text { grid-column: 2; font-size: 9px; line-height: 1.45; overflow-wrap: anywhere; }
+.video-dialogue-direction { grid-column: 2; color: var(--muted); font-size: 8px; }
+.video-dialogue-badge { grid-column: 2; color: var(--muted); font-size: 8px; }
+.video-cast-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.video-cast-actions button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: inherit; font-size: 9px; cursor: pointer; }
+.video-cast-actions button:disabled { opacity: .5; cursor: not-allowed; }
+.video-cast-notice { margin: 0; color: var(--muted); font-size: 8px; line-height: 1.5; }
+
 .video-inspector-receipt { display: flex; gap: 7px; margin: 11px 13px; padding: 9px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); font-size: 8px; line-height: 1.45; }
 .video-inspector-receipt.is-dirty { color: var(--text); }
 .video-add-control { position: relative; }

@@ -989,6 +989,19 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
           : null,
       };
     },
+    async narrateTurns(projectId, turnIds, draft) {
+      const project = projects.get(projectId);
+      if (!project) throw new Error("Video project was not found.");
+      if (!turnIds.length) throw new Error("video.invalid_request: Name at least one line to narrate.");
+      const performed = clone(project);
+      const wanted = new Set(turnIds);
+      // A line that already has a take is skipped rather than re-read.
+      performed.manifest.dialogue = (performed.manifest.dialogue ?? []).map((turn) =>
+        wanted.has(turn.id) && !turn.narrated
+          ? { ...turn, narrated: true, draft: Boolean(draft) }
+          : turn);
+      return store(performed);
+    },
     async transcribeAndCheckEpisode(projectId) {
       // Browser preview has no local recognizer, so nothing was heard and nothing is claimed.
       return this.checkEpisodeQuality(projectId, {});
@@ -1423,6 +1436,8 @@ function createNativeVideoService(): VideoStudioService {
       invoke<VideoReleaseExportResult>("export_episode_release", { projectId, hasShowNotes }).then((result) => ({ ...result, project: withNativeProjectUrls(result.project) })),
     listenToEpisode: (projectId, integratedLufsMilli, truePeakDbMilli) =>
       invoke<VideoEpisodeListening>("listen_to_episode", { projectId, integratedLufsMilli, truePeakDbMilli }),
+    narrateTurns: (projectId, turnIds, draft) =>
+      invoke<VideoProject>("narrate_video_turns", { projectId, turnIds, draft }).then(withNativeProjectUrls),
     transcribeAndCheckEpisode: (projectId, modelId) =>
       invoke<VideoQcReport>("transcribe_and_check_episode_quality", { projectId, modelId }),
     checkEpisodeQuality: (projectId, heard, integratedLufsMilli, truePeakDbMilli) =>

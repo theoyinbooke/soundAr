@@ -806,12 +806,21 @@ Slice 12.1 is implemented and locally verified.
   new ones so the caller renders only what changed.
 - The `write_video_script` agent tool, its Tauri command, the headless `agent video` dispatch, the
   presented project shape, and the typed frontend bridge all use that one service operation.
-- Verified locally: 338 native tests including cast-parser, manifest-contract, and
-  dialogue-application cases plus one durable service case proving version binding, idempotent
-  replay, stale-write rejection, and turn reuse; and 142 React tests including preview-bridge
-  coverage of the same reuse behaviour.
-- Remaining for this slice: the desktop cast and script editing surface, and per-turn narration
-  rendering through the scheduler.
+- Verified locally: cast-parser, manifest-contract, and dialogue-application cases plus one durable
+  service case proving version binding, idempotent replay, stale-write rejection, and turn reuse;
+  and a rendered UI case proving the Cast tab names all three line states and narrates only the
+  lines that need it.
+- `narrate_turns` performs the named lines with their characters' own voices, one durable job per
+  line, so a long episode narrates through the same GPU-aware scheduler as every other generation
+  and an interrupted run resumes line by line rather than starting over. A line that already has a
+  take is skipped rather than re-read, and lines are performed in script order so a partly narrated
+  episode reads from the top.
+- The desktop Cast tab shows each line's take state - performed, standing in, or not yet read -
+  because those three states are what decide what to do next and none of them is visible anywhere
+  else in the editor. It narrates only the lines that need it, drafts the remainder in one action,
+  and promotes stand-ins by dropping their takes and reading those lines for real. The tab appears
+  only once a project has a cast, so an imported-video project is never given a tab that could not
+  say anything.
 
 ### Slice 12.2: Performance Timing
 

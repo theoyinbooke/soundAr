@@ -1000,6 +1000,8 @@ export interface VideoStudioService {
    * against the script. Prefer this over supplying `heard` yourself.
    */
   transcribeAndCheckEpisode(projectId: string, modelId: string): Promise<VideoQcReport>;
+  /** Perform the named lines with their characters' own voices, one durable job per line. */
+  narrateTurns(projectId: string, turnIds: string[], draft?: boolean): Promise<VideoProject>;
   checkEpisodeQuality(
     projectId: string,
     heard: Record<string, string>,
