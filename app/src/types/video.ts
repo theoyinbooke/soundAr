@@ -238,6 +238,12 @@ export interface VideoNarrationBinding {
   language: string;
   script_sha256: string;
   created_at: string;
+  /** Set when this take performs one dialogue turn rather than a whole scene. */
+  turn_id?: string | null;
+  /** Fingerprint of the pronunciation rules this take was produced under. */
+  lexicon_fingerprint?: string | null;
+  /** A draft take is a fast stand-in and can never be exported as a master. */
+  fidelity?: VideoTakeFidelity;
 }
 
 export interface VideoTimelineItem {
@@ -312,6 +318,24 @@ export interface VideoProjectManifest {
   candidates: CandidateVideoClip[];
   scenes: VideoScene[];
   narration_bindings: VideoNarrationBinding[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  cast?: VideoCastMember[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  dialogue?: (VideoDialogueTurn & { narrated: boolean; draft?: boolean })[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  lexicon?: VideoLexiconEntry[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  music_cues?: VideoMusicCue[];
+  /** Set when this episode was started from a saved show format. */
+  format_origin?: VideoFormatOrigin | null;
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  sound_assets?: VideoSoundAsset[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  sound_layers?: VideoSoundLayer[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  turn_beats?: VideoTurnBeat[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  performance_clock?: VideoPerformanceClock;
   /** Present on current manifests; optional only for migration-era project compatibility. */
   visual_assets?: VideoVisualAsset[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
@@ -480,6 +504,18 @@ export type VideoTimelineOperation =
   | { type: "trim_scene"; scene_id: string; source_start_us: number; source_end_us: number }
   | { type: "reorder_scene"; scene_id: string; to_index: number }
   | { type: "merge_scenes"; first_scene_id: string; second_scene_id: string }
+  | { type: "set_turn_beat"; turn_id: string; lead_in_us: number; overlap_us: number }
+  | { type: "clear_turn_beat"; turn_id: string }
+  | { type: "set_lexicon_entry"; entry: VideoLexiconEntry }
+  | { type: "remove_lexicon_entry"; entry_id: string }
+  | { type: "set_music_cue"; cue: VideoMusicCueInput }
+  | { type: "remove_music_cue"; cue_id: string }
+  | { type: "place_music_cue"; cue_id: string; source_asset_id: string }
+  | { type: "register_sound_asset"; asset_id: string; source_asset_id: string; name: string; tags: string[] }
+  | { type: "remove_sound_asset"; asset_id: string }
+  | { type: "promote_turns_to_final"; turn_ids: string[] }
+  | { type: "set_sound_layer"; layer: VideoSoundLayerInput }
+  | { type: "remove_sound_layer"; layer_id: string }
   | {
     type: "update_visual_layer";
     layer_id: string;
@@ -492,6 +528,352 @@ export type VideoTimelineOperation =
     transition_in_us: number;
     transition_out_us: number;
   };
+
+/** Per-character delivery defaults, in milli-units so a saved performance reproduces exactly. */
+export interface VideoCastDelivery {
+  /** 1000 is natural speed; 250..4000 is the supported envelope. */
+  rate_milli: number;
+  pitch_milli: number;
+  energy_milli: number;
+}
+
+/** One named character bound to the exact voice route that performs every line it speaks. */
+export interface VideoCastMember {
+  id: string;
+  /** The token used in the script, e.g. `NARRATOR`. Matched case-insensitively. */
+  name: string;
+  display_name: string;
+  voice_id: string;
+  model_id: string;
+  language: string;
+  delivery: VideoCastDelivery;
+  consent_reference_id?: string | null;
+  notes?: string | null;
+  created_at: string;
+}
+
+/** One character's uninterrupted contribution to the script, and the unit soundAr renders. */
+export interface VideoDialogueTurn {
+  id: string;
+  scene_id?: string | null;
+  order: number;
+  character_id: string;
+  /** Exactly what the voice is asked to speak. A stage direction is never part of this text. */
+  text: string;
+  direction?: string | null;
+  /** 1-indexed line in the script this turn was parsed from. */
+  source_line: number;
+  revision: number;
+}
+
+/**
+ * `one_shot` happens once at a point; `ambience` runs across a scene span; `room_tone` runs under
+ * a whole scene and is what removes the digital silence between takes.
+ */
+export type VideoSoundPlacementKind = "one_shot" | "ambience" | "room_tone";
+
+/**
+ * One registered sound-design file. soundAr never generates these; the user supplies them, and the
+ * media itself is managed media imported through the ordinary path. Path and duration are resolved
+ * from that managed source rather than duplicated here.
+ */
+export interface VideoSoundAsset {
+  id: string;
+  name: string;
+  source_asset_id: string;
+  local_path: string | null;
+  duration_ms: number | null;
+  tags: string[];
+  created_at: string;
+}
+
+/** One placed sound. */
+export interface VideoSoundLayer {
+  id: string;
+  asset_id: string;
+  kind: VideoSoundPlacementKind;
+  scene_id?: string | null;
+  turn_id?: string | null;
+  start_ms: number;
+  end_ms: number;
+  gain_db: number;
+  fade_in_ms: number;
+  fade_out_ms: number;
+  loop_to_fill: boolean;
+  duck_under_speech: boolean;
+}
+
+/** The wire shape `set_sound_layer` sends, in microseconds. */
+export interface VideoSoundLayerInput {
+  id: string;
+  asset_id: string;
+  kind: VideoSoundPlacementKind;
+  scene_id?: string | null;
+  turn_id?: string | null;
+  range: { start_us: number; end_us: number };
+  gain_db_milli: number;
+  fade_in_us: number;
+  fade_out_us: number;
+  loop_to_fill?: boolean;
+  duck_under_speech?: boolean;
+}
+
+/** `sting` opens, `bed` sits under dialogue and always ducks, `outro` resolves after the last line. */
+export type VideoCueRole = "sting" | "bed" | "transition" | "outro";
+
+/** Anchored to a scene or turn so the cue moves when the script is edited. */
+export type VideoCueAnchor =
+  | { kind: "scene"; scene_id: string }
+  | { kind: "turn"; turn_id: string }
+  | { kind: "after_final_turn" };
+
+/** One piece of score. Durations are targets until local generation has produced audio. */
+export interface VideoMusicCue {
+  id: string;
+  role: VideoCueRole;
+  anchor: VideoCueAnchor;
+  target_duration_ms: number;
+  direction: string;
+  source_asset_id?: string | null;
+  /** The audio track carrying this cue. A bed placed on a track always ducks against speech. */
+  track_id?: string | null;
+  gain_db: number;
+  fade_in_ms: number;
+  fade_out_ms: number;
+  /** True while the cue is planned but its music does not exist yet. */
+  needs_generation: boolean;
+  created_at: string;
+}
+
+/** The wire shape `set_music_cue` sends, in microseconds. */
+export interface VideoMusicCueInput {
+  id: string;
+  role: VideoCueRole;
+  anchor: VideoCueAnchor;
+  target_duration_us: number;
+  direction: string;
+  source_asset_id?: string | null;
+  track_id?: string | null;
+  gain_db_milli: number;
+  fade_in_us: number;
+  fade_out_us: number;
+  created_at: string;
+}
+
+/** Whether a take is the finished performance or a fast stand-in. */
+export type VideoTakeFidelity = "draft" | "final";
+
+/** How much of the episode one character actually speaks, measured from their takes. */
+export interface VideoSpeakerShare {
+  character_id: string;
+  display_name: string;
+  narrated_turns: number;
+  spoken_us: number;
+  /** Share of all spoken time, in basis points. */
+  share_bp: number;
+}
+
+export interface VideoGapSummary {
+  count: number;
+  total_us: number;
+  longest_us: number;
+  median_us: number;
+}
+
+/** One performed line, as it actually sits in the episode. */
+export interface VideoListenedLine {
+  turn_id: string;
+  character_id: string;
+  text: string;
+  start_us: number;
+  duration_us: number;
+  /** Silence between the previous line and this one, as rendered. */
+  lead_in_us: number;
+}
+
+/**
+ * The episode as rendered rather than as planned. A line with no measured take is reported as
+ * unnarrated rather than counted, and loudness is absent unless it was measured.
+ */
+export interface VideoEpisodeListening {
+  project_id: string;
+  timeline_duration_us: number;
+  spoken_us: number;
+  narrated_turns: number;
+  unnarrated_turns: string[];
+  speakers: VideoSpeakerShare[];
+  gaps: VideoGapSummary;
+  lines: VideoListenedLine[];
+  music_cues_placed: number;
+  music_cues_planned: number;
+  sound_placements: number;
+  /** Lines still standing in with a draft take. An episode with any of these is unfinished. */
+  draft_turns: string[];
+  loudness?: { integrated_lufs_milli: number; true_peak_db_milli: number } | null;
+}
+
+export type VideoQcFindingKind =
+  | "skipped_word"
+  | "inserted_word"
+  | "replaced_word"
+  | "loudness_off_target"
+  | "true_peak_exceeded"
+  | "caption_drift"
+  | "dead_air";
+
+export type VideoQcSeverity = "notice" | "warning" | "blocking";
+
+/** One reviewable finding. Quality control reports; it never repairs what it finds. */
+export interface VideoQcFinding {
+  id: string;
+  kind: VideoQcFindingKind;
+  severity: VideoQcSeverity;
+  turn_id?: string | null;
+  detail: string;
+  at_us?: number | null;
+}
+
+/**
+ * The result of checking one episode. A turn nobody listened back to is reported as unchecked
+ * rather than as passed, and without a measurement the master is not claimed to be within target.
+ */
+export interface VideoQcReport {
+  findings: VideoQcFinding[];
+  checked_turns: string[];
+  unchecked_turns: string[];
+  loudness_checked: boolean;
+}
+
+/** What a finished release contains. */
+export type VideoReleaseMemberKind =
+  | "podcast_audio"
+  | "video_master"
+  | "trailer"
+  | "transcript"
+  | "show_notes";
+
+/** A blocked member always names its missing prerequisite rather than being quietly omitted. */
+export interface VideoReleaseMemberPlan {
+  kind: VideoReleaseMemberKind;
+  ready: boolean;
+  blocked_reason?: string | null;
+}
+
+export interface VideoReleaseChapter {
+  id: string;
+  title: string;
+  start_us: number;
+  end_us: number;
+}
+
+/** Everything a release would contain, and what is still missing. */
+export interface VideoReleasePlan {
+  members: VideoReleaseMemberPlan[];
+  chapters: VideoReleaseChapter[];
+  /** The moment the trailer would be cut from, chosen from the episode's own narration. */
+  trailer_range?: { start_us: number; end_us: number } | null;
+}
+
+/** A cue the format supplies for every episode, before there is a script to anchor it to. */
+export interface VideoCueTemplate {
+  id: string;
+  role: VideoCueRole;
+  target_duration_us: number;
+  direction: string;
+  gain_db_milli: number;
+  fade_in_us: number;
+  fade_out_us: number;
+}
+
+/**
+ * The reusable shape of a series. Instantiation copies, so editing a format never changes an
+ * episode that already exists.
+ */
+export interface VideoShowFormat {
+  id: string;
+  name: string;
+  /** Owned by soundAr and bumped on every save. */
+  revision: number;
+  cast: VideoCastMember[];
+  lexicon: VideoLexiconEntry[];
+  performance_clock: {
+    intra_exchange_us: number;
+    turn_of_thought_us: number;
+    pre_reveal_us: number;
+    scene_boundary_us: number;
+  };
+  caption_preset_id: string;
+  canvas_mode: "portrait" | "landscape" | "square" | "custom";
+  canvas: { width: number; height: number; pixel_aspect_numerator: number; pixel_aspect_denominator: number };
+  frame_rate: { numerator: number; denominator: number };
+  target_lufs_milli: number;
+  true_peak_db_milli: number;
+  target_duration_us: number;
+  opening?: VideoCueTemplate | null;
+  closing?: VideoCueTemplate | null;
+  show_notes_style?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Where an episode's inherited values came from. Provenance, not a live link. */
+export interface VideoFormatOrigin {
+  format_id: string;
+  format_name: string;
+  format_revision: number;
+  instantiated_at: string;
+}
+
+/** Precedence runs character, then project, then global: the most specific rule wins. */
+export type VideoLexiconScope = "character" | "project" | "global";
+
+/** `word` is case-insensitive; `exact` is case-sensitive, for acronyms. */
+export type VideoLexiconMatch = "word" | "exact";
+
+/**
+ * One pronunciation rule. `replacement` is ordinary respelled text, not a phoneme alphabet,
+ * because soundAr's engines differ in what notation they accept.
+ */
+export interface VideoLexiconEntry {
+  id: string;
+  scope: VideoLexiconScope;
+  /** Required for character scope and rejected for every other scope. */
+  character_id?: string | null;
+  match_text: string;
+  replacement: string;
+  matching: VideoLexiconMatch;
+  notes?: string | null;
+  created_at: string;
+}
+
+/** Whether a beat was inferred from the script or deliberately chosen by the writer. */
+export type VideoBeatSource = "derived" | "explicit";
+
+/** The silence - or overlap - immediately before one dialogue turn. */
+export interface VideoTurnBeat {
+  turn_id: string;
+  lead_in_ms: number;
+  /** How far this turn starts before the previous one ends. An interjection. */
+  overlap_ms: number;
+  source: VideoBeatSource;
+}
+
+/** The four beats a scripted conversation needs, in milliseconds. */
+export interface VideoPerformanceClock {
+  intra_exchange_ms: number;
+  turn_of_thought_ms: number;
+  pre_reveal_ms: number;
+  scene_boundary_ms: number;
+}
+
+export interface VideoScriptRequest {
+  project_id: string;
+  expected_revision: number;
+  base_version_id: string;
+  operation_id: string;
+  cast: VideoCastMember[];
+  script: string;
+}
 
 export interface VideoTimelineEditRequest {
   project_id: string;
@@ -522,6 +904,27 @@ export interface VideoTimelineChangeReceipt {
   operation_id: string;
   changed_paths: string[];
   invalidated_stages: VideoRevisionStage[];
+}
+
+export interface VideoScriptReceipt {
+  project_id: string;
+  expected_revision: number;
+  base_version_id: string;
+  operation_id: string;
+  changed_paths: string[];
+  invalidated_stages: VideoRevisionStage[];
+  /** Turns whose words are unchanged. Their existing takes are still valid. */
+  retained_turn_ids: string[];
+  /** The only turns that need narration after this revision. */
+  new_turn_ids: string[];
+  dropped_binding_ids: string[];
+}
+
+export interface VideoScriptResponse {
+  project: VideoProject;
+  receipt: VideoScriptReceipt;
+  job_id: string;
+  replayed: boolean;
 }
 
 export interface VideoTimelineEditResponse {
@@ -561,6 +964,23 @@ export interface VideoStudioService {
   getVideoProject(projectId: string): Promise<VideoProject>;
   renderVideoPreview(projectId: string, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;
   editVideoTimeline(request: VideoTimelineEditRequest): Promise<VideoTimelineEditResponse>;
+  writeVideoScript(request: VideoScriptRequest): Promise<VideoScriptResponse>;
+  listShowFormats(): Promise<VideoShowFormat[]>;
+  saveShowFormat(format: VideoShowFormat): Promise<VideoShowFormat>;
+  deleteShowFormat(formatId: string): Promise<void>;
+  createEpisode(formatId: string, episodeName: string, brief?: string): Promise<VideoProject>;
+  planEpisodeRelease(projectId: string, hasShowNotes: boolean): Promise<VideoReleasePlan>;
+  listenToEpisode(
+    projectId: string,
+    integratedLufsMilli?: number,
+    truePeakDbMilli?: number,
+  ): Promise<VideoEpisodeListening>;
+  checkEpisodeQuality(
+    projectId: string,
+    heard: Record<string, string>,
+    integratedLufsMilli?: number,
+    truePeakDbMilli?: number,
+  ): Promise<VideoQcReport>;
   addVideoVisualAsset(request: AddVisualAssetRequest): Promise<AddVisualAssetResponse>;
   reviseVideo(request: ReviseVideoRequest): Promise<VideoProject>;
   exportVideo(request: VideoExportRequest, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;

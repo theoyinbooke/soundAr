@@ -5,21 +5,26 @@
 //! [`Store`] and deterministic media planning to the sibling video modules.
 
 use super::{
-    apply_timeline_edit, build_ass_document, build_portrait_command_with_layout,
-    build_proxy_command, build_thumbnail_command, build_timeline_render_plan,
-    build_waveform_command, discover_media_runtime, local_media_input_args,
-    preflight_import_url_destination, probe_media, publish_atomic, sibling_staging_path,
-    terminate_process_group, validate_import_url, write_ass_document_atomic, AdmissionOutcome,
-    AssemblyOptions, CacheKeyBuilder, CacheStage, CaptionTheme, FfmpegProgressParser, LayoutRole,
-    MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance,
-    ProvenanceKind, PublicHttpsProxy, PublicationState, RationalFrameRate, RationalRate,
-    RenderArtifact, RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile,
-    RenderWorkloadClass, ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord,
-    RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, SourceAsset,
-    SourceAssetKind, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder,
-    VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_VISUAL_ASSET_BYTES,
-    MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
+    apply_dialogue_script, apply_lexicon, apply_timeline_edit, build_ass_document,
+    build_portrait_command_with_layout, build_proxy_command, build_report, build_thumbnail_command,
+    build_timeline_render_plan, build_waveform_command, diff_spoken_words, discover_media_runtime,
+    effective_entries, episode_transcript, findings_for_dead_air, findings_for_loudness,
+    findings_for_turn, identify_clip_candidates, instantiate_format, listen_to_episode,
+    local_media_input_args, plan_release, preflight_import_url_destination, probe_media,
+    publish_atomic, sibling_staging_path, terminate_process_group, validate_import_url,
+    write_ass_document_atomic, AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage,
+    CandidatePolicy, CaptionTheme, CastMember, DialogueScriptRequest, EpisodeListening,
+    FfmpegProgressParser, LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus,
+    Microseconds, NarrationBinding, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
+    PublicationState, QcReport, RationalFrameRate, RationalRate, ReleasePlan, RenderArtifact,
+    RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass,
+    ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis,
+    RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
+    TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder, VideoError,
+    VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest, VisualAsset,
+    VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES,
+    MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US,
+    TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -574,6 +579,45 @@ pub struct TimelineEditServiceResult {
     pub replayed: bool,
 }
 
+/// One idempotent application of a cast and a written script to a durable project.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VideoScriptRequest {
+    pub project_id: String,
+    pub expected_revision: u64,
+    /// Opaque Store version. The service owns its compare-and-swap check.
+    pub base_version_id: String,
+    /// Idempotency key for this exact cast and script.
+    pub operation_id: String,
+    pub cast: Vec<CastMember>,
+    pub script: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VideoScriptReceipt {
+    pub project_id: String,
+    pub expected_revision: u64,
+    pub base_version_id: String,
+    pub operation_id: String,
+    pub changed_paths: Vec<String>,
+    pub invalidated_stages: BTreeSet<RevisionStage>,
+    /// Turns whose words are unchanged. Their existing takes are still valid and must not be
+    /// re-rendered; the caller queues speech only for `new_turn_ids`.
+    pub retained_turn_ids: Vec<String>,
+    pub new_turn_ids: Vec<String>,
+    pub dropped_binding_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ScriptServiceResult {
+    pub project: Value,
+    pub receipt: VideoScriptReceipt,
+    pub job_id: String,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum VisualAssetOrigin {
@@ -850,8 +894,16 @@ pub struct TimelineRenderBatchRequest {
 pub struct NarrationReplacement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_id: Option<String>,
+    /// Whether this take is the finished performance or a fast stand-in. Draft takes let a whole
+    /// episode be heard quickly; only the lines that survive that listen are re-read for real.
+    #[serde(default)]
+    pub fidelity: TakeFidelity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene_id: Option<String>,
+    /// Target one dialogue turn. Turn-scoped replacement is the multi-character path: it
+    /// re-reads exactly one line and leaves every other take in the scene untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip_id: Option<String>,
     pub history_id: String,
@@ -5354,6 +5406,30 @@ pub(crate) fn invalidated_stages_for_manifest_changes(
                 RevisionStage::FinalRender,
                 RevisionStage::PublishPackage,
             ])
+        } else if path.starts_with("/turn_beats") || path.starts_with("/performance_clock") {
+            // Retiming a conversation changes how the takes are assembled, not what any voice was
+            // asked to say. Invalidating Speech here would re-read every line to move one pause.
+            BTreeSet::from([
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ])
+        } else if path.starts_with("/cast")
+            || path.starts_with("/dialogue")
+            || path.starts_with("/lexicon")
+        {
+            // A cast or script change can only invalidate performed speech and everything
+            // assembled from it. Ingest, transcript, and analysis describe imported source and
+            // are deliberately untouched by rewriting what the characters say.
+            BTreeSet::from([
+                RevisionStage::Speech,
+                RevisionStage::Captions,
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ])
         } else if path.starts_with("/narration_bindings") {
             BTreeSet::from([
                 RevisionStage::Speech,
@@ -5957,6 +6033,252 @@ mod tests {
             .edit_timeline(conflicting)
             .expect_err("operation identifiers cannot be reused with different edits");
         assert_eq!(error.code, "video.idempotency_conflict");
+    }
+
+    fn script_cast() -> Vec<CastMember> {
+        vec![
+            CastMember {
+                id: "narrator".to_string(),
+                name: "NARRATOR".to_string(),
+                display_name: "Narrator".to_string(),
+                voice_id: "af-heart".to_string(),
+                model_id: "hexgrad/Kokoro-82M".to_string(),
+                language: "en-US".to_string(),
+                delivery: super::super::CastDelivery::default(),
+                consent_reference_id: None,
+                notes: None,
+                created_at: utc_now(),
+            },
+            CastMember {
+                id: "adaeze".to_string(),
+                name: "ADAEZE".to_string(),
+                display_name: "Adaeze".to_string(),
+                voice_id: "af-bella".to_string(),
+                model_id: "hexgrad/Kokoro-82M".to_string(),
+                language: "en-US".to_string(),
+                delivery: super::super::CastDelivery::default(),
+                consent_reference_id: None,
+                notes: None,
+                created_at: utc_now(),
+            },
+        ]
+    }
+
+    fn show_format() -> ShowFormat {
+        use super::super::{CanvasMode, CanvasSpec, PerformanceClock};
+        ShowFormat {
+            id: "show-harmattan".to_string(),
+            name: "The Harmattan Letters".to_string(),
+            revision: 0,
+            cast: script_cast(),
+            lexicon: Vec::new(),
+            performance_clock: PerformanceClock::default(),
+            caption_preset_id: "podcast".to_string(),
+            canvas_mode: CanvasMode::Portrait,
+            canvas: CanvasSpec {
+                width: 1080,
+                height: 1920,
+                pixel_aspect_numerator: 1,
+                pixel_aspect_denominator: 1,
+            },
+            frame_rate: RationalFrameRate::FPS_30,
+            target_lufs_milli: -16_000,
+            true_peak_db_milli: -1_000,
+            target_duration_us: Microseconds(600_000_000),
+            opening: None,
+            closing: None,
+            show_notes_style: None,
+            created_at: utc_now(),
+            updated_at: utc_now(),
+        }
+    }
+
+    #[test]
+    fn a_show_format_is_durable_and_an_episode_inherits_it_by_copy() {
+        let workspace = TestWorkspace::new();
+
+        let saved = workspace
+            .service
+            .save_show_format(show_format())
+            .expect("save the show format");
+        // The service owns the revision so two formats cannot claim the same provenance.
+        assert_eq!(saved.revision, 1);
+        assert_eq!(workspace.service.list_show_formats().unwrap().len(), 1);
+
+        let episode = workspace
+            .service
+            .create_episode(&saved.id, "Episode 1", "service-test", None)
+            .expect("start the first episode");
+        let manifest: VideoProjectManifest =
+            serde_json::from_value(episode.get("manifest").cloned().expect("manifest"))
+                .expect("decode episode manifest");
+        assert_eq!(manifest.cast.len(), 2);
+        assert_eq!(manifest.audio_mix.target_lufs_milli, -16_000);
+        assert_eq!(
+            manifest
+                .format_origin
+                .as_ref()
+                .map(|origin| origin.format_revision),
+            Some(1)
+        );
+
+        // Recasting the show must not reach the episode that already exists.
+        let mut revised = saved.clone();
+        revised.cast[1].voice_id = "af-nova".to_string();
+        let revised = workspace
+            .service
+            .save_show_format(revised)
+            .expect("revise the show format");
+        assert_eq!(revised.revision, 2);
+        assert_eq!(revised.created_at, saved.created_at);
+
+        let reloaded = workspace.service.get_project(&manifest.project_id).unwrap();
+        let reloaded: VideoProjectManifest =
+            serde_json::from_value(reloaded.get("manifest").cloned().expect("manifest"))
+                .expect("decode reloaded manifest");
+        assert_eq!(reloaded.cast[1].voice_id, "af-bella");
+
+        // A new episode picks up the change.
+        let next = workspace
+            .service
+            .create_episode(&revised.id, "Episode 2", "service-test", None)
+            .expect("start the second episode");
+        let next: VideoProjectManifest =
+            serde_json::from_value(next.get("manifest").cloned().expect("manifest"))
+                .expect("decode second episode manifest");
+        assert_eq!(next.cast[1].voice_id, "af-nova");
+        assert_eq!(
+            next.format_origin.map(|origin| origin.format_revision),
+            Some(2)
+        );
+
+        workspace
+            .service
+            .delete_show_format(&saved.id)
+            .expect("delete the show format");
+        assert!(workspace.service.list_show_formats().unwrap().is_empty());
+        assert!(workspace
+            .service
+            .create_episode(&saved.id, "Episode 3", "service-test", None)
+            .is_err());
+    }
+
+    #[test]
+    fn applying_a_script_is_version_bound_idempotent_and_reuses_unchanged_turns() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        let created = workspace.create_project(&project_id, "Story episode");
+        let version_id = created
+            .pointer("/version/id")
+            .and_then(Value::as_str)
+            .expect("initial version")
+            .to_string();
+
+        let script = "NARRATOR: The harmattan came early.\n\nADAEZE: (quiet) You said you would come back.\n\nNARRATOR: She did not answer.\n";
+        let request = VideoScriptRequest {
+            project_id: project_id.clone(),
+            expected_revision: 1,
+            base_version_id: version_id,
+            operation_id: "script-draft-1".to_string(),
+            cast: script_cast(),
+            script: script.to_string(),
+        };
+
+        let applied = workspace
+            .service
+            .apply_script(request.clone())
+            .expect("commit the first script");
+        assert!(!applied.replayed);
+        assert_eq!(
+            applied.project.get("revision").and_then(Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(applied.receipt.new_turn_ids.len(), 3);
+        assert!(applied.receipt.retained_turn_ids.is_empty());
+        assert_eq!(
+            applied
+                .project
+                .pointer("/manifest/dialogue/1/character_id")
+                .and_then(Value::as_str),
+            Some("adaeze")
+        );
+        assert_eq!(
+            workspace
+                .service
+                .store
+                .get_job(&applied.job_id)
+                .expect("script job")
+                .and_then(|job| job.get("status").cloned())
+                .and_then(|status| status.as_str().map(str::to_string))
+                .as_deref(),
+            Some("completed")
+        );
+
+        // An exact replay adopts the committed revision instead of writing the script twice.
+        let replay = workspace
+            .service
+            .apply_script(request.clone())
+            .expect("adopt the exact script replay");
+        assert!(replay.replayed);
+        assert_eq!(replay.job_id, applied.job_id);
+        assert_eq!(
+            replay.project.get("revision").and_then(Value::as_i64),
+            Some(2),
+            "an idempotent replay must not create another version"
+        );
+        assert!(
+            replay.receipt.new_turn_ids.is_empty(),
+            "a replay must never ask the caller to re-render an already committed turn"
+        );
+
+        // Rewriting one line must reuse the two untouched turns.
+        let next_version = applied
+            .project
+            .pointer("/version/id")
+            .and_then(Value::as_str)
+            .expect("committed version")
+            .to_string();
+        let revised = workspace
+            .service
+            .apply_script(VideoScriptRequest {
+                project_id: project_id.clone(),
+                expected_revision: 2,
+                base_version_id: next_version,
+                operation_id: "script-draft-2".to_string(),
+                cast: script_cast(),
+                script: script.replace("She did not answer.", "She said nothing at all."),
+            })
+            .expect("commit the revised script");
+        assert_eq!(revised.receipt.new_turn_ids.len(), 1);
+        assert_eq!(revised.receipt.retained_turn_ids.len(), 2);
+        assert_eq!(
+            revised.receipt.retained_turn_ids,
+            applied.receipt.new_turn_ids[..2].to_vec()
+        );
+
+        // A stale base version cannot silently overwrite the newer revision.
+        let stale = workspace
+            .service
+            .apply_script(VideoScriptRequest {
+                operation_id: "script-draft-3".to_string(),
+                ..request.clone()
+            })
+            .expect_err("a stale revision must be rejected");
+        assert!(
+            stale.code.starts_with("video."),
+            "unexpected stale-write code: {}",
+            stale.code
+        );
+
+        // The same operation id cannot be reused for different content.
+        let conflicting = workspace
+            .service
+            .apply_script(VideoScriptRequest {
+                script: "NARRATOR: Something else entirely.\n".to_string(),
+                ..request
+            })
+            .expect_err("operation identifiers cannot be reused with a different script");
+        assert_eq!(conflicting.code, "video.idempotency_conflict");
     }
 
     #[test]
@@ -7079,6 +7401,7 @@ mod tests {
                     let make_clip = |id: &str| TimelineClip {
                         id: id.to_string(),
                         scene_id: Some("wikimedia-scene".to_string()),
+                        turn_id: None,
                         media: MediaReference {
                             source_asset_id: Some(source_id.clone()),
                             render_artifact_id: None,
@@ -7529,7 +7852,9 @@ mod tests {
             parent_job_id: Some(parent_job_id),
             replacements: vec![NarrationReplacement {
                 binding_id: None,
+                fidelity: TakeFidelity::Final,
                 scene_id: Some(scene_id.clone()),
+                turn_id: None,
                 clip_id: None,
                 history_id: history_id.clone(),
                 voice_id: "voice-new".to_string(),
@@ -7652,7 +7977,9 @@ mod tests {
             parent_job_id: Some(cancel_parent_job_id.clone()),
             replacements: vec![NarrationReplacement {
                 binding_id: None,
+                fidelity: TakeFidelity::Final,
                 scene_id: Some(scene_id.clone()),
+                turn_id: None,
                 clip_id: None,
                 history_id: history_id.clone(),
                 voice_id: "voice-cancelled-before-commit".to_string(),
@@ -8484,6 +8811,7 @@ mod tests {
                          timeline_duration: i64| TimelineClip {
                             id: id.to_string(),
                             scene_id: Some(scene_id.to_string()),
+                            turn_id: None,
                             media: MediaReference {
                                 source_asset_id: Some(source_id.clone()),
                                 render_artifact_id: None,
@@ -11983,6 +12311,468 @@ impl VideoStudioService {
         })
     }
 
+    /// Applies one cast and written script and returns the authoritative project.
+    ///
+    /// The receipt separates turns whose words survived from turns that are genuinely new, so the
+    /// caller renders only what changed. Like `edit_timeline`, the durable job, revision CAS,
+    /// project lock, and terminal completion commit as one observable operation, and a crash
+    /// replay adopts the existing revision instead of applying the script twice.
+    pub fn apply_script(&self, request: VideoScriptRequest) -> ServiceResult<ScriptServiceResult> {
+        let request_value = serde_json::to_value(&request).map_err(json_error)?;
+        let idempotency_key = format!(
+            "apply-script:{}",
+            sha256_bytes(format!("{}:{}", request.project_id, request.operation_id).as_bytes())
+        );
+        let Some((job_id, created)) = self
+            .store
+            .create_idempotent_job("video_apply_script", &idempotency_key, &request_value)
+            .map_err(VideoServiceError::store)?
+        else {
+            return Err(VideoServiceError::new(
+                "video.idempotency_conflict",
+                "This script operation identifier was already used with a different request",
+            ));
+        };
+
+        let result = self.apply_script_with_job(&request, &job_id, created);
+        if let Err(error) = &result {
+            let _ = self.store.fail_job(&job_id, &error.stable_message());
+        }
+        result
+    }
+
+    fn apply_script_with_job(
+        &self,
+        request: &VideoScriptRequest,
+        job_id: &str,
+        created: bool,
+    ) -> ServiceResult<ScriptServiceResult> {
+        let reason = format!("Cast and script {}", request.operation_id);
+        let actor = "video-studio-writer";
+        let existing_job = self
+            .store
+            .get_job(job_id)
+            .map_err(VideoServiceError::store)?
+            .ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.job_not_found",
+                    "The durable script job was not found",
+                )
+            })?;
+        let existing_status = existing_job
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_store_shape("job.status"))?;
+
+        if !created && matches!(existing_status, "preparing" | "running" | "queued") {
+            return Err(VideoServiceError::new(
+                "video.operation_in_progress",
+                "This script is already being applied",
+            )
+            .retryable(true)
+            .details(json!({ "job_id": job_id })));
+        }
+        if !created && matches!(existing_status, "failed" | "cancelled") {
+            self.store
+                .resume_video_job(job_id, &["video_apply_script"])
+                .map_err(VideoServiceError::store)?;
+        }
+
+        let lock = ProjectLock::acquire(self, &request.project_id, actor)?;
+        let current = self.get_project(&request.project_id)?;
+        let current_manifest: VideoProjectManifest = serde_json::from_value(
+            current
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        current_manifest.validate_strict()?;
+
+        // A replay after a crash between commit and job completion finds its own revision
+        // already recorded and adopts it rather than writing the script a second time.
+        if let Some(record) = current_manifest.revision_history.iter().find(|record| {
+            record.reason == reason
+                && record.actor == actor
+                && record.revision == request.expected_revision.saturating_add(1)
+        }) {
+            if existing_status != "completed" {
+                let completed = self
+                    .store
+                    .complete_job(job_id)
+                    .map_err(VideoServiceError::store)?;
+                if !completed {
+                    return Err(VideoServiceError::new(
+                        "video.cancelled",
+                        "The script was applied before cancellation and is ready to reload",
+                    )
+                    .details(json!({ "job_id": job_id, "project_id": request.project_id })));
+                }
+            }
+            let turn_ids = current_manifest
+                .dialogue
+                .iter()
+                .map(|turn| turn.id.clone())
+                .collect::<Vec<_>>();
+            drop(lock);
+            return Ok(ScriptServiceResult {
+                project: current,
+                receipt: VideoScriptReceipt {
+                    project_id: request.project_id.clone(),
+                    expected_revision: request.expected_revision,
+                    base_version_id: request.base_version_id.clone(),
+                    operation_id: request.operation_id.clone(),
+                    changed_paths: record.changed_paths.clone(),
+                    invalidated_stages: record.invalidated_stages.clone(),
+                    // A replay cannot reconstruct which turns were new at the time, and guessing
+                    // would invite a duplicate render. Reporting every turn as retained keeps the
+                    // caller from re-reading work the committed revision already owns.
+                    retained_turn_ids: turn_ids,
+                    new_turn_ids: Vec::new(),
+                    dropped_binding_ids: Vec::new(),
+                },
+                job_id: job_id.to_string(),
+                replayed: true,
+            });
+        }
+
+        if existing_status == "completed" {
+            return Err(VideoServiceError::new(
+                "video.integrity_failed",
+                "The completed script job has no matching project revision",
+            ));
+        }
+        self.store
+            .start_job(job_id)
+            .map_err(VideoServiceError::store)?;
+
+        let expectation = ProjectExpectation {
+            revision: i64::try_from(request.expected_revision).map_err(|_| {
+                VideoServiceError::new(
+                    "video.invalid_revision",
+                    "The script revision is outside the supported range",
+                )
+            })?,
+            version_id: request.base_version_id.clone(),
+        };
+        ensure_project_matches(&current, &expectation)?;
+        let applied = apply_dialogue_script(
+            &current_manifest,
+            &DialogueScriptRequest {
+                cast: request.cast.clone(),
+                script: request.script.clone(),
+            },
+        )?;
+        let mut manifest = applied.manifest;
+        let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
+            VideoServiceError::new(
+                "video.revision_overflow",
+                "The script revision could not be advanced",
+            )
+        })?;
+        manifest.revision = next_revision;
+        manifest.updated_at = utc_now();
+        manifest.revision_history.push(RevisionRecord {
+            id: new_id(),
+            revision: next_revision,
+            parent_id: manifest
+                .revision_history
+                .last()
+                .map(|record| record.id.clone()),
+            actor: actor.to_string(),
+            reason: reason.clone(),
+            changed_paths: applied.changed_paths.clone(),
+            invalidated_stages: applied.invalidated_stages.clone(),
+            created_at: manifest.updated_at.clone(),
+        });
+        manifest.validate_strict()?;
+        let manifest_value = serde_json::to_value(&manifest).map_err(json_error)?;
+        let status = current.get("status").and_then(Value::as_str);
+        let project = self
+            .store
+            .commit_video_manifest_and_complete_job(
+                &request.project_id,
+                expectation.revision,
+                &manifest_value,
+                actor,
+                &reason,
+                &lock.token,
+                status,
+                job_id,
+            )
+            .map_err(VideoServiceError::store)?;
+        drop(lock);
+        Ok(ScriptServiceResult {
+            project,
+            receipt: VideoScriptReceipt {
+                project_id: request.project_id.clone(),
+                expected_revision: request.expected_revision,
+                base_version_id: request.base_version_id.clone(),
+                operation_id: request.operation_id.clone(),
+                changed_paths: applied.changed_paths,
+                invalidated_stages: applied.invalidated_stages,
+                retained_turn_ids: applied.retained_turn_ids,
+                new_turn_ids: applied.new_turn_ids,
+                dropped_binding_ids: applied.dropped_binding_ids,
+            },
+            job_id: job_id.to_string(),
+            replayed: false,
+        })
+    }
+
+    /// Describe the episode as rendered, so a revision responds to something measured.
+    ///
+    /// Strictly read-only. Every number comes from a published artifact with a measured duration;
+    /// a value that was never measured is absent rather than approximated, because an
+    /// approximation the assistant cannot distinguish from a measurement is worse than no value.
+    pub fn listen_to_episode(
+        &self,
+        project_id: &str,
+        loudness: Option<LoudnessMeasurement>,
+    ) -> ServiceResult<EpisodeListening> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+        Ok(listen_to_episode(&manifest, loudness)?)
+    }
+
+    /// Check a rendered episode against the script it was asked to speak.
+    ///
+    /// `heard` maps a turn id to what a local recognizer actually heard in that turn's take. A turn
+    /// missing from that map is reported as unchecked rather than as passed, because nobody
+    /// listened back to it. `loudness` is a measurement the runtime made; without one the report
+    /// says the master was not checked instead of claiming it is within target.
+    ///
+    /// This reports. It never rewrites a script, re-renders a take, or adjusts a mix.
+    pub fn check_episode_quality(
+        &self,
+        project_id: &str,
+        heard: &BTreeMap<String, String>,
+        loudness: Option<LoudnessMeasurement>,
+    ) -> ServiceResult<QcReport> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+
+        let mut findings = Vec::new();
+        let mut checked_turns = Vec::new();
+        let mut unchecked_turns = Vec::new();
+
+        // Only a turn with a take can be listened back to; a turn nobody narrated is not a turn
+        // that failed a check, it is a turn with no audio to check.
+        let narrated_turns = manifest
+            .narration_bindings
+            .iter()
+            .filter_map(|binding| binding.turn_id.as_deref())
+            .collect::<BTreeSet<_>>();
+        for turn in &manifest.dialogue {
+            if !narrated_turns.contains(turn.id.as_str()) {
+                continue;
+            }
+            match heard.get(&turn.id) {
+                Some(spoken) => {
+                    // The comparison is against what the voice was asked to say, which is the
+                    // scripted line after its pronunciation rules were applied.
+                    let asked = apply_lexicon(
+                        turn.spoken_text(),
+                        &effective_entries(&manifest.lexicon, &turn.character_id),
+                    )
+                    .spoken_text;
+                    findings.extend(findings_for_turn(
+                        &turn.id,
+                        &diff_spoken_words(&asked, spoken),
+                    ));
+                    checked_turns.push(turn.id.clone());
+                }
+                None => unchecked_turns.push(turn.id.clone()),
+            }
+        }
+
+        if let Some(measured) = loudness {
+            findings.extend(findings_for_loudness(
+                measured,
+                manifest.audio_mix.target_lufs_milli,
+                manifest.audio_mix.true_peak_db_milli,
+            ));
+        }
+
+        // Silence a listener actually hears: the gaps between what the speech track occupies.
+        let speech_spans = manifest
+            .tracks
+            .iter()
+            .filter(|track| matches!(track.kind, TrackKind::Audio))
+            .flat_map(|track| track.clips.iter())
+            .filter(|clip| clip.turn_id.is_some())
+            .map(|clip| {
+                Ok((
+                    clip.timeline_start_us,
+                    clip.timeline_start_us
+                        .checked_add(clip.timeline_duration_us)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, VideoError>>()?;
+        if !speech_spans.is_empty() {
+            findings.extend(findings_for_dead_air(
+                &speech_spans,
+                manifest.timeline_duration_us,
+            ));
+        }
+
+        Ok(build_report(
+            findings,
+            checked_turns,
+            unchecked_turns,
+            loudness.is_some(),
+        )?)
+    }
+
+    /// What this episode's release would contain, and what is still missing.
+    ///
+    /// The trailer moment is chosen by pointing soundAr's existing candidate analyst at the
+    /// episode's own narration, so generated work is reviewed by the same deterministic rules as
+    /// imported source rather than by a second, unproven selector.
+    pub fn plan_episode_release(
+        &self,
+        project_id: &str,
+        has_show_notes: bool,
+    ) -> ServiceResult<ReleasePlan> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+
+        let trailer_range = match episode_transcript(&manifest)? {
+            Some(transcript) => identify_clip_candidates(
+                &transcript,
+                &CandidatePolicy {
+                    minimum_duration_us: Microseconds(TRAILER_MINIMUM_US),
+                    target_duration_us: Microseconds(TRAILER_TARGET_US),
+                    maximum_duration_us: Microseconds(TRAILER_MAXIMUM_US),
+                    maximum_candidates: 4,
+                },
+                &BTreeSet::new(),
+            )?
+            .candidates
+            .first()
+            .map(|candidate| candidate.source_range),
+            None => None,
+        };
+        Ok(plan_release(&manifest, trailer_range, has_show_notes)?)
+    }
+
+    /// Every saved show format, validated on the way out so a corrupted document cannot reach a
+    /// project as if it were a usable format.
+    pub fn list_show_formats(&self) -> ServiceResult<Vec<ShowFormat>> {
+        let stored = self
+            .store
+            .show_formats()
+            .map_err(VideoServiceError::store)?;
+        let formats: Vec<ShowFormat> = serde_json::from_value(stored).map_err(json_error)?;
+        for format in &formats {
+            format.validate()?;
+        }
+        Ok(formats)
+    }
+
+    /// Create or replace one show format, advancing its revision.
+    ///
+    /// The revision is owned here rather than by the caller: an episode records the revision it
+    /// inherited from, and a caller that could choose its own number could make two different
+    /// formats claim the same provenance.
+    pub fn save_show_format(&self, mut format: ShowFormat) -> ServiceResult<ShowFormat> {
+        let mut formats = self.list_show_formats()?;
+        let existing = formats.iter().position(|saved| saved.id == format.id);
+        format.revision = existing
+            .and_then(|index| formats.get(index))
+            .map_or(1, |saved| saved.revision.saturating_add(1));
+        format.created_at = existing
+            .and_then(|index| formats.get(index))
+            .map_or_else(utc_now, |saved| saved.created_at.clone());
+        format.updated_at = utc_now();
+        format.validate()?;
+        match existing {
+            Some(index) => formats[index] = format.clone(),
+            None => {
+                if formats.len() >= MAX_SHOW_FORMATS {
+                    return Err(VideoServiceError::new(
+                        "video.too_many_show_formats",
+                        format!("soundAr keeps at most {MAX_SHOW_FORMATS} show formats"),
+                    ));
+                }
+                formats.push(format.clone());
+            }
+        }
+        let value = serde_json::to_value(&formats).map_err(json_error)?;
+        self.store
+            .save_show_formats(&value)
+            .map_err(VideoServiceError::store)?;
+        Ok(format)
+    }
+
+    pub fn delete_show_format(&self, format_id: &str) -> ServiceResult<()> {
+        let mut formats = self.list_show_formats()?;
+        let before = formats.len();
+        formats.retain(|format| format.id != format_id);
+        if formats.len() == before {
+            return Err(VideoServiceError::new(
+                "video.show_format_not_found",
+                "That show format does not exist",
+            ));
+        }
+        let value = serde_json::to_value(&formats).map_err(json_error)?;
+        self.store
+            .save_show_formats(&value)
+            .map_err(VideoServiceError::store)
+    }
+
+    /// Start a new episode of a show.
+    ///
+    /// The episode inherits the format's decisions by copy. Nothing links back, so editing the
+    /// format later cannot change this episode, and this episode reproduces what it was made from.
+    pub fn create_episode(
+        &self,
+        format_id: &str,
+        episode_name: &str,
+        actor: &str,
+        initial_intent: Option<String>,
+    ) -> ServiceResult<Value> {
+        let format = self
+            .list_show_formats()?
+            .into_iter()
+            .find(|format| format.id == format_id)
+            .ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.show_format_not_found",
+                    "That show format does not exist",
+                )
+            })?;
+        let project_id = format!("project-{}", new_id());
+        let manifest = instantiate_format(&format, &project_id, episode_name, &utc_now())?;
+        self.create_project(CreateVideoProjectRequest {
+            name: episode_name.to_string(),
+            manifest,
+            actor: actor.to_string(),
+            initial_intent,
+        })
+    }
+
     /// Records one exact local image selected by the trusted native backend picker. The returned
     /// opaque receipt is short-lived and may be claimed by only one durable add-visual job.
     pub(crate) fn authorize_user_visual_selection(
@@ -14654,6 +15444,7 @@ impl VideoStudioService {
         let mut prepared = Vec::with_capacity(request.replacements.len());
         let mut prepared_clip_ids = BTreeSet::new();
         let mut prepared_scene_ids = BTreeSet::new();
+        let mut prepared_turn_ids = BTreeSet::new();
         for (index, replacement) in request.replacements.iter().enumerate() {
             self.ensure_not_cancelled(cancel)?;
             let existing_binding = if let Some(binding_id) = replacement.binding_id.as_deref() {
@@ -14670,6 +15461,12 @@ impl VideoStudioService {
                             )
                         })?,
                 )
+            } else if let Some(turn_id) = replacement.turn_id.as_deref() {
+                manifest
+                    .narration_bindings
+                    .iter()
+                    .find(|binding| binding.turn_id.as_deref() == Some(turn_id))
+                    .cloned()
             } else if let Some(scene_id) = replacement.scene_id.as_deref() {
                 manifest
                     .narration_bindings
@@ -14701,6 +15498,9 @@ impl VideoStudioService {
                 .filter(|clip| {
                     if let Some(clip_id) = replacement.clip_id.as_deref() {
                         return clip.id == clip_id;
+                    }
+                    if let Some(turn_id) = replacement.turn_id.as_deref() {
+                        return clip.turn_id.as_deref() == Some(turn_id);
                     }
                     if let Some(binding) = existing_binding.as_ref() {
                         return clip.media.render_artifact_id.as_deref()
@@ -14773,6 +15573,81 @@ impl VideoStudioService {
                 })
                 .transpose()?;
 
+            // A turn-scoped replacement re-reads exactly one line. Resolving the turn from the
+            // request, the existing binding, or the clip keeps a repeated request idempotent
+            // whichever of those the caller had available.
+            let turn_id = replacement
+                .turn_id
+                .clone()
+                .or_else(|| {
+                    existing_binding
+                        .as_ref()
+                        .and_then(|binding| binding.turn_id.clone())
+                })
+                .or_else(|| target_clip.turn_id.clone());
+            if replacement.turn_id.is_some()
+                && target_clip.turn_id.as_deref() != replacement.turn_id.as_deref()
+            {
+                return Err(VideoServiceError::new(
+                    "video.narration_target_mismatch",
+                    "The selected clip does not carry the requested dialogue turn",
+                ));
+            }
+            if let Some(turn_id) = turn_id.as_deref() {
+                if !prepared_turn_ids.insert(turn_id.to_string()) {
+                    return Err(VideoServiceError::new(
+                        "video.duplicate_narration_target",
+                        "A dialogue turn can receive only one narration take per revision",
+                    ));
+                }
+            }
+            let turn = turn_id
+                .as_deref()
+                .map(|turn_id| {
+                    manifest
+                        .dialogue
+                        .iter()
+                        .find(|turn| turn.id == turn_id)
+                        .ok_or_else(|| {
+                            VideoServiceError::new(
+                                "video.narration_target_not_found",
+                                "The narration dialogue turn no longer exists",
+                            )
+                        })
+                })
+                .transpose()?;
+            // The character owns the route. Accepting a take recorded against a different
+            // speaker would break the guarantee that reassigning one character's voice
+            // invalidates exactly that character's takes.
+            if let Some(turn) = turn {
+                let member = manifest
+                    .cast
+                    .iter()
+                    .find(|member| member.id == turn.character_id)
+                    .ok_or_else(|| {
+                        VideoServiceError::new(
+                            "video.narration_target_not_found",
+                            "The character who speaks this turn is no longer in the cast",
+                        )
+                    })?;
+                if !replacement
+                    .speaker
+                    .trim()
+                    .eq_ignore_ascii_case(member.name.trim())
+                {
+                    return Err(VideoServiceError::new(
+                        "video.narration_speaker_mismatch",
+                        "The replacement speaker does not match the character who speaks this turn",
+                    ));
+                }
+            }
+            // The lexicon rewrites the line before a voice speaks it, so the generated audio is
+            // checked against the spoken text while the take still records the words the writer
+            // actually wrote.
+            let lexicon_fingerprint = turn.and_then(|turn| {
+                super::lexicon::fingerprint_for_character(&manifest.lexicon, &turn.character_id)
+            });
+
             let history = self
                 .store
                 .get_history(&replacement.history_id)
@@ -14820,21 +15695,34 @@ impl VideoStudioService {
                     "The selected History id does not own the speech artifact",
                 ));
             }
-            let script = scene
-                .map(|scene| scene.script.as_str())
+            let script = turn
+                .map(|turn| turn.spoken_text())
+                .or_else(|| scene.map(|scene| scene.script.as_str()))
                 .unwrap_or_else(|| history.get("text").and_then(Value::as_str).unwrap_or(""));
             let script_sha = sha256_bytes(script.as_bytes());
-            if scene.is_some()
+            // What the engine was asked to say. Identical to the written line unless a
+            // pronunciation rule governs this character.
+            let spoken = turn
+                .map(|turn| {
+                    super::lexicon::apply_lexicon(
+                        turn.spoken_text(),
+                        &super::lexicon::effective_entries(&manifest.lexicon, &turn.character_id),
+                    )
+                    .spoken_text
+                })
+                .unwrap_or_else(|| script.to_string());
+            let spoken_sha = sha256_bytes(spoken.as_bytes());
+            if (turn.is_some() || scene.is_some())
                 && history
                     .get("text")
                     .and_then(Value::as_str)
                     .map(|text| sha256_bytes(text.as_bytes()))
                     .as_deref()
-                    != Some(script_sha.as_str())
+                    != Some(spoken_sha.as_str())
             {
                 return Err(VideoServiceError::new(
                     "video.narration_script_mismatch",
-                    "The generated speech does not match the current reviewed scene script",
+                    "The generated speech does not match the words this scene or turn must speak",
                 ));
             }
             let source_probe = probe_media(&source_path, ffprobe)?;
@@ -14995,6 +15883,9 @@ impl VideoStudioService {
                     .map(|binding| binding.id.clone())
                     .unwrap_or_else(new_id),
                 scene_id: scene_id.clone(),
+                turn_id: turn_id.clone(),
+                lexicon_fingerprint: lexicon_fingerprint.clone(),
+                fidelity: replacement.fidelity,
                 render_artifact_id: artifact.id.clone(),
                 history_id: replacement.history_id.clone(),
                 generation_job_id,
@@ -17952,6 +18843,7 @@ impl VideoStudioService {
                         clips: vec![TimelineClip {
                             id: format!("source-clip-{source_id}"),
                             scene_id: None,
+                            turn_id: None,
                             media: super::MediaReference {
                                 source_asset_id: Some(source_id.clone()),
                                 render_artifact_id: None,

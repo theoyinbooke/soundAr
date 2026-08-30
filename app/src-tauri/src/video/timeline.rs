@@ -452,6 +452,7 @@ mod tests {
         TimelineClip {
             id: id.into(),
             scene_id: None,
+            turn_id: None,
             media: MediaReference {
                 source_asset_id: Some("source-1".into()),
                 render_artifact_id: None,

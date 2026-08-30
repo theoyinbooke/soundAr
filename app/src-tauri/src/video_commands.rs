@@ -153,6 +153,12 @@ struct DurablePlanRequest {
 struct DurableNarrationRevisionRequest {
     project_id: String,
     scene_id: String,
+    /// Whether this re-read is the finished performance or a fast stand-in.
+    #[serde(default)]
+    fidelity: video::TakeFidelity,
+    /// Set when the revision re-reads one dialogue turn rather than a whole scene.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
     binding_id: Option<String>,
     script: String,
     script_sha256: String,
@@ -184,6 +190,25 @@ struct DurablePromptVideoRequest {
     speaker: String,
     voice_name: String,
     language: String,
+    priority: String,
+}
+
+/// Owns the complete cue -> local music -> registered timeline placement pipeline.
+///
+/// The parent is created before generation and every child is idempotently bound to its id, so a
+/// crash between generating the music and placing it adopts the existing History and import rather
+/// than asking the GPU for the same piece twice.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DurableCueMusicRequest {
+    project_id: String,
+    cue_id: String,
+    direction: String,
+    direction_sha256: String,
+    target_duration_us: i64,
+    model_id: String,
+    title: String,
+    actor: String,
     priority: String,
 }
 
@@ -323,6 +348,188 @@ pub(crate) fn dispatch_video_operation(
                 kind,
                 VideoAgentResultStatus::Ready,
                 "Video project loaded with playable registered artifacts",
+                project,
+                None,
+            )
+        }
+        VideoAgentOperation::WriteVideoScript(request) => {
+            let result = runtime
+                .video
+                .apply_script(request)
+                .map_err(VideoAgentToolError::from)?;
+            let project = video::present_video_project(
+                &result.project,
+                &runtime.store.video_artifacts_root(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            let retained = result.receipt.retained_turn_ids.len();
+            let fresh = result.receipt.new_turn_ids.len();
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                // Saying which turns survived is what stops the agent re-reading lines that
+                // already have a valid take.
+                format!(
+                    "Cast and script committed: {fresh} turn(s) need narration, {retained} existing take(s) remain valid"
+                ),
+                project,
+                Some(result.job_id),
+            )
+        }
+        VideoAgentOperation::SaveShowFormat(format) => {
+            let saved = runtime
+                .video
+                .save_show_format(format)
+                .map_err(VideoAgentToolError::from)?;
+            let summary = format!(
+                "Saved show format {} at revision {}",
+                saved.name, saved.revision
+            );
+            Ok(VideoAgentResult::ready(
+                kind,
+                &summary,
+                json!({ "format": saved }),
+            ))
+        }
+        VideoAgentOperation::ListShowFormats(_) => {
+            let formats = runtime
+                .video
+                .list_show_formats()
+                .map_err(VideoAgentToolError::from)?;
+            Ok(VideoAgentResult::ready(
+                kind,
+                "Saved show formats",
+                json!({ "formats": formats }),
+            ))
+        }
+        VideoAgentOperation::CreateEpisode(request) => {
+            let record = runtime
+                .video
+                .create_episode(
+                    &request.format_id,
+                    &request.episode_name,
+                    "video-studio-producer",
+                    request.brief,
+                )
+                .map_err(VideoAgentToolError::from)?;
+            let project =
+                video::present_video_project(&record, &runtime.store.video_artifacts_root())
+                    .map_err(VideoAgentToolError::from)?;
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Ready,
+                "The episode inherits its show's cast, pronunciation, timing, canvas, and mix; write its script next",
+                project,
+                None,
+            )
+        }
+        VideoAgentOperation::ListenToEpisode(request) => {
+            let loudness = match (request.integrated_lufs_milli, request.true_peak_db_milli) {
+                (Some(integrated_lufs_milli), Some(true_peak_db_milli)) => {
+                    Some(video::LoudnessMeasurement {
+                        integrated_lufs_milli,
+                        true_peak_db_milli,
+                    })
+                }
+                _ => None,
+            };
+            let heard = runtime
+                .video
+                .listen_to_episode(&request.project_id, loudness)
+                .map_err(VideoAgentToolError::from)?;
+            let summary = format!(
+                "{} line(s) performed, {:.1}s spoken, {} line(s) not yet narrated",
+                heard.narrated_turns,
+                (heard.spoken_us.0 as f64) / 1_000_000.0,
+                heard.unnarrated_turns.len()
+            );
+            Ok(VideoAgentResult::ready(
+                kind,
+                &summary,
+                serde_json::to_value(&heard).map_err(|error| {
+                    VideoAgentToolError::new(
+                        "video.agent_result_encode_failed",
+                        format!("The listening report could not be encoded: {error}"),
+                    )
+                })?,
+            ))
+        }
+        VideoAgentOperation::CheckEpisodeQuality(request) => {
+            // A partial measurement is no measurement: reporting loudness without its true peak
+            // would let half a check read as a whole one.
+            let loudness = match (request.integrated_lufs_milli, request.true_peak_db_milli) {
+                (Some(integrated_lufs_milli), Some(true_peak_db_milli)) => {
+                    Some(video::LoudnessMeasurement {
+                        integrated_lufs_milli,
+                        true_peak_db_milli,
+                    })
+                }
+                _ => None,
+            };
+            let report = runtime
+                .video
+                .check_episode_quality(&request.project_id, &request.heard, loudness)
+                .map_err(VideoAgentToolError::from)?;
+            let summary = if report.is_clear() {
+                "Every narrated line matches its script and the master is within target".to_string()
+            } else {
+                format!(
+                    "{} blocking finding(s), {} unchecked line(s)",
+                    report.blocking().len(),
+                    report.unchecked_turns.len()
+                )
+            };
+            Ok(VideoAgentResult::ready(
+                kind,
+                &summary,
+                serde_json::to_value(&report).map_err(|error| {
+                    VideoAgentToolError::new(
+                        "video.agent_result_encode_failed",
+                        format!("The quality report could not be encoded: {error}"),
+                    )
+                })?,
+            ))
+        }
+        VideoAgentOperation::PlanEpisodeRelease(request) => {
+            let plan = runtime
+                .video
+                .plan_episode_release(&request.project_id, request.has_show_notes)
+                .map_err(VideoAgentToolError::from)?;
+            let summary = if plan.is_ready() {
+                "Every release member can be produced".to_string()
+            } else {
+                format!(
+                    "{} release member(s) are still blocked",
+                    plan.blocked().len()
+                )
+            };
+            Ok(VideoAgentResult::ready(
+                kind,
+                &summary,
+                serde_json::to_value(&plan).map_err(|error| {
+                    VideoAgentToolError::new(
+                        "video.agent_result_encode_failed",
+                        format!("The release plan could not be encoded: {error}"),
+                    )
+                })?,
+            ))
+        }
+        VideoAgentOperation::GenerateCueMusic(request) => {
+            let record = generate_cue_music(
+                runtime,
+                &request.project_id,
+                &request.cue_id,
+                request.model_id,
+                progress.as_ref(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            let project =
+                video::present_video_project(&record, &runtime.store.video_artifacts_root())
+                    .map_err(VideoAgentToolError::from)?;
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                "The cue is composed locally, fitted to its length, and placed at its anchor",
                 project,
                 None,
             )
@@ -718,6 +925,219 @@ pub(crate) async fn revise_video(
     .map_err(|error| format!("video.worker_failed: Revision worker failed: {error}"))?
 }
 
+/// Resolve exactly what a voice would say for a sample line, so one pronunciation rule can be
+/// auditioned without re-rendering the work around it. The caller synthesizes the returned text
+/// with the character's own voice through the ordinary speech queue.
+#[tauri::command]
+pub(crate) async fn listen_to_episode(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    integrated_lufs_milli: Option<i32>,
+    true_peak_db_milli: Option<i32>,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let loudness = match (integrated_lufs_milli, true_peak_db_milli) {
+            (Some(integrated_lufs_milli), Some(true_peak_db_milli)) => {
+                Some(video::LoudnessMeasurement {
+                    integrated_lufs_milli,
+                    true_peak_db_milli,
+                })
+            }
+            _ => None,
+        };
+        let heard = service
+            .listen_to_episode(&project_id, loudness)
+            .map_err(service_error)?;
+        serde_json::to_value(heard).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Listening worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn check_episode_quality(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    heard: std::collections::BTreeMap<String, String>,
+    integrated_lufs_milli: Option<i32>,
+    true_peak_db_milli: Option<i32>,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let loudness = match (integrated_lufs_milli, true_peak_db_milli) {
+            (Some(integrated_lufs_milli), Some(true_peak_db_milli)) => {
+                Some(video::LoudnessMeasurement {
+                    integrated_lufs_milli,
+                    true_peak_db_milli,
+                })
+            }
+            _ => None,
+        };
+        let report = service
+            .check_episode_quality(&project_id, &heard, loudness)
+            .map_err(service_error)?;
+        serde_json::to_value(report).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Quality worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn plan_episode_release(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    has_show_notes: bool,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let plan = service
+            .plan_episode_release(&project_id, has_show_notes)
+            .map_err(service_error)?;
+        serde_json::to_value(plan).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Release worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn list_show_formats(
+    state: tauri::State<'_, RuntimeState>,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let formats = service.list_show_formats().map_err(service_error)?;
+        serde_json::to_value(formats).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Show format worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn save_show_format(
+    state: tauri::State<'_, RuntimeState>,
+    format: video::ShowFormat,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let saved = service.save_show_format(format).map_err(service_error)?;
+        serde_json::to_value(saved).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Show format worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn delete_show_format(
+    state: tauri::State<'_, RuntimeState>,
+    format_id: String,
+) -> Result<(), String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        service
+            .delete_show_format(&format_id)
+            .map_err(service_error)
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Show format worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn create_episode(
+    state: tauri::State<'_, RuntimeState>,
+    format_id: String,
+    episode_name: String,
+    brief: Option<String>,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let record = service
+            .create_episode(&format_id, &episode_name, "video-studio-producer", brief)
+            .map_err(service_error)?;
+        video::present_video_project(&record, &video_root).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Episode worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn generate_video_cue_music(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    cue_id: String,
+    model_id: Option<String>,
+) -> Result<Value, String> {
+    let runtime = state.inner().clone();
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let record = generate_cue_music(&runtime, &project_id, &cue_id, model_id, None)?;
+        video::present_video_project(&record, &video_root).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Cue music worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn preview_video_pronunciation(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    character_id: String,
+    sample_text: String,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let record = service.get_project(&project_id).map_err(service_error)?;
+        let manifest: video::VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or("video.invalid_manifest: Project manifest is missing")?,
+        )
+        .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+        let member = manifest
+            .cast
+            .iter()
+            .find(|member| member.id == character_id)
+            .ok_or("video.unknown_speaker: That character is not in this project's cast")?;
+        let entries = video::effective_entries(&manifest.lexicon, &member.id);
+        let applied = video::apply_lexicon(&sample_text, &entries);
+        Ok(json!({
+            "character_id": member.id,
+            "voice_id": member.voice_id,
+            "model_id": member.model_id,
+            "language": member.language,
+            "written_text": sample_text,
+            "spoken_text": applied.spoken_text,
+            "applied_entry_ids": applied.applied_entry_ids,
+        }))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Pronunciation preview failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn write_video_script(
+    state: tauri::State<'_, RuntimeState>,
+    request: video::VideoScriptRequest,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = service.apply_script(request).map_err(service_error)?;
+        let project = video::present_video_project(&result.project, &video_root)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "project": project,
+            "receipt": result.receipt,
+            "job_id": result.job_id,
+            "replayed": result.replayed,
+        }))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Script worker failed: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn edit_video_timeline(
     state: tauri::State<'_, RuntimeState>,
@@ -940,6 +1360,10 @@ fn revise_project(
         let durable = DurableNarrationRevisionRequest {
             project_id: request.project_id.clone(),
             scene_id: scene.id.clone(),
+            fidelity: video::TakeFidelity::Final,
+            // This command revises a whole scene's narration. Turn-scoped re-reads arrive
+            // through the dialogue path, which resolves its own binding.
+            turn_id: None,
             binding_id,
             script: script.to_string(),
             script_sha256: sha256_text(script),
@@ -1371,7 +1795,15 @@ fn narration_replacement_request(
         actor: request.actor.clone(),
         replacements: vec![video::service::NarrationReplacement {
             binding_id: request.binding_id.clone(),
-            scene_id: Some(request.scene_id.clone()),
+            fidelity: request.fidelity,
+            // A turn-scoped revision must not also claim its scene, or the service would
+            // resolve two competing narration targets for one take.
+            scene_id: if request.turn_id.is_some() {
+                None
+            } else {
+                Some(request.scene_id.clone())
+            },
+            turn_id: request.turn_id.clone(),
             clip_id: None,
             history_id: history_id.to_string(),
             voice_id: request.voice_id.clone(),
@@ -4310,6 +4742,343 @@ fn validate_prompt_history(
     Ok(())
 }
 
+/// The recommended local music route. ACE-Step is the only installed engine that takes a written
+/// direction and returns a full-band 48 kHz stereo piece, which is what score needs; MusicGen
+/// remains available for short instrumental drafts by passing `model_id` explicitly.
+const DEFAULT_CUE_MUSIC_MODEL: &str = "ACE-Step/Ace-Step1.5";
+
+fn run_cue_music_job_guarded(
+    runtime: &RuntimeState,
+    parent_job_id: &str,
+    request: &DurableCueMusicRequest,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<Value, String> {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        run_cue_music_job(runtime, parent_job_id, request, progress)
+    }))
+    .unwrap_or_else(|_| {
+        Err("video.worker_panicked: The cue music worker stopped unexpectedly".into())
+    });
+    if let Err(error) = &result {
+        persist_command_job_failure(runtime, parent_job_id, error);
+    }
+    result
+}
+
+/// Compose and place one planned cue.
+///
+/// The cue is the request: its direction, target length, and anchor are already committed, so this
+/// takes only the project and the cue and reads the rest from the durable manifest.
+pub(crate) fn generate_cue_music(
+    runtime: &RuntimeState,
+    project_id: &str,
+    cue_id: &str,
+    model_id: Option<String>,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<Value, String> {
+    let record = runtime
+        .video
+        .get_project(project_id)
+        .map_err(service_error)?;
+    let manifest: video::VideoProjectManifest = serde_json::from_value(
+        record
+            .get("manifest")
+            .cloned()
+            .ok_or("video.invalid_manifest: Project manifest is missing")?,
+    )
+    .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+    let cue = manifest
+        .music_cues
+        .iter()
+        .find(|cue| cue.id == cue_id)
+        .ok_or("video.missing_reference: That music cue is not in this project")?;
+    if !cue.needs_generation() {
+        return Err(
+            "video.invalid_cue: That cue already has music placed; remove it before regenerating"
+                .into(),
+        );
+    }
+    let direction = cue.direction.trim().to_string();
+    let durable = DurableCueMusicRequest {
+        project_id: project_id.to_string(),
+        cue_id: cue_id.to_string(),
+        direction_sha256: sha256_text(&direction),
+        direction,
+        target_duration_us: cue.target_duration_us.0,
+        model_id: model_id.unwrap_or_else(|| DEFAULT_CUE_MUSIC_MODEL.to_string()),
+        title: format!("{} · {}", manifest.name, cue.id),
+        actor: "video-studio-composer".to_string(),
+        priority: "normal".to_string(),
+    };
+    let durable_value = serde_json::to_value(&durable)
+        .map_err(|error| format!("video.invalid_request: {error}"))?;
+    let parent_job_id = runtime
+        .store
+        .create_job("video_generate_cue_music", &durable_value)?;
+    run_cue_music_job_guarded(runtime, &parent_job_id, &durable, progress)
+}
+
+/// Generate a planned cue's music locally and place it on the timeline.
+///
+/// The cue already declares what it wants: a direction, a target length, and an anchor. This asks
+/// the installed local music engine for exactly that, registers the result as managed project
+/// media, and commits the placement through the same revision-checked edit path the UI uses.
+fn run_cue_music_job(
+    runtime: &RuntimeState,
+    parent_job_id: &str,
+    request: &DurableCueMusicRequest,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<Value, String> {
+    let status = runtime.store.start_job(parent_job_id)?;
+    if status == "cancelled" {
+        return Err("video.cancelled: Cue music generation was cancelled".into());
+    }
+    ensure_command_job_active(runtime, parent_job_id)?;
+    if sha256_text(request.direction.trim()) != request.direction_sha256 {
+        return Err(
+            "video.resume_invalid: The durable cue identity no longer matches its direction".into(),
+        );
+    }
+
+    emit_operation_progress(
+        progress,
+        parent_job_id,
+        &request.project_id,
+        "review",
+        0.08,
+        "Composing the cue with the installed local music model",
+        None,
+    );
+    let generation_request = cue_music_request(request);
+    let (history, _generation_job_id) = run_cue_music_child(
+        runtime,
+        parent_job_id,
+        request,
+        &generation_request,
+        progress,
+    )?;
+    let audio_path = history
+        .get("audio_path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or("video.music_failed: The generated cue has no registered audio artifact")?;
+
+    // Registering before placing keeps the media managed and checksummed, so a cue can only ever
+    // point at bytes soundAr owns.
+    ensure_command_job_active(runtime, parent_job_id)?;
+    runtime.store.update_job(parent_job_id, "running", 0.62)?;
+    let before = video_source_asset_ids(runtime, &request.project_id)?;
+    let queued = runtime
+        .video
+        .queue_local_import_idempotent(
+            video::LocalImportRequest {
+                project_id: request.project_id.clone(),
+                source_path: audio_path,
+                actor: request.actor.clone(),
+                title: Some(format!("{} music", request.title)),
+            },
+            parent_job_id,
+            None,
+        )
+        .map_err(service_error)?;
+    if let Err(error) = ensure_command_job_active(runtime, parent_job_id) {
+        runtime.video.cancel_job(&queued.job_id).ok();
+        return Err(error);
+    }
+    let completed = runtime
+        .video
+        .wait_for_job(&queued.job_id, &request.project_id, VIDEO_COMMAND_TIMEOUT)
+        .map_err(service_error)?;
+    ensure_command_job_active(runtime, parent_job_id)?;
+
+    let source_asset_id = new_video_source_asset_id(&completed.project, &before)?;
+    runtime.store.update_job(parent_job_id, "running", 0.85)?;
+    emit_operation_progress(
+        progress,
+        parent_job_id,
+        &request.project_id,
+        "review",
+        0.85,
+        "Fitting the cue to its length and placing it on the timeline",
+        None,
+    );
+
+    let revision = completed
+        .project
+        .get("revision")
+        .and_then(Value::as_i64)
+        .ok_or("video.invalid_project: Project revision is missing")?;
+    let placed = runtime
+        .video
+        .edit_timeline(video::VideoTimelineEditRequest {
+            project_id: request.project_id.clone(),
+            expected_revision: u64::try_from(revision)
+                .map_err(|_| "video.invalid_revision: Project revision is out of range")?,
+            base_version_id: project_version_id(&completed.project)?.to_string(),
+            operation_id: format!("place-cue-{}", request.cue_id),
+            operations: vec![video::VideoTimelineOperation::PlaceMusicCue {
+                cue_id: request.cue_id.clone(),
+                source_asset_id,
+            }],
+        })
+        .map_err(service_error)?;
+
+    if !runtime.store.complete_job(parent_job_id)? {
+        return Err(
+            "video.parent_job_inactive: Cue music generation did not remain active through completion"
+                .into(),
+        );
+    }
+    emit_operation_progress(
+        progress,
+        parent_job_id,
+        &request.project_id,
+        "review",
+        1.0,
+        "The cue is composed, fitted, and placed",
+        None,
+    );
+    Ok(placed.project)
+}
+
+fn cue_music_request(request: &DurableCueMusicRequest) -> Value {
+    // A content-derived seed makes an interrupted job regenerate the same piece on resume rather
+    // than a different one that no longer matches the cue the user approved.
+    let seed = u32::from_str_radix(&request.direction_sha256[..8], 16).unwrap_or(42_817);
+    json!({
+        "operation": "generate_music",
+        "generation_kind": "music",
+        "model_id": request.model_id,
+        "prompt": request.direction,
+        // Generation is asked for the cue's exact target; `fit_cue` reconciles what it returns.
+        "duration_seconds": (request.target_duration_us as f64 / 1_000_000.0).ceil(),
+        "seed": seed,
+        "output_format": "wav",
+        "title": request.title,
+        "priority": request.priority,
+    })
+}
+
+fn run_cue_music_child(
+    runtime: &RuntimeState,
+    parent_job_id: &str,
+    request: &DurableCueMusicRequest,
+    generation_request: &Value,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<(Value, String), String> {
+    let Some((child_job_id, created)) = runtime.store.create_idempotent_job(
+        "synthesis",
+        &format!("video-cue-music-{parent_job_id}"),
+        generation_request,
+    )?
+    else {
+        return Err(
+            "video.resume_conflict: The cue parent is already bound to different music inputs"
+                .into(),
+        );
+    };
+    ensure_command_job_active(runtime, parent_job_id).map_err(|error| {
+        runtime.cancel_job(&child_job_id).ok();
+        error
+    })?;
+
+    let run_child = |child_request: Value| -> Result<Value, String> {
+        emit_operation_progress(
+            progress,
+            parent_job_id,
+            &request.project_id,
+            "review",
+            0.24,
+            "Rendering the cue locally",
+            None,
+        );
+        let outcome = runtime
+            .request_for_job(child_request.clone(), &child_job_id)
+            .and_then(|result| {
+                runtime
+                    .store
+                    .complete_synthesis(&child_job_id, &child_request, &result)
+            });
+        if let Err(error) = &outcome {
+            if runtime.store.job_status(&child_job_id)?.as_deref() != Some("cancelled") {
+                runtime.store.fail_job(&child_job_id, error)?;
+            }
+        }
+        outcome.map_err(|error| format!("video.music_failed: {error}"))
+    };
+
+    let history = if created {
+        run_child(generation_request.clone())?
+    } else {
+        match runtime.store.job_status(&child_job_id)?.as_deref() {
+            Some("completed") => runtime
+                .store
+                .get_history_by_job_id(&child_job_id)?
+                .ok_or("video.music_failed: The completed cue music has no History artifact")?,
+            Some("failed" | "cancelled") => {
+                let (_, stored_request) = runtime.store.retry_synthesis_job(&child_job_id)?;
+                if stored_request != *generation_request {
+                    return Err("video.resume_conflict: The stored cue music inputs changed".into());
+                }
+                run_child(stored_request)?
+            }
+            _ => run_child(generation_request.clone())?,
+        }
+    };
+    if history.get("generation_kind").and_then(Value::as_str) != Some("music") {
+        return Err("video.music_failed: The cue child produced a non-music artifact".into());
+    }
+    Ok((history, child_job_id))
+}
+
+/// The source assets a project already owns, so the newly imported one can be identified without
+/// guessing from a filename.
+fn video_source_asset_ids(
+    runtime: &RuntimeState,
+    project_id: &str,
+) -> Result<BTreeSet<String>, String> {
+    let record = runtime
+        .video
+        .get_project(project_id)
+        .map_err(service_error)?;
+    let manifest: video::VideoProjectManifest = serde_json::from_value(
+        record
+            .get("manifest")
+            .cloned()
+            .ok_or("video.invalid_manifest: Project manifest is missing")?,
+    )
+    .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+    Ok(manifest
+        .source_assets
+        .into_iter()
+        .map(|asset| asset.id)
+        .collect())
+}
+
+fn new_video_source_asset_id(project: &Value, before: &BTreeSet<String>) -> Result<String, String> {
+    let manifest: video::VideoProjectManifest = serde_json::from_value(
+        project
+            .get("manifest")
+            .cloned()
+            .ok_or("video.invalid_manifest: Project manifest is missing")?,
+    )
+    .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+    let mut added = manifest
+        .source_assets
+        .into_iter()
+        .filter(|asset| !before.contains(&asset.id))
+        .map(|asset| asset.id)
+        .collect::<Vec<_>>();
+    match added.len() {
+        1 => Ok(added.remove(0)),
+        0 => Err("video.import_missing: The cue import registered no new source asset".into()),
+        _ => Err(
+            "video.import_ambiguous: The cue import registered more than one source asset".into(),
+        ),
+    }
+}
+
 fn adopt_or_resume_prompt_import(
     runtime: &RuntimeState,
     parent_job_id: &str,
@@ -4976,6 +5745,7 @@ mod tests {
                 video::TimelineClip {
                     id: format!("{prefix}-opening"),
                     scene_id: Some("scene-opening".into()),
+                    turn_id: None,
                     media: video::MediaReference {
                         source_asset_id: Some("source-1".into()),
                         render_artifact_id: None,
@@ -4991,6 +5761,7 @@ mod tests {
                 video::TimelineClip {
                     id: format!("{prefix}-close"),
                     scene_id: Some("scene-close".into()),
+                    turn_id: None,
                     media: video::MediaReference {
                         source_asset_id: Some("source-1".into()),
                         render_artifact_id: None,
@@ -5202,6 +5973,8 @@ mod tests {
         let durable = DurableNarrationRevisionRequest {
             project_id: "project-1".into(),
             scene_id: "scene-opening".into(),
+            fidelity: video::TakeFidelity::Final,
+            turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: "A reviewed opening.".into(),
             script_sha256: sha256_text("A reviewed opening."),
@@ -5278,6 +6051,9 @@ mod tests {
         manifest.narration_bindings.push(video::NarrationBinding {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
+            turn_id: None,
+            lexicon_fingerprint: None,
+            fidelity: video::TakeFidelity::Final,
             render_artifact_id: artifact.id.clone(),
             history_id: "history-exact".into(),
             generation_job_id: "synthesis-exact".into(),
@@ -5308,6 +6084,8 @@ mod tests {
         let request = DurableNarrationRevisionRequest {
             project_id: manifest.project_id.clone(),
             scene_id: "scene-opening".into(),
+            fidelity: video::TakeFidelity::Final,
+            turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: script.clone(),
             script_sha256: sha256_text(&script),
@@ -5453,6 +6231,8 @@ mod tests {
         let request = DurableNarrationRevisionRequest {
             project_id: project_id.clone(),
             scene_id: "scene-opening".into(),
+            fidelity: video::TakeFidelity::Final,
+            turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: script.clone(),
             script_sha256: sha256_text(&script),
@@ -5585,6 +6365,9 @@ mod tests {
             .push(video::NarrationBinding {
                 id: "binding-opening".into(),
                 scene_id: Some("scene-opening".into()),
+                turn_id: None,
+                lexicon_fingerprint: None,
+                fidelity: video::TakeFidelity::Final,
                 render_artifact_id: artifact_id.into(),
                 history_id: "narration-post-manifest-history".into(),
                 generation_job_id: synthesis_job_id.clone(),
@@ -6587,6 +7370,9 @@ mod tests {
         after.narration_bindings.push(video::NarrationBinding {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
+            turn_id: None,
+            lexicon_fingerprint: None,
+            fidelity: video::TakeFidelity::Final,
             render_artifact_id: "speech-opening".into(),
             history_id: "history-opening".into(),
             generation_job_id: "synthesis-opening".into(),

@@ -5,6 +5,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use super::cast::{
+    index_cast_by_name, CastMember, DialogueTurn, MAX_CAST_MEMBERS, MAX_DIALOGUE_TURNS,
+};
+use super::format::FormatOrigin;
+use super::lexicon::{fingerprint_for_character, validate_lexicon, LexiconEntry};
+use super::performance::{index_turns, validate_turn_beats, PerformanceClock, TurnBeat};
+use super::score::{validate_cue_sheet, MusicCue};
+use super::sound::{validate_sound_design, SoundAsset, SoundLayer};
 use super::visuals::{VisualAsset, VisualLayer, MAX_VISUAL_ASSETS, MAX_VISUAL_LAYERS};
 
 pub const VIDEO_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -36,6 +44,18 @@ pub enum VideoErrorCode {
     InvalidLayout,
     InvalidAudioMix,
     InvalidNarration,
+    InvalidCast,
+    InvalidCue,
+    CueFitFailed,
+    InvalidDialogue,
+    InvalidLexicon,
+    InvalidPerformance,
+    InvalidQualityReport,
+    DraftNotPromoted,
+    InvalidRelease,
+    InvalidShowFormat,
+    InvalidSoundPlacement,
+    UnknownSpeaker,
     InvalidArtifact,
     InvalidRevision,
     DuplicateId,
@@ -69,6 +89,18 @@ impl VideoErrorCode {
             Self::InvalidLayout => "video.invalid_layout",
             Self::InvalidAudioMix => "video.invalid_audio_mix",
             Self::InvalidNarration => "video.invalid_narration",
+            Self::InvalidCast => "video.invalid_cast",
+            Self::InvalidCue => "video.invalid_cue",
+            Self::CueFitFailed => "video.cue_fit_failed",
+            Self::InvalidDialogue => "video.invalid_dialogue",
+            Self::InvalidLexicon => "video.invalid_lexicon",
+            Self::InvalidQualityReport => "video.invalid_quality_report",
+            Self::DraftNotPromoted => "video.draft_not_promoted",
+            Self::InvalidRelease => "video.invalid_release",
+            Self::InvalidShowFormat => "video.invalid_show_format",
+            Self::InvalidSoundPlacement => "video.invalid_sound_placement",
+            Self::InvalidPerformance => "video.invalid_performance",
+            Self::UnknownSpeaker => "video.unknown_speaker",
             Self::InvalidArtifact => "video.invalid_artifact",
             Self::InvalidRevision => "video.invalid_revision",
             Self::DuplicateId => "video.duplicate_id",
@@ -854,6 +886,10 @@ pub fn caption_bounds_for_scene(
 pub struct TimelineClip {
     pub id: String,
     pub scene_id: Option<String>,
+    /// Present on the audio clip that carries one dialogue turn's narration, so a re-read of a
+    /// single line resolves to exactly one clip without guessing from scene membership.
+    #[serde(default)]
+    pub turn_id: Option<String>,
     pub media: MediaReference,
     pub source_range: TimeRange,
     pub timeline_start_us: Microseconds,
@@ -876,6 +912,9 @@ impl TimelineClip {
 impl Validate for TimelineClip {
     fn validate(&self) -> VideoResult<()> {
         validate_identifier(&self.id, "tracks.clips.id")?;
+        if let Some(turn_id) = &self.turn_id {
+            validate_identifier(turn_id, "tracks.clips.turn_id")?;
+        }
         if let Some(scene_id) = &self.scene_id {
             validate_identifier(scene_id, "tracks.clips.scene_id")?;
         }
@@ -1335,6 +1374,22 @@ impl Validate for RenderArtifact {
 /// Binds the active generated narration for a scene to both its soundAr History
 /// provenance and the immutable managed artifact used by the canonical timeline.
 ///
+/// Whether a take is the finished performance or a fast stand-in.
+///
+/// Draft mode exists so a whole episode can be heard in about a minute with the fastest installed
+/// voice, and only the lines that survive that listen are re-read with the expensive one. The
+/// fidelity travels with the take because a draft that could not be told apart from a final take
+/// would eventually be published as one.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TakeFidelity {
+    /// A fast stand-in. Never exportable as a master, never a release member.
+    Draft,
+    /// The performance as intended.
+    #[default]
+    Final,
+}
+
 /// The generation route is stored explicitly so a later voice revision can be
 /// reproduced without guessing which model, speaker, or consent-backed voice was
 /// used. `script_sha256` prevents a narration take from silently surviving a
@@ -1344,6 +1399,19 @@ impl Validate for RenderArtifact {
 pub struct NarrationBinding {
     pub id: String,
     pub scene_id: Option<String>,
+    /// Present when this take performs one dialogue turn. Turn-scoped narration is what lets a
+    /// single re-read invalidate one line instead of the whole scene that contains it.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// Fingerprint of the pronunciation rules this take was produced under. `None` means no rule
+    /// applied to its character, which is also what every take recorded before the lexicon
+    /// existed carries, so those takes stay valid.
+    #[serde(default)]
+    pub lexicon_fingerprint: Option<String>,
+    /// Whether this is the finished performance or a fast stand-in. Takes recorded before draft
+    /// mode existed decode as final, which is what they were.
+    #[serde(default)]
+    pub fidelity: TakeFidelity,
     pub render_artifact_id: String,
     pub history_id: String,
     pub generation_job_id: String,
@@ -1360,6 +1428,9 @@ impl Validate for NarrationBinding {
         validate_identifier(&self.id, "narration_bindings.id")?;
         if let Some(scene_id) = &self.scene_id {
             validate_identifier(scene_id, "narration_bindings.scene_id")?;
+        }
+        if let Some(turn_id) = &self.turn_id {
+            validate_identifier(turn_id, "narration_bindings.turn_id")?;
         }
         validate_identifier(
             &self.render_artifact_id,
@@ -1462,6 +1533,26 @@ pub struct VideoProjectManifest {
     pub layout: LayoutPlan,
     pub audio_mix: AudioMix,
     #[serde(default)]
+    pub cast: Vec<CastMember>,
+    #[serde(default)]
+    pub dialogue: Vec<DialogueTurn>,
+    #[serde(default)]
+    pub lexicon: Vec<LexiconEntry>,
+    #[serde(default)]
+    pub music_cues: Vec<MusicCue>,
+    /// Where this episode's inherited values came from. Provenance, not a live link: nothing reads
+    /// back through it, so editing the format cannot change an episode that already exists.
+    #[serde(default)]
+    pub format_origin: Option<FormatOrigin>,
+    #[serde(default)]
+    pub sound_assets: Vec<SoundAsset>,
+    #[serde(default)]
+    pub sound_layers: Vec<SoundLayer>,
+    #[serde(default)]
+    pub performance_clock: PerformanceClock,
+    #[serde(default)]
+    pub turn_beats: Vec<TurnBeat>,
+    #[serde(default)]
     pub narration_bindings: Vec<NarrationBinding>,
     pub render_artifacts: Vec<RenderArtifact>,
     pub revision_history: Vec<RevisionRecord>,
@@ -1470,6 +1561,18 @@ pub struct VideoProjectManifest {
 }
 
 impl VideoProjectManifest {
+    /// Turns still standing in with a draft take.
+    ///
+    /// An episode with any of these is unfinished by definition: something in it is a stand-in the
+    /// author has not yet replaced.
+    pub fn draft_turn_ids(&self) -> Vec<&str> {
+        self.narration_bindings
+            .iter()
+            .filter(|binding| matches!(binding.fidelity, TakeFidelity::Draft))
+            .filter_map(|binding| binding.turn_id.as_deref())
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         project_id: impl Into<String>,
@@ -1500,6 +1603,15 @@ impl VideoProjectManifest {
             captions: Vec::new(),
             layout,
             audio_mix,
+            cast: Vec::new(),
+            dialogue: Vec::new(),
+            lexicon: Vec::new(),
+            music_cues: Vec::new(),
+            format_origin: None,
+            sound_assets: Vec::new(),
+            sound_layers: Vec::new(),
+            performance_clock: PerformanceClock::default(),
+            turn_beats: Vec::new(),
             narration_bindings: Vec::new(),
             render_artifacts: Vec::new(),
             revision_history: Vec::new(),
@@ -1594,12 +1706,31 @@ impl Validate for VideoProjectManifest {
                 .map(|artifact| artifact.id.as_str()),
             "render_artifacts",
         )?;
+        validate_unique_ids(self.cast.iter().map(|member| member.id.as_str()), "cast")?;
+        validate_unique_ids(
+            self.dialogue.iter().map(|turn| turn.id.as_str()),
+            "dialogue",
+        )?;
         validate_unique_ids(
             self.narration_bindings
                 .iter()
                 .map(|binding| binding.id.as_str()),
             "narration_bindings",
         )?;
+        if self.cast.len() > MAX_CAST_MEMBERS {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidCast,
+                format!("a project supports at most {MAX_CAST_MEMBERS} cast members"),
+            )
+            .at("cast"));
+        }
+        if self.dialogue.len() > MAX_DIALOGUE_TURNS {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidDialogue,
+                format!("a project supports at most {MAX_DIALOGUE_TURNS} dialogue turns"),
+            )
+            .at("dialogue"));
+        }
         validate_unique_ids(
             self.revision_history
                 .iter()
@@ -1816,9 +1947,262 @@ impl Validate for VideoProjectManifest {
             }
         }
 
+        // `index_cast_by_name` validates each member and rejects two characters whose script
+        // names cannot be told apart, which would make the written script ambiguous.
+        let cast_by_name = index_cast_by_name(&self.cast)?;
+        let cast_by_id = self
+            .cast
+            .iter()
+            .map(|member| (member.id.as_str(), member))
+            .collect::<BTreeMap<_, _>>();
+        let mut turn_orders = BTreeSet::new();
+        for turn in &self.dialogue {
+            turn.validate()?;
+            if !cast_by_id.contains_key(turn.character_id.as_str()) {
+                return Err(VideoError::new(
+                    VideoErrorCode::UnknownSpeaker,
+                    format!(
+                        "the turn from source line {} is spoken by a character who is not in the cast",
+                        turn.source_line
+                    ),
+                )
+                .at("dialogue.character_id"));
+            }
+            if let Some(scene_id) = turn.scene_id.as_deref() {
+                if !scene_by_id.contains_key(scene_id) {
+                    return Err(VideoError::new(
+                        VideoErrorCode::MissingReference,
+                        "a dialogue turn references a missing scene",
+                    )
+                    .at("dialogue.scene_id"));
+                }
+            }
+            if !turn_orders.insert(turn.order) {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidDialogue,
+                    "two dialogue turns claim the same position in the script",
+                )
+                .at("dialogue.order"));
+            }
+        }
+        let turn_by_id = self
+            .dialogue
+            .iter()
+            .map(|turn| (turn.id.as_str(), turn))
+            .collect::<BTreeMap<_, _>>();
+
+        let cast_ids = self
+            .cast
+            .iter()
+            .map(|member| member.id.as_str())
+            .collect::<BTreeSet<_>>();
+        validate_lexicon(&self.lexicon, &cast_ids)?;
+        if let Some(origin) = &self.format_origin {
+            origin.validate()?;
+        }
+        let music_asset_ids = self
+            .source_assets
+            .iter()
+            .filter(|asset| matches!(asset.kind, SourceAssetKind::SoundArMusic))
+            .map(|asset| asset.id.as_str())
+            .collect::<BTreeSet<_>>();
+        validate_cue_sheet(
+            &self.music_cues,
+            &scene_by_id.keys().copied().collect(),
+            &self
+                .dialogue
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            &music_asset_ids,
+            !self.dialogue.is_empty(),
+        )?;
+        let scene_ranges = self
+            .reviewed_scenes
+            .iter()
+            .map(|scene| {
+                let end = scene
+                    .timeline_start_us
+                    .checked_add(scene.timeline_duration_us)?;
+                Ok((
+                    scene.id.as_str(),
+                    TimeRange::new(scene.timeline_start_us.0, end.0)?,
+                ))
+            })
+            .collect::<VideoResult<BTreeMap<_, _>>>()?;
+        validate_sound_design(
+            &self.sound_assets,
+            &self.sound_layers,
+            &scene_ranges,
+            &self
+                .dialogue
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            &self
+                .source_assets
+                .iter()
+                .filter(|asset| asset.probe.has_audio)
+                .map(|asset| asset.id.as_str())
+                .collect::<BTreeSet<_>>(),
+        )?;
+
+        // A master assembled from stand-ins would be published as the finished episode. The
+        // fidelity is recorded on the take precisely so this can be refused rather than noticed
+        // later by a listener.
+        if !self.draft_turn_ids().is_empty()
+            && self.render_artifacts.iter().any(|artifact| {
+                matches!(artifact.role, RenderArtifactRole::FinalMaster)
+                    && matches!(artifact.publication_state, PublicationState::Published)
+            })
+        {
+            return Err(VideoError::new(
+                VideoErrorCode::DraftNotPromoted,
+                "a final master cannot be published while any line is still a draft take",
+            )
+            .at("narration_bindings.fidelity"));
+        }
+
+        // A bed that does not duck buries the dialogue it is supposed to support. The mix contract
+        // can already express the envelope, so the only thing missing was refusing to render a bed
+        // without one.
+        for cue in &self.music_cues {
+            let Some(track_id) = cue.track_id.as_deref() else {
+                continue;
+            };
+            let track = self
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::MissingReference,
+                        "a music cue references a timeline track that does not exist",
+                    )
+                    .at("music_cues.track_id")
+                })?;
+            if !matches!(track.kind, TrackKind::Audio) {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidCue,
+                    "a music cue must occupy an audio track",
+                )
+                .at("music_cues.track_id"));
+            }
+            if !cue.role.is_underscore() {
+                continue;
+            }
+            let ducks = self
+                .audio_mix
+                .tracks
+                .iter()
+                .find(|mix| mix.track_id == track_id)
+                .is_some_and(|mix| mix.ducking.is_some());
+            if !ducks {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidCue,
+                    "a music bed must duck against the speech it plays under",
+                )
+                .at("music_cues.track_id"));
+            }
+        }
+        // Resolved once per character rather than once per take: a long episode has thousands of
+        // takes and only a handful of characters.
+        let lexicon_by_character = self
+            .cast
+            .iter()
+            .map(|member| {
+                (
+                    member.id.as_str(),
+                    fingerprint_for_character(&self.lexicon, &member.id),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        // An overlap is only bounded against takes that actually exist; a turn with no rendered
+        // narration yet has no measured duration to compare against. The index is built once here
+        // rather than scanned per beat so validating a long script stays linear.
+        self.performance_clock.validate()?;
+        let (turn_positions, ordered_turn_ids) = index_turns(&self.dialogue);
+        let take_duration_us = self
+            .narration_bindings
+            .iter()
+            .filter_map(|binding| {
+                let turn_id = binding.turn_id.as_deref()?;
+                let duration = artifact_by_id
+                    .get(binding.render_artifact_id.as_str())?
+                    .duration_us?;
+                Some((turn_id, duration.0))
+            })
+            .collect::<BTreeMap<_, _>>();
+        validate_turn_beats(
+            &self.turn_beats,
+            &turn_positions,
+            &ordered_turn_ids,
+            &take_duration_us,
+        )?;
+
         let mut bound_scene_ids = BTreeSet::new();
+        let mut bound_turn_ids = BTreeSet::new();
         for binding in &self.narration_bindings {
             binding.validate()?;
+            if let Some(turn_id) = binding.turn_id.as_deref() {
+                let turn = turn_by_id.get(turn_id).ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::MissingReference,
+                        "narration binding references a missing dialogue turn",
+                    )
+                    .at("narration_bindings.turn_id")
+                })?;
+                if !bound_turn_ids.insert(turn_id) {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidNarration,
+                        "a dialogue turn may have only one active narration binding",
+                    )
+                    .at("narration_bindings.turn_id"));
+                }
+                let expected_script_sha256 =
+                    format!("{:x}", Sha256::digest(turn.spoken_text().as_bytes()));
+                if binding.script_sha256 != expected_script_sha256 {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidNarration,
+                        "narration script provenance does not match the current turn text",
+                    )
+                    .at("narration_bindings.script_sha256"));
+                }
+                // A take must record the character it actually performed, so reassigning a
+                // character's voice can invalidate exactly that character's takes.
+                let member = cast_by_id.get(turn.character_id.as_str()).ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::UnknownSpeaker,
+                        "narration binding references a turn whose character left the cast",
+                    )
+                    .at("narration_bindings.turn_id")
+                })?;
+                if cast_by_name
+                    .get(&super::cast::normalize_speaker_name(&binding.speaker))
+                    .map(|matched| matched.id.as_str())
+                    != Some(member.id.as_str())
+                {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidNarration,
+                        "narration speaker does not match the character who speaks this turn",
+                    )
+                    .at("narration_bindings.speaker"));
+                }
+                // Changing a rule that governs this character's lines makes this take stale in
+                // exactly the way changing the line's words does.
+                if binding.lexicon_fingerprint
+                    != *lexicon_by_character
+                        .get(member.id.as_str())
+                        .unwrap_or(&None)
+                {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidNarration,
+                        "narration was produced under different pronunciation rules than this character now uses",
+                    )
+                    .at("narration_bindings.lexicon_fingerprint"));
+                }
+            }
             if let Some(scene_id) = binding.scene_id.as_deref() {
                 let scene = scene_by_id.get(scene_id).ok_or_else(|| {
                     VideoError::new(
@@ -2180,7 +2564,7 @@ pub(crate) fn validate_nonempty(
     Ok(())
 }
 
-fn validate_language_tag(value: &str, field: &str) -> VideoResult<()> {
+pub(crate) fn validate_language_tag(value: &str, field: &str) -> VideoResult<()> {
     let valid = !value.is_empty()
         && value.len() <= 64
         && value.split('-').all(|part| {
@@ -2436,6 +2820,7 @@ mod tests {
         TimelineClip {
             id: id.into(),
             scene_id: None,
+            turn_id: None,
             media: MediaReference {
                 source_asset_id: Some("source-1".into()),
                 render_artifact_id: None,
@@ -2505,6 +2890,15 @@ mod tests {
                 true_peak_db_milli: -1_000,
                 tracks: vec![],
             },
+            cast: vec![],
+            dialogue: vec![],
+            lexicon: vec![],
+            music_cues: vec![],
+            format_origin: None,
+            sound_assets: vec![],
+            sound_layers: vec![],
+            performance_clock: PerformanceClock::default(),
+            turn_beats: vec![],
             narration_bindings: vec![],
             render_artifacts: vec![],
             revision_history: vec![],
@@ -2726,6 +3120,320 @@ mod tests {
         decoded.validate_strict().unwrap();
     }
 
+    /// Build a manifest carrying one two-character exchange with a published take bound to the
+    /// first turn, so each test below can corrupt exactly one relationship.
+    fn dialogue_manifest() -> VideoProjectManifest {
+        let mut manifest = manifest();
+        manifest.reviewed_scenes.push(ReviewedScene {
+            id: "scene-dialogue".into(),
+            candidate_id: None,
+            source_asset_id: Some("source-1".into()),
+            source_range: Some(TimeRange::new(0, 3_000_000).unwrap()),
+            timeline_start_us: Microseconds::ZERO,
+            timeline_duration_us: Microseconds(3_000_000),
+            title: "Dialogue scene".into(),
+            script: "The harmattan came early.".into(),
+            review_state: ReviewState::Approved,
+            revision: 1,
+        });
+        manifest.cast.push(CastMember {
+            id: "narrator".into(),
+            name: "NARRATOR".into(),
+            display_name: "Narrator".into(),
+            voice_id: "af-heart".into(),
+            model_id: "hexgrad/Kokoro-82M".into(),
+            language: "en-US".into(),
+            delivery: super::super::cast::CastDelivery::default(),
+            consent_reference_id: None,
+            notes: None,
+            created_at: timestamp(),
+        });
+        manifest.cast.push(CastMember {
+            id: "adaeze".into(),
+            name: "ADAEZE".into(),
+            display_name: "Adaeze".into(),
+            voice_id: "af-bella".into(),
+            model_id: "hexgrad/Kokoro-82M".into(),
+            language: "en-US".into(),
+            delivery: super::super::cast::CastDelivery::default(),
+            consent_reference_id: None,
+            notes: None,
+            created_at: timestamp(),
+        });
+        manifest.dialogue.push(DialogueTurn {
+            id: "turn-1".into(),
+            scene_id: Some("scene-dialogue".into()),
+            order: 0,
+            character_id: "narrator".into(),
+            text: "The harmattan came early.".into(),
+            direction: None,
+            source_line: 1,
+            revision: 1,
+        });
+        manifest.dialogue.push(DialogueTurn {
+            id: "turn-2".into(),
+            scene_id: Some("scene-dialogue".into()),
+            order: 1,
+            character_id: "adaeze".into(),
+            text: "You said you would come back.".into(),
+            direction: Some("quiet".into()),
+            source_line: 2,
+            revision: 1,
+        });
+        manifest.render_artifacts.push(RenderArtifact {
+            id: "turn-audio".into(),
+            role: RenderArtifactRole::SceneSegment,
+            scene_id: Some("scene-dialogue".into()),
+            managed_path: "renders/turn-audio.wav".into(),
+            sha256: hash('b'),
+            cache_key: hash('c'),
+            mime_type: "audio/wav".into(),
+            duration_us: Some(Microseconds(3_000_000)),
+            width: None,
+            height: None,
+            publication_state: PublicationState::Published,
+            created_at: timestamp(),
+        });
+        manifest.narration_bindings.push(NarrationBinding {
+            id: "turn-binding".into(),
+            scene_id: None,
+            turn_id: Some("turn-1".into()),
+            lexicon_fingerprint: None,
+            fidelity: TakeFidelity::Final,
+            render_artifact_id: "turn-audio".into(),
+            history_id: "history-turn".into(),
+            generation_job_id: "job-turn".into(),
+            voice_id: "af-heart".into(),
+            model_id: "hexgrad/Kokoro-82M".into(),
+            speaker: "NARRATOR".into(),
+            language: "en-US".into(),
+            script_sha256: format!(
+                "{:x}",
+                Sha256::digest("The harmattan came early.".as_bytes())
+            ),
+            created_at: timestamp(),
+        });
+        manifest
+    }
+
+    /// A full-length episode is thousands of turns. `validate_strict` runs on every manifest load,
+    /// revision, and render admission, so this proves a long script validates correctly and that
+    /// the per-turn indexes stay consistent at scale. Beat validation is indexed rather than
+    /// scanned per beat for the same reason, but that cost is a benchmark concern, not something
+    /// a wall-clock assertion here could honestly discriminate.
+    #[test]
+    fn a_full_length_script_validates_at_scale() {
+        let mut manifest = dialogue_manifest();
+        manifest.dialogue.clear();
+        manifest.turn_beats.clear();
+        manifest.narration_bindings.clear();
+        const TURNS: usize = 2_000;
+        for index in 0..TURNS {
+            let id = format!("turn-{index:05}");
+            manifest.dialogue.push(DialogueTurn {
+                id: id.clone(),
+                scene_id: Some("scene-dialogue".into()),
+                order: index as u32,
+                character_id: if index % 2 == 0 { "narrator" } else { "adaeze" }.into(),
+                text: format!("Line number {index}."),
+                direction: None,
+                source_line: index as u32 + 1,
+                revision: 1,
+            });
+            manifest
+                .turn_beats
+                .push(super::super::performance::TurnBeat {
+                    turn_id: id,
+                    lead_in_us: Microseconds(220_000),
+                    overlap_us: Microseconds::ZERO,
+                    source: super::super::performance::BeatSource::Derived,
+                });
+        }
+
+        manifest.validate_strict().unwrap();
+        assert_eq!(manifest.dialogue.len(), TURNS);
+        assert_eq!(manifest.turn_beats.len(), TURNS);
+
+        // One bad beat deep inside a long script must still be found and named.
+        manifest.turn_beats[TURNS - 1].turn_id = "turn-absent".into();
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+        assert_eq!(error.field.as_deref(), Some("turn_beats.turn_id"));
+    }
+
+    #[test]
+    fn a_pronunciation_rule_stales_only_the_takes_it_governs() {
+        use super::super::lexicon::{LexiconEntry, LexiconMatch, LexiconScope};
+
+        let mut manifest = dialogue_manifest();
+        // The bound take belongs to NARRATOR and was produced under no rules at all.
+        manifest.validate_strict().unwrap();
+
+        // A rule scoped to the other character cannot stale it.
+        manifest.lexicon.push(LexiconEntry {
+            id: "rule-adaeze".into(),
+            scope: LexiconScope::Character,
+            character_id: Some("adaeze".into()),
+            match_text: "harmattan".into(),
+            replacement: "har-mah-TAN".into(),
+            matching: LexiconMatch::Word,
+            notes: None,
+            created_at: timestamp(),
+        });
+        manifest.validate_strict().unwrap();
+
+        // A project-wide rule does govern this character, so its take is now stale.
+        manifest.lexicon.push(LexiconEntry {
+            id: "rule-project".into(),
+            scope: LexiconScope::Project,
+            character_id: None,
+            match_text: "harmattan".into(),
+            replacement: "HAR-mah-tan".into(),
+            matching: LexiconMatch::Word,
+            notes: None,
+            created_at: timestamp(),
+        });
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidNarration);
+        assert_eq!(
+            error.field.as_deref(),
+            Some("narration_bindings.lexicon_fingerprint")
+        );
+
+        // Recording the take against the rules that now govern it makes it valid again.
+        manifest.narration_bindings[0].lexicon_fingerprint =
+            super::super::lexicon::fingerprint_for_character(&manifest.lexicon, "narrator");
+        manifest.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn a_rule_cannot_name_a_character_outside_the_cast() {
+        use super::super::lexicon::{LexiconEntry, LexiconMatch, LexiconScope};
+
+        let mut manifest = dialogue_manifest();
+        manifest.lexicon.push(LexiconEntry {
+            id: "rule-stray".into(),
+            scope: LexiconScope::Character,
+            character_id: Some("emeka".into()),
+            match_text: "harmattan".into(),
+            replacement: "har-mah-TAN".into(),
+            matching: LexiconMatch::Word,
+            notes: None,
+            created_at: timestamp(),
+        });
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::UnknownSpeaker);
+        assert_eq!(error.field.as_deref(), Some("lexicon.character_id"));
+    }
+
+    #[test]
+    fn legacy_manifests_default_to_an_empty_lexicon() {
+        let mut value = serde_json::to_value(manifest()).unwrap();
+        value.as_object_mut().unwrap().remove("lexicon");
+        let decoded = serde_json::from_value::<VideoProjectManifest>(value).unwrap();
+        assert!(decoded.lexicon.is_empty());
+        decoded.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn turn_scoped_narration_binds_to_its_own_turn_text() {
+        dialogue_manifest().validate_strict().unwrap();
+    }
+
+    #[test]
+    fn editing_one_turn_invalidates_only_that_turns_take() {
+        // Editing the turn that has no take must leave the bound take valid; editing the bound
+        // turn must reject its now-stale provenance.
+        let mut untouched = dialogue_manifest();
+        untouched.dialogue[1].text = "And you did not.".into();
+        untouched.validate_strict().unwrap();
+
+        let mut edited = dialogue_manifest();
+        edited.dialogue[0].text = "The harmattan came late.".into();
+        let error = edited.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidNarration);
+        assert_eq!(
+            error.field.as_deref(),
+            Some("narration_bindings.script_sha256")
+        );
+    }
+
+    #[test]
+    fn a_turn_accepts_only_one_active_narration_binding() {
+        let mut manifest = dialogue_manifest();
+        let mut duplicate = manifest.narration_bindings[0].clone();
+        duplicate.id = "turn-binding-2".into();
+        manifest.narration_bindings.push(duplicate);
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidNarration);
+        assert_eq!(error.field.as_deref(), Some("narration_bindings.turn_id"));
+    }
+
+    #[test]
+    fn narration_cannot_reference_a_missing_turn() {
+        let mut manifest = dialogue_manifest();
+        manifest.narration_bindings[0].turn_id = Some("turn-absent".into());
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+        assert_eq!(error.field.as_deref(), Some("narration_bindings.turn_id"));
+    }
+
+    #[test]
+    fn a_take_must_record_the_character_who_speaks_its_turn() {
+        let mut manifest = dialogue_manifest();
+        manifest.narration_bindings[0].speaker = "ADAEZE".into();
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidNarration);
+        assert_eq!(error.field.as_deref(), Some("narration_bindings.speaker"));
+    }
+
+    #[test]
+    fn dialogue_cannot_be_spoken_by_a_character_outside_the_cast() {
+        let mut manifest = dialogue_manifest();
+        manifest.dialogue[1].character_id = "emeka".into();
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::UnknownSpeaker);
+        assert_eq!(error.field.as_deref(), Some("dialogue.character_id"));
+    }
+
+    #[test]
+    fn dialogue_cannot_reference_a_missing_scene() {
+        let mut manifest = dialogue_manifest();
+        manifest.dialogue[0].scene_id = Some("scene-absent".into());
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+        assert_eq!(error.field.as_deref(), Some("dialogue.scene_id"));
+    }
+
+    #[test]
+    fn two_turns_cannot_claim_the_same_position() {
+        let mut manifest = dialogue_manifest();
+        manifest.dialogue[1].order = manifest.dialogue[0].order;
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidDialogue);
+        assert_eq!(error.field.as_deref(), Some("dialogue.order"));
+    }
+
+    #[test]
+    fn a_cast_with_indistinguishable_script_names_is_rejected() {
+        let mut manifest = dialogue_manifest();
+        manifest.cast[1].name = "narrator".into();
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidCast);
+    }
+
+    #[test]
+    fn legacy_manifests_default_to_no_cast_or_dialogue() {
+        let mut value = serde_json::to_value(manifest()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("cast");
+        object.remove("dialogue");
+        let decoded = serde_json::from_value::<VideoProjectManifest>(value).unwrap();
+        assert!(decoded.cast.is_empty());
+        assert!(decoded.dialogue.is_empty());
+        decoded.validate_strict().unwrap();
+    }
+
     #[test]
     fn narration_binding_is_audio_backed_and_bound_to_current_scene_script() {
         let mut manifest = manifest();
@@ -2759,6 +3467,9 @@ mod tests {
         manifest.narration_bindings.push(NarrationBinding {
             id: "narration-binding".into(),
             scene_id: Some("scene-narration".into()),
+            turn_id: None,
+            lexicon_fingerprint: None,
+            fidelity: TakeFidelity::Final,
             render_artifact_id: "narration-audio".into(),
             history_id: "history-narration".into(),
             generation_job_id: "job-narration".into(),

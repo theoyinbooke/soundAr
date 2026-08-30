@@ -55,6 +55,14 @@ pub(crate) enum VideoAgentOperationKind {
     ListVideoProjects,
     GetVideoProject,
     EditVideoTimeline,
+    WriteVideoScript,
+    GenerateCueMusic,
+    SaveShowFormat,
+    ListShowFormats,
+    CreateEpisode,
+    PlanEpisodeRelease,
+    CheckEpisodeQuality,
+    ListenToEpisode,
     RegisterGeneratedVisual,
     AddVisualAsset,
     RenderVideoPreview,
@@ -78,6 +86,14 @@ impl VideoAgentOperationKind {
             Self::ListVideoProjects => "list_video_projects",
             Self::GetVideoProject => "get_video_project",
             Self::EditVideoTimeline => "edit_video_timeline",
+            Self::WriteVideoScript => "write_video_script",
+            Self::GenerateCueMusic => "generate_cue_music",
+            Self::SaveShowFormat => "save_show_format",
+            Self::ListShowFormats => "list_show_formats",
+            Self::CreateEpisode => "create_episode",
+            Self::PlanEpisodeRelease => "plan_episode_release",
+            Self::CheckEpisodeQuality => "check_episode_quality",
+            Self::ListenToEpisode => "listen_to_episode",
             Self::RegisterGeneratedVisual => "register_generated_visual",
             Self::AddVisualAsset => "add_visual_asset",
             Self::RenderVideoPreview => "render_video_preview",
@@ -95,16 +111,25 @@ impl VideoAgentOperationKind {
             | Self::PreviewLink
             | Self::ImportLink
             | Self::CreateVideoProject
+            | Self::CreateEpisode
             | Self::RegisterGeneratedVisual => VideoProductionPhase::Source,
             Self::AnalyzeVideo => VideoProductionPhase::Analyze,
             Self::PlanVideo
             | Self::ReviseVideo
             | Self::EditVideoTimeline
+            | Self::WriteVideoScript
+            | Self::GenerateCueMusic
             | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
-            Self::ExportVideo | Self::ExportPublishPackage => VideoProductionPhase::Export,
+            Self::ExportVideo
+            | Self::ExportPublishPackage
+            | Self::PlanEpisodeRelease
+            | Self::CheckEpisodeQuality => VideoProductionPhase::Export,
             Self::ListVideoProjects
             | Self::GetVideoProject
+            | Self::SaveShowFormat
+            | Self::ListShowFormats
+            | Self::ListenToEpisode
             | Self::CancelVideoJob
             | Self::ResumeVideoJob => VideoProductionPhase::Project,
         }
@@ -123,6 +148,14 @@ pub(crate) enum VideoAgentOperation {
     ListVideoProjects(EmptyRequest),
     GetVideoProject(GetVideoProjectRequest),
     EditVideoTimeline(video::VideoTimelineEditRequest),
+    WriteVideoScript(video::VideoScriptRequest),
+    GenerateCueMusic(GenerateCueMusicRequest),
+    SaveShowFormat(video::ShowFormat),
+    ListShowFormats(EmptyRequest),
+    CreateEpisode(CreateEpisodeRequest),
+    PlanEpisodeRelease(PlanEpisodeReleaseRequest),
+    CheckEpisodeQuality(CheckEpisodeQualityRequest),
+    ListenToEpisode(ListenToEpisodeRequest),
     RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
     AddVisualAsset(video::AddVisualAssetRequest),
     RenderVideoPreview(RenderVideoPreviewRequest),
@@ -145,6 +178,14 @@ impl VideoAgentOperation {
             Self::ListVideoProjects(_) => VideoAgentOperationKind::ListVideoProjects,
             Self::GetVideoProject(_) => VideoAgentOperationKind::GetVideoProject,
             Self::EditVideoTimeline(_) => VideoAgentOperationKind::EditVideoTimeline,
+            Self::WriteVideoScript(_) => VideoAgentOperationKind::WriteVideoScript,
+            Self::GenerateCueMusic(_) => VideoAgentOperationKind::GenerateCueMusic,
+            Self::SaveShowFormat(_) => VideoAgentOperationKind::SaveShowFormat,
+            Self::ListShowFormats(_) => VideoAgentOperationKind::ListShowFormats,
+            Self::CreateEpisode(_) => VideoAgentOperationKind::CreateEpisode,
+            Self::PlanEpisodeRelease(_) => VideoAgentOperationKind::PlanEpisodeRelease,
+            Self::CheckEpisodeQuality(_) => VideoAgentOperationKind::CheckEpisodeQuality,
+            Self::ListenToEpisode(_) => VideoAgentOperationKind::ListenToEpisode,
             Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
             Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
             Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
@@ -168,6 +209,14 @@ impl VideoAgentOperation {
             "list_video_projects" => Self::ListVideoProjects(decode(arguments)?),
             "get_video_project" => Self::GetVideoProject(decode(arguments)?),
             "edit_video_timeline" => Self::EditVideoTimeline(decode(arguments)?),
+            "write_video_script" => Self::WriteVideoScript(decode(arguments)?),
+            "generate_cue_music" => Self::GenerateCueMusic(decode(arguments)?),
+            "save_show_format" => Self::SaveShowFormat(decode(arguments)?),
+            "list_show_formats" => Self::ListShowFormats(decode(arguments)?),
+            "create_episode" => Self::CreateEpisode(decode(arguments)?),
+            "plan_episode_release" => Self::PlanEpisodeRelease(decode(arguments)?),
+            "check_episode_quality" => Self::CheckEpisodeQuality(decode(arguments)?),
+            "listen_to_episode" => Self::ListenToEpisode(decode(arguments)?),
             "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
             "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
             "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
@@ -189,7 +238,19 @@ impl VideoAgentOperation {
 
     fn validate(&self) -> Result<(), VideoAgentToolError> {
         match self {
-            Self::VideoRuntimeStatus(_) | Self::ListVideoProjects(_) => Ok(()),
+            Self::VideoRuntimeStatus(_) | Self::ListVideoProjects(_) | Self::ListShowFormats(_) => {
+                Ok(())
+            }
+            Self::SaveShowFormat(format) => {
+                video::Validate::validate(format).map_err(VideoAgentToolError::from)
+            }
+            Self::CreateEpisode(request) => {
+                require_text(&request.format_id, "format_id")?;
+                require_text(&request.episode_name, "episode_name")
+            }
+            Self::PlanEpisodeRelease(request) => require_text(&request.project_id, "project_id"),
+            Self::CheckEpisodeQuality(request) => require_text(&request.project_id, "project_id"),
+            Self::ListenToEpisode(request) => require_text(&request.project_id, "project_id"),
             Self::PreviewLink(request) => {
                 require_text(&request.exact_url, "exact_url")?;
                 video::validate_import_url(&request.exact_url)
@@ -322,6 +383,30 @@ impl VideoAgentOperation {
                         "Submit between one and one hundred ordered timeline edits",
                     ));
                 }
+                Ok(())
+            }
+            Self::WriteVideoScript(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.base_version_id, "base_version_id")?;
+                require_text(&request.operation_id, "operation_id")?;
+                require_text(&request.script, "script")?;
+                if request.expected_revision < 1 {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "expected_revision",
+                        "Writing a script requires a positive current project revision",
+                    ));
+                }
+                if request.cast.is_empty() || request.cast.len() > video::MAX_CAST_MEMBERS {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "cast",
+                        "Declare between one and thirty-two characters before writing a script",
+                    ));
+                }
+                Ok(())
+            }
+            Self::GenerateCueMusic(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.cue_id, "cue_id")?;
                 Ok(())
             }
             Self::RegisterGeneratedVisual(request) => {
@@ -477,6 +562,57 @@ pub(crate) struct CreateVideoProjectRequest {
     pub audio_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ListenToEpisodeRequest {
+    pub(crate) project_id: String,
+    #[serde(default)]
+    pub(crate) integrated_lufs_milli: Option<i32>,
+    #[serde(default)]
+    pub(crate) true_peak_db_milli: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckEpisodeQualityRequest {
+    pub(crate) project_id: String,
+    /// What a local recognizer actually heard, keyed by turn id. A turn left out is reported as
+    /// unchecked rather than as passed.
+    #[serde(default)]
+    pub(crate) heard: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) integrated_lufs_milli: Option<i32>,
+    #[serde(default)]
+    pub(crate) true_peak_db_milli: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanEpisodeReleaseRequest {
+    pub(crate) project_id: String,
+    /// Notes are written, not derived, so the caller says whether they exist.
+    #[serde(default)]
+    pub(crate) has_show_notes: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateEpisodeRequest {
+    pub(crate) format_id: String,
+    pub(crate) episode_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) brief: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GenerateCueMusicRequest {
+    pub(crate) project_id: String,
+    pub(crate) cue_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1058,6 +1194,14 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "list_video_projects" => VideoAgentOperationKind::ListVideoProjects,
         "get_video_project" => VideoAgentOperationKind::GetVideoProject,
         "edit_video_timeline" => VideoAgentOperationKind::EditVideoTimeline,
+        "write_video_script" => VideoAgentOperationKind::WriteVideoScript,
+        "generate_cue_music" => VideoAgentOperationKind::GenerateCueMusic,
+        "save_show_format" => VideoAgentOperationKind::SaveShowFormat,
+        "list_show_formats" => VideoAgentOperationKind::ListShowFormats,
+        "create_episode" => VideoAgentOperationKind::CreateEpisode,
+        "plan_episode_release" => VideoAgentOperationKind::PlanEpisodeRelease,
+        "check_episode_quality" => VideoAgentOperationKind::CheckEpisodeQuality,
+        "listen_to_episode" => VideoAgentOperationKind::ListenToEpisode,
         "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
         "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
         "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
@@ -1079,6 +1223,10 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::PlanVideo
                 | VideoAgentOperationKind::CreateVideoProject
                 | VideoAgentOperationKind::EditVideoTimeline
+                | VideoAgentOperationKind::WriteVideoScript
+                | VideoAgentOperationKind::GenerateCueMusic
+                | VideoAgentOperationKind::SaveShowFormat
+                | VideoAgentOperationKind::CreateEpisode
                 | VideoAgentOperationKind::RegisterGeneratedVisual
                 | VideoAgentOperationKind::AddVisualAsset
                 | VideoAgentOperationKind::RenderVideoPreview
@@ -1217,8 +1365,83 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "edit_video_timeline",
-            "Apply source-clock-safe split, trim, reorder, or exact merge operations to one immutable project version. Use one stable operation_id for retries. Requires Studio or Full access.",
+            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, set or remove a pronunciation rule, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line; changing a pronunciation rule re-reads only the lines that rule governs; a music bed placed on a track always ducks against the speech beneath it; sound-design placements reference audio the user already registered and never introduce new files; promoting a draft line re-reads only that line. Use one stable operation_id for retries. Requires Studio or Full access.",
             timeline_edit_schema(),
+        ),
+        tool(
+            "write_video_script",
+            "Declare the cast and write the speaker-attributed script for one project version. Each character is bound to one voice, and each `NAME: line` becomes one durable dialogue turn. Re-applying a script keeps every turn whose words are unchanged, so revising one line re-reads only that line. Use one stable operation_id for retries. Requires Studio or Full access.",
+            video_script_schema(),
+        ),
+        tool(
+            "save_show_format",
+            "Create or update the reusable shape of a series: its cast, pronunciation rules, conversational timing, caption preset, canvas, loudness targets, usual episode length, and opening and closing music. soundAr owns the revision number. Editing a format never changes an episode that already exists - instantiation copies, so a shipped episode reproduces what it was made from. Requires Studio or Full access.",
+            show_format_schema(),
+        ),
+        tool(
+            "list_show_formats",
+            "List saved show formats with their current revision. Read-only.",
+            object_schema(&[], Map::new()),
+        ),
+        tool(
+            "create_episode",
+            "Start a new episode of a saved show. The episode inherits the format's cast, pronunciation, timing, canvas, and mix by copy, and records which format revision it came from. Write its script next with write_video_script. Requires Studio or Full access.",
+            object_schema(
+                &["format_id", "episode_name"],
+                properties([
+                    ("format_id", string("A saved show format id")),
+                    ("episode_name", string("This episode's name")),
+                    ("brief", nullable_string("What this episode is about, recorded as its initial intent")),
+                ]),
+            ),
+        ),
+        tool(
+            "listen_to_episode",
+            "Report the episode as rendered rather than as planned: which lines were performed, how long each one actually runs, how the speaking time divides between characters, where the silences fall, and how much score and sound design is placed. Every number comes from a published take with a measured duration; a line with no measured take is reported as unnarrated rather than counted, and loudness is absent unless you supply a measurement. Use this before judging pacing or balance, and never state a listening result this tool did not return. Read-only.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("integrated_lufs_milli", json!({"type":["integer","null"],"description":"Measured integrated loudness of the master, in milli-LUFS. Never estimate this."})),
+                    ("true_peak_db_milli", json!({"type":["integer","null"],"description":"Measured true peak of the master, in milli-dBTP"})),
+                ]),
+            ),
+        ),
+        tool(
+            "check_episode_quality",
+            "Check a rendered episode against the script it was asked to speak. Supply what a local recognizer actually heard for each turn, keyed by turn id, and optionally the measured loudness of the master. Reports skipped, inserted, and mispronounced words per line, an off-target master, and silence long enough to read as a fault. A turn you do not supply is reported as unchecked rather than as passed, and without a measurement the master is reported as unchecked rather than as within target. This reports only: it never rewrites a script, re-renders a take, or adjusts a mix. Read-only.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("heard", json!({"type":"object","additionalProperties":{"type":"string"},"description":"Turn id to the text a local recognizer heard in that turn's take"})),
+                    ("integrated_lufs_milli", json!({"type":["integer","null"],"description":"Measured integrated loudness of the master, in milli-LUFS. Never estimate this."})),
+                    ("true_peak_db_milli", json!({"type":["integer","null"],"description":"Measured true peak of the master, in milli-dBTP"})),
+                ]),
+            ),
+        ),
+        tool(
+            "plan_episode_release",
+            "Report what this episode's release would contain and what is still missing: the audio episode with its chapters, the video master, a short vertical trailer, the transcript, and show notes. The trailer moment is chosen by running soundAr's existing candidate analyst over the episode's own narration, so generated work is reviewed by the same deterministic rules as imported source. A blocked member always names its missing prerequisite instead of being quietly omitted. Read-only.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode. Notes are written, not derived."})),
+                ]),
+            ),
+        ),
+        tool(
+            "generate_cue_music",
+            "Compose one planned music cue with the installed local music model, register the result as managed project media, fit it to the cue's target length, and place it at the cue's anchor. A bed receives its ducking envelope automatically. The cue already declares its direction, length, and anchor, so this takes only the project and the cue. Requires Studio or Full access.",
+            object_schema(
+                &["project_id", "cue_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("cue_id", string("A music cue in this project that has no music yet")),
+                    ("model_id", nullable_string("Installed local music model; defaults to the recommended ACE-Step Studio route")),
+                ]),
+            ),
         ),
         tool(
             "register_generated_visual",
@@ -1384,6 +1607,220 @@ fn visual_motion_schema() -> Value {
     })
 }
 
+/// The cast is the route: a character names the voice, model, and language that perform every
+/// line it speaks, so the agent cannot leave a character's delivery implicit.
+/// The cast shape shared by `write_video_script` and `save_show_format`. A character names the
+/// exact voice, model, and language that perform every line it speaks.
+fn cast_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": video::MAX_CAST_MEMBERS,
+        "items": {
+            "type": "object",
+            "required": ["id", "name", "display_name", "voice_id", "model_id", "language", "created_at"],
+            "additionalProperties": false,
+            "properties": {
+                "id": {"type": "string", "description": "Stable character id, reused across revisions"},
+                "name": {"type": "string", "description": "Script token, e.g. NARRATOR. Matched case-insensitively"},
+                "display_name": {"type": "string"},
+                "voice_id": {"type": "string", "description": "Installed soundAr voice id"},
+                "model_id": {"type": "string", "description": "Installed speech model id"},
+                "language": {"type": "string", "description": "BCP-47 tag, e.g. en-US"},
+                "delivery": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "rate_milli": {"type": "integer", "minimum": 250, "maximum": 4000, "description": "1000 is natural speed"},
+                        "pitch_milli": {"type": "integer", "minimum": -1000, "maximum": 1000},
+                        "energy_milli": {"type": "integer", "minimum": 0, "maximum": 2000}
+                    }
+                },
+                "consent_reference_id": {"type": ["string", "null"], "description": "Required when a cloned managed voice performs this character"},
+                "notes": {"type": ["string", "null"]},
+                "created_at": {"type": "string", "description": "UTC RFC3339 timestamp"}
+            }
+        }
+    })
+}
+
+/// One pronunciation rule, shared by the lexicon edit operation and `save_show_format`.
+fn lexicon_entry_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["id","scope","match_text","replacement","matching","created_at"],
+        "properties":{
+            "id":{"type":"string","minLength":1},
+            "scope":{"type":"string","enum":["character","project","global"],"description":"Precedence runs character, then project, then global. A global entry in a project is a snapshot taken when it was imported, so the episode stays reproducible."},
+            "character_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for character scope and rejected for every other scope"},
+            "match_text":{"type":"string","minLength":1,"maxLength":200},
+            "replacement":{"type":"string","minLength":1,"maxLength":400,"description":"Ordinary respelled text, not a phoneme alphabet: engines differ in what notation they accept"},
+            "matching":{"type":"string","enum":["word","exact"],"description":"word is case-insensitive; exact is case-sensitive, for acronyms"},
+            "notes":{"oneOf":[{"type":"string"},{"type":"null"}]},
+            "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
+        }
+    })
+}
+
+fn cue_template_schema(role_note: &str) -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["id","role","target_duration_us","direction","gain_db_milli","fade_in_us","fade_out_us"],
+        "properties":{
+            "id":{"type":"string","minLength":1},
+            "role":{"type":"string","enum":["sting","bed","transition","outro"],"description":role_note},
+            "target_duration_us":{"type":"integer","minimum":500000,"maximum":900000000},
+            "direction":{"type":"string","minLength":1,"maxLength":2000},
+            "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000},
+            "fade_in_us":{"type":"integer","minimum":0},
+            "fade_out_us":{"type":"integer","minimum":0}
+        }
+    })
+}
+
+fn show_format_schema() -> Value {
+    object_schema(
+        &[
+            "id",
+            "name",
+            "revision",
+            "cast",
+            "lexicon",
+            "performance_clock",
+            "caption_preset_id",
+            "canvas_mode",
+            "canvas",
+            "frame_rate",
+            "target_lufs_milli",
+            "true_peak_db_milli",
+            "target_duration_us",
+            "created_at",
+            "updated_at",
+        ],
+        properties([
+            ("id", string("Stable show id, reused across episodes")),
+            ("name", string("The show's name")),
+            (
+                "revision",
+                json!({"type":"integer","minimum":0,"description":"Ignored on save; soundAr owns the revision so two formats cannot claim the same provenance"}),
+            ),
+            ("cast", cast_schema()),
+            (
+                "lexicon",
+                json!({"type":"array","maxItems":500,"items":lexicon_entry_schema()}),
+            ),
+            (
+                "performance_clock",
+                json!({
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["intra_exchange_us","turn_of_thought_us","pre_reveal_us","scene_boundary_us"],
+                    "properties":{
+                        "intra_exchange_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Between two characters trading lines: the fastest beat"},
+                        "turn_of_thought_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"When the same character continues"},
+                        "pre_reveal_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Before a line the script marks as landing"},
+                        "scene_boundary_us":{"type":"integer","minimum":0,"maximum":10000000}
+                    }
+                }),
+            ),
+            (
+                "caption_preset_id",
+                string("One of soundAr's caption presets"),
+            ),
+            (
+                "canvas_mode",
+                json!({"type":"string","enum":["portrait","landscape","square","custom"]}),
+            ),
+            (
+                "canvas",
+                json!({
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["width","height","pixel_aspect_numerator","pixel_aspect_denominator"],
+                    "properties":{
+                        "width":{"type":"integer","minimum":1},
+                        "height":{"type":"integer","minimum":1},
+                        "pixel_aspect_numerator":{"type":"integer","minimum":1},
+                        "pixel_aspect_denominator":{"type":"integer","minimum":1}
+                    }
+                }),
+            ),
+            (
+                "frame_rate",
+                json!({
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["numerator","denominator"],
+                    "properties":{"numerator":{"type":"integer","minimum":1},"denominator":{"type":"integer","minimum":1}}
+                }),
+            ),
+            (
+                "target_lufs_milli",
+                json!({"type":"integer","minimum":-36000,"maximum":-5000,"description":"Integrated loudness target for the master"}),
+            ),
+            (
+                "true_peak_db_milli",
+                json!({"type":"integer","description":"True-peak ceiling for the master"}),
+            ),
+            (
+                "target_duration_us",
+                json!({"type":"integer","minimum":1,"description":"How long an episode usually runs: a planning target, never a hard limit"}),
+            ),
+            (
+                "opening",
+                json!({"oneOf":[cue_template_schema("An opening cannot be an outro"),{"type":"null"}]}),
+            ),
+            (
+                "closing",
+                json!({"oneOf":[cue_template_schema("A closing must be an outro"),{"type":"null"}]}),
+            ),
+            (
+                "show_notes_style",
+                nullable_string("How show notes for this series are written"),
+            ),
+            (
+                "created_at",
+                string("UTC RFC3339 timestamp; preserved from the saved format when updating"),
+            ),
+            ("updated_at", string("UTC RFC3339 timestamp")),
+        ]),
+    )
+}
+
+fn video_script_schema() -> Value {
+    object_schema(
+        &[
+            "project_id",
+            "expected_revision",
+            "base_version_id",
+            "operation_id",
+            "cast",
+            "script",
+        ],
+        properties([
+            ("project_id", string("Video Studio project id")),
+            ("expected_revision", json!({"type":"integer","minimum":1})),
+            (
+                "base_version_id",
+                string("Exact current immutable version id"),
+            ),
+            (
+                "operation_id",
+                string("Stable idempotency key for this exact cast and script"),
+            ),
+            ("cast", cast_schema()),
+            (
+                "script",
+                string(
+                    "Speaker-attributed script. Each turn opens with `NAME:` naming a declared cast member; following lines continue it and a blank line closes it. A leading `(direction)` steers performance and is never spoken.",
+                ),
+            ),
+        ]),
+    )
+}
+
 fn timeline_edit_schema() -> Value {
     object_schema(
         &[
@@ -1413,72 +1850,305 @@ fn timeline_edit_schema() -> Value {
                     "type":"array",
                     "minItems":1,
                     "maxItems":100,
-                    "items": {
-                        "oneOf": [
-                            {
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","scene_id","at_timeline_us"],
-                                "properties":{
-                                    "type":{"const":"split_scene"},
-                                    "scene_id":{"type":"string","minLength":1},
-                                    "at_timeline_us":{"type":"integer","minimum":0}
-                                }
-                            },
-                            {
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","scene_id","source_start_us","source_end_us"],
-                                "properties":{
-                                    "type":{"const":"trim_scene"},
-                                    "scene_id":{"type":"string","minLength":1},
-                                    "source_start_us":{"type":"integer","minimum":0},
-                                    "source_end_us":{"type":"integer","minimum":1}
-                                }
-                            },
-                            {
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","scene_id","to_index"],
-                                "properties":{
-                                    "type":{"const":"reorder_scene"},
-                                    "scene_id":{"type":"string","minLength":1},
-                                    "to_index":{"type":"integer","minimum":0}
-                                }
-                            },
-                            {
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","first_scene_id","second_scene_id"],
-                                "properties":{
-                                    "type":{"const":"merge_scenes"},
-                                    "first_scene_id":{"type":"string","minLength":1},
-                                    "second_scene_id":{"type":"string","minLength":1}
-                                }
-                            },
-                            {
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","layer_id","scene_id","range","fit","crop","z_index","motion","transition_in_us","transition_out_us"],
-                                "properties":{
-                                    "type":{"const":"update_visual_layer"},
-                                    "layer_id":{"type":"string","minLength":1},
-                                    "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}]},
-                                    "range":visual_range_schema(),
-                                    "fit":{"type":"string","enum":["cover","contain","stretch"]},
-                                    "crop":{"oneOf":[normalized_visual_bounds_schema(),{"type":"null"}]},
-                                    "z_index":{"type":"integer","minimum":-32768,"maximum":32767},
-                                    "motion":visual_motion_schema(),
-                                    "transition_in_us":{"type":"integer","minimum":0},
-                                    "transition_out_us":{"type":"integer","minimum":0}
-                                }
-                            }
-                        ]
-                    }
+                    "items": { "oneOf": timeline_operation_schemas() }
                 }),
             ),
         ]),
     )
+}
+
+/// Every operation `edit_video_timeline` accepts, one schema per function.
+///
+/// These are separate functions rather than one literal because `json!` expands recursively and a
+/// union this large exceeds the macro's recursion limit when written inline.
+fn timeline_operation_schemas() -> Vec<Value> {
+    vec![
+        split_scene_operation_schema(),
+        trim_scene_operation_schema(),
+        reorder_scene_operation_schema(),
+        merge_scenes_operation_schema(),
+        set_turn_beat_operation_schema(),
+        clear_turn_beat_operation_schema(),
+        set_lexicon_entry_operation_schema(),
+        remove_lexicon_entry_operation_schema(),
+        set_music_cue_operation_schema(),
+        remove_music_cue_operation_schema(),
+        place_music_cue_operation_schema(),
+        register_sound_asset_operation_schema(),
+        remove_sound_asset_operation_schema(),
+        promote_turns_to_final_operation_schema(),
+        set_sound_layer_operation_schema(),
+        remove_sound_layer_operation_schema(),
+        update_visual_layer_operation_schema(),
+    ]
+}
+
+fn split_scene_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","scene_id","at_timeline_us"],
+        "properties":{
+            "type":{"const":"split_scene"},
+            "scene_id":{"type":"string","minLength":1},
+            "at_timeline_us":{"type":"integer","minimum":0}
+        }
+    })
+}
+
+fn trim_scene_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","scene_id","source_start_us","source_end_us"],
+        "properties":{
+            "type":{"const":"trim_scene"},
+            "scene_id":{"type":"string","minLength":1},
+            "source_start_us":{"type":"integer","minimum":0},
+            "source_end_us":{"type":"integer","minimum":1}
+        }
+    })
+}
+
+fn reorder_scene_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","scene_id","to_index"],
+        "properties":{
+            "type":{"const":"reorder_scene"},
+            "scene_id":{"type":"string","minLength":1},
+            "to_index":{"type":"integer","minimum":0}
+        }
+    })
+}
+
+fn merge_scenes_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","first_scene_id","second_scene_id"],
+        "properties":{
+            "type":{"const":"merge_scenes"},
+            "first_scene_id":{"type":"string","minLength":1},
+            "second_scene_id":{"type":"string","minLength":1}
+        }
+    })
+}
+
+fn set_turn_beat_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","turn_id","lead_in_us","overlap_us"],
+        "properties":{
+            "type":{"const":"set_turn_beat"},
+            "turn_id":{"type":"string","minLength":1},
+            "lead_in_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Silence held before this turn. Zero when the turn overlaps instead."},
+            "overlap_us":{"type":"integer","minimum":0,"maximum":2000000,"description":"How far this turn starts before the previous one ends. Zero when the turn waits instead."}
+        }
+    })
+}
+
+fn clear_turn_beat_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","turn_id"],
+        "properties":{
+            "type":{"const":"clear_turn_beat"},
+            "turn_id":{"type":"string","minLength":1}
+        }
+    })
+}
+
+fn set_lexicon_entry_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","entry"],
+        "properties":{
+            "type":{"const":"set_lexicon_entry"},
+            "entry":lexicon_entry_schema()
+        }
+    })
+}
+
+fn remove_lexicon_entry_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","entry_id"],
+        "properties":{
+            "type":{"const":"remove_lexicon_entry"},
+            "entry_id":{"type":"string","minLength":1}
+        }
+    })
+}
+
+fn set_music_cue_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","cue"],
+        "properties":{
+            "type":{"const":"set_music_cue"},
+            "cue":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["id","role","anchor","target_duration_us","direction","gain_db_milli","fade_in_us","fade_out_us","created_at"],
+                "properties":{
+                    "id":{"type":"string","minLength":1},
+                    "role":{"type":"string","enum":["sting","bed","transition","outro"],"description":"sting opens, bed sits under dialogue and always ducks, transition covers a cut, outro resolves after the final line"},
+                    "anchor":{
+                        "oneOf":[
+                            {"type":"object","additionalProperties":false,"required":["kind","scene_id"],"properties":{"kind":{"const":"scene"},"scene_id":{"type":"string","minLength":1}}},
+                            {"type":"object","additionalProperties":false,"required":["kind","turn_id"],"properties":{"kind":{"const":"turn"},"turn_id":{"type":"string","minLength":1}}},
+                            {"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"const":"after_final_turn"}}}
+                        ],
+                        "description":"Anchor to a scene or turn so the cue moves when the script is edited. Only an outro may use after_final_turn, and an outro must use it."
+                    },
+                    "target_duration_us":{"type":"integer","minimum":500000,"maximum":900000000,"description":"Ask the local music engine for this length; the rendered result is fitted to it"},
+                    "direction":{"type":"string","minLength":1,"maxLength":2000},
+                    "source_asset_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"The registered soundAr music artifact once generated; null while the cue is only planned"},
+                    "track_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"The audio track carrying this cue. Requires source_asset_id. A bed placed on a track is given its ducking envelope automatically."},
+                    "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000},
+                    "fade_in_us":{"type":"integer","minimum":0},
+                    "fade_out_us":{"type":"integer","minimum":0},
+                    "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
+                }
+            }
+        }
+    })
+}
+
+fn remove_music_cue_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","cue_id"],
+        "properties":{
+            "type":{"const":"remove_music_cue"},
+            "cue_id":{"type":"string","minLength":1}
+        }
+    })
+}
+
+fn register_sound_asset_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","asset_id","source_asset_id","name","tags"],
+        "properties":{
+            "type":{"const":"register_sound_asset"},
+            "asset_id":{"type":"string","minLength":1},
+            "source_asset_id":{"type":"string","minLength":1,"description":"Managed media already imported into this project. Sound design labels imported media; it never names a path on the machine."},
+            "name":{"type":"string","minLength":1,"maxLength":256},
+            "tags":{"type":"array","maxItems":16,"items":{"type":"string","minLength":1,"maxLength":48},"description":"How this sound is found, e.g. rain, door, room tone. Matched loosely, so written stage directions can locate it."}
+        }
+    })
+}
+
+fn remove_sound_asset_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","asset_id"],
+        "properties":{
+            "type":{"const":"remove_sound_asset"},
+            "asset_id":{"type":"string","minLength":1}
+        }
+    })
+}
+
+fn place_music_cue_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","cue_id","source_asset_id"],
+        "properties":{
+            "type":{"const":"place_music_cue"},
+            "cue_id":{"type":"string","minLength":1},
+            "source_asset_id":{"type":"string","minLength":1,"description":"Registered soundAr music already imported into this project. Prefer generate_cue_music, which composes and places in one durable job."}
+        }
+    })
+}
+
+fn promote_turns_to_final_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","turn_ids"],
+        "properties":{
+            "type":{"const":"promote_turns_to_final"},
+            "turn_ids":{
+                "type":"array","minItems":1,"maxItems":500,
+                "items":{"type":"string","minLength":1},
+                "description":"Draft lines to re-read at final fidelity. Only these lose their stand-in takes, so promoting one line never re-reads the rest of the episode."
+            }
+        }
+    })
+}
+
+fn set_sound_layer_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","layer"],
+        "properties":{
+            "type":{"const":"set_sound_layer"},
+            "layer":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["id","asset_id","kind","range","gain_db_milli","fade_in_us","fade_out_us"],
+                "properties":{
+                    "id":{"type":"string","minLength":1},
+                    "asset_id":{"type":"string","minLength":1,"description":"A sound asset already registered in this project. Placements never introduce new audio."},
+                    "kind":{"type":"string","enum":["one_shot","ambience","room_tone"],"description":"one_shot happens once at a point; ambience runs across a scene span; room_tone runs under a whole scene and is what removes the digital silence between takes"},
+                    "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for ambience and room tone"},
+                    "turn_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Anchors a one-shot to the line it punctuates so it moves when that line does. Rejected for ambience and room tone."},
+                    "range":visual_range_schema(),
+                    "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000,"description":"Room tone must be at or below -18000 so it reads as a room rather than as noise"},
+                    "fade_in_us":{"type":"integer","minimum":0},
+                    "fade_out_us":{"type":"integer","minimum":0},
+                    "loop_to_fill":{"type":"boolean","description":"Repeat the asset across the range. Rejected for a one-shot."},
+                    "duck_under_speech":{"type":"boolean"}
+                }
+            }
+        }
+    })
+}
+
+fn remove_sound_layer_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","layer_id"],
+        "properties":{
+            "type":{"const":"remove_sound_layer"},
+            "layer_id":{"type":"string","minLength":1}
+        }
+    })
+}
+
+fn update_visual_layer_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","layer_id","scene_id","range","fit","crop","z_index","motion","transition_in_us","transition_out_us"],
+        "properties":{
+            "type":{"const":"update_visual_layer"},
+            "layer_id":{"type":"string","minLength":1},
+            "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}]},
+            "range":visual_range_schema(),
+            "fit":{"type":"string","enum":["cover","contain","stretch"]},
+            "crop":{"oneOf":[normalized_visual_bounds_schema(),{"type":"null"}]},
+            "z_index":{"type":"integer","minimum":-32768,"maximum":32767},
+            "motion":visual_motion_schema(),
+            "transition_in_us":{"type":"integer","minimum":0},
+            "transition_out_us":{"type":"integer","minimum":0}
+        }
+    })
 }
 
 fn visual_asset_schema() -> Value {
@@ -1782,8 +2452,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 17);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 17);
+        assert_eq!(names.len(), 25);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 25);
         for required in [
             "preview_link",
             "import_link",
@@ -1793,6 +2463,14 @@ mod tests {
             "list_video_projects",
             "get_video_project",
             "edit_video_timeline",
+            "write_video_script",
+            "generate_cue_music",
+            "save_show_format",
+            "list_show_formats",
+            "create_episode",
+            "plan_episode_release",
+            "check_episode_quality",
+            "listen_to_episode",
             "register_generated_visual",
             "add_visual_asset",
             "render_video_preview",
@@ -1862,8 +2540,25 @@ mod tests {
             schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(5)
+            Some(17)
         );
+
+        // Retiming a conversation goes through the same version-bound batch as every other edit.
+        let beats = VideoAgentOperation::parse(
+            "edit_video_timeline",
+            json!({
+                "project_id":"project-7",
+                "expected_revision":4,
+                "base_version_id":"version-4",
+                "operation_id":"operation-beats",
+                "operations":[
+                    {"type":"set_turn_beat","turn_id":"turn-b","lead_in_us":2000000,"overlap_us":0},
+                    {"type":"clear_turn_beat","turn_id":"turn-c"}
+                ]
+            }),
+        )
+        .expect("beat edit request");
+        assert_eq!(beats.kind(), VideoAgentOperationKind::EditVideoTimeline);
 
         let error = VideoAgentOperation::parse(
             "edit_video_timeline",

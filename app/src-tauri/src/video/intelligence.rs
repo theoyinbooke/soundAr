@@ -431,6 +431,7 @@ pub fn plan_reviewed_timeline(
         let make_clip = |suffix: &str| TimelineClip {
             id: format!("clip-{suffix}-{:03}", index + 1),
             scene_id: Some(scene_id.clone()),
+            turn_id: None,
             media: MediaReference {
                 source_asset_id: Some(candidate.source_asset_id.clone()),
                 render_artifact_id: None,

@@ -2596,6 +2596,7 @@ mod tests {
         let make_clip = |id: &str| TimelineClip {
             id: id.into(),
             scene_id: Some("scene-1".into()),
+            turn_id: None,
             media: MediaReference {
                 source_asset_id: Some("source-1".into()),
                 render_artifact_id: None,
@@ -2737,6 +2738,7 @@ mod tests {
                          crop: Option<NormalizedRect>| TimelineClip {
             id: id.into(),
             scene_id: Some(scene_id.into()),
+            turn_id: None,
             media: MediaReference {
                 source_asset_id: Some("source-canonical".into()),
                 render_artifact_id: None,

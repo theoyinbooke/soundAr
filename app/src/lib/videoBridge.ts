@@ -25,9 +25,26 @@ import type {
   VideoProject,
   VideoProjectManifest,
   VideoProjectSummary,
+  VideoCastMember,
+  VideoLexiconEntry,
+  VideoLexiconScope,
+  VideoMusicCue,
+  VideoPerformanceClock,
   VideoScene,
+  VideoScriptResponse,
+  VideoEpisodeListening,
+  VideoQcFinding,
+  VideoQcFindingKind,
+  VideoQcReport,
+  VideoReleaseMemberKind,
+  VideoReleaseMemberPlan,
+  VideoReleasePlan,
+  VideoShowFormat,
+  VideoSoundAsset,
+  VideoSoundLayer,
   VideoStudioService,
   VideoTimelineManifest,
+  VideoTurnBeat,
   VideoTimelineEditRequest,
   VideoTimelineEditResponse,
   VideoToolStatus,
@@ -358,6 +375,157 @@ function validateVisualLayerFields(request: {
   }
 }
 
+/**
+ * Preview-side mirror of the native script parser. It exists so the browser design preview shows
+ * the same rejections a real project would produce; the native path is always authoritative.
+ */
+function parsePreviewDialogue(script: string, cast: VideoCastMember[]): { characterId: string; text: string; direction?: string; sourceLine: number }[] {
+  const byName = new Map(cast.map((member) => [member.name.trim().toLowerCase(), member]));
+  if (byName.size !== cast.length) throw new Error("video.invalid_cast: Two cast members share the same script name.");
+  if (!cast.length) throw new Error("video.invalid_cast: A dialogue script requires at least one cast member.");
+  const turns: { characterId: string; text: string; direction?: string; sourceLine: number }[] = [];
+  let open: { characterId: string; text: string; sourceLine: number } | undefined;
+  const close = () => {
+    if (!open) return;
+    let text = open.text.trim();
+    let direction: string | undefined;
+    if (text.startsWith("(")) {
+      const end = text.indexOf(")");
+      if (end < 0) throw new Error(`video.invalid_dialogue: The stage direction opened at line ${open.sourceLine} is never closed.`);
+      direction = text.slice(1, end).trim();
+      if (!direction) throw new Error(`video.invalid_dialogue: The stage direction at line ${open.sourceLine} is empty.`);
+      text = text.slice(end + 1).trim();
+    }
+    if (!text) throw new Error(`video.invalid_dialogue: The turn opened at line ${open.sourceLine} has a speaker but nothing to say.`);
+    turns.push({ characterId: open.characterId, text, direction, sourceLine: open.sourceLine });
+    open = undefined;
+  };
+  script.split(/\r?\n/).forEach((raw, index) => {
+    const line = raw.trimEnd();
+    const sourceLine = index + 1;
+    if (!line.trim()) { close(); return; }
+    const colon = line.indexOf(":");
+    const speaker = colon > 0 ? line.slice(0, colon).trim() : "";
+    // A colon alone is not a speaker cue: prose says "and then she said: run". A header must name
+    // a declared character, or be an all-capitals screenplay cue we then require to be castable.
+    const named = speaker && /^[\p{L}\p{N} _.'-]+$/u.test(speaker) && speaker.length <= 64;
+    const known = named ? byName.get(speaker.toLowerCase()) : undefined;
+    const isCue = named && speaker === speaker.toUpperCase() && /\p{L}/u.test(speaker);
+    if (known || (isCue && !open) || isCue) {
+      if (!known) throw new Error(`video.unknown_speaker: Line ${sourceLine} is spoken by ${speaker}, who is not in the cast.`);
+      close();
+      open = { characterId: known.id, text: line.slice(colon + 1).trim(), sourceLine };
+      return;
+    }
+    if (!open) throw new Error(`video.invalid_dialogue: Line ${sourceLine} has no speaker; every line must follow a NAME: header.`);
+    open.text = open.text ? `${open.text} ${line.trim()}` : line.trim();
+  });
+  close();
+  if (!turns.length) throw new Error("video.invalid_dialogue: The script contains no dialogue turns.");
+  return turns;
+}
+
+/** Stable, content-derived turn id so re-applying an unchanged script reuses every turn. */
+function previewTurnIdentity(characterId: string, text: string): string {
+  let hash = 0x811c9dc5;
+  const value = `${characterId}\u0001${text}`;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * Preview-side mirror of `video/lexicon.rs` precedence and fingerprinting. `null` means no rule
+ * governs this character, which is what a take recorded before the lexicon existed carries.
+ */
+function previewEffectiveLexicon(lexicon: VideoLexiconEntry[], characterId: string): VideoLexiconEntry[] {
+  const order: Record<VideoLexiconScope, number> = { character: 0, project: 1, global: 2 };
+  return lexicon
+    .filter((entry) => (entry.scope === "character" ? entry.character_id === characterId : true))
+    .sort((left, right) => order[left.scope] - order[right.scope] || right.match_text.length - left.match_text.length || left.id.localeCompare(right.id));
+}
+
+function previewLexiconFingerprint(lexicon: VideoLexiconEntry[], characterId: string): string | null {
+  const entries = previewEffectiveLexicon(lexicon, characterId);
+  if (!entries.length) return null;
+  let hash = 0x811c9dc5;
+  const value = entries.map((entry) => `${entry.id}\u0001${entry.match_text}\u0001${entry.replacement}\u0001${entry.matching}`).join("\u0002");
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * Preview-side word comparison. Punctuation and capitalization are not errors, because a recognizer
+ * does not reproduce them and reporting them would bury the real findings.
+ */
+function previewWordDifferences(expected: string, heard: string): { kind: VideoQcFindingKind; detail: string }[] {
+  const normalize = (text: string) => text.split(/\s+/)
+    .map((word) => word.replace(/[^\p{L}\p{N}']/gu, "").toLowerCase())
+    .filter(Boolean);
+  const wanted = normalize(expected);
+  const said = normalize(heard);
+  const differences: { kind: VideoQcFindingKind; detail: string }[] = [];
+  let index = 0;
+  let cursor = 0;
+  while (index < wanted.length && cursor < said.length) {
+    if (wanted[index] === said[cursor]) { index += 1; cursor += 1; continue; }
+    if (wanted[index + 1] === said[cursor + 1]) {
+      differences.push({ kind: "replaced_word", detail: `The take says "${said[cursor]}" where the script says "${wanted[index]}"` });
+      index += 1; cursor += 1;
+    } else if (wanted[index + 1] === said[cursor]) {
+      differences.push({ kind: "skipped_word", detail: `The take does not say "${wanted[index]}"` });
+      index += 1;
+    } else {
+      differences.push({ kind: "inserted_word", detail: `The take says "${said[cursor]}", which the script does not contain` });
+      cursor += 1;
+    }
+  }
+  for (; index < wanted.length; index += 1) differences.push({ kind: "skipped_word", detail: `The take does not say "${wanted[index]}"` });
+  for (; cursor < said.length; cursor += 1) differences.push({ kind: "inserted_word", detail: `The take says "${said[cursor]}", which the script does not contain` });
+  return differences;
+}
+
+const DEFAULT_PERFORMANCE_CLOCK: VideoPerformanceClock = { intra_exchange_ms: 220, turn_of_thought_ms: 600, pre_reveal_ms: 1_200, scene_boundary_ms: 900 };
+const PREVIEW_INTERJECTION_OVERLAP_MS = 250;
+const PAUSE_MARKERS = ["pause", "beat", "silence", "hesitant", "hesitates", "after a moment", "slowly", "reluctant"];
+const INTERJECTION_MARKERS = ["interrupting", "interrupts", "cutting in", "cuts in", "overlapping"];
+
+/**
+ * Preview-side mirror of `video/performance.rs`. A fast beat reads as a reply, a long one as
+ * hesitation, and a small overlap as an interruption; explicit beats are never recomputed.
+ */
+function derivePreviewBeats(
+  dialogue: { id: string; scene_id?: string | null; character_id: string; text: string; direction?: string | null }[],
+  clock: VideoPerformanceClock,
+  explicit: VideoTurnBeat[],
+): VideoTurnBeat[] {
+  const overrides = new Map(explicit.filter((beat) => beat.source === "explicit").map((beat) => [beat.turn_id, beat]));
+  return dialogue.map((turn, index) => {
+    const held = overrides.get(turn.id);
+    if (held) return { ...held };
+    const previous = index > 0 ? dialogue[index - 1] : undefined;
+    if (!previous) return { turn_id: turn.id, lead_in_ms: 0, overlap_ms: 0, source: "derived" };
+    const direction = (turn.direction ?? "").toLowerCase();
+    if (INTERJECTION_MARKERS.some((marker) => direction.includes(marker))) {
+      return { turn_id: turn.id, lead_in_ms: 0, overlap_ms: PREVIEW_INTERJECTION_OVERLAP_MS, source: "derived" };
+    }
+    const trailsOff = /(\.\.\.|\u2026|\u2014|\u2013)$/.test(previous.text.trimEnd());
+    const leadIn = (turn.scene_id ?? null) !== (previous.scene_id ?? null)
+      ? clock.scene_boundary_ms
+      : PAUSE_MARKERS.some((marker) => direction.includes(marker)) || trailsOff
+        ? clock.pre_reveal_ms
+        : turn.character_id === previous.character_id
+          ? clock.turn_of_thought_ms
+          : clock.intra_exchange_ms;
+    return { turn_id: turn.id, lead_in_ms: leadIn, overlap_ms: 0, source: "derived" };
+  });
+}
+
 function applyBrowserTimelineOperations(project: VideoProject, request: VideoTimelineEditRequest): VideoProject {
   if (!request.operations.length || request.operations.length > 100) throw new Error("video.invalid_scene: Add between one and 100 timeline operations.");
   const edited = clone(project);
@@ -416,6 +584,155 @@ function applyBrowserTimelineOperations(project: VideoProject, request: VideoTim
       const second = scenes[secondIndex];
       if (Math.abs(first.timeline_end_ms - second.timeline_start_ms) > 0.001) throw new Error("video.invalid_scene: Merge requires contiguous split scenes.");
       scenes.splice(firstIndex, 2, { ...first, source_end_ms: second.source_end_ms, timeline_end_ms: second.timeline_end_ms, transcript: `${first.transcript} ${second.transcript}`.trim() });
+    } else if (operation.type === "set_turn_beat" || operation.type === "clear_turn_beat") {
+      const dialogue = edited.manifest.dialogue ?? [];
+      if (!dialogue.some((turn) => turn.id === operation.turn_id)) throw new Error("video.missing_reference: The dialogue turn no longer exists.");
+      const clock = edited.manifest.performance_clock ?? DEFAULT_PERFORMANCE_CLOCK;
+      const beats = edited.manifest.turn_beats ?? [];
+      if (operation.type === "set_turn_beat") {
+        if (operation.lead_in_us > 0 && operation.overlap_us > 0) throw new Error("video.invalid_performance: A turn may hold a lead-in or overlap the previous turn, not both.");
+        const held: VideoTurnBeat = {
+          turn_id: operation.turn_id,
+          lead_in_ms: microsecondsToMilliseconds(operation.lead_in_us, "lead_in_us"),
+          overlap_ms: microsecondsToMilliseconds(operation.overlap_us, "overlap_us"),
+          source: "explicit",
+        };
+        edited.manifest.turn_beats = beats.some((beat) => beat.turn_id === operation.turn_id)
+          ? beats.map((beat) => (beat.turn_id === operation.turn_id ? held : beat))
+          : [...beats, held];
+      } else {
+        if (!beats.some((beat) => beat.turn_id === operation.turn_id && beat.source === "explicit")) {
+          throw new Error("video.invalid_performance: This turn already uses its derived beat.");
+        }
+        // Re-derive from the script so the restored beat is back in conversation with its neighbours.
+        edited.manifest.turn_beats = derivePreviewBeats(dialogue, clock, beats.filter((beat) => beat.turn_id !== operation.turn_id));
+      }
+    } else if (operation.type === "set_lexicon_entry" || operation.type === "remove_lexicon_entry") {
+      const lexicon = edited.manifest.lexicon ?? [];
+      if (operation.type === "set_lexicon_entry") {
+        const { entry } = operation;
+        if (entry.match_text.trim() === entry.replacement.trim()) throw new Error("video.invalid_lexicon: A rule must change the text it matches.");
+        if ((entry.scope === "character") !== Boolean(entry.character_id)) throw new Error("video.invalid_lexicon: Only a character-scoped rule may name a character.");
+        if (entry.character_id && !(edited.manifest.cast ?? []).some((member) => member.id === entry.character_id)) {
+          throw new Error("video.unknown_speaker: A pronunciation rule names a character who is not in the cast.");
+        }
+        edited.manifest.lexicon = lexicon.some((existing) => existing.id === entry.id)
+          ? lexicon.map((existing) => (existing.id === entry.id ? clone(entry) : existing))
+          : [...lexicon, clone(entry)];
+      } else {
+        if (!lexicon.some((existing) => existing.id === operation.entry_id)) throw new Error("video.missing_reference: The pronunciation rule no longer exists.");
+        edited.manifest.lexicon = lexicon.filter((existing) => existing.id !== operation.entry_id);
+      }
+      // Drop only the takes whose character's rules actually changed.
+      const characterByTurn = new Map((edited.manifest.dialogue ?? []).map((turn) => [turn.id, turn.character_id]));
+      const fingerprintByCharacter = new Map((edited.manifest.cast ?? []).map((member) => [member.id, previewLexiconFingerprint(edited.manifest.lexicon ?? [], member.id)]));
+      edited.manifest.narration_bindings = (edited.manifest.narration_bindings ?? []).filter((binding) => {
+        if (!binding.turn_id) return true;
+        const character = characterByTurn.get(binding.turn_id);
+        if (!character) return true;
+        return (fingerprintByCharacter.get(character) ?? null) === (binding.lexicon_fingerprint ?? null);
+      });
+    } else if (operation.type === "set_music_cue" || operation.type === "remove_music_cue") {
+      const cues = edited.manifest.music_cues ?? [];
+      if (operation.type === "set_music_cue") {
+        const { cue } = operation;
+        const isOutro = cue.role === "outro";
+        if (isOutro !== (cue.anchor.kind === "after_final_turn")) throw new Error("video.invalid_cue: Only an outro may play after the final line, and an outro must.");
+        if (cue.fade_in_us + cue.fade_out_us > cue.target_duration_us) throw new Error("video.invalid_cue: Cue fades cannot together exceed the cue's own length.");
+        if (cue.track_id && !cue.source_asset_id) throw new Error("video.invalid_cue: A cue cannot occupy a timeline track before its music exists.");
+        if (isOutro && !(edited.manifest.dialogue ?? []).length) throw new Error("video.missing_reference: An outro needs a script to play after.");
+        if (isOutro && cues.some((existing) => existing.role === "outro" && existing.id !== cue.id)) throw new Error("video.invalid_cue: An episode may end on only one outro.");
+        const presented: VideoMusicCue = {
+          id: cue.id, role: cue.role, anchor: cue.anchor,
+          target_duration_ms: microsecondsToMilliseconds(cue.target_duration_us, "target_duration_us"),
+          direction: cue.direction, source_asset_id: cue.source_asset_id ?? null, track_id: cue.track_id ?? null,
+          gain_db: cue.gain_db_milli / 1000,
+          fade_in_ms: microsecondsToMilliseconds(cue.fade_in_us, "fade_in_us"),
+          fade_out_ms: microsecondsToMilliseconds(cue.fade_out_us, "fade_out_us"),
+          needs_generation: !cue.source_asset_id, created_at: cue.created_at,
+        };
+        edited.manifest.music_cues = cues.some((existing) => existing.id === cue.id)
+          ? cues.map((existing) => (existing.id === cue.id ? presented : existing))
+          : [...cues, presented];
+      } else {
+        if (!cues.some((existing) => existing.id === operation.cue_id)) throw new Error("video.missing_reference: The music cue no longer exists.");
+        edited.manifest.music_cues = cues.filter((existing) => existing.id !== operation.cue_id);
+      }
+    } else if (operation.type === "promote_turns_to_final") {
+      const drafts = new Set((edited.manifest.narration_bindings ?? []).filter((binding) => binding.fidelity === "draft").map((binding) => binding.turn_id));
+      // Naming a line that is already final would read as a promotion that did something.
+      const alreadyFinal = operation.turn_ids.find((turnId) => !drafts.has(turnId));
+      if (alreadyFinal) throw new Error(`video.invalid_performance: Dialogue turn ${alreadyFinal} does not have a draft take to promote.`);
+      // Only the named lines lose their stand-ins, so the rest are never re-read.
+      const promoted = new Set(operation.turn_ids);
+      edited.manifest.narration_bindings = (edited.manifest.narration_bindings ?? []).filter((binding) => !binding.turn_id || !promoted.has(binding.turn_id));
+      edited.manifest.dialogue = (edited.manifest.dialogue ?? []).map((turn) =>
+        promoted.has(turn.id) ? { ...turn, narrated: false, draft: false } : turn);
+    } else if (operation.type === "set_sound_layer" || operation.type === "remove_sound_layer") {
+      const layers = edited.manifest.sound_layers ?? [];
+      if (operation.type === "set_sound_layer") {
+        const { layer } = operation;
+        if (!(edited.manifest.sound_assets ?? []).some((asset) => asset.id === layer.asset_id)) {
+          throw new Error("video.missing_reference: That sound asset is not registered in this project.");
+        }
+        const span = layer.range.end_us - layer.range.start_us;
+        if (layer.fade_in_us + layer.fade_out_us > span) throw new Error("video.invalid_sound_placement: Sound layer fades cannot together exceed the placement.");
+        if (layer.loop_to_fill && layer.kind === "one_shot") throw new Error("video.invalid_sound_placement: A one-shot happens once and cannot loop.");
+        if (layer.kind === "one_shot" && !layer.scene_id && !layer.turn_id) throw new Error("video.invalid_sound_placement: A one-shot must be anchored to the scene or turn it punctuates.");
+        if (layer.kind !== "one_shot" && !layer.scene_id) throw new Error("video.invalid_sound_placement: Ambience and room tone belong to a scene.");
+        if (layer.kind !== "one_shot" && layer.turn_id) throw new Error("video.invalid_sound_placement: Ambience and room tone run under a whole scene, not one turn.");
+        if (layer.kind === "room_tone" && layer.gain_db_milli > -18_000) throw new Error("video.invalid_sound_placement: Room tone must sit far under the dialogue.");
+        const presented: VideoSoundLayer = {
+          id: layer.id, asset_id: layer.asset_id, kind: layer.kind,
+          scene_id: layer.scene_id ?? null, turn_id: layer.turn_id ?? null,
+          start_ms: microsecondsToMilliseconds(layer.range.start_us, "range start_us"),
+          end_ms: microsecondsToMilliseconds(layer.range.end_us, "range end_us"),
+          gain_db: layer.gain_db_milli / 1000,
+          fade_in_ms: microsecondsToMilliseconds(layer.fade_in_us, "fade_in_us"),
+          fade_out_ms: microsecondsToMilliseconds(layer.fade_out_us, "fade_out_us"),
+          loop_to_fill: layer.loop_to_fill ?? false, duck_under_speech: layer.duck_under_speech ?? false,
+        };
+        edited.manifest.sound_layers = layers.some((existing) => existing.id === layer.id)
+          ? layers.map((existing) => (existing.id === layer.id ? presented : existing))
+          : [...layers, presented];
+      } else {
+        if (!layers.some((existing) => existing.id === operation.layer_id)) throw new Error("video.missing_reference: The sound placement no longer exists.");
+        edited.manifest.sound_layers = layers.filter((existing) => existing.id !== operation.layer_id);
+      }
+    } else if (operation.type === "register_sound_asset" || operation.type === "remove_sound_asset" || operation.type === "place_music_cue") {
+      const assets = edited.manifest.sound_assets ?? [];
+      if (operation.type === "register_sound_asset") {
+        // Sound design labels media the project already imported; it never names a path.
+        if (operation.source_asset_id !== edited.manifest.source.id) {
+          throw new Error("video.missing_reference: That managed source is not registered in this project.");
+        }
+        if (assets.some((asset) => asset.source_asset_id === operation.source_asset_id && asset.id !== operation.asset_id)) {
+          throw new Error("video.duplicate_id: That managed source is already registered as a sound asset.");
+        }
+        const registered: VideoSoundAsset = {
+          id: operation.asset_id, name: operation.name, source_asset_id: operation.source_asset_id,
+          local_path: edited.manifest.source.local_path ?? null,
+          duration_ms: edited.manifest.source.duration_ms ?? null,
+          tags: [...operation.tags], created_at: FIXED_NOW,
+        };
+        edited.manifest.sound_assets = assets.some((asset) => asset.id === operation.asset_id)
+          ? assets.map((asset) => (asset.id === operation.asset_id ? registered : asset))
+          : [...assets, registered];
+      } else if (operation.type === "remove_sound_asset") {
+        if (!assets.some((asset) => asset.id === operation.asset_id)) throw new Error("video.missing_reference: The sound asset no longer exists.");
+        edited.manifest.sound_assets = assets.filter((asset) => asset.id !== operation.asset_id);
+        // A placement without its audio cannot be rendered, so it goes with the sound.
+        edited.manifest.sound_layers = (edited.manifest.sound_layers ?? []).filter((layer) => layer.asset_id !== operation.asset_id);
+      } else {
+        const cues = edited.manifest.music_cues ?? [];
+        const cue = cues.find((existing) => existing.id === operation.cue_id);
+        if (!cue) throw new Error("video.missing_reference: The music cue no longer exists.");
+        if (!cue.needs_generation) throw new Error("video.invalid_cue: That cue already has music placed.");
+        edited.manifest.music_cues = cues.map((existing) =>
+          existing.id === operation.cue_id
+            ? { ...existing, source_asset_id: operation.source_asset_id, track_id: `music-${operation.cue_id}`, needs_generation: false }
+            : existing);
+      }
     } else {
       const layerIndex = (edited.manifest.visual_layers ?? []).findIndex((layer) => layer.id === operation.layer_id);
       if (layerIndex < 0) throw new Error("video.missing_reference: The image layer no longer exists.");
@@ -487,6 +804,8 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
   let sequence = 1;
   const cancelledJobs = new Set<string>();
   const timelineEditReplays = new Map<string, VideoTimelineEditResponse>();
+  const scriptReplays = new Map<string, VideoScriptResponse>();
+  const showFormats = new Map<string, VideoShowFormat>();
   const visualAssetReplays = new Map<string, AddVisualAssetResponse>();
   const visualReceipts = new Map<string, VisualSourceReceipt & { consumed: boolean; localPath: string }>();
   let visualReceiptSequence = 1;
@@ -631,6 +950,173 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       rendered.status = "editing";
       rendered.manifest.artifacts.push({ id: `${projectId}-preview`, project_id: projectId, version_id: rendered.manifest.version_id, role: "preview", title: `${rendered.name} preview`, mime_type: "video/mp4", format: "mp4", url: FIXTURE_VIDEO_URL, download_name: `${projectId}-preview.mp4`, duration_ms: rendered.duration_ms, width: 540, height: 960, frame_rate: 30, codec: "H.264", file_size_bytes: 1_448, playable: true, created_at: FIXED_NOW });
       return store(rendered);
+    },
+    async listenToEpisode(projectId, integratedLufsMilli, truePeakDbMilli) {
+      const project = projects.get(projectId);
+      if (!project) throw new Error("Video project was not found.");
+      const turns = project.manifest.dialogue ?? [];
+      // Only a performed line contributes a measured duration.
+      const lines = turns.filter((turn) => turn.narrated).map((turn, index) => ({
+        turn_id: turn.id, character_id: turn.character_id, text: turn.text,
+        start_us: index * 5_000_000, duration_us: 5_000_000, lead_in_us: index === 0 ? 0 : 0,
+      }));
+      const spoken = lines.reduce((total, line) => total + line.duration_us, 0);
+      const byCharacter = new Map<string, { turns: number; spoken: number }>();
+      for (const line of lines) {
+        const entry = byCharacter.get(line.character_id) ?? { turns: 0, spoken: 0 };
+        byCharacter.set(line.character_id, { turns: entry.turns + 1, spoken: entry.spoken + line.duration_us });
+      }
+      return {
+        project_id: projectId, timeline_duration_us: project.duration_ms * 1000, spoken_us: spoken,
+        narrated_turns: lines.length,
+        unnarrated_turns: turns.filter((turn) => !turn.narrated).map((turn) => turn.id),
+        speakers: [...byCharacter.entries()].map(([characterId, entry]) => ({
+          character_id: characterId,
+          display_name: (project.manifest.cast ?? []).find((member) => member.id === characterId)?.display_name ?? characterId,
+          narrated_turns: entry.turns, spoken_us: entry.spoken,
+          share_bp: spoken > 0 ? Math.floor((entry.spoken * 10_000) / spoken) : 0,
+        })).sort((left, right) => right.spoken_us - left.spoken_us),
+        gaps: { count: 0, total_us: 0, longest_us: 0, median_us: 0 },
+        lines,
+        music_cues_placed: (project.manifest.music_cues ?? []).filter((cue) => !cue.needs_generation).length,
+        music_cues_planned: (project.manifest.music_cues ?? []).filter((cue) => cue.needs_generation).length,
+        sound_placements: (project.manifest.sound_layers ?? []).length,
+        draft_turns: turns.filter((turn) => turn.draft).map((turn) => turn.id),
+        // Absent means unmeasured, never "fine".
+        loudness: integratedLufsMilli !== undefined && truePeakDbMilli !== undefined
+          ? { integrated_lufs_milli: integratedLufsMilli, true_peak_db_milli: truePeakDbMilli }
+          : null,
+      };
+    },
+    async checkEpisodeQuality(projectId, heard, integratedLufsMilli, truePeakDbMilli) {
+      const project = projects.get(projectId);
+      if (!project) throw new Error("Video project was not found.");
+      const narrated = (project.manifest.dialogue ?? []).filter((turn) => turn.narrated);
+      const checked = narrated.filter((turn) => turn.id in heard);
+      // A turn nobody listened back to is not a turn that passed.
+      const unchecked = narrated.filter((turn) => !(turn.id in heard)).map((turn) => turn.id);
+      const findings: VideoQcFinding[] = checked.flatMap((turn) =>
+        previewWordDifferences(turn.text, heard[turn.id]).map((detail, index) => ({
+          id: `qc-${turn.id}-${String(index).padStart(3, "0")}`,
+          kind: detail.kind, severity: "blocking" as const, turn_id: turn.id, detail: detail.detail, at_us: null,
+        })));
+      const loudnessChecked = integratedLufsMilli !== undefined && truePeakDbMilli !== undefined;
+      return { findings, checked_turns: checked.map((turn) => turn.id), unchecked_turns: unchecked, loudness_checked: loudnessChecked };
+    },
+    async planEpisodeRelease(projectId, hasShowNotes) {
+      const project = projects.get(projectId);
+      if (!project) throw new Error("Video project was not found.");
+      // A turn reaches the transcript only when it has a take, so an unperformed script blocks the
+      // members that describe audio.
+      const narrated = (project.manifest.dialogue ?? []).some((turn) => turn.narrated);
+      const hasMaster = Boolean(project.master);
+      const trailer = narrated ? { start_us: 0, end_us: 30_000_000 } : null;
+      const member = (kind: VideoReleaseMemberKind, ready: boolean, reason: string): VideoReleaseMemberPlan =>
+        ({ kind, ready, blocked_reason: ready ? null : reason });
+      return {
+        members: [
+          member("podcast_audio", narrated, "No line has been narrated yet, so there is no audio episode to publish"),
+          member("video_master", hasMaster, "Render a final master for the current timeline first"),
+          member("trailer", Boolean(trailer), "No narrated moment is long enough to cut a trailer from"),
+          member("transcript", narrated, "No line has been narrated yet, so there is nothing to transcribe"),
+          member("show_notes", hasShowNotes, "Write the episode's show notes first"),
+        ],
+        chapters: project.manifest.scenes.map((scene) => ({
+          id: `chapter-${scene.id}`, title: scene.title,
+          start_us: scene.timeline_start_ms * 1000, end_us: scene.timeline_end_ms * 1000,
+        })),
+        trailer_range: trailer,
+      };
+    },
+    async listShowFormats() {
+      return [...showFormats.values()].map(clone);
+    },
+    async saveShowFormat(format) {
+      const existing = showFormats.get(format.id);
+      // soundAr owns the revision so two formats cannot claim the same provenance.
+      const saved: VideoShowFormat = {
+        ...clone(format),
+        revision: existing ? existing.revision + 1 : 1,
+        created_at: existing?.created_at ?? FIXED_NOW,
+        updated_at: FIXED_NOW,
+      };
+      showFormats.set(saved.id, saved);
+      return clone(saved);
+    },
+    async deleteShowFormat(formatId) {
+      if (!showFormats.delete(formatId)) throw new Error("video.show_format_not_found: That show format does not exist.");
+    },
+    async createEpisode(formatId, episodeName) {
+      const format = showFormats.get(formatId);
+      if (!format) throw new Error("video.show_format_not_found: That show format does not exist.");
+      // Instantiation copies: the episode never reads back through its format.
+      const episode = clone(await this.createVideoProject({ prompt: episodeName }));
+      episode.name = episodeName;
+      episode.manifest.cast = clone(format.cast);
+      episode.manifest.lexicon = clone(format.lexicon);
+      episode.manifest.dialogue = [];
+      episode.manifest.turn_beats = [];
+      episode.manifest.music_cues = [];
+      episode.manifest.format_origin = {
+        format_id: format.id, format_name: format.name, format_revision: format.revision, instantiated_at: FIXED_NOW,
+      };
+      return store(episode);
+    },
+    async writeVideoScript(request) {
+      const replay = scriptReplays.get(request.operation_id);
+      if (replay) return clone({ ...replay, replayed: true });
+      const current = projects.get(request.project_id);
+      if (!current) throw new Error("Video project was not found.");
+      if (current.revision !== request.expected_revision || current.manifest.version_id !== request.base_version_id) {
+        throw new Error("video.revision_conflict: The project changed before the script could be applied.");
+      }
+      const parsed = parsePreviewDialogue(request.script, request.cast);
+      // Reuse a turn whose character and words are unchanged so its take survives the revision.
+      const reusable = new Map<string, string[]>();
+      (current.manifest.dialogue ?? []).forEach((turn) => {
+        const key = previewTurnIdentity(turn.character_id, turn.text);
+        reusable.set(key, [...(reusable.get(key) ?? []), turn.id]);
+      });
+      const retained: string[] = [];
+      const minted: string[] = [];
+      const narrated = new Set((current.manifest.narration_bindings ?? []).map((binding) => binding.turn_id).filter(Boolean) as string[]);
+      const dialogue = parsed.map((turn, order) => {
+        const key = previewTurnIdentity(turn.characterId, turn.text);
+        const queue = reusable.get(key) ?? [];
+        const existing = queue.shift();
+        reusable.set(key, queue);
+        const id = existing ?? `turn-${String(order).padStart(4, "0")}-${key}`;
+        if (existing) retained.push(existing); else minted.push(id);
+        return { id, scene_id: null, order, character_id: turn.characterId, text: turn.text, direction: turn.direction ?? null, source_line: turn.sourceLine, revision: 1, narrated: existing ? narrated.has(existing) : false };
+      });
+      const surviving = new Set(dialogue.map((turn) => turn.id));
+      const written = clone(current);
+      written.manifest.cast = clone(request.cast);
+      written.manifest.dialogue = dialogue;
+      // An explicit beat is the writer's decision and survives every edit that leaves its line alone.
+      const clock = written.manifest.performance_clock ?? DEFAULT_PERFORMANCE_CLOCK;
+      written.manifest.performance_clock = clock;
+      written.manifest.turn_beats = derivePreviewBeats(dialogue, clock, (current.manifest.turn_beats ?? []).filter((beat) => beat.source === "explicit" && surviving.has(beat.turn_id)));
+      const dropped = (written.manifest.narration_bindings ?? []).filter((binding) => binding.turn_id && !surviving.has(binding.turn_id));
+      written.manifest.narration_bindings = (written.manifest.narration_bindings ?? []).filter((binding) => !binding.turn_id || surviving.has(binding.turn_id));
+      const response: VideoScriptResponse = {
+        project: store(written),
+        receipt: {
+          project_id: request.project_id,
+          expected_revision: request.expected_revision,
+          base_version_id: request.base_version_id,
+          operation_id: request.operation_id,
+          changed_paths: ["cast", "dialogue"],
+          invalidated_stages: ["speech", "captions", "scene_render", "preview", "final_render", "publish_package"],
+          retained_turn_ids: retained,
+          new_turn_ids: minted,
+          dropped_binding_ids: dropped.map((binding) => binding.id),
+        },
+        job_id: `apply-script-${request.operation_id}`,
+        replayed: false,
+      };
+      scriptReplays.set(request.operation_id, response);
+      return clone(response);
     },
     async editVideoTimeline(request) {
       const replay = timelineEditReplays.get(request.operation_id);
@@ -905,6 +1391,16 @@ function createNativeVideoService(): VideoStudioService {
     getVideoProject: (projectId) => invoke<VideoProject>("get_video_project", { projectId }).then(withNativeProjectUrls),
     renderVideoPreview: (projectId, onProgress) => nativeWithProgress<VideoProject>(projectId, "render_video_preview", { projectId }, onProgress).then(withNativeProjectUrls),
     editVideoTimeline: (request) => invoke<VideoTimelineEditResponse>("edit_video_timeline", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),
+    writeVideoScript: (request) => invoke<VideoScriptResponse>("write_video_script", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),
+    listShowFormats: () => invoke<VideoShowFormat[]>("list_show_formats"),
+    saveShowFormat: (format) => invoke<VideoShowFormat>("save_show_format", { format }),
+    deleteShowFormat: (formatId) => invoke<void>("delete_show_format", { formatId }),
+    createEpisode: (formatId, episodeName, brief) => invoke<VideoProject>("create_episode", { formatId, episodeName, brief }).then(withNativeProjectUrls),
+    planEpisodeRelease: (projectId, hasShowNotes) => invoke<VideoReleasePlan>("plan_episode_release", { projectId, hasShowNotes }),
+    listenToEpisode: (projectId, integratedLufsMilli, truePeakDbMilli) =>
+      invoke<VideoEpisodeListening>("listen_to_episode", { projectId, integratedLufsMilli, truePeakDbMilli }),
+    checkEpisodeQuality: (projectId, heard, integratedLufsMilli, truePeakDbMilli) =>
+      invoke<VideoQcReport>("check_episode_quality", { projectId, heard, integratedLufsMilli, truePeakDbMilli }),
     addVideoVisualAsset: (request) => invoke<AddVisualAssetResponse>("add_video_visual_asset", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),
     reviseVideo: (request: ReviseVideoRequest) => invoke<VideoProject>("revise_video", { request }).then(withNativeProjectUrls),
     exportVideo: (request: VideoExportRequest, onProgress) => nativeWithProgress<VideoProject>(request.project_id, "export_video", { request }, onProgress).then(withNativeProjectUrls),

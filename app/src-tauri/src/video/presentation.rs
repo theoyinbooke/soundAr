@@ -242,6 +242,153 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "language": binding.language,
                 "script_sha256": binding.script_sha256,
                 "created_at": binding.created_at,
+                "turn_id": binding.turn_id,
+                "fidelity": binding.fidelity,
+            })
+        })
+        .collect::<Vec<_>>();
+    // The cast and the script are presented together: a turn is only readable next to the
+    // character who speaks it, and the UI needs the voice route to explain a take.
+    let cast = manifest
+        .cast
+        .iter()
+        .map(|member| {
+            json!({
+                "id": member.id,
+                "name": member.name,
+                "display_name": member.display_name,
+                "voice_id": member.voice_id,
+                "model_id": member.model_id,
+                "language": member.language,
+                "delivery": member.delivery,
+                "consent_reference_id": member.consent_reference_id,
+                "notes": member.notes,
+                "created_at": member.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let draft_turn_ids = manifest
+        .draft_turn_ids()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let narrated_turn_ids = manifest
+        .narration_bindings
+        .iter()
+        .filter_map(|binding| binding.turn_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let dialogue = manifest
+        .dialogue
+        .iter()
+        .map(|turn| {
+            json!({
+                "id": turn.id,
+                "scene_id": turn.scene_id,
+                "order": turn.order,
+                "character_id": turn.character_id,
+                "text": turn.text,
+                "direction": turn.direction,
+                "source_line": turn.source_line,
+                "revision": turn.revision,
+                // Whether this line has a valid take is the one thing a reader most needs and
+                // cannot derive without cross-referencing the bindings themselves.
+                "narrated": narrated_turn_ids.contains(turn.id.as_str()),
+                "draft": draft_turn_ids.contains(turn.id.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
+    // Rules are presented with the project so a reader can see why a name is spoken the way it is
+    // without opening the manifest.
+    let lexicon = manifest
+        .lexicon
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "scope": entry.scope,
+                "character_id": entry.character_id,
+                "match_text": entry.match_text,
+                "replacement": entry.replacement,
+                "matching": entry.matching,
+                "notes": entry.notes,
+                "created_at": entry.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    // The managed source carries the media facts, so they are resolved rather than duplicated.
+    let source_by_id = manifest
+        .source_assets
+        .iter()
+        .map(|source| (source.id.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let sound_assets = manifest
+        .sound_assets
+        .iter()
+        .map(|asset| {
+            let source = source_by_id.get(asset.source_asset_id.as_str());
+            json!({
+                "id": asset.id,
+                "name": asset.name,
+                "source_asset_id": asset.source_asset_id,
+                "local_path": source.map(|source| managed_path(video_root, &source.managed_path)),
+                "duration_ms": source.map(|source| micros_to_millis(source.probe.duration_us)),
+                "tags": asset.tags,
+                "created_at": asset.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let sound_layers = manifest
+        .sound_layers
+        .iter()
+        .map(|layer| {
+            json!({
+                "id": layer.id,
+                "asset_id": layer.asset_id,
+                "kind": layer.kind,
+                "scene_id": layer.scene_id,
+                "turn_id": layer.turn_id,
+                "start_ms": micros_to_millis(layer.range.start_us),
+                "end_ms": micros_to_millis(layer.range.end_us),
+                "gain_db": f64::from(layer.gain_db_milli) / 1000.0,
+                "fade_in_ms": micros_to_millis(layer.fade_in_us),
+                "fade_out_ms": micros_to_millis(layer.fade_out_us),
+                "loop_to_fill": layer.loop_to_fill,
+                "duck_under_speech": layer.duck_under_speech,
+            })
+        })
+        .collect::<Vec<_>>();
+    // A cue reports the length it was asked for. The fitted length is only real once local
+    // generation has produced audio, so a planned cue reports no duration of its own.
+    let music_cues = manifest
+        .music_cues
+        .iter()
+        .map(|cue| {
+            json!({
+                "id": cue.id,
+                "role": cue.role,
+                "anchor": cue.anchor,
+                "target_duration_ms": micros_to_millis(cue.target_duration_us),
+                "direction": cue.direction,
+                "source_asset_id": cue.source_asset_id,
+                "track_id": cue.track_id,
+                "gain_db": f64::from(cue.gain_db_milli) / 1000.0,
+                "fade_in_ms": micros_to_millis(cue.fade_in_us),
+                "fade_out_ms": micros_to_millis(cue.fade_out_us),
+                "needs_generation": cue.needs_generation(),
+                "created_at": cue.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    // Beats are presented beside the dialogue because a pause is only meaningful next to the
+    // lines it separates, and the UI must be able to show which ones the writer chose.
+    let turn_beats = manifest
+        .turn_beats
+        .iter()
+        .map(|beat| {
+            json!({
+                "turn_id": beat.turn_id,
+                "lead_in_ms": micros_to_millis(beat.lead_in_us),
+                "overlap_ms": micros_to_millis(beat.overlap_us),
+                "source": beat.source,
             })
         })
         .collect::<Vec<_>>();
@@ -342,6 +489,20 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "scenes": scenes,
             "caption_pages": presented_caption_pages,
             "narration_bindings": narration_bindings,
+            "cast": cast,
+            "dialogue": dialogue,
+            "format_origin": manifest.format_origin,
+            "lexicon": lexicon,
+            "music_cues": music_cues,
+            "sound_assets": sound_assets,
+            "sound_layers": sound_layers,
+            "turn_beats": turn_beats,
+            "performance_clock": {
+                "intra_exchange_ms": micros_to_millis(manifest.performance_clock.intra_exchange_us),
+                "turn_of_thought_ms": micros_to_millis(manifest.performance_clock.turn_of_thought_us),
+                "pre_reveal_ms": micros_to_millis(manifest.performance_clock.pre_reveal_us),
+                "scene_boundary_ms": micros_to_millis(manifest.performance_clock.scene_boundary_us),
+            },
             "visual_assets": visual_assets,
             "visual_layers": visual_layers,
             "timeline": timeline,

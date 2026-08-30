@@ -746,6 +746,488 @@ Every model must provide:
 - Trust indicators distinguish recorded fact, user assertion, model metadata, and
   probabilistic detection.
 
+## Phase 12: Narrative Production - Cast, Score, and Show Formats
+
+**Priority:** P2, delivered after the Video Studio timeline contract is stable
+**Expected effort:** 10-14 engineering weeks across ten releasable slices
+**Depends on:** Phases 1, 3, 4, 7, and the durable Video Studio manifest
+**Why now:** soundAr can already synthesize speech, compose music, and render a
+captioned local video, but a user who wants one finished story episode must still
+drive every primitive by hand. The missing work is not inference capability. It is
+the small set of durable abstractions - a cast, a performance clock, a score, and a
+reusable format - that turn a studio into something a person can publish from every
+week.
+
+**Non-goals for this phase:** generative sound-effect models, video avatars, cloud
+rendering, collaborative editing, and any melody-conditioned music route. Sound
+design in this phase is user-supplied local media, not generated audio.
+
+### Product Outcome
+
+A user describes an episode. soundAr assigns the cast, writes and revises the
+script, performs it with distinct consent-backed voices and believable turn timing,
+scores it with a fitted bed and a resolving outro, renders it as a captioned local
+video, checks the result against the script it was asked to speak, and publishes one
+release containing the audio episode, the video, a short vertical trailer, a
+transcript, and show notes.
+
+### Slice 12.1: Cast and Dialogue Script
+
+Depends on: Phase 3 voice consent, Phase 7 project revisions.
+
+- Add a durable `Cast` to the project manifest: named characters, each bound to a
+  voice reference, model, language, and delivery defaults, with the same consent
+  evidence and revision rules as a managed voice reference.
+- Accept a speaker-attributed script - `SPEAKER: line` with optional parenthetical
+  direction - and parse it into ordered `DialogueTurn` records that preserve source
+  line numbers and reject unknown speakers instead of silently narrating them.
+- Replace scene-scoped narration with turn-scoped narration. Every turn carries its
+  own `NarrationBinding`, so one re-read of one line invalidates only that turn.
+- Cast membership, per-character delivery, and turn text are separately revisable
+  and each records which rendered takes it invalidated.
+
+### Current Evidence
+
+Slice 12.1 is implemented and locally verified.
+
+- `video/cast.rs` holds the `CastMember`, `CastDelivery`, and `DialogueTurn` contracts and the
+  strict script parser. A speaker header must name a declared character or be an all-capitals
+  screenplay cue, so prose containing a colon continues its turn while a misspelled character
+  name is reported instead of being narrated by the wrong voice.
+- `video/dialogue.rs` applies a cast and script as a pure, revision-safe manifest transformation.
+  A turn's identity is its character and its words, so re-applying a script keeps every unchanged
+  turn's identifier and its rendered take. Reordering costs nothing, a repeated line keeps both of
+  its turns, and changing only a stage direction does not discard a valid take.
+- The manifest carries `cast`, `dialogue`, and turn-scoped `narration_bindings`. Validation
+  enforces that a take records the character who speaks its turn, matches that turn's exact words,
+  and is unique per turn. Legacy manifests decode with an empty cast and dialogue.
+- `VideoStudioService::apply_script` commits through the same durable job, project lock, revision
+  CAS, and idempotent replay path as `edit_timeline`, and its receipt separates retained turns from
+  new ones so the caller renders only what changed.
+- The `write_video_script` agent tool, its Tauri command, the headless `agent video` dispatch, the
+  presented project shape, and the typed frontend bridge all use that one service operation.
+- Verified locally: 338 native tests including cast-parser, manifest-contract, and
+  dialogue-application cases plus one durable service case proving version binding, idempotent
+  replay, stale-write rejection, and turn reuse; and 142 React tests including preview-bridge
+  coverage of the same reuse behaviour.
+- Remaining for this slice: the desktop cast and script editing surface, and per-turn narration
+  rendering through the scheduler.
+
+### Slice 12.2: Performance Timing
+
+Depends on: 12.1.
+
+- Add a `PerformanceClock` describing the gap policy between turns: intra-exchange,
+  turn-of-thought, pre-reveal beat, and scene boundary.
+- Derive default beats from terminal punctuation and parenthetical direction, and
+  allow an explicit per-turn override that survives a script edit that did not
+  change that turn's words.
+- Support declared overlap for interjections, bounded so that an overlap can never
+  reorder turns or exceed the shorter turn.
+- Continuous room tone per scene is delivered in 12.5, where registered sound-design
+  media exists to supply it. Beats and overlap ship here without it rather than
+  shipping a control that cannot yet produce sound.
+
+### Current Evidence
+
+Slice 12.2 is implemented and locally verified.
+
+- `video/performance.rs` holds the `PerformanceClock` and `TurnBeat` contracts and derives a beat
+  for every turn from what the script already says: a reply is faster than the same character
+  continuing a thought, a line that trails off or carries a pause direction earns a longer beat,
+  and an interjection direction overlaps the previous line instead of waiting.
+- An explicit beat is keyed by turn id, so a deliberate pause survives every later edit that leaves
+  its own line alone and is discarded only with the line it belongs to. A stale derived beat is
+  always recomputed and is never mistaken for an override.
+- A turn may hold a lead-in or overlap the previous turn, never both. An overlap is rejected on the
+  first turn, and bounded against the shorter of the two rendered takes - measured from published
+  artifacts, never guessed when a take does not exist yet.
+- `set_turn_beat` and `clear_turn_beat` join the existing revision-checked `edit_video_timeline`
+  batch rather than adding a parallel path, and are exposed to the assistant through that tool.
+- Retiming invalidates only assembly: `/turn_beats` and `/performance_clock` map to scene render,
+  preview, final render, and publish, never to Speech. Moving a pause never re-reads a line.
+- Beat validation runs inside `validate_strict`, which is on the hot path for every manifest load,
+  revision, and render admission, so it uses one prebuilt turn index instead of scanning the
+  narration bindings per beat.
+- Verified locally: 359 native tests, including twelve beat-derivation and bounds cases, four
+  editor cases proving an explicit beat is marked, restored, and never invalidates speech, and a
+  two-thousand-turn manifest that validates and still names a bad beat deep inside it; plus 143
+  React tests including preview-bridge parity for derivation and for a held pause surviving a
+  later edit.
+
+### Slice 12.3: Project Pronunciation Lexicon
+
+Pulled forward from Phase 11 because invented names make it a prerequisite for
+stories, not a finishing touch.
+
+- Project, cast-character, and global lexicon scopes with explicit precedence.
+- Entries apply to every take and every voice in the project and are recorded in
+  the take's reproducibility metadata.
+- Instant audition of a single entry without rendering the surrounding work.
+- One project's lexicon never leaks into another.
+
+### Current Evidence
+
+Slice 12.3 is implemented and locally verified.
+
+- `video/lexicon.rs` holds the `LexiconEntry` contract, precedence resolution, application, and
+  fingerprinting. Precedence runs character, then project, then global, and within a scope the
+  longest match wins so a rule for a full name is not consumed by a rule for its first word.
+- A rule never fires inside a longer word, so a rule for `Ada` cannot mispronounce `Adaeze`.
+  Replacement text is final: a lower-precedence rule cannot rewrite inside it, which keeps the
+  spoken result predictable from reading the lexicon.
+- The project's lexicon is self-contained. Entries imported from the machine's global lexicon are
+  snapshotted into the project with `Global` scope, so an episode reproduces identically later even
+  if the global lexicon has since changed, and one project's rules can never reach another.
+- A take records the fingerprint of the exact rules that produced it. Changing a rule stales
+  exactly the lines that rule governs: a character-scoped rule drops only that character's takes,
+  and a rule no line uses changes no fingerprint and re-reads nothing. Takes recorded before the
+  lexicon existed carry no fingerprint and stay valid.
+- `set_lexicon_entry` and `remove_lexicon_entry` join the existing revision-checked
+  `edit_video_timeline` batch and are exposed to the assistant through that tool.
+- `preview_video_pronunciation` resolves exactly what a voice would say for a sample line, so one
+  rule can be auditioned by synthesizing one short line with the character's own voice rather than
+  re-rendering the work around it.
+- Replacements are ordinary respelled text rather than a phoneme alphabet, because soundAr's
+  engines differ in what notation they accept and a rule that works on one engine only is worse
+  than a respelling that works everywhere.
+- Verified locally: 381 native tests including sixteen lexicon cases covering precedence,
+  word boundaries, multibyte text, non-cascading replacement, and fingerprint isolation; three
+  manifest contract cases proving a rule stales only the takes it governs; and three editor cases
+  proving scoped drops. Plus 144 React tests including preview-bridge parity.
+
+### Slice 12.4: Score Cue Sheet
+
+Depends on: 12.1, existing `AudioMix` ducking and loudness contracts.
+
+- Add a `CueSheet` of music cues, each with a role - `sting`, `bed`, `transition`,
+  or `outro` - an anchor to a scene or turn, a target duration, and a direction.
+- Fit generated music to its target duration using the existing ACE-Step extend and
+  edit-region routes plus a musical tail fade, rather than a hard cut.
+- Automatically bind a `bed` cue to a ducking envelope sidechained to the speech
+  track, using the mix contract that already exists.
+- An `outro` cue resolves after the final turn and defines the episode's end.
+
+### Current Evidence
+
+Slice 12.4 is implemented and locally verified, end to end.
+
+- `video/score.rs` holds the `MusicCue` contract. A cue's role - sting, bed, transition, or outro -
+  decides where it sits and how it is mixed, rather than treating four different jobs as one
+  generic audio file stapled to the end of an episode.
+- Cues anchor to a scene or a turn rather than to an absolute timestamp, so re-reading a line or
+  retiming a pause moves the cue with it. Only an outro may anchor after the final line, only an
+  outro may use that anchor, an outro needs a script to play after, and an episode may end on only
+  one outro.
+- A bed placed on a timeline track is given its ducking envelope automatically, sidechained to the
+  audio track that actually carries narration rather than to a default the renderer would have to
+  resolve. The manifest refuses a bed on a track that does not duck, and removing a cue takes its
+  mix entry with it so no envelope is left pointing at music the project no longer has.
+- `fit_cue` fits generated music to its target. A piece that runs long is trimmed with its fade-out
+  extended to carry a musical tail rather than cut off, and the tail is bounded by half the cue so
+  a short sting cannot become mostly fade. A piece that falls more than the tolerance short is
+  reported for regeneration: stretching would change its tempo, and padding with silence would put
+  dead air where the score should be.
+- A cue cannot occupy a timeline track before its music exists, and can only reference a registered
+  soundAr music artifact, so a planned cue never presents itself as rendered score.
+- `set_music_cue`, `remove_music_cue`, and `place_music_cue` join the existing revision-checked
+  `edit_video_timeline` batch and are exposed to the assistant through that tool.
+- `generate_cue_music` is the durable job that closes the loop: it asks the installed local music
+  model for the cue's exact target length, registers the result through the ordinary managed import
+  so a cue can only point at bytes soundAr owns, fits it, and places it at its anchor. It uses the
+  same parent/child idempotency as prompt-to-video, so a crash between composing and placing adopts
+  the existing History rather than asking the GPU for the same piece twice, and the generation seed
+  is derived from the direction so a resume produces the piece the user approved.
+- Anchors resolve at placement time from the timeline as it stands, so a cue can be authored before
+  the scenes and takes it refers to are final. An outro cannot be placed before there is narration
+  to resolve after, and a cue that will not fit inside the timeline at its anchor is refused.
+- Verified locally: 398 native tests including thirteen score cases covering roles, anchors, fit
+  behaviour, and asset binding, plus four editor cases proving a bed receives its envelope, cannot
+  be placed without narration to duck against, and takes its mix entry with it on removal. Plus 145
+  React tests including preview-bridge parity.
+
+### Slice 12.5: Sound Design Library
+
+Depends on: 12.2 for placement, existing visual-asset registration for the pattern.
+
+- Register user-supplied local audio as tagged sound-design assets through the same
+  rights-and-registration path as visual assets. No generative model is introduced.
+- Place one-shot effects at a turn or timeline position and ambience across a scene,
+  both as revisable timeline layers with independent level and fades.
+- The assistant may propose placements from parenthetical stage directions, but a
+  placement is only applied through the same revision-checked service the UI uses.
+
+### Current Evidence
+
+Slice 12.5 is implemented and locally verified, end to end.
+
+- `video/sound.rs` holds the `SoundAsset` and `SoundLayer` contracts. Nothing here generates audio:
+  assets are files the user already has, carrying the same rights and provenance record as any
+  other imported media, which keeps the feature outside the licensing and hardware-qualification
+  questions a generative sound-effect model would raise.
+- Room tone is delivered here, where registered media exists to supply it. It must run under the
+  whole scene rather than stopping partway, because stopping leaves exactly the digital silence it
+  exists to remove, and a scene has only one room and so only one room tone. Its level is capped
+  far under the dialogue; nearer than that it reads as noise rather than as a room.
+- A one-shot must be anchored to the scene or turn it punctuates, so a later edit cannot silently
+  move it away from the moment it was placed for, and it cannot loop. Ambience and room tone belong
+  to a scene rather than to one line. No placement may spill past its scene into the next cut.
+- Assets are found by normalized tag rather than filename, because the assistant proposes
+  placements from written stage directions rather than from a controlled vocabulary.
+- Registration reuses the ordinary local-import pipeline rather than duplicating it. The media is
+  imported as managed media - copied, checksummed, and probed by the proven path - and
+  `register_sound_asset` then labels that managed source. A `SoundAsset` therefore carries only a
+  name and its tags; duplicating the path, checksum, or duration would create a second copy of
+  facts that could disagree with the source they describe. Because only the native import path can
+  create a managed source, the assistant can never name an arbitrary file on the machine.
+- Media with no audio track cannot become sound design, one managed source is registered as exactly
+  one sound, and removing a sound removes its placements rather than leaving the manifest with a
+  placement that has no audio.
+- `register_sound_asset`, `remove_sound_asset`, `set_sound_layer`, and `remove_sound_layer` join the
+  existing revision-checked `edit_video_timeline` batch. A placement can only reference an already
+  registered asset, so a proposal from a stage direction can never invent audio the project does
+  not have.
+- The `edit_video_timeline` operation union outgrew a single `json!` literal and now builds from one
+  schema function per operation.
+- Verified locally: 415 native tests including thirteen sound cases and four editor cases, plus 146
+  React tests including preview-bridge parity.
+
+### Slice 12.6: Show Formats
+
+Depends on: 12.1 through 12.5.
+
+- Save a reusable `ShowFormat`: cast, caption preset, visual treatment, cue sheet
+  defaults, opening and closing, loudness target, aspect ratio, target length, and
+  show-notes style.
+- Instantiate an episode from a format with one brief. Inherited values are visibly
+  inherited and can be overridden per episode without editing the format.
+- Editing a format never retroactively mutates a published episode.
+
+### Current Evidence
+
+Slice 12.6 is implemented and locally verified.
+
+- `video/format.rs` holds the `ShowFormat` contract: the cast, pronunciation rules, conversational
+  timing, caption preset, canvas, frame rate, loudness targets, usual episode length, show-notes
+  style, and opening and closing cue templates that do not change between episodes.
+- Instantiation copies. An episode never reads back through its format at render time, so editing a
+  format cannot retroactively change an episode that already shipped, and an episode rendered next
+  year reproduces what it was rendered from today. `format_origin` on the manifest records which
+  format and which revision the values came from - provenance, not a live link.
+- soundAr owns the format revision rather than the caller, because an episode records the revision
+  it inherited and a caller that could choose its own number could make two different formats claim
+  the same provenance. `created_at` is preserved across updates.
+- A format cannot store values the renderer would later reject: the loudness target is validated by
+  building the mix an episode would actually inherit, the caption preset must be one soundAr has, a
+  cast whose script names cannot be told apart is refused, and a rule cannot name a character
+  outside the format's own cast.
+- Cue templates carry no anchor, because an opening belongs to whatever the first line turns out to
+  be and a closing to whatever the last one is. `materialize_format_cues` resolves them against a
+  written script and returns nothing for an episode that has none, rather than inventing an anchor
+  at a moment the writer never chose. An opening cannot be an outro and a closing must be.
+- Formats persist as one validated document in the durable settings table, which keeps them
+  transactional and restart-safe without a schema migration, and they are validated on the way out
+  so a corrupted document cannot reach a project as if it were a usable format.
+- `save_show_format`, `list_show_formats`, and `create_episode` are exposed as assistant tools and
+  Tauri commands, and the producer prompt now directs recurring work through them.
+- The cast and lexicon tool schemas are shared between `write_video_script` and `save_show_format`
+  rather than duplicated.
+- Verified locally: 432 native tests including eight format cases and one durable service case
+  proving the revision is owned by soundAr, an episode inherits by copy, and recasting the show
+  leaves an existing episode untouched; plus 148 React tests including preview-bridge parity for the
+  same guarantee.
+
+### Slice 12.7: Release Package
+
+Depends on: 12.6, the existing publish package and candidate analyst.
+
+- Produce one release from one production: podcast audio with chapter marks and
+  embedded metadata, the video master, a short vertical trailer, a square audiogram,
+  the transcript, and show notes.
+- Cut the trailer by running the existing candidate-moment analyst over the episode's
+  own narration transcript, so the same reviewed-candidate contract applies to
+  generated work as to imported source.
+- Every release member is checksum-registered and playable in the application, never
+  presented only as a filesystem path.
+
+### Current Evidence
+
+Slice 12.7's planning layer is implemented and locally verified. The remaining work is the FFmpeg
+rendering of the audio episode with embedded chapters, the vertical trailer cut, and the audiogram.
+
+- `video/release.rs` holds the release contract. A blocked member always names its missing
+  prerequisite, because a release that quietly omits its trailer looks identical to one that never
+  wanted a trailer.
+- `episode_transcript` builds a source-clock transcript from the episode's own narration. A turn
+  appears only when it has a published take with a measured duration and a clip placing it on the
+  timeline, so the result is a measurement rather than an estimate and a moment chosen from it is
+  the same moment in the finished file. An unperformed script yields no transcript at all rather
+  than one describing audio that does not exist, and the timing source is recorded as written
+  rather than claiming a recognizer produced it.
+- That transcript is fed to soundAr's existing candidate analyst, so the trailer is chosen from
+  generated work by the same deterministic rules already used on imported source, rather than by a
+  second, unproven selector. This is the loop the original design called for: the moment-finder
+  built for imported video, pointed at soundAr's own output.
+- Scenes are the episode's chapters, because they are the author's own divisions. An episode with
+  no scenes has no chapters rather than one invented per line.
+- `plan_episode_release` is exposed as an assistant tool and a Tauri command, and the producer
+  prompt now directs the assistant to call it before declaring an episode finished.
+- Verified locally: 438 native tests including six release cases - one proving the existing analyst
+  picks a bounded, on-clock moment from generated narration - plus 149 React tests.
+
+### Slice 12.8: Production Quality Control
+
+Depends on: 12.1, Phase 9 transcription and alignment evidence.
+
+- Re-transcribe rendered narration and diff it against the exact script revision it
+  was asked to speak, reporting skipped, inserted, and mispronounced words per turn.
+- Measure integrated loudness and true peak against the format's target.
+- Measure caption drift against the rendered word timings.
+- Detect dead air and clipping.
+- Report every finding as reviewable evidence linked to a turn. Quality control
+  flags work; it never silently rewrites or re-renders it.
+
+### Current Evidence
+
+Slice 12.8 is implemented and locally verified. The remaining work is the runtime that transcribes
+the rendered narration and measures the master's loudness and true peak; the checks themselves take
+those measurements as input.
+
+- `video/quality.rs` compares what a take was asked to say with what a local recognizer actually
+  heard. Comparison is on normalized words, because a recognizer does not reproduce punctuation or
+  capitalization and reporting those would bury the real findings.
+- The comparison is aligned rather than positional, so a mispronounced invented name reads as one
+  replacement - "the take says Adaze where the script says Adaeze" - instead of a deletion and an
+  insertion nobody can act on. That is the exact failure this slice exists to catch.
+- The line is compared against what the voice was actually asked to say, which is the scripted text
+  after its pronunciation rules were applied, so a working lexicon entry is never reported as an
+  error.
+- Everything reports. Nothing rewrites a script, re-renders a take, or adjusts a mix. A check that
+  silently repaired what it found would destroy the only thing it exists to provide.
+- A turn nobody listened back to is reported as unchecked rather than as passed, and without a
+  loudness measurement the report says the master was not checked instead of claiming it is within
+  target. A partial measurement is treated as no measurement, so half a check cannot read as a whole
+  one. An episode is only clear when there are no blocking findings, no unchecked turns, and the
+  master was measured.
+- Severity is assigned by consequence: a misstated script and an off-target master block, because
+  the episode does not say what it was asked to say or a platform will change how it sounds after it
+  leaves soundAr. Caption drift and dead air warn.
+- `check_episode_quality` is exposed as an assistant tool and a Tauri command, and the producer
+  prompt now directs the assistant to transcribe the rendered narration and run it before declaring
+  an episode finished.
+- Verified locally: 451 native tests including thirteen quality cases covering alignment, severity,
+  and the unchecked-is-not-passed rule; plus 150 React tests.
+
+### Slice 12.9: Assistant Listening and Director's Pass
+
+Depends on: 12.8.
+
+- Add a strict read-only tool that returns what was actually rendered - transcript,
+  word timings, per-speaker duration, loudness, and gap distribution - so the
+  assistant revises from measured output instead of from the plan it wrote.
+- A director's pass reviews the assembled episode against the original brief and
+  proposes turn-level revisions through the existing revision-checked tools.
+- The assistant never claims a listening result it did not receive from this tool.
+
+### Current Evidence
+
+Slice 12.9's listening tool is implemented and locally verified. The director's pass is the
+assistant's own use of it and of the existing revision-checked tools; no separate mechanism was
+added for it, because one would only duplicate them.
+
+- `video/listening.rs` reports the episode as rendered rather than as planned: which lines were
+  performed, how long each one actually runs, how the speaking time divides between characters,
+  where the silences fall, and how much score and sound design is placed. Until now the assistant
+  revised from the plan it wrote, which says what was intended rather than what exists.
+- Every number comes from a published artifact with a measured duration. A line rendered but never
+  measured is reported as unnarrated rather than counted, so a summary never describes audio nobody
+  has. Nothing is estimated from word counts or reading speed.
+- Loudness is absent unless the caller supplies a measurement, and a partial measurement is treated
+  as none. An approximation the assistant cannot distinguish from a measurement is worse than no
+  value at all.
+- Speaker share is measured from takes, so a character with few but long lines is correctly
+  reported as dominating the episode. The gap summary reports a median rather than a mean, because
+  one long pause distorts a mean.
+- `listen_to_episode` is strictly read-only and is exposed as an assistant tool and a Tauri command.
+  The producer prompt now requires it before any judgment about pacing, balance, or length, and
+  forbids stating a listening result the tool did not return or estimating a value it reported as
+  unmeasured.
+- Verified locally: 457 native tests including six listening cases covering measured-only counting,
+  rendered lead-in, speaker share, and the unmeasured-loudness rule; plus 150 React tests.
+
+### Slice 12.10: Draft Mode
+
+Depends on: 12.1, the existing preview renderer and segment cache.
+
+- Render a complete episode at draft fidelity using the fastest qualified local voice
+  and a low-resolution video path, then selectively promote turns or scenes to final
+  voices without re-rendering unchanged work.
+- Draft artifacts are visibly labelled draft, are never exportable as a master, and
+  are never registered as a final release member.
+
+### Current Evidence
+
+Slice 12.10 is implemented and locally verified.
+
+- `TakeFidelity` travels with each take, because a draft that could not be told apart from a final
+  take would eventually be published as one. Takes recorded before draft mode existed decode as
+  final, which is what they were.
+- A final master cannot be published while any line is still a stand-in. The manifest refuses it
+  outright rather than leaving it to be noticed later by a listener, and the release plan blocks the
+  audio episode and the video master with a reason naming how many lines are left to re-read.
+- `promote_turns_to_final` drops the stand-in takes for exactly the named lines, so promoting one
+  line never re-reads the rest of the episode. That is the whole point of drafting: the expensive
+  voice is spent only on what survived the listen. A line that is already final cannot be promoted,
+  because that would read as a promotion that did something.
+- The listening report and the presented project both name the draft lines, so an unfinished
+  episode is visibly unfinished in the UI and to the assistant.
+- The producer prompt now describes the draft-then-promote route explicitly.
+- Verified locally: 461 native tests including three draft cases covering selective promotion, the
+  already-final rejection, and the refusal to publish a master built on stand-ins, plus a release
+  case proving a stand-in cannot leave soundAr as the finished episode; and 151 React tests.
+
+### Required Tests
+
+- Parse representative, malformed, and very large speaker-attributed scripts,
+  including unknown speakers, empty turns, unbalanced parentheticals, and mixed line
+  endings; every rejection names the offending source line.
+- Render a multi-character episode, edit one turn's text, and prove that only that
+  turn regenerates while every other take, its checksum, and its history row survive.
+- Reassign one character's voice and prove that exactly that character's takes
+  invalidate and no other character's do.
+- Prove per-turn beat overrides survive an unrelated script edit and that a declared
+  overlap can never reorder turns or exceed the shorter turn.
+- Apply a lexicon entry, reopen the project, and reproduce identical pronunciation
+  metadata; prove one project's lexicon cannot affect another.
+- Fit a generated cue to a target duration and prove the rendered episode ends on the
+  outro's resolution within the timeline's microsecond tolerance.
+- Prove a `bed` cue produces a ducking envelope sidechained to the speech track and
+  that removing the cue removes the envelope.
+- Round-trip a show format: create, instantiate two episodes, edit the format, and
+  prove the already-published episode is unchanged.
+- Produce a release package and verify every member's checksum, playability, and
+  provenance, including a trailer whose source range maps back to real narration
+  word timings.
+- Run quality control against a deliberately corrupted take and prove the reported
+  skipped and inserted words match a known fixture.
+- Prove the assistant's listening tool is read-only, that it cannot mutate a project,
+  and that its results reflect the rendered artifact rather than the manifest.
+- Prove a draft artifact cannot be exported as a master or registered in a release.
+- Complete one full episode on the RTX 4080 12 GB machine, interrupt it mid-render,
+  restart the application, resume, and export without lost edits or hidden
+  regeneration.
+
+### Exit Gate
+
+- One brief produces one complete, playable, checksum-registered episode with
+  distinct consent-backed voices, believable turn timing, a fitted score, captions,
+  and a release package - without the user issuing a per-primitive command.
+- Every turn, beat, cue, placement, and format value is durable, revisable, and
+  attributable to the revision that produced it.
+- Quality control reports measured facts about the rendered episode and never
+  presents a corrected or predicted result as a measurement.
+- No draft or simulated artifact can reach a master or a release.
+
 ## Cross-Cutting Test Strategy
 
 ### Layer 1: Fast CI on Every Pull Request
@@ -856,6 +1338,7 @@ Release channels should be:
 | 9 | Transcription and dubbing | Localization and speech repair |
 | 10 | Local API and CLI | Ecosystem and automation |
 | 11 | Finishing and trust tools | Professional delivery and governance |
+| 12 | Cast, score, formats, and releases | Publishable narrative episodes |
 
 ## What We Will Not Do Yet
 
@@ -868,7 +1351,9 @@ Release channels should be:
   sound-effects generation, before each has dedicated hardware qualification,
   listening evidence, and license review. The current ACE-Step path accepts
   direction plus optional lyrics, while the MusicGen path is instrumental-only;
-  neither is a general audio-editing or melody-conditioning surface.
+  neither is a general audio-editing or melody-conditioning surface. Phase 12's
+  sound-design library is user-supplied local media registered under the existing
+  rights path, not generated audio, and does not relax this rule.
 - Train professional voice models before reference ingestion, consent, dataset
   quality, evaluation, and isolated training runtimes are complete.
 - Call a feature complete because its screen exists.
@@ -893,6 +1378,11 @@ Release channels should be:
 
 Project Studio, Real-Time Studio, Dubbing, and the Developer Harness can then ship
 as post-1.0 minor releases without weakening the 1.0 definition.
+
+Phase 12 ships as a sequence of post-1.0 minor releases, one slice at a time. Cast
+and dialogue is the first, because performance timing, the score, sound design,
+formats, releases, quality control, and the assistant's listening pass all depend on
+turn-scoped narration existing first.
 
 ## Roadmap Maintenance
 
