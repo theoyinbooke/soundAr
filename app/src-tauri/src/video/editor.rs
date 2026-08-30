@@ -10,6 +10,7 @@ use super::contracts::{
     TimelineClip, TimelineGap, Validate, VideoError, VideoErrorCode, VideoProjectManifest,
     VideoResult,
 };
+use super::performance::{derive_turn_beats, BeatSource, TurnBeat};
 use super::timeline::{
     map_source_endpoint_to_timeline, map_timeline_endpoint_to_source, QuantizeMode,
 };
@@ -54,6 +55,15 @@ pub enum VideoTimelineOperation {
         first_scene_id: String,
         second_scene_id: String,
     },
+    /// Overrides the silence - or overlap - before one dialogue turn. An explicit beat is the
+    /// writer's decision and survives every later edit that leaves this turn's words alone.
+    SetTurnBeat {
+        turn_id: String,
+        lead_in_us: Microseconds,
+        overlap_us: Microseconds,
+    },
+    /// Returns one turn to the beat derived from the script.
+    ClearTurnBeat { turn_id: String },
     /// Repositions or animates an existing managed visual without replacing its immutable bytes.
     UpdateVisualLayer {
         layer_id: String,
@@ -120,6 +130,14 @@ pub fn apply_timeline_edit(
                 first_scene_id,
                 second_scene_id,
             } => merge_scenes(&mut edited, first_scene_id, second_scene_id)?,
+            VideoTimelineOperation::SetTurnBeat {
+                turn_id,
+                lead_in_us,
+                overlap_us,
+            } => set_turn_beat(&mut edited, turn_id, *lead_in_us, *overlap_us)?,
+            VideoTimelineOperation::ClearTurnBeat { turn_id } => {
+                clear_turn_beat(&mut edited, turn_id)?
+            }
             VideoTimelineOperation::UpdateVisualLayer {
                 layer_id,
                 scene_id,
@@ -231,6 +249,10 @@ fn validate_request(
                 validate_identifier(first_scene_id, "operations.first_scene_id")?;
                 validate_identifier(second_scene_id, "operations.second_scene_id")?;
             }
+            VideoTimelineOperation::SetTurnBeat { turn_id, .. }
+            | VideoTimelineOperation::ClearTurnBeat { turn_id } => {
+                validate_identifier(turn_id, "operations.turn_id")?
+            }
             VideoTimelineOperation::UpdateVisualLayer {
                 layer_id, scene_id, ..
             } => {
@@ -277,6 +299,92 @@ fn update_visual_layer(
     layer.transition_in_us = transition_in_us;
     layer.transition_out_us = transition_out_us;
     layer.validate()
+}
+
+/// Hold or tighten the beat before one turn.
+///
+/// Marking it explicit is what makes it survive: `apply_dialogue_script` recomputes derived beats
+/// from the script on every revision but carries explicit ones forward untouched.
+fn set_turn_beat(
+    manifest: &mut VideoProjectManifest,
+    turn_id: &str,
+    lead_in_us: Microseconds,
+    overlap_us: Microseconds,
+) -> VideoResult<()> {
+    if !manifest.dialogue.iter().any(|turn| turn.id == turn_id) {
+        return Err(edit_error(
+            VideoErrorCode::MissingReference,
+            format!("dialogue turn {turn_id} does not exist"),
+            "operations.turn_id",
+        ));
+    }
+    let beat = TurnBeat {
+        turn_id: turn_id.to_string(),
+        lead_in_us,
+        overlap_us,
+        source: BeatSource::Explicit,
+    };
+    beat.validate()?;
+    match manifest
+        .turn_beats
+        .iter_mut()
+        .find(|existing| existing.turn_id == turn_id)
+    {
+        Some(existing) => *existing = beat,
+        None => manifest.turn_beats.push(beat),
+    }
+    Ok(())
+}
+
+/// Return one turn to the beat the script implies.
+fn clear_turn_beat(manifest: &mut VideoProjectManifest, turn_id: &str) -> VideoResult<()> {
+    let Some(position) = manifest
+        .dialogue
+        .iter()
+        .position(|turn| turn.id == turn_id)
+    else {
+        return Err(edit_error(
+            VideoErrorCode::MissingReference,
+            format!("dialogue turn {turn_id} does not exist"),
+            "operations.turn_id",
+        ));
+    };
+    let is_explicit = manifest
+        .turn_beats
+        .iter()
+        .any(|beat| beat.turn_id == turn_id && matches!(beat.source, BeatSource::Explicit));
+    if !is_explicit {
+        return Err(edit_error(
+            VideoErrorCode::InvalidPerformance,
+            format!("dialogue turn {turn_id} already uses its derived beat"),
+            "operations.turn_id",
+        ));
+    }
+    // Re-deriving from the script is what puts this turn back in conversation with its
+    // neighbours; deleting the beat alone would leave a gap the assembler cannot interpret.
+    let surviving = manifest
+        .turn_beats
+        .iter()
+        .filter(|beat| beat.turn_id != turn_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let derived = derive_turn_beats(&manifest.dialogue, &manifest.performance_clock, &surviving)?;
+    let restored = derived.get(position).cloned().ok_or_else(|| {
+        edit_error(
+            VideoErrorCode::InvalidPerformance,
+            "the derived beat for this turn could not be recomputed",
+            "operations.turn_id",
+        )
+    })?;
+    match manifest
+        .turn_beats
+        .iter_mut()
+        .find(|beat| beat.turn_id == turn_id)
+    {
+        Some(existing) => *existing = restored,
+        None => manifest.turn_beats.push(restored),
+    }
+    Ok(())
 }
 
 fn validate_editable_scene_references(manifest: &VideoProjectManifest) -> VideoResult<()> {
@@ -1887,6 +1995,7 @@ mod tests {
         TimelineClip {
             id: id.into(),
             scene_id: Some(scene_id.into()),
+            turn_id: None,
             media: MediaReference {
                 source_asset_id: Some(SOURCE_ID.into()),
                 render_artifact_id: None,
@@ -2244,6 +2353,142 @@ mod tests {
         });
     }
 
+    /// Add a two-character exchange to the editor fixture so beat edits have real turns.
+    fn with_dialogue(manifest: &VideoProjectManifest) -> VideoProjectManifest {
+        use super::super::cast::{CastDelivery, CastMember, DialogueTurn};
+        let mut manifest = manifest.clone();
+        for (id, name, voice) in [
+            ("narrator", "NARRATOR", "af-heart"),
+            ("adaeze", "ADAEZE", "af-bella"),
+        ] {
+            manifest.cast.push(CastMember {
+                id: id.into(),
+                name: name.into(),
+                display_name: name.into(),
+                voice_id: voice.into(),
+                model_id: "hexgrad/Kokoro-82M".into(),
+                language: "en-US".into(),
+                delivery: CastDelivery::default(),
+                consent_reference_id: None,
+                notes: None,
+                created_at: NOW.into(),
+            });
+        }
+        for (index, (id, character, text)) in [
+            ("turn-a", "narrator", "He asked her name."),
+            ("turn-b", "adaeze", "Adaeze."),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            manifest.dialogue.push(DialogueTurn {
+                id: id.into(),
+                scene_id: None,
+                order: index as u32,
+                character_id: character.into(),
+                text: text.into(),
+                direction: None,
+                source_line: index as u32 + 1,
+                revision: 1,
+            });
+        }
+        manifest.turn_beats =
+            derive_turn_beats(&manifest.dialogue, &manifest.performance_clock, &[]).unwrap();
+        manifest.validate_strict().unwrap();
+        manifest
+    }
+
+    #[test]
+    fn holding_a_beat_marks_it_explicit_and_clearing_it_restores_the_derived_one() {
+        let manifest = with_dialogue(&manifest());
+        let derived = manifest.turn_beats[1].lead_in_us;
+
+        let held = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetTurnBeat {
+                turn_id: "turn-b".into(),
+                lead_in_us: Microseconds(2_000_000),
+                overlap_us: Microseconds::ZERO,
+            }]),
+        )
+        .unwrap();
+        let beat = held
+            .manifest
+            .turn_beats
+            .iter()
+            .find(|beat| beat.turn_id == "turn-b")
+            .unwrap();
+        assert_eq!(beat.lead_in_us, Microseconds(2_000_000));
+        assert_eq!(beat.source, BeatSource::Explicit);
+        assert!(held
+            .receipt
+            .invalidated_stages
+            .contains(&RevisionStage::SceneRender));
+        assert!(
+            !held.receipt.invalidated_stages.contains(&RevisionStage::Speech),
+            "retiming a pause must not re-read any line"
+        );
+
+        let cleared = apply_timeline_edit(
+            &held.manifest,
+            &request(vec![VideoTimelineOperation::ClearTurnBeat {
+                turn_id: "turn-b".into(),
+            }]),
+        )
+        .unwrap();
+        let restored = cleared
+            .manifest
+            .turn_beats
+            .iter()
+            .find(|beat| beat.turn_id == "turn-b")
+            .unwrap();
+        assert_eq!(restored.lead_in_us, derived);
+        assert_eq!(restored.source, BeatSource::Derived);
+    }
+
+    #[test]
+    fn a_beat_edit_must_name_a_turn_that_exists() {
+        let manifest = with_dialogue(&manifest());
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetTurnBeat {
+                turn_id: "turn-absent".into(),
+                lead_in_us: Microseconds(500_000),
+                overlap_us: Microseconds::ZERO,
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+    }
+
+    #[test]
+    fn clearing_a_beat_that_is_already_derived_is_rejected_as_no_change() {
+        let manifest = with_dialogue(&manifest());
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::ClearTurnBeat {
+                turn_id: "turn-b".into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidPerformance);
+    }
+
+    #[test]
+    fn a_beat_cannot_both_hold_and_overlap() {
+        let manifest = with_dialogue(&manifest());
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetTurnBeat {
+                turn_id: "turn-b".into(),
+                lead_in_us: Microseconds(500_000),
+                overlap_us: Microseconds(500_000),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidPerformance);
+    }
+
     fn request(operations: Vec<VideoTimelineOperation>) -> VideoTimelineEditRequest {
         VideoTimelineEditRequest {
             project_id: "project-editor".into(),
@@ -2280,6 +2525,7 @@ mod tests {
         manifest.narration_bindings.push(NarrationBinding {
             id: format!("narration-{suffix}"),
             scene_id: Some(scene_id.into()),
+            turn_id: None,
             render_artifact_id: artifact_id,
             history_id: format!("history-{suffix}"),
             generation_job_id: format!("job-{suffix}"),

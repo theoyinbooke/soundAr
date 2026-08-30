@@ -242,6 +242,65 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "language": binding.language,
                 "script_sha256": binding.script_sha256,
                 "created_at": binding.created_at,
+                "turn_id": binding.turn_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    // The cast and the script are presented together: a turn is only readable next to the
+    // character who speaks it, and the UI needs the voice route to explain a take.
+    let cast = manifest
+        .cast
+        .iter()
+        .map(|member| {
+            json!({
+                "id": member.id,
+                "name": member.name,
+                "display_name": member.display_name,
+                "voice_id": member.voice_id,
+                "model_id": member.model_id,
+                "language": member.language,
+                "delivery": member.delivery,
+                "consent_reference_id": member.consent_reference_id,
+                "notes": member.notes,
+                "created_at": member.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let narrated_turn_ids = manifest
+        .narration_bindings
+        .iter()
+        .filter_map(|binding| binding.turn_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let dialogue = manifest
+        .dialogue
+        .iter()
+        .map(|turn| {
+            json!({
+                "id": turn.id,
+                "scene_id": turn.scene_id,
+                "order": turn.order,
+                "character_id": turn.character_id,
+                "text": turn.text,
+                "direction": turn.direction,
+                "source_line": turn.source_line,
+                "revision": turn.revision,
+                // Whether this line has a valid take is the one thing a reader most needs and
+                // cannot derive without cross-referencing the bindings themselves.
+                "narrated": narrated_turn_ids.contains(turn.id.as_str()),
+            })
+        })
+        .collect::<Vec<_>>();
+    // Beats are presented beside the dialogue because a pause is only meaningful next to the
+    // lines it separates, and the UI must be able to show which ones the writer chose.
+    let turn_beats = manifest
+        .turn_beats
+        .iter()
+        .map(|beat| {
+            json!({
+                "turn_id": beat.turn_id,
+                "lead_in_ms": micros_to_millis(beat.lead_in_us),
+                "overlap_ms": micros_to_millis(beat.overlap_us),
+                "source": beat.source,
             })
         })
         .collect::<Vec<_>>();
@@ -342,6 +401,15 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "scenes": scenes,
             "caption_pages": presented_caption_pages,
             "narration_bindings": narration_bindings,
+            "cast": cast,
+            "dialogue": dialogue,
+            "turn_beats": turn_beats,
+            "performance_clock": {
+                "intra_exchange_ms": micros_to_millis(manifest.performance_clock.intra_exchange_us),
+                "turn_of_thought_ms": micros_to_millis(manifest.performance_clock.turn_of_thought_us),
+                "pre_reveal_ms": micros_to_millis(manifest.performance_clock.pre_reveal_us),
+                "scene_boundary_ms": micros_to_millis(manifest.performance_clock.scene_boundary_us),
+            },
             "visual_assets": visual_assets,
             "visual_layers": visual_layers,
             "timeline": timeline,

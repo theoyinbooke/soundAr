@@ -153,6 +153,9 @@ struct DurablePlanRequest {
 struct DurableNarrationRevisionRequest {
     project_id: String,
     scene_id: String,
+    /// Set when the revision re-reads one dialogue turn rather than a whole scene.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
     binding_id: Option<String>,
     script: String,
     script_sha256: String,
@@ -325,6 +328,30 @@ pub(crate) fn dispatch_video_operation(
                 "Video project loaded with playable registered artifacts",
                 project,
                 None,
+            )
+        }
+        VideoAgentOperation::WriteVideoScript(request) => {
+            let result = runtime
+                .video
+                .apply_script(request)
+                .map_err(VideoAgentToolError::from)?;
+            let project = video::present_video_project(
+                &result.project,
+                &runtime.store.video_artifacts_root(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            let retained = result.receipt.retained_turn_ids.len();
+            let fresh = result.receipt.new_turn_ids.len();
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                // Saying which turns survived is what stops the agent re-reading lines that
+                // already have a valid take.
+                &format!(
+                    "Cast and script committed: {fresh} turn(s) need narration, {retained} existing take(s) remain valid"
+                ),
+                project,
+                Some(result.job_id),
             )
         }
         VideoAgentOperation::EditVideoTimeline(request) => {
@@ -719,6 +746,28 @@ pub(crate) async fn revise_video(
 }
 
 #[tauri::command]
+pub(crate) async fn write_video_script(
+    state: tauri::State<'_, RuntimeState>,
+    request: video::VideoScriptRequest,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = service.apply_script(request).map_err(service_error)?;
+        let project = video::present_video_project(&result.project, &video_root)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "project": project,
+            "receipt": result.receipt,
+            "job_id": result.job_id,
+            "replayed": result.replayed,
+        }))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Script worker failed: {error}"))?
+}
+
+#[tauri::command]
 pub(crate) async fn edit_video_timeline(
     state: tauri::State<'_, RuntimeState>,
     request: video::VideoTimelineEditRequest,
@@ -940,6 +989,9 @@ fn revise_project(
         let durable = DurableNarrationRevisionRequest {
             project_id: request.project_id.clone(),
             scene_id: scene.id.clone(),
+            // This command revises a whole scene's narration. Turn-scoped re-reads arrive
+            // through the dialogue path, which resolves its own binding.
+            turn_id: None,
             binding_id,
             script: script.to_string(),
             script_sha256: sha256_text(script),
@@ -1371,7 +1423,14 @@ fn narration_replacement_request(
         actor: request.actor.clone(),
         replacements: vec![video::service::NarrationReplacement {
             binding_id: request.binding_id.clone(),
-            scene_id: Some(request.scene_id.clone()),
+            // A turn-scoped revision must not also claim its scene, or the service would
+            // resolve two competing narration targets for one take.
+            scene_id: if request.turn_id.is_some() {
+                None
+            } else {
+                Some(request.scene_id.clone())
+            },
+            turn_id: request.turn_id.clone(),
             clip_id: None,
             history_id: history_id.to_string(),
             voice_id: request.voice_id.clone(),
@@ -4976,6 +5035,7 @@ mod tests {
                 video::TimelineClip {
                     id: format!("{prefix}-opening"),
                     scene_id: Some("scene-opening".into()),
+                    turn_id: None,
                     media: video::MediaReference {
                         source_asset_id: Some("source-1".into()),
                         render_artifact_id: None,
@@ -4991,6 +5051,7 @@ mod tests {
                 video::TimelineClip {
                     id: format!("{prefix}-close"),
                     scene_id: Some("scene-close".into()),
+                    turn_id: None,
                     media: video::MediaReference {
                         source_asset_id: Some("source-1".into()),
                         render_artifact_id: None,
@@ -5202,6 +5263,7 @@ mod tests {
         let durable = DurableNarrationRevisionRequest {
             project_id: "project-1".into(),
             scene_id: "scene-opening".into(),
+            turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: "A reviewed opening.".into(),
             script_sha256: sha256_text("A reviewed opening."),
@@ -5278,6 +5340,7 @@ mod tests {
         manifest.narration_bindings.push(video::NarrationBinding {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
+            turn_id: None,
             render_artifact_id: artifact.id.clone(),
             history_id: "history-exact".into(),
             generation_job_id: "synthesis-exact".into(),
@@ -5308,6 +5371,7 @@ mod tests {
         let request = DurableNarrationRevisionRequest {
             project_id: manifest.project_id.clone(),
             scene_id: "scene-opening".into(),
+            turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: script.clone(),
             script_sha256: sha256_text(&script),
@@ -5453,6 +5517,7 @@ mod tests {
         let request = DurableNarrationRevisionRequest {
             project_id: project_id.clone(),
             scene_id: "scene-opening".into(),
+            turn_id: None,
             binding_id: Some("binding-opening".into()),
             script: script.clone(),
             script_sha256: sha256_text(&script),
@@ -5585,6 +5650,7 @@ mod tests {
             .push(video::NarrationBinding {
                 id: "binding-opening".into(),
                 scene_id: Some("scene-opening".into()),
+                turn_id: None,
                 render_artifact_id: artifact_id.into(),
                 history_id: "narration-post-manifest-history".into(),
                 generation_job_id: synthesis_job_id.clone(),
@@ -6587,6 +6653,7 @@ mod tests {
         after.narration_bindings.push(video::NarrationBinding {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
+            turn_id: None,
             render_artifact_id: "speech-opening".into(),
             history_id: "history-opening".into(),
             generation_job_id: "synthesis-opening".into(),

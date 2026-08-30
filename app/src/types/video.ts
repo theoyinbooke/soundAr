@@ -238,6 +238,8 @@ export interface VideoNarrationBinding {
   language: string;
   script_sha256: string;
   created_at: string;
+  /** Set when this take performs one dialogue turn rather than a whole scene. */
+  turn_id?: string | null;
 }
 
 export interface VideoTimelineItem {
@@ -312,6 +314,14 @@ export interface VideoProjectManifest {
   candidates: CandidateVideoClip[];
   scenes: VideoScene[];
   narration_bindings: VideoNarrationBinding[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  cast?: VideoCastMember[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  dialogue?: (VideoDialogueTurn & { narrated: boolean })[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  turn_beats?: VideoTurnBeat[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  performance_clock?: VideoPerformanceClock;
   /** Present on current manifests; optional only for migration-era project compatibility. */
   visual_assets?: VideoVisualAsset[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
@@ -480,6 +490,8 @@ export type VideoTimelineOperation =
   | { type: "trim_scene"; scene_id: string; source_start_us: number; source_end_us: number }
   | { type: "reorder_scene"; scene_id: string; to_index: number }
   | { type: "merge_scenes"; first_scene_id: string; second_scene_id: string }
+  | { type: "set_turn_beat"; turn_id: string; lead_in_us: number; overlap_us: number }
+  | { type: "clear_turn_beat"; turn_id: string }
   | {
     type: "update_visual_layer";
     layer_id: string;
@@ -492,6 +504,72 @@ export type VideoTimelineOperation =
     transition_in_us: number;
     transition_out_us: number;
   };
+
+/** Per-character delivery defaults, in milli-units so a saved performance reproduces exactly. */
+export interface VideoCastDelivery {
+  /** 1000 is natural speed; 250..4000 is the supported envelope. */
+  rate_milli: number;
+  pitch_milli: number;
+  energy_milli: number;
+}
+
+/** One named character bound to the exact voice route that performs every line it speaks. */
+export interface VideoCastMember {
+  id: string;
+  /** The token used in the script, e.g. `NARRATOR`. Matched case-insensitively. */
+  name: string;
+  display_name: string;
+  voice_id: string;
+  model_id: string;
+  language: string;
+  delivery: VideoCastDelivery;
+  consent_reference_id?: string | null;
+  notes?: string | null;
+  created_at: string;
+}
+
+/** One character's uninterrupted contribution to the script, and the unit soundAr renders. */
+export interface VideoDialogueTurn {
+  id: string;
+  scene_id?: string | null;
+  order: number;
+  character_id: string;
+  /** Exactly what the voice is asked to speak. A stage direction is never part of this text. */
+  text: string;
+  direction?: string | null;
+  /** 1-indexed line in the script this turn was parsed from. */
+  source_line: number;
+  revision: number;
+}
+
+/** Whether a beat was inferred from the script or deliberately chosen by the writer. */
+export type VideoBeatSource = "derived" | "explicit";
+
+/** The silence - or overlap - immediately before one dialogue turn. */
+export interface VideoTurnBeat {
+  turn_id: string;
+  lead_in_ms: number;
+  /** How far this turn starts before the previous one ends. An interjection. */
+  overlap_ms: number;
+  source: VideoBeatSource;
+}
+
+/** The four beats a scripted conversation needs, in milliseconds. */
+export interface VideoPerformanceClock {
+  intra_exchange_ms: number;
+  turn_of_thought_ms: number;
+  pre_reveal_ms: number;
+  scene_boundary_ms: number;
+}
+
+export interface VideoScriptRequest {
+  project_id: string;
+  expected_revision: number;
+  base_version_id: string;
+  operation_id: string;
+  cast: VideoCastMember[];
+  script: string;
+}
 
 export interface VideoTimelineEditRequest {
   project_id: string;
@@ -522,6 +600,27 @@ export interface VideoTimelineChangeReceipt {
   operation_id: string;
   changed_paths: string[];
   invalidated_stages: VideoRevisionStage[];
+}
+
+export interface VideoScriptReceipt {
+  project_id: string;
+  expected_revision: number;
+  base_version_id: string;
+  operation_id: string;
+  changed_paths: string[];
+  invalidated_stages: VideoRevisionStage[];
+  /** Turns whose words are unchanged. Their existing takes are still valid. */
+  retained_turn_ids: string[];
+  /** The only turns that need narration after this revision. */
+  new_turn_ids: string[];
+  dropped_binding_ids: string[];
+}
+
+export interface VideoScriptResponse {
+  project: VideoProject;
+  receipt: VideoScriptReceipt;
+  job_id: string;
+  replayed: boolean;
 }
 
 export interface VideoTimelineEditResponse {
@@ -561,6 +660,7 @@ export interface VideoStudioService {
   getVideoProject(projectId: string): Promise<VideoProject>;
   renderVideoPreview(projectId: string, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;
   editVideoTimeline(request: VideoTimelineEditRequest): Promise<VideoTimelineEditResponse>;
+  writeVideoScript(request: VideoScriptRequest): Promise<VideoScriptResponse>;
   addVideoVisualAsset(request: AddVisualAssetRequest): Promise<AddVisualAssetResponse>;
   reviseVideo(request: ReviseVideoRequest): Promise<VideoProject>;
   exportVideo(request: VideoExportRequest, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;

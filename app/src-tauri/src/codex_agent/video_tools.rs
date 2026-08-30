@@ -55,6 +55,7 @@ pub(crate) enum VideoAgentOperationKind {
     ListVideoProjects,
     GetVideoProject,
     EditVideoTimeline,
+    WriteVideoScript,
     RegisterGeneratedVisual,
     AddVisualAsset,
     RenderVideoPreview,
@@ -78,6 +79,7 @@ impl VideoAgentOperationKind {
             Self::ListVideoProjects => "list_video_projects",
             Self::GetVideoProject => "get_video_project",
             Self::EditVideoTimeline => "edit_video_timeline",
+            Self::WriteVideoScript => "write_video_script",
             Self::RegisterGeneratedVisual => "register_generated_visual",
             Self::AddVisualAsset => "add_visual_asset",
             Self::RenderVideoPreview => "render_video_preview",
@@ -100,6 +102,7 @@ impl VideoAgentOperationKind {
             Self::PlanVideo
             | Self::ReviseVideo
             | Self::EditVideoTimeline
+            | Self::WriteVideoScript
             | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
             Self::ExportVideo | Self::ExportPublishPackage => VideoProductionPhase::Export,
@@ -123,6 +126,7 @@ pub(crate) enum VideoAgentOperation {
     ListVideoProjects(EmptyRequest),
     GetVideoProject(GetVideoProjectRequest),
     EditVideoTimeline(video::VideoTimelineEditRequest),
+    WriteVideoScript(video::VideoScriptRequest),
     RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
     AddVisualAsset(video::AddVisualAssetRequest),
     RenderVideoPreview(RenderVideoPreviewRequest),
@@ -145,6 +149,7 @@ impl VideoAgentOperation {
             Self::ListVideoProjects(_) => VideoAgentOperationKind::ListVideoProjects,
             Self::GetVideoProject(_) => VideoAgentOperationKind::GetVideoProject,
             Self::EditVideoTimeline(_) => VideoAgentOperationKind::EditVideoTimeline,
+            Self::WriteVideoScript(_) => VideoAgentOperationKind::WriteVideoScript,
             Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
             Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
             Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
@@ -168,6 +173,7 @@ impl VideoAgentOperation {
             "list_video_projects" => Self::ListVideoProjects(decode(arguments)?),
             "get_video_project" => Self::GetVideoProject(decode(arguments)?),
             "edit_video_timeline" => Self::EditVideoTimeline(decode(arguments)?),
+            "write_video_script" => Self::WriteVideoScript(decode(arguments)?),
             "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
             "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
             "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
@@ -320,6 +326,25 @@ impl VideoAgentOperation {
                     return Err(VideoAgentToolError::invalid_field(
                         "operations",
                         "Submit between one and one hundred ordered timeline edits",
+                    ));
+                }
+                Ok(())
+            }
+            Self::WriteVideoScript(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.base_version_id, "base_version_id")?;
+                require_text(&request.operation_id, "operation_id")?;
+                require_text(&request.script, "script")?;
+                if request.expected_revision < 1 {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "expected_revision",
+                        "Writing a script requires a positive current project revision",
+                    ));
+                }
+                if request.cast.is_empty() || request.cast.len() > video::MAX_CAST_MEMBERS {
+                    return Err(VideoAgentToolError::invalid_field(
+                        "cast",
+                        "Declare between one and thirty-two characters before writing a script",
                     ));
                 }
                 Ok(())
@@ -1058,6 +1083,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "list_video_projects" => VideoAgentOperationKind::ListVideoProjects,
         "get_video_project" => VideoAgentOperationKind::GetVideoProject,
         "edit_video_timeline" => VideoAgentOperationKind::EditVideoTimeline,
+        "write_video_script" => VideoAgentOperationKind::WriteVideoScript,
         "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
         "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
         "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
@@ -1079,6 +1105,7 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::PlanVideo
                 | VideoAgentOperationKind::CreateVideoProject
                 | VideoAgentOperationKind::EditVideoTimeline
+                | VideoAgentOperationKind::WriteVideoScript
                 | VideoAgentOperationKind::RegisterGeneratedVisual
                 | VideoAgentOperationKind::AddVisualAsset
                 | VideoAgentOperationKind::RenderVideoPreview
@@ -1217,8 +1244,13 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "edit_video_timeline",
-            "Apply source-clock-safe split, trim, reorder, or exact merge operations to one immutable project version. Use one stable operation_id for retries. Requires Studio or Full access.",
+            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line. Use one stable operation_id for retries. Requires Studio or Full access.",
             timeline_edit_schema(),
+        ),
+        tool(
+            "write_video_script",
+            "Declare the cast and write the speaker-attributed script for one project version. Each character is bound to one voice, and each `NAME: line` becomes one durable dialogue turn. Re-applying a script keeps every turn whose words are unchanged, so revising one line re-reads only that line. Use one stable operation_id for retries. Requires Studio or Full access.",
+            video_script_schema(),
         ),
         tool(
             "register_generated_visual",
@@ -1384,6 +1416,72 @@ fn visual_motion_schema() -> Value {
     })
 }
 
+/// The cast is the route: a character names the voice, model, and language that perform every
+/// line it speaks, so the agent cannot leave a character's delivery implicit.
+fn video_script_schema() -> Value {
+    object_schema(
+        &[
+            "project_id",
+            "expected_revision",
+            "base_version_id",
+            "operation_id",
+            "cast",
+            "script",
+        ],
+        properties([
+            ("project_id", string("Video Studio project id")),
+            ("expected_revision", json!({"type":"integer","minimum":1})),
+            (
+                "base_version_id",
+                string("Exact current immutable version id"),
+            ),
+            (
+                "operation_id",
+                string("Stable idempotency key for this exact cast and script"),
+            ),
+            (
+                "cast",
+                json!({
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": video::MAX_CAST_MEMBERS,
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "name", "display_name", "voice_id", "model_id", "language", "created_at"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": {"type": "string", "description": "Stable character id, reused across revisions"},
+                            "name": {"type": "string", "description": "Script token, e.g. NARRATOR. Matched case-insensitively"},
+                            "display_name": {"type": "string"},
+                            "voice_id": {"type": "string", "description": "Installed soundAr voice id"},
+                            "model_id": {"type": "string", "description": "Installed speech model id"},
+                            "language": {"type": "string", "description": "BCP-47 tag, e.g. en-US"},
+                            "delivery": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "rate_milli": {"type": "integer", "minimum": 250, "maximum": 4000, "description": "1000 is natural speed"},
+                                    "pitch_milli": {"type": "integer", "minimum": -1000, "maximum": 1000},
+                                    "energy_milli": {"type": "integer", "minimum": 0, "maximum": 2000}
+                                }
+                            },
+                            "consent_reference_id": {"type": ["string", "null"], "description": "Required when a cloned managed voice performs this character"},
+                            "notes": {"type": ["string", "null"]},
+                            "created_at": {"type": "string", "description": "UTC RFC3339 timestamp"}
+                        }
+                    }
+                }),
+            ),
+            (
+                "script",
+                string(
+                    "Speaker-attributed script. Each turn opens with `NAME:` naming a declared cast member; following lines continue it and a blank line closes it. A leading `(direction)` steers performance and is never spoken.",
+                ),
+            ),
+        ]),
+    )
+}
+
 fn timeline_edit_schema() -> Value {
     object_schema(
         &[
@@ -1454,6 +1552,26 @@ fn timeline_edit_schema() -> Value {
                                     "type":{"const":"merge_scenes"},
                                     "first_scene_id":{"type":"string","minLength":1},
                                     "second_scene_id":{"type":"string","minLength":1}
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","turn_id","lead_in_us","overlap_us"],
+                                "properties":{
+                                    "type":{"const":"set_turn_beat"},
+                                    "turn_id":{"type":"string","minLength":1},
+                                    "lead_in_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Silence held before this turn. Zero when the turn overlaps instead."},
+                                    "overlap_us":{"type":"integer","minimum":0,"maximum":2000000,"description":"How far this turn starts before the previous one ends. Zero when the turn waits instead."}
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","turn_id"],
+                                "properties":{
+                                    "type":{"const":"clear_turn_beat"},
+                                    "turn_id":{"type":"string","minLength":1}
                                 }
                             },
                             {
@@ -1782,8 +1900,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 17);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 17);
+        assert_eq!(names.len(), 18);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 18);
         for required in [
             "preview_link",
             "import_link",
@@ -1793,6 +1911,7 @@ mod tests {
             "list_video_projects",
             "get_video_project",
             "edit_video_timeline",
+            "write_video_script",
             "register_generated_visual",
             "add_visual_asset",
             "render_video_preview",
@@ -1862,8 +1981,25 @@ mod tests {
             schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(5)
+            Some(7)
         );
+
+        // Retiming a conversation goes through the same version-bound batch as every other edit.
+        let beats = VideoAgentOperation::parse(
+            "edit_video_timeline",
+            json!({
+                "project_id":"project-7",
+                "expected_revision":4,
+                "base_version_id":"version-4",
+                "operation_id":"operation-beats",
+                "operations":[
+                    {"type":"set_turn_beat","turn_id":"turn-b","lead_in_us":2000000,"overlap_us":0},
+                    {"type":"clear_turn_beat","turn_id":"turn-c"}
+                ]
+            }),
+        )
+        .expect("beat edit request");
+        assert_eq!(beats.kind(), VideoAgentOperationKind::EditVideoTimeline);
 
         let error = VideoAgentOperation::parse(
             "edit_video_timeline",

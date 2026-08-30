@@ -6,11 +6,14 @@
 
 pub mod assembly;
 pub mod cache;
+pub mod cast;
 pub mod contracts;
+pub mod dialogue;
 pub mod editor;
 pub mod intelligence;
 pub mod media;
 pub mod media_server;
+pub mod performance;
 pub mod presentation;
 pub mod renderer;
 pub mod scheduler;
@@ -27,7 +30,17 @@ pub use cache::{
     CacheArtifactInput, CacheKey, CacheKeyBuilder, CacheKeyInput, CacheStage, InvalidationPlan,
     ManifestChange,
 };
+pub use cast::{
+    index_cast_by_name, parse_dialogue_script, CastDelivery, CastMember, DialogueTurn, ParsedTurn,
+    MAX_CAST_MEMBERS, MAX_DIALOGUE_TURNS, MAX_DIRECTION_BYTES, MAX_SCRIPT_BYTES,
+    MAX_TURN_TEXT_BYTES,
+};
 pub use contracts::*;
+pub use performance::{
+    derive_turn_beats, BeatSource, PerformanceClock, TurnBeat, DEFAULT_INTERJECTION_OVERLAP_US,
+    MAX_BEAT_US, MAX_OVERLAP_US,
+};
+pub use dialogue::{apply_dialogue_script, AppliedDialogueScript, DialogueScriptRequest};
 pub use editor::{
     apply_timeline_edit, AppliedVideoTimelineEdit, VideoTimelineChangeReceipt,
     VideoTimelineEditRequest, VideoTimelineOperation,
@@ -69,11 +82,13 @@ pub use service::{
     CreateVideoProjectRequest as ServiceCreateVideoProjectRequest, LinkImportRequest, LinkPreview,
     LinkRightsRequest, LocalImportRequest, NarrationReplacement, PortraitRenderRequest,
     PortraitSourceLayout, ProgressCallback, PublishPackageRequest, QueuedVideoJob,
-    ReplaceNarrationRequest, ReviseVideoManifestRequest, ServiceResult, SharedGpuAdmissionGate,
+    ReplaceNarrationRequest, ReviseVideoManifestRequest, ScriptServiceResult, ServiceResult,
+    SharedGpuAdmissionGate,
     SharedGpuAdmissionLease, SharedGpuAdmissionOutcome, SharedGpuAdmissionRequest,
     SharedGpuAdmissionWait, TimelineEditServiceResult, TimelineRenderBatchRequest,
-    TimelineRenderProfile, TimelineRenderRequest, VideoJobResult, VideoServiceError,
-    VideoServiceProgress, VideoStudioService, VisualAssetOrigin, VisualSourceReceipt,
+    TimelineRenderProfile, TimelineRenderRequest, VideoJobResult, VideoScriptReceipt,
+    VideoScriptRequest, VideoServiceError, VideoServiceProgress, VideoStudioService,
+    VisualAssetOrigin, VisualSourceReceipt,
 };
 pub use timeline::{
     frame_index_at, frame_time_us, map_source_endpoint_to_timeline, map_source_to_timeline,
