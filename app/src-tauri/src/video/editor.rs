@@ -10,6 +10,7 @@ use super::contracts::{
     TimelineClip, TimelineGap, Validate, VideoError, VideoErrorCode, VideoProjectManifest,
     VideoResult,
 };
+use super::lexicon::{fingerprint_for_character, LexiconEntry};
 use super::performance::{derive_turn_beats, BeatSource, TurnBeat};
 use super::timeline::{
     map_source_endpoint_to_timeline, map_timeline_endpoint_to_source, QuantizeMode,
@@ -64,6 +65,11 @@ pub enum VideoTimelineOperation {
     },
     /// Returns one turn to the beat derived from the script.
     ClearTurnBeat { turn_id: String },
+    /// Adds or replaces one pronunciation rule. Takes produced under the rules this changes are
+    /// dropped, so the affected lines are re-read and no other line is disturbed.
+    SetLexiconEntry { entry: LexiconEntry },
+    /// Removes one pronunciation rule, dropping the takes it governed.
+    RemoveLexiconEntry { entry_id: String },
     /// Repositions or animates an existing managed visual without replacing its immutable bytes.
     UpdateVisualLayer {
         layer_id: String,
@@ -137,6 +143,12 @@ pub fn apply_timeline_edit(
             } => set_turn_beat(&mut edited, turn_id, *lead_in_us, *overlap_us)?,
             VideoTimelineOperation::ClearTurnBeat { turn_id } => {
                 clear_turn_beat(&mut edited, turn_id)?
+            }
+            VideoTimelineOperation::SetLexiconEntry { entry } => {
+                set_lexicon_entry(&mut edited, entry)?
+            }
+            VideoTimelineOperation::RemoveLexiconEntry { entry_id } => {
+                remove_lexicon_entry(&mut edited, entry_id)?
             }
             VideoTimelineOperation::UpdateVisualLayer {
                 layer_id,
@@ -252,6 +264,10 @@ fn validate_request(
             VideoTimelineOperation::SetTurnBeat { turn_id, .. }
             | VideoTimelineOperation::ClearTurnBeat { turn_id } => {
                 validate_identifier(turn_id, "operations.turn_id")?
+            }
+            VideoTimelineOperation::SetLexiconEntry { entry } => entry.validate()?,
+            VideoTimelineOperation::RemoveLexiconEntry { entry_id } => {
+                validate_identifier(entry_id, "operations.entry_id")?
             }
             VideoTimelineOperation::UpdateVisualLayer {
                 layer_id, scene_id, ..
@@ -385,6 +401,70 @@ fn clear_turn_beat(manifest: &mut VideoProjectManifest, turn_id: &str) -> VideoR
         None => manifest.turn_beats.push(restored),
     }
     Ok(())
+}
+
+fn set_lexicon_entry(manifest: &mut VideoProjectManifest, entry: &LexiconEntry) -> VideoResult<()> {
+    entry.validate()?;
+    match manifest
+        .lexicon
+        .iter_mut()
+        .find(|existing| existing.id == entry.id)
+    {
+        Some(existing) => *existing = entry.clone(),
+        None => manifest.lexicon.push(entry.clone()),
+    }
+    drop_takes_with_stale_pronunciation(manifest);
+    Ok(())
+}
+
+fn remove_lexicon_entry(manifest: &mut VideoProjectManifest, entry_id: &str) -> VideoResult<()> {
+    let before = manifest.lexicon.len();
+    manifest.lexicon.retain(|entry| entry.id != entry_id);
+    if manifest.lexicon.len() == before {
+        return Err(edit_error(
+            VideoErrorCode::MissingReference,
+            format!("pronunciation rule {entry_id} does not exist"),
+            "operations.entry_id",
+        ));
+    }
+    drop_takes_with_stale_pronunciation(manifest);
+    Ok(())
+}
+
+/// Drop only the takes whose character's rules actually changed.
+///
+/// A rule scoped to one character cannot stale another character's lines, and a project-wide rule
+/// that no line uses changes no fingerprint, so nothing is re-read for it.
+fn drop_takes_with_stale_pronunciation(manifest: &mut VideoProjectManifest) {
+    let character_by_turn = manifest
+        .dialogue
+        .iter()
+        .map(|turn| (turn.id.clone(), turn.character_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let fingerprint_by_character = manifest
+        .cast
+        .iter()
+        .map(|member| {
+            (
+                member.id.clone(),
+                fingerprint_for_character(&manifest.lexicon, &member.id),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    manifest.narration_bindings.retain(|binding| {
+        let Some(turn_id) = binding.turn_id.as_deref() else {
+            // A scene-scoped take predates the cast and is governed by no character's rules.
+            return true;
+        };
+        let Some(character_id) = character_by_turn.get(turn_id) else {
+            return true;
+        };
+        fingerprint_by_character
+            .get(character_id)
+            .cloned()
+            .flatten()
+            == binding.lexicon_fingerprint
+    });
 }
 
 fn validate_editable_scene_references(manifest: &VideoProjectManifest) -> VideoResult<()> {
@@ -2446,6 +2526,154 @@ mod tests {
         assert_eq!(restored.source, BeatSource::Derived);
     }
 
+    /// Give both turns a published take so a rule change has something to stale.
+    fn with_takes(manifest: &VideoProjectManifest) -> VideoProjectManifest {
+        use super::super::contracts::{
+            NarrationBinding, PublicationState, RenderArtifact, RenderArtifactRole,
+        };
+        use sha2::{Digest, Sha256};
+
+        let mut manifest = manifest.clone();
+        for (index, turn) in manifest.dialogue.clone().iter().enumerate() {
+            let artifact_id = format!("take-{}", turn.id);
+            manifest.render_artifacts.push(RenderArtifact {
+                id: artifact_id.clone(),
+                role: RenderArtifactRole::SceneSegment,
+                scene_id: None,
+                managed_path: format!("renders/{artifact_id}.wav"),
+                sha256: format!("{index:064}"),
+                cache_key: format!("{:064}", index + 100),
+                mime_type: "audio/wav".into(),
+                duration_us: Microseconds(1_500_000).into(),
+                width: None,
+                height: None,
+                publication_state: PublicationState::Published,
+                created_at: NOW.into(),
+            });
+            let member = manifest
+                .cast
+                .iter()
+                .find(|member| member.id == turn.character_id)
+                .unwrap()
+                .clone();
+            manifest.narration_bindings.push(NarrationBinding {
+                id: format!("binding-{}", turn.id),
+                scene_id: None,
+                turn_id: Some(turn.id.clone()),
+                lexicon_fingerprint: fingerprint_for_character(&manifest.lexicon, &member.id),
+                render_artifact_id: artifact_id,
+                history_id: format!("history-{}", turn.id),
+                generation_job_id: format!("job-{}", turn.id),
+                voice_id: member.voice_id.clone(),
+                model_id: member.model_id.clone(),
+                speaker: member.name.clone(),
+                language: member.language.clone(),
+                script_sha256: format!("{:x}", Sha256::digest(turn.text.as_bytes())),
+                created_at: NOW.into(),
+            });
+        }
+        manifest.validate_strict().unwrap();
+        manifest
+    }
+
+    fn rule(id: &str, scope: super::super::lexicon::LexiconScope, character: Option<&str>) -> LexiconEntry {
+        use super::super::lexicon::LexiconMatch;
+        LexiconEntry {
+            id: id.into(),
+            scope,
+            character_id: character.map(str::to_string),
+            match_text: "Adaeze".into(),
+            replacement: "Ah-DAH-eh-zeh".into(),
+            matching: LexiconMatch::Word,
+            notes: None,
+            created_at: NOW.into(),
+        }
+    }
+
+    #[test]
+    fn a_character_rule_drops_only_that_characters_takes() {
+        use super::super::lexicon::LexiconScope;
+
+        let manifest = with_takes(&with_dialogue(&manifest()));
+        assert_eq!(manifest.narration_bindings.len(), 2);
+
+        let edited = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetLexiconEntry {
+                entry: rule("rule-adaeze", LexiconScope::Character, Some("adaeze")),
+            }]),
+        )
+        .unwrap();
+
+        let surviving = edited
+            .manifest
+            .narration_bindings
+            .iter()
+            .map(|binding| binding.turn_id.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            surviving,
+            vec!["turn-a".to_string()],
+            "only ADAEZE's line is re-read"
+        );
+        assert!(edited
+            .receipt
+            .invalidated_stages
+            .contains(&RevisionStage::Speech));
+    }
+
+    #[test]
+    fn a_project_rule_drops_every_take_and_removing_it_drops_them_again() {
+        use super::super::lexicon::LexiconScope;
+
+        let manifest = with_takes(&with_dialogue(&manifest()));
+        let applied = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetLexiconEntry {
+                entry: rule("rule-project", LexiconScope::Project, None),
+            }]),
+        )
+        .unwrap();
+        assert!(applied.manifest.narration_bindings.is_empty());
+
+        // Re-record both takes under the new rules, then prove removing the rule stales them too.
+        let mut rerecorded = applied.manifest.clone();
+        rerecorded.narration_bindings = manifest
+            .narration_bindings
+            .iter()
+            .map(|binding| {
+                let mut binding = binding.clone();
+                binding.lexicon_fingerprint =
+                    fingerprint_for_character(&rerecorded.lexicon, "narrator");
+                binding
+            })
+            .collect();
+        rerecorded.validate_strict().unwrap();
+
+        let removed = apply_timeline_edit(
+            &rerecorded,
+            &request(vec![VideoTimelineOperation::RemoveLexiconEntry {
+                entry_id: "rule-project".into(),
+            }]),
+        )
+        .unwrap();
+        assert!(removed.manifest.lexicon.is_empty());
+        assert!(removed.manifest.narration_bindings.is_empty());
+    }
+
+    #[test]
+    fn removing_a_rule_that_does_not_exist_is_rejected() {
+        let manifest = with_dialogue(&manifest());
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::RemoveLexiconEntry {
+                entry_id: "rule-absent".into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+    }
+
     #[test]
     fn a_beat_edit_must_name_a_turn_that_exists() {
         let manifest = with_dialogue(&manifest());
@@ -2526,6 +2754,7 @@ mod tests {
             id: format!("narration-{suffix}"),
             scene_id: Some(scene_id.into()),
             turn_id: None,
+            lexicon_fingerprint: None,
             render_artifact_id: artifact_id,
             history_id: format!("history-{suffix}"),
             generation_job_id: format!("job-{suffix}"),

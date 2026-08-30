@@ -138,6 +138,57 @@ describe("videoStudioReducer", () => {
     expect(revised.project.manifest.turn_beats?.find((beat) => beat.turn_id === heldTurn)).toMatchObject({ lead_in_ms: 2_000, source: "explicit" });
   });
 
+  it("stores pronunciation rules and rejects ones that cannot apply", async () => {
+    const service = createBrowserPreviewVideoService();
+    const created = await service.createVideoProject({ prompt: "A short story about a missing letter." });
+    const cast = [
+      { id: "narrator", name: "NARRATOR", display_name: "Narrator", voice_id: "af-heart", model_id: "kokoro-82m", language: "en-US", delivery: { rate_milli: 1000, pitch_milli: 0, energy_milli: 1000 }, created_at: "2026-01-01T00:00:00Z" },
+      { id: "adaeze", name: "ADAEZE", display_name: "Adaeze", voice_id: "af-bella", model_id: "kokoro-82m", language: "en-US", delivery: { rate_milli: 1000, pitch_milli: 0, energy_milli: 1000 }, created_at: "2026-01-01T00:00:00Z" },
+    ];
+    const written = await service.writeVideoScript({
+      project_id: created.id,
+      expected_revision: created.revision,
+      base_version_id: created.manifest.version_id,
+      operation_id: "lexicon-script",
+      cast,
+      script: "NARRATOR: Adaeze came home.\n\nADAEZE: I am here.\n",
+    });
+
+    const scoped = await service.editVideoTimeline({
+      project_id: created.id,
+      expected_revision: written.project.revision,
+      base_version_id: written.project.manifest.version_id,
+      operation_id: "rule-1",
+      operations: [{ type: "set_lexicon_entry", entry: { id: "rule-adaeze", scope: "character", character_id: "adaeze", match_text: "Adaeze", replacement: "Ah-DAH-eh-zeh", matching: "word", created_at: "2026-01-01T00:00:00Z" } }],
+    });
+    expect(scoped.project.manifest.lexicon).toEqual([
+      expect.objectContaining({ id: "rule-adaeze", scope: "character", character_id: "adaeze" }),
+    ]);
+
+    // A rule naming a character outside the cast could never fire, so it fails closed.
+    await expect(
+      service.editVideoTimeline({
+        project_id: created.id, expected_revision: scoped.project.revision, base_version_id: scoped.project.manifest.version_id, operation_id: "rule-2",
+        operations: [{ type: "set_lexicon_entry", entry: { id: "rule-stray", scope: "character", character_id: "emeka", match_text: "Kano", replacement: "KAH-noh", matching: "word", created_at: "2026-01-01T00:00:00Z" } }],
+      }),
+    ).rejects.toThrow(/not in the cast/i);
+
+    // A rule that rewrites a word to itself reads as broken rather than deliberate.
+    await expect(
+      service.editVideoTimeline({
+        project_id: created.id, expected_revision: scoped.project.revision, base_version_id: scoped.project.manifest.version_id, operation_id: "rule-3",
+        operations: [{ type: "set_lexicon_entry", entry: { id: "rule-noop", scope: "project", match_text: "Kano", replacement: "Kano", matching: "word", created_at: "2026-01-01T00:00:00Z" } }],
+      }),
+    ).rejects.toThrow(/must change the text/i);
+
+    await expect(
+      service.editVideoTimeline({
+        project_id: created.id, expected_revision: scoped.project.revision, base_version_id: scoped.project.manifest.version_id, operation_id: "rule-4",
+        operations: [{ type: "remove_lexicon_entry", entry_id: "rule-absent" }],
+      }),
+    ).rejects.toThrow(/no longer exists/i);
+  });
+
   it("moves a durable project through intake, analysis, review, render, and export", async () => {
     const service = createBrowserPreviewVideoService();
     let state: VideoStudioState = initialVideoStudioState;

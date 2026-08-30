@@ -1244,7 +1244,7 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "edit_video_timeline",
-            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line. Use one stable operation_id for retries. Requires Studio or Full access.",
+            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, set or remove a pronunciation rule, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line; changing a pronunciation rule re-reads only the lines that rule governs. Use one stable operation_id for retries. Requires Studio or Full access.",
             timeline_edit_schema(),
         ),
         tool(
@@ -1572,6 +1572,38 @@ fn timeline_edit_schema() -> Value {
                                 "properties":{
                                     "type":{"const":"clear_turn_beat"},
                                     "turn_id":{"type":"string","minLength":1}
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","entry"],
+                                "properties":{
+                                    "type":{"const":"set_lexicon_entry"},
+                                    "entry":{
+                                        "type":"object",
+                                        "additionalProperties":false,
+                                        "required":["id","scope","match_text","replacement","matching","created_at"],
+                                        "properties":{
+                                            "id":{"type":"string","minLength":1},
+                                            "scope":{"type":"string","enum":["character","project","global"],"description":"Precedence runs character, then project, then global. A global entry in a project is a snapshot taken when it was imported, so the episode stays reproducible."},
+                                            "character_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for character scope and rejected for every other scope"},
+                                            "match_text":{"type":"string","minLength":1,"maxLength":200},
+                                            "replacement":{"type":"string","minLength":1,"maxLength":400,"description":"Ordinary respelled text, not a phoneme alphabet: engines differ in what notation they accept"},
+                                            "matching":{"type":"string","enum":["word","exact"],"description":"word is case-insensitive; exact is case-sensitive, for acronyms"},
+                                            "notes":{"oneOf":[{"type":"string"},{"type":"null"}]},
+                                            "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","entry_id"],
+                                "properties":{
+                                    "type":{"const":"remove_lexicon_entry"},
+                                    "entry_id":{"type":"string","minLength":1}
                                 }
                             },
                             {
@@ -1981,7 +2013,7 @@ mod tests {
             schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(7)
+            Some(9)
         );
 
         // Retiming a conversation goes through the same version-bound batch as every other edit.

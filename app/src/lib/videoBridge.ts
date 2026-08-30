@@ -26,6 +26,8 @@ import type {
   VideoProjectManifest,
   VideoProjectSummary,
   VideoCastMember,
+  VideoLexiconEntry,
+  VideoLexiconScope,
   VideoPerformanceClock,
   VideoScene,
   VideoScriptResponse,
@@ -423,6 +425,29 @@ function previewTurnIdentity(characterId: string, text: string): string {
   return hash.toString(16).padStart(8, "0");
 }
 
+/**
+ * Preview-side mirror of `video/lexicon.rs` precedence and fingerprinting. `null` means no rule
+ * governs this character, which is what a take recorded before the lexicon existed carries.
+ */
+function previewEffectiveLexicon(lexicon: VideoLexiconEntry[], characterId: string): VideoLexiconEntry[] {
+  const order: Record<VideoLexiconScope, number> = { character: 0, project: 1, global: 2 };
+  return lexicon
+    .filter((entry) => (entry.scope === "character" ? entry.character_id === characterId : true))
+    .sort((left, right) => order[left.scope] - order[right.scope] || right.match_text.length - left.match_text.length || left.id.localeCompare(right.id));
+}
+
+function previewLexiconFingerprint(lexicon: VideoLexiconEntry[], characterId: string): string | null {
+  const entries = previewEffectiveLexicon(lexicon, characterId);
+  if (!entries.length) return null;
+  let hash = 0x811c9dc5;
+  const value = entries.map((entry) => `${entry.id}\u0001${entry.match_text}\u0001${entry.replacement}\u0001${entry.matching}`).join("\u0002");
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
 const DEFAULT_PERFORMANCE_CLOCK: VideoPerformanceClock = { intra_exchange_ms: 220, turn_of_thought_ms: 600, pre_reveal_ms: 1_200, scene_boundary_ms: 900 };
 const PREVIEW_INTERJECTION_OVERLAP_MS = 250;
 const PAUSE_MARKERS = ["pause", "beat", "silence", "hesitant", "hesitates", "after a moment", "slowly", "reluctant"];
@@ -540,6 +565,31 @@ function applyBrowserTimelineOperations(project: VideoProject, request: VideoTim
         // Re-derive from the script so the restored beat is back in conversation with its neighbours.
         edited.manifest.turn_beats = derivePreviewBeats(dialogue, clock, beats.filter((beat) => beat.turn_id !== operation.turn_id));
       }
+    } else if (operation.type === "set_lexicon_entry" || operation.type === "remove_lexicon_entry") {
+      const lexicon = edited.manifest.lexicon ?? [];
+      if (operation.type === "set_lexicon_entry") {
+        const { entry } = operation;
+        if (entry.match_text.trim() === entry.replacement.trim()) throw new Error("video.invalid_lexicon: A rule must change the text it matches.");
+        if ((entry.scope === "character") !== Boolean(entry.character_id)) throw new Error("video.invalid_lexicon: Only a character-scoped rule may name a character.");
+        if (entry.character_id && !(edited.manifest.cast ?? []).some((member) => member.id === entry.character_id)) {
+          throw new Error("video.unknown_speaker: A pronunciation rule names a character who is not in the cast.");
+        }
+        edited.manifest.lexicon = lexicon.some((existing) => existing.id === entry.id)
+          ? lexicon.map((existing) => (existing.id === entry.id ? clone(entry) : existing))
+          : [...lexicon, clone(entry)];
+      } else {
+        if (!lexicon.some((existing) => existing.id === operation.entry_id)) throw new Error("video.missing_reference: The pronunciation rule no longer exists.");
+        edited.manifest.lexicon = lexicon.filter((existing) => existing.id !== operation.entry_id);
+      }
+      // Drop only the takes whose character's rules actually changed.
+      const characterByTurn = new Map((edited.manifest.dialogue ?? []).map((turn) => [turn.id, turn.character_id]));
+      const fingerprintByCharacter = new Map((edited.manifest.cast ?? []).map((member) => [member.id, previewLexiconFingerprint(edited.manifest.lexicon ?? [], member.id)]));
+      edited.manifest.narration_bindings = (edited.manifest.narration_bindings ?? []).filter((binding) => {
+        if (!binding.turn_id) return true;
+        const character = characterByTurn.get(binding.turn_id);
+        if (!character) return true;
+        return (fingerprintByCharacter.get(character) ?? null) === (binding.lexicon_fingerprint ?? null);
+      });
     } else {
       const layerIndex = (edited.manifest.visual_layers ?? []).findIndex((layer) => layer.id === operation.layer_id);
       if (layerIndex < 0) throw new Error("video.missing_reference: The image layer no longer exists.");

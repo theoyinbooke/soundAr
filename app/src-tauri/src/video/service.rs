@@ -5408,7 +5408,10 @@ pub(crate) fn invalidated_stages_for_manifest_changes(
                 RevisionStage::FinalRender,
                 RevisionStage::PublishPackage,
             ])
-        } else if path.starts_with("/cast") || path.starts_with("/dialogue") {
+        } else if path.starts_with("/cast")
+            || path.starts_with("/dialogue")
+            || path.starts_with("/lexicon")
+        {
             // A cast or script change can only invalidate performed speech and everything
             // assembled from it. Ingest, transcript, and analysis describe imported source and
             // are deliberately untouched by rewriting what the characters say.
@@ -15273,6 +15276,12 @@ impl VideoStudioService {
                     ));
                 }
             }
+            // The lexicon rewrites the line before a voice speaks it, so the generated audio is
+            // checked against the spoken text while the take still records the words the writer
+            // actually wrote.
+            let lexicon_fingerprint = turn.and_then(|turn| {
+                super::lexicon::fingerprint_for_character(&manifest.lexicon, &turn.character_id)
+            });
 
             let history = self
                 .store
@@ -15326,13 +15335,25 @@ impl VideoStudioService {
                 .or_else(|| scene.map(|scene| scene.script.as_str()))
                 .unwrap_or_else(|| history.get("text").and_then(Value::as_str).unwrap_or(""));
             let script_sha = sha256_bytes(script.as_bytes());
+            // What the engine was asked to say. Identical to the written line unless a
+            // pronunciation rule governs this character.
+            let spoken = turn
+                .map(|turn| {
+                    super::lexicon::apply_lexicon(
+                        turn.spoken_text(),
+                        &super::lexicon::effective_entries(&manifest.lexicon, &turn.character_id),
+                    )
+                    .spoken_text
+                })
+                .unwrap_or_else(|| script.to_string());
+            let spoken_sha = sha256_bytes(spoken.as_bytes());
             if (turn.is_some() || scene.is_some())
                 && history
                     .get("text")
                     .and_then(Value::as_str)
                     .map(|text| sha256_bytes(text.as_bytes()))
                     .as_deref()
-                    != Some(script_sha.as_str())
+                    != Some(spoken_sha.as_str())
             {
                 return Err(VideoServiceError::new(
                     "video.narration_script_mismatch",
@@ -15498,6 +15519,7 @@ impl VideoStudioService {
                     .unwrap_or_else(new_id),
                 scene_id: scene_id.clone(),
                 turn_id: turn_id.clone(),
+                lexicon_fingerprint: lexicon_fingerprint.clone(),
                 render_artifact_id: artifact.id.clone(),
                 history_id: replacement.history_id.clone(),
                 generation_job_id,

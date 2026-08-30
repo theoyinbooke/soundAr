@@ -745,6 +745,47 @@ pub(crate) async fn revise_video(
     .map_err(|error| format!("video.worker_failed: Revision worker failed: {error}"))?
 }
 
+/// Resolve exactly what a voice would say for a sample line, so one pronunciation rule can be
+/// auditioned without re-rendering the work around it. The caller synthesizes the returned text
+/// with the character's own voice through the ordinary speech queue.
+#[tauri::command]
+pub(crate) async fn preview_video_pronunciation(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    character_id: String,
+    sample_text: String,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let record = service.get_project(&project_id).map_err(service_error)?;
+        let manifest: video::VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or("video.invalid_manifest: Project manifest is missing")?,
+        )
+        .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+        let member = manifest
+            .cast
+            .iter()
+            .find(|member| member.id == character_id)
+            .ok_or("video.unknown_speaker: That character is not in this project's cast")?;
+        let entries = video::effective_entries(&manifest.lexicon, &member.id);
+        let applied = video::apply_lexicon(&sample_text, &entries);
+        Ok(json!({
+            "character_id": member.id,
+            "voice_id": member.voice_id,
+            "model_id": member.model_id,
+            "language": member.language,
+            "written_text": sample_text,
+            "spoken_text": applied.spoken_text,
+            "applied_entry_ids": applied.applied_entry_ids,
+        }))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Pronunciation preview failed: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn write_video_script(
     state: tauri::State<'_, RuntimeState>,
@@ -5341,6 +5382,7 @@ mod tests {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
             turn_id: None,
+            lexicon_fingerprint: None,
             render_artifact_id: artifact.id.clone(),
             history_id: "history-exact".into(),
             generation_job_id: "synthesis-exact".into(),
@@ -5651,6 +5693,7 @@ mod tests {
                 id: "binding-opening".into(),
                 scene_id: Some("scene-opening".into()),
                 turn_id: None,
+                lexicon_fingerprint: None,
                 render_artifact_id: artifact_id.into(),
                 history_id: "narration-post-manifest-history".into(),
                 generation_job_id: synthesis_job_id.clone(),
@@ -6654,6 +6697,7 @@ mod tests {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
             turn_id: None,
+            lexicon_fingerprint: None,
             render_artifact_id: "speech-opening".into(),
             history_id: "history-opening".into(),
             generation_job_id: "synthesis-opening".into(),

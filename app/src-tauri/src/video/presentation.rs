@@ -290,6 +290,24 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             })
         })
         .collect::<Vec<_>>();
+    // Rules are presented with the project so a reader can see why a name is spoken the way it is
+    // without opening the manifest.
+    let lexicon = manifest
+        .lexicon
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "scope": entry.scope,
+                "character_id": entry.character_id,
+                "match_text": entry.match_text,
+                "replacement": entry.replacement,
+                "matching": entry.matching,
+                "notes": entry.notes,
+                "created_at": entry.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
     // Beats are presented beside the dialogue because a pause is only meaningful next to the
     // lines it separates, and the UI must be able to show which ones the writer chose.
     let turn_beats = manifest
@@ -403,6 +421,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "narration_bindings": narration_bindings,
             "cast": cast,
             "dialogue": dialogue,
+            "lexicon": lexicon,
             "turn_beats": turn_beats,
             "performance_clock": {
                 "intra_exchange_ms": micros_to_millis(manifest.performance_clock.intra_exchange_us),

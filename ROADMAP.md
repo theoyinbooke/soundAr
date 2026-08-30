@@ -866,6 +866,36 @@ stories, not a finishing touch.
 - Instant audition of a single entry without rendering the surrounding work.
 - One project's lexicon never leaks into another.
 
+### Current Evidence
+
+Slice 12.3 is implemented and locally verified.
+
+- `video/lexicon.rs` holds the `LexiconEntry` contract, precedence resolution, application, and
+  fingerprinting. Precedence runs character, then project, then global, and within a scope the
+  longest match wins so a rule for a full name is not consumed by a rule for its first word.
+- A rule never fires inside a longer word, so a rule for `Ada` cannot mispronounce `Adaeze`.
+  Replacement text is final: a lower-precedence rule cannot rewrite inside it, which keeps the
+  spoken result predictable from reading the lexicon.
+- The project's lexicon is self-contained. Entries imported from the machine's global lexicon are
+  snapshotted into the project with `Global` scope, so an episode reproduces identically later even
+  if the global lexicon has since changed, and one project's rules can never reach another.
+- A take records the fingerprint of the exact rules that produced it. Changing a rule stales
+  exactly the lines that rule governs: a character-scoped rule drops only that character's takes,
+  and a rule no line uses changes no fingerprint and re-reads nothing. Takes recorded before the
+  lexicon existed carry no fingerprint and stay valid.
+- `set_lexicon_entry` and `remove_lexicon_entry` join the existing revision-checked
+  `edit_video_timeline` batch and are exposed to the assistant through that tool.
+- `preview_video_pronunciation` resolves exactly what a voice would say for a sample line, so one
+  rule can be auditioned by synthesizing one short line with the character's own voice rather than
+  re-rendering the work around it.
+- Replacements are ordinary respelled text rather than a phoneme alphabet, because soundAr's
+  engines differ in what notation they accept and a rule that works on one engine only is worse
+  than a respelling that works everywhere.
+- Verified locally: 381 native tests including sixteen lexicon cases covering precedence,
+  word boundaries, multibyte text, non-cascading replacement, and fingerprint isolation; three
+  manifest contract cases proving a rule stales only the takes it governs; and three editor cases
+  proving scoped drops. Plus 144 React tests including preview-bridge parity.
+
 ### Slice 12.4: Score Cue Sheet
 
 Depends on: 12.1, existing `AudioMix` ducking and loudness contracts.

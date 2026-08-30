@@ -8,6 +8,7 @@ use std::fmt;
 use super::cast::{
     index_cast_by_name, CastMember, DialogueTurn, MAX_CAST_MEMBERS, MAX_DIALOGUE_TURNS,
 };
+use super::lexicon::{fingerprint_for_character, validate_lexicon, LexiconEntry};
 use super::performance::{index_turns, validate_turn_beats, PerformanceClock, TurnBeat};
 use super::visuals::{VisualAsset, VisualLayer, MAX_VISUAL_ASSETS, MAX_VISUAL_LAYERS};
 
@@ -42,6 +43,7 @@ pub enum VideoErrorCode {
     InvalidNarration,
     InvalidCast,
     InvalidDialogue,
+    InvalidLexicon,
     InvalidPerformance,
     UnknownSpeaker,
     InvalidArtifact,
@@ -79,6 +81,7 @@ impl VideoErrorCode {
             Self::InvalidNarration => "video.invalid_narration",
             Self::InvalidCast => "video.invalid_cast",
             Self::InvalidDialogue => "video.invalid_dialogue",
+            Self::InvalidLexicon => "video.invalid_lexicon",
             Self::InvalidPerformance => "video.invalid_performance",
             Self::UnknownSpeaker => "video.unknown_speaker",
             Self::InvalidArtifact => "video.invalid_artifact",
@@ -1367,6 +1370,11 @@ pub struct NarrationBinding {
     /// single re-read invalidate one line instead of the whole scene that contains it.
     #[serde(default)]
     pub turn_id: Option<String>,
+    /// Fingerprint of the pronunciation rules this take was produced under. `None` means no rule
+    /// applied to its character, which is also what every take recorded before the lexicon
+    /// existed carries, so those takes stay valid.
+    #[serde(default)]
+    pub lexicon_fingerprint: Option<String>,
     pub render_artifact_id: String,
     pub history_id: String,
     pub generation_job_id: String,
@@ -1492,6 +1500,8 @@ pub struct VideoProjectManifest {
     #[serde(default)]
     pub dialogue: Vec<DialogueTurn>,
     #[serde(default)]
+    pub lexicon: Vec<LexiconEntry>,
+    #[serde(default)]
     pub performance_clock: PerformanceClock,
     #[serde(default)]
     pub turn_beats: Vec<TurnBeat>,
@@ -1536,6 +1546,7 @@ impl VideoProjectManifest {
             audio_mix,
             cast: Vec::new(),
             dialogue: Vec::new(),
+            lexicon: Vec::new(),
             performance_clock: PerformanceClock::default(),
             turn_beats: Vec::new(),
             narration_bindings: Vec::new(),
@@ -1914,6 +1925,25 @@ impl Validate for VideoProjectManifest {
             .map(|turn| (turn.id.as_str(), turn))
             .collect::<BTreeMap<_, _>>();
 
+        let cast_ids = self
+            .cast
+            .iter()
+            .map(|member| member.id.as_str())
+            .collect::<BTreeSet<_>>();
+        validate_lexicon(&self.lexicon, &cast_ids)?;
+        // Resolved once per character rather than once per take: a long episode has thousands of
+        // takes and only a handful of characters.
+        let lexicon_by_character = self
+            .cast
+            .iter()
+            .map(|member| {
+                (
+                    member.id.as_str(),
+                    fingerprint_for_character(&self.lexicon, &member.id),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
         // An overlap is only bounded against takes that actually exist; a turn with no rendered
         // narration yet has no measured duration to compare against. The index is built once here
         // rather than scanned per beat so validating a long script stays linear.
@@ -1984,6 +2014,19 @@ impl Validate for VideoProjectManifest {
                         "narration speaker does not match the character who speaks this turn",
                     )
                     .at("narration_bindings.speaker"));
+                }
+                // Changing a rule that governs this character's lines makes this take stale in
+                // exactly the way changing the line's words does.
+                if binding.lexicon_fingerprint
+                    != *lexicon_by_character
+                        .get(member.id.as_str())
+                        .unwrap_or(&None)
+                {
+                    return Err(VideoError::new(
+                        VideoErrorCode::InvalidNarration,
+                        "narration was produced under different pronunciation rules than this character now uses",
+                    )
+                    .at("narration_bindings.lexicon_fingerprint"));
                 }
             }
             if let Some(scene_id) = binding.scene_id.as_deref() {
@@ -2675,6 +2718,7 @@ mod tests {
             },
             cast: vec![],
             dialogue: vec![],
+            lexicon: vec![],
             performance_clock: PerformanceClock::default(),
             turn_beats: vec![],
             narration_bindings: vec![],
@@ -2976,6 +3020,7 @@ mod tests {
             id: "turn-binding".into(),
             scene_id: None,
             turn_id: Some("turn-1".into()),
+            lexicon_fingerprint: None,
             render_artifact_id: "turn-audio".into(),
             history_id: "history-turn".into(),
             generation_job_id: "job-turn".into(),
@@ -3033,6 +3078,80 @@ mod tests {
         let error = manifest.validate_strict().unwrap_err();
         assert_eq!(error.code, VideoErrorCode::MissingReference);
         assert_eq!(error.field.as_deref(), Some("turn_beats.turn_id"));
+    }
+
+    #[test]
+    fn a_pronunciation_rule_stales_only_the_takes_it_governs() {
+        use super::super::lexicon::{LexiconEntry, LexiconMatch, LexiconScope};
+
+        let mut manifest = dialogue_manifest();
+        // The bound take belongs to NARRATOR and was produced under no rules at all.
+        manifest.validate_strict().unwrap();
+
+        // A rule scoped to the other character cannot stale it.
+        manifest.lexicon.push(LexiconEntry {
+            id: "rule-adaeze".into(),
+            scope: LexiconScope::Character,
+            character_id: Some("adaeze".into()),
+            match_text: "harmattan".into(),
+            replacement: "har-mah-TAN".into(),
+            matching: LexiconMatch::Word,
+            notes: None,
+            created_at: timestamp(),
+        });
+        manifest.validate_strict().unwrap();
+
+        // A project-wide rule does govern this character, so its take is now stale.
+        manifest.lexicon.push(LexiconEntry {
+            id: "rule-project".into(),
+            scope: LexiconScope::Project,
+            character_id: None,
+            match_text: "harmattan".into(),
+            replacement: "HAR-mah-tan".into(),
+            matching: LexiconMatch::Word,
+            notes: None,
+            created_at: timestamp(),
+        });
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidNarration);
+        assert_eq!(
+            error.field.as_deref(),
+            Some("narration_bindings.lexicon_fingerprint")
+        );
+
+        // Recording the take against the rules that now govern it makes it valid again.
+        manifest.narration_bindings[0].lexicon_fingerprint =
+            super::super::lexicon::fingerprint_for_character(&manifest.lexicon, "narrator");
+        manifest.validate_strict().unwrap();
+    }
+
+    #[test]
+    fn a_rule_cannot_name_a_character_outside_the_cast() {
+        use super::super::lexicon::{LexiconEntry, LexiconMatch, LexiconScope};
+
+        let mut manifest = dialogue_manifest();
+        manifest.lexicon.push(LexiconEntry {
+            id: "rule-stray".into(),
+            scope: LexiconScope::Character,
+            character_id: Some("emeka".into()),
+            match_text: "harmattan".into(),
+            replacement: "har-mah-TAN".into(),
+            matching: LexiconMatch::Word,
+            notes: None,
+            created_at: timestamp(),
+        });
+        let error = manifest.validate_strict().unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::UnknownSpeaker);
+        assert_eq!(error.field.as_deref(), Some("lexicon.character_id"));
+    }
+
+    #[test]
+    fn legacy_manifests_default_to_an_empty_lexicon() {
+        let mut value = serde_json::to_value(manifest()).unwrap();
+        value.as_object_mut().unwrap().remove("lexicon");
+        let decoded = serde_json::from_value::<VideoProjectManifest>(value).unwrap();
+        assert!(decoded.lexicon.is_empty());
+        decoded.validate_strict().unwrap();
     }
 
     #[test]
@@ -3168,6 +3287,7 @@ mod tests {
             id: "narration-binding".into(),
             scene_id: Some("scene-narration".into()),
             turn_id: None,
+            lexicon_fingerprint: None,
             render_artifact_id: "narration-audio".into(),
             history_id: "history-narration".into(),
             generation_job_id: "job-narration".into(),

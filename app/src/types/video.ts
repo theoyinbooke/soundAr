@@ -240,6 +240,8 @@ export interface VideoNarrationBinding {
   created_at: string;
   /** Set when this take performs one dialogue turn rather than a whole scene. */
   turn_id?: string | null;
+  /** Fingerprint of the pronunciation rules this take was produced under. */
+  lexicon_fingerprint?: string | null;
 }
 
 export interface VideoTimelineItem {
@@ -318,6 +320,8 @@ export interface VideoProjectManifest {
   cast?: VideoCastMember[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
   dialogue?: (VideoDialogueTurn & { narrated: boolean })[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  lexicon?: VideoLexiconEntry[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
   turn_beats?: VideoTurnBeat[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
@@ -492,6 +496,8 @@ export type VideoTimelineOperation =
   | { type: "merge_scenes"; first_scene_id: string; second_scene_id: string }
   | { type: "set_turn_beat"; turn_id: string; lead_in_us: number; overlap_us: number }
   | { type: "clear_turn_beat"; turn_id: string }
+  | { type: "set_lexicon_entry"; entry: VideoLexiconEntry }
+  | { type: "remove_lexicon_entry"; entry_id: string }
   | {
     type: "update_visual_layer";
     layer_id: string;
@@ -540,6 +546,28 @@ export interface VideoDialogueTurn {
   /** 1-indexed line in the script this turn was parsed from. */
   source_line: number;
   revision: number;
+}
+
+/** Precedence runs character, then project, then global: the most specific rule wins. */
+export type VideoLexiconScope = "character" | "project" | "global";
+
+/** `word` is case-insensitive; `exact` is case-sensitive, for acronyms. */
+export type VideoLexiconMatch = "word" | "exact";
+
+/**
+ * One pronunciation rule. `replacement` is ordinary respelled text, not a phoneme alphabet,
+ * because soundAr's engines differ in what notation they accept.
+ */
+export interface VideoLexiconEntry {
+  id: string;
+  scope: VideoLexiconScope;
+  /** Required for character scope and rejected for every other scope. */
+  character_id?: string | null;
+  match_text: string;
+  replacement: string;
+  matching: VideoLexiconMatch;
+  notes?: string | null;
+  created_at: string;
 }
 
 /** Whether a beat was inferred from the script or deliberately chosen by the writer. */

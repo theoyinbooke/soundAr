@@ -11,6 +11,7 @@ pub mod contracts;
 pub mod dialogue;
 pub mod editor;
 pub mod intelligence;
+pub mod lexicon;
 pub mod media;
 pub mod media_server;
 pub mod performance;
@@ -36,6 +37,10 @@ pub use cast::{
     MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
+pub use lexicon::{
+    apply_lexicon, effective_entries, fingerprint_for_character, lexicon_fingerprint,
+    LexiconApplication, LexiconEntry, LexiconMatch, LexiconScope, MAX_LEXICON_ENTRIES,
+};
 pub use performance::{
     derive_turn_beats, BeatSource, PerformanceClock, TurnBeat, DEFAULT_INTERJECTION_OVERLAP_US,
     MAX_BEAT_US, MAX_OVERLAP_US,
