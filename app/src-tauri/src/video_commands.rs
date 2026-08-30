@@ -1649,10 +1649,19 @@ pub(crate) fn narrate_turns(
             &video::effective_entries(&manifest.lexicon, &member.id),
         )
         .spoken_text;
+        // The engine speaker is resolved from the installed voice library rather than assumed: a
+        // preset route must name its preset voice, and a cloned one carries its reference.
+        let route = resolve_voice_revision_route(
+            runtime,
+            VoiceRevisionSelection {
+                voice_id: member.voice_id.clone(),
+                model_id: member.model_id.clone(),
+                speaker: member.voice_id.clone(),
+                language: member.language.clone(),
+            },
+        )?;
         let durable = DurableNarrationRevisionRequest {
             project_id: project_id.to_string(),
-            // A turn-scoped take belongs to its line, not to a scene, so the scene is only carried
-            // for progress reporting and is never used as a second narration target.
             // A turn-scoped narration has no scene; the line is its own identity.
             scene_id: None,
             fidelity,
@@ -1660,12 +1669,12 @@ pub(crate) fn narrate_turns(
             binding_id: None,
             script_sha256: sha256_text(&spoken),
             script: spoken,
-            voice_id: member.voice_id.clone(),
-            model_id: member.model_id.clone(),
-            speaker: member.name.clone(),
-            language: member.language.clone(),
-            voice_name: member.display_name.clone(),
-            reference_audio_path: None,
+            voice_id: route.selection.voice_id,
+            model_id: route.selection.model_id,
+            speaker: route.selection.speaker,
+            language: route.selection.language,
+            voice_name: route.voice_name,
+            reference_audio_path: route.reference_audio_path,
             expected_revision: record
                 .get("revision")
                 .and_then(Value::as_i64)
@@ -6415,6 +6424,7 @@ mod tests {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
             turn_id: None,
+            character_id: None,
             lexicon_fingerprint: None,
             fidelity: video::TakeFidelity::Final,
             render_artifact_id: artifact.id.clone(),
@@ -6729,6 +6739,7 @@ mod tests {
                 id: "binding-opening".into(),
                 scene_id: Some("scene-opening".into()),
                 turn_id: None,
+                character_id: None,
                 lexicon_fingerprint: None,
                 fidelity: video::TakeFidelity::Final,
                 render_artifact_id: artifact_id.into(),
@@ -7734,6 +7745,7 @@ mod tests {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
             turn_id: None,
+            character_id: None,
             lexicon_fingerprint: None,
             fidelity: video::TakeFidelity::Final,
             render_artifact_id: "speech-opening".into(),

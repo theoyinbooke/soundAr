@@ -243,6 +243,8 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "script_sha256": binding.script_sha256,
                 "created_at": binding.created_at,
                 "turn_id": binding.turn_id,
+                // The character who performed the line, distinct from the engine's speaker above.
+                "character_id": binding.character_id,
                 "fidelity": binding.fidelity,
             })
         })

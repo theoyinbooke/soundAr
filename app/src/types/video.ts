@@ -242,6 +242,8 @@ export interface VideoNarrationBinding {
   turn_id?: string | null;
   /** Fingerprint of the pronunciation rules this take was produced under. */
   lexicon_fingerprint?: string | null;
+  /** The character who performed this line, distinct from the engine's `speaker` voice route. */
+  character_id?: string | null;
   /** A draft take is a fast stand-in and can never be exported as a master. */
   fidelity?: VideoTakeFidelity;
 }

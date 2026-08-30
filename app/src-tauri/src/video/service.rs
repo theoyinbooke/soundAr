@@ -15,18 +15,19 @@ use super::{
     plan_release, preflight_import_url_destination, probe_media, publish_atomic,
     sibling_staging_path, terminate_process_group, validate_import_url, write_ass_document_atomic,
     AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme,
-    CastMember, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser, LayoutRole,
-    LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding,
-    PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy, PublicationState, QcReport,
-    RationalFrameRate, RationalRate, ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan,
-    RenderArtifact, RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile,
-    RenderWorkloadClass, ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord,
-    RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset,
-    SourceAssetKind, TakeFidelity, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate,
-    VideoEncoder, VideoError, VideoProjectManifest, VideoTimelineChangeReceipt,
-    VideoTimelineEditRequest, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
-    MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
-    TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
+    CastMember, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser, GapReason,
+    LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds,
+    NarrationBinding, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
+    PublicationState, QcReport, RationalFrameRate, RationalRate, ReleaseMemberKind,
+    ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole, RenderCommand,
+    RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass, ResourceRequest,
+    ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis, RightsConfirmation,
+    RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity, TimeRange,
+    TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate, VideoEncoder, VideoError,
+    VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest, VisualAsset,
+    VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES,
+    MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US,
+    TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -55,6 +56,10 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+/// The track a performed line is placed on. Named rather than derived so dialogue never lands on
+/// an imported source's audio track.
+const DIALOGUE_TRACK_ID: &str = "dialogue";
 
 const SERVICE_VERSION: &str = "video-service-v1";
 const PROJECT_LOCK_SECONDS: i64 = 120;
@@ -1857,6 +1862,9 @@ struct PublishPackagePayloads {
 
 struct PreparedNarrationReplacement {
     clip_id: String,
+    /// Set when the line has never been performed, so the commit appends this clip instead of
+    /// rewriting one.
+    new_clip: Option<TimelineClip>,
     replaced_binding_id: Option<String>,
     artifact: RenderArtifact,
     binding: NarrationBinding,
@@ -14980,10 +14988,18 @@ impl VideoStudioService {
                         .as_deref()
                         .map(|value| format!("scene:{value}"))
                 })
+                // A dialogue turn is a narration target in its own right: a line has a take
+                // whether or not it has been placed on the timeline as a clip yet.
+                .or_else(|| {
+                    replacement
+                        .turn_id
+                        .as_deref()
+                        .map(|value| format!("turn:{value}"))
+                })
                 .ok_or_else(|| {
                     VideoServiceError::new(
                         "video.narration_target_required",
-                        "Select an exact narration binding, clip, or scene",
+                        "Select an exact narration binding, clip, scene, or dialogue turn",
                     )
                 })?;
             if !targets.insert(target) {
@@ -16248,8 +16264,12 @@ impl VideoStudioService {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let target_clip = match candidate_clips.as_slice() {
-                [clip] => clip.clone(),
+            // A line that has never been performed has no clip to replace. That is the ordinary first
+            // narration of a script, not a missing target, so its clip is created below at the take's
+            // own measured length once the audio has been probed.
+            let existing_clip = match candidate_clips.as_slice() {
+                [clip] => Some(clip.clone()),
+                [] if replacement.turn_id.is_some() => None,
                 [] => {
                     return Err(VideoServiceError::new(
                         "video.narration_target_not_found",
@@ -16261,7 +16281,44 @@ impl VideoStudioService {
                     "The selected scene has multiple audio clips; choose the exact narration clip",
                 )),
             };
-            if !prepared_clip_ids.insert(target_clip.id.clone()) {
+            let placement_start_us = match &existing_clip {
+                Some(clip) => clip.timeline_start_us,
+                // Appended after everything already spoken, plus this line's own beat, so the
+                // conversation is laid out in the order and timing the script asks for.
+                None => {
+                    let spoken_end = manifest
+                        .tracks
+                        .iter()
+                        .filter(|track| matches!(track.kind, TrackKind::Audio))
+                        .flat_map(|track| track.clips.iter())
+                        .filter(|clip| clip.turn_id.is_some())
+                        .map(|clip| clip.timeline_start_us.0 + clip.timeline_duration_us.0)
+                        .max()
+                        .unwrap_or(0);
+                    let beat = replacement
+                        .turn_id
+                        .as_deref()
+                        .and_then(|turn_id| {
+                            manifest
+                                .turn_beats
+                                .iter()
+                                .find(|beat| beat.turn_id == turn_id)
+                        })
+                        .map(|beat| beat.lead_in_us.0 - beat.overlap_us.0)
+                        .unwrap_or(0);
+                    Microseconds((spoken_end + beat).max(0))
+                }
+            };
+            let placeholder_clip_id = existing_clip
+                .as_ref()
+                .map(|clip| clip.id.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "dialogue-clip-{}",
+                        replacement.turn_id.as_deref().unwrap_or_default()
+                    )
+                });
+            if !prepared_clip_ids.insert(placeholder_clip_id.clone()) {
                 return Err(VideoServiceError::new(
                     "video.duplicate_narration_target",
                     "Two replacements resolved to the same narration clip",
@@ -16275,9 +16332,15 @@ impl VideoStudioService {
                         .as_ref()
                         .and_then(|binding| binding.scene_id.clone())
                 })
-                .or_else(|| target_clip.scene_id.clone());
+                .or_else(|| {
+                    existing_clip
+                        .as_ref()
+                        .and_then(|clip| clip.scene_id.clone())
+                });
             if replacement.scene_id.is_some()
-                && target_clip.scene_id.as_deref() != replacement.scene_id.as_deref()
+                && existing_clip
+                    .as_ref()
+                    .is_some_and(|clip| clip.scene_id.as_deref() != replacement.scene_id.as_deref())
             {
                 return Err(VideoServiceError::new(
                     "video.narration_target_mismatch",
@@ -16319,9 +16382,11 @@ impl VideoStudioService {
                         .as_ref()
                         .and_then(|binding| binding.turn_id.clone())
                 })
-                .or_else(|| target_clip.turn_id.clone());
+                .or_else(|| existing_clip.as_ref().and_then(|clip| clip.turn_id.clone()));
             if replacement.turn_id.is_some()
-                && target_clip.turn_id.as_deref() != replacement.turn_id.as_deref()
+                && existing_clip
+                    .as_ref()
+                    .is_some_and(|clip| clip.turn_id.as_deref() != replacement.turn_id.as_deref())
             {
                 return Err(VideoServiceError::new(
                     "video.narration_target_mismatch",
@@ -16365,14 +16430,14 @@ impl VideoStudioService {
                             "The character who speaks this turn is no longer in the cast",
                         )
                     })?;
-                if !replacement
-                    .speaker
-                    .trim()
-                    .eq_ignore_ascii_case(member.name.trim())
+                // The engine speaker is the voice route, not a person; what must match the
+                // character is the route their cast entry declares.
+                if replacement.voice_id != member.voice_id
+                    || replacement.model_id != member.model_id
                 {
                     return Err(VideoServiceError::new(
-                        "video.narration_speaker_mismatch",
-                        "The replacement speaker does not match the character who speaks this turn",
+                        "video.narration_route_mismatch",
+                        "The replacement voice route does not match the character who speaks this turn",
                     ));
                 }
             }
@@ -16469,7 +16534,11 @@ impl VideoStudioService {
             }
             validate_media_duration(source_probe.duration_us)?;
             let source_sha = sha256_file_with_cancel(&source_path, Some(cancel))?;
-            let target_duration_us = target_clip.timeline_duration_us.0;
+            // A replaced line keeps its existing slot so the timeline does not move under it; a
+            // first performance takes the take's own measured length.
+            let target_duration_us = existing_clip
+                .as_ref()
+                .map_or(source_probe.duration_us, |clip| clip.timeline_duration_us.0);
             let cache_key = CacheKeyBuilder::new(
                 CacheStage::Speech,
                 format!("{SERVICE_VERSION}:narration-conform-v1"),
@@ -16484,7 +16553,7 @@ impl VideoStudioService {
                     .unwrap_or_else(|| "unknown".to_string()),
             )
             .manifest_slice(json!({
-                "clip_id": target_clip.id,
+                "clip_id": placeholder_clip_id,
                 "scene_id": scene_id,
                 "script_sha256": script_sha,
                 "timeline_duration_us": target_duration_us,
@@ -16619,6 +16688,9 @@ impl VideoStudioService {
                     .unwrap_or_else(new_id),
                 scene_id: scene_id.clone(),
                 turn_id: turn_id.clone(),
+                // The character comes from the turn itself, so a take can never claim a character
+                // other than the one whose line it performs.
+                character_id: turn.map(|turn| turn.character_id.clone()),
                 lexicon_fingerprint: lexicon_fingerprint.clone(),
                 fidelity: replacement.fidelity,
                 render_artifact_id: artifact.id.clone(),
@@ -16674,7 +16746,26 @@ impl VideoStudioService {
                 Some(json!({ "scene_id": scene_id, "cache_hit": cache_hit })),
             );
             prepared.push(PreparedNarrationReplacement {
-                clip_id: target_clip.id,
+                clip_id: placeholder_clip_id.clone(),
+                // Present when this line has never been performed, so the commit places it rather
+                // than looking for a clip that does not exist.
+                new_clip: existing_clip.is_none().then(|| TimelineClip {
+                    id: placeholder_clip_id,
+                    scene_id: scene_id.clone(),
+                    turn_id: replacement.turn_id.clone(),
+                    media: super::MediaReference {
+                        source_asset_id: None,
+                        render_artifact_id: Some(artifact.id.clone()),
+                    },
+                    source_range: TimeRange::new(0, target_duration_us)
+                        .unwrap_or(TimeRange::new(0, 1).expect("a positive minimal range")),
+                    timeline_start_us: placement_start_us,
+                    timeline_duration_us: Microseconds(target_duration_us),
+                    playback_rate: RationalRate::ONE,
+                    gain_db_milli: 0,
+                    muted: false,
+                    crop: None,
+                }),
                 replaced_binding_id: existing_binding.map(|binding| binding.id),
                 artifact,
                 binding,
@@ -16754,10 +16845,53 @@ impl VideoStudioService {
                         }
                     }
                     if !found {
-                        return Err(VideoServiceError::new(
-                            "video.narration_target_not_found",
-                            "The narration clip changed before the revision was committed",
-                        ));
+                        // A first performance places its line rather than rewriting one, on a
+                        // dedicated dialogue track so it never disturbs imported source audio.
+                        let Some(new_clip) = replacement.new_clip.clone() else {
+                            return Err(VideoServiceError::new(
+                                "video.narration_target_not_found",
+                                "The narration clip changed before the revision was committed",
+                            ));
+                        };
+                        let end = new_clip.timeline_start_us.0 + new_clip.timeline_duration_us.0;
+                        if end > manifest.timeline_duration_us.0 {
+                            let previous_end = manifest.timeline_duration_us.0;
+                            manifest.timeline_duration_us = Microseconds(end);
+                            // A gap-preserving track must explicitly cover the whole timeline, so
+                            // lengthening the episode extends each one with a declared gap rather
+                            // than leaving an implicit hole the renderer would have to interpret.
+                            let extended = manifest
+                                .tracks
+                                .iter()
+                                .filter(|track| track.preserve_gaps)
+                                .map(|track| track.id.clone())
+                                .collect::<Vec<_>>();
+                            for track_id in extended {
+                                manifest.gaps.push(TimelineGap {
+                                    id: format!("gap-{track_id}-{previous_end:012}"),
+                                    track_id,
+                                    range: TimeRange::new(previous_end, end)?,
+                                    reason: GapReason::Padding,
+                                    source_asset_id: None,
+                                    source_range: None,
+                                });
+                            }
+                        }
+                        match manifest
+                            .tracks
+                            .iter_mut()
+                            .find(|track| track.id == DIALOGUE_TRACK_ID)
+                        {
+                            Some(track) => track.clips.push(new_clip),
+                            None => manifest.tracks.push(TimelineTrack {
+                                id: DIALOGUE_TRACK_ID.to_string(),
+                                kind: TrackKind::Audio,
+                                clips: vec![new_clip],
+                                // Dialogue occupies only the moments its lines are spoken, so this
+                                // track deliberately does not partition the timeline.
+                                preserve_gaps: false,
+                            }),
+                        }
                     }
                     if !manifest
                         .render_artifacts
@@ -16767,9 +16901,20 @@ impl VideoStudioService {
                         manifest.render_artifacts.push(replacement.artifact.clone());
                     }
                     manifest.narration_bindings.retain(|binding| {
-                        replacement.replaced_binding_id.as_deref() != Some(binding.id.as_str())
-                            && replacement.binding.scene_id.as_deref()
-                                != binding.scene_id.as_deref()
+                        if replacement.replaced_binding_id.as_deref() == Some(binding.id.as_str()) {
+                            return false;
+                        }
+                        // A line's take replaces that line's previous take; a scene's replaces that
+                        // scene's. Matching on the wrong one would drop an unrelated take, and a
+                        // scene-scoped binding has `None` here, which must not collide.
+                        match replacement.binding.turn_id.as_deref() {
+                            Some(turn_id) => binding.turn_id.as_deref() != Some(turn_id),
+                            None => {
+                                replacement.binding.scene_id.is_none()
+                                    || replacement.binding.scene_id.as_deref()
+                                        != binding.scene_id.as_deref()
+                            }
+                        }
                     });
                     manifest
                         .narration_bindings

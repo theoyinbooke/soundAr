@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.8.6 - 2026-08-30
+
+- Reported which character performed a take. The take records it, but the project view left it out,
+  so a line's performer was invisible to the UI and to the assistant even though the manifest knew
+  it.
+
+## 0.8.5 - 2026-08-30
+
+- Let a script run longer than its source. Placing a performed line past the end of the timeline
+  left the imported source's gap-preserving track no longer covering it, so narration failed with
+  `video.timeline_gap`. Lengthening an episode now extends each of those tracks with a declared gap
+  rather than leaving an implicit hole for the renderer to interpret.
+
+## 0.8.4 - 2026-08-30
+
+- Performed a script for the first time. Narrating a line that had never been read generated the
+  speech and then failed, because the only way to attach a take was to replace a clip that already
+  existed. A first performance now places its line on a dedicated dialogue track at the take's own
+  measured length, positioned after everything already spoken plus that line's beat, so a written
+  conversation is laid out in the order and timing the script asks for. Replacing an existing line
+  still keeps its slot, so the timeline does not move under it.
+
+## 0.8.3 - 2026-08-30
+
+- Accepted a dialogue line as a narration target. Performing a script generated the speech and then
+  refused to attach it, because a take could only be aimed at a binding, a clip, or a scene. A line
+  has a take whether or not it has been placed on the timeline yet.
+
+## 0.8.2 - 2026-08-30
+
+- Fixed narrating a character's line. A narration take records both the engine's speaker - which is
+  a voice route - and the character who performs the line. Those were being stored in one field, so
+  a preset voice and a character name fought over it and performing any line failed with
+  `video.voice_speaker_mismatch`. The character is now recorded separately, and a take is checked
+  against the voice route its cast entry declares rather than against a name.
+- Resolved a line's voice through the installed voice library instead of assuming it, so a preset
+  route names its preset voice and a cloned one carries its consent-backed reference.
+
 ## 0.8.1 - 2026-08-30
 
 - Made the episode surface findable. The Video Studio inspector now always offers a Cast tab

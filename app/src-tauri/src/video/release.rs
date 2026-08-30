@@ -582,6 +582,9 @@ mod tests {
                     id: format!("binding-{index}"),
                     scene_id: None,
                     turn_id: Some(format!("turn-{index}")),
+                    character_id: Some(
+                        if index % 2 == 0 { "narrator" } else { "adaeze" }.to_string(),
+                    ),
                     lexicon_fingerprint: None,
                     fidelity: if index == 3 {
                         TakeFidelity::Draft
