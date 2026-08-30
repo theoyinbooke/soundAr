@@ -990,6 +990,9 @@ export interface VideoStudioService {
   saveShowFormat(format: VideoShowFormat): Promise<VideoShowFormat>;
   deleteShowFormat(formatId: string): Promise<void>;
   createEpisode(formatId: string, episodeName: string, brief?: string): Promise<VideoProject>;
+  /** Draw this episode's cover so it can be packaged as video. Pass redraw to replace a picture
+   *  the episode already has. */
+  ensureEpisodeCover(projectId: string, redraw?: boolean): Promise<VideoProject>;
   planEpisodeRelease(projectId: string, hasShowNotes: boolean): Promise<VideoReleasePlan>;
   exportEpisodeRelease(projectId: string, hasShowNotes: boolean): Promise<VideoReleaseExportResult>;
   listenToEpisode(

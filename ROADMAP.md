@@ -1447,26 +1447,36 @@ and dialogue is the first, because performance timing, the score, sound design,
 formats, releases, quality control, and the assistant's listening pass all depend on
 turn-scoped narration existing first.
 
-## Known Boundary: Picture for an Audio-Only Episode
+## Resolved: Picture for an Audio-Only Episode
 
-An episode written entirely as dialogue has no imported video, so it has no picture. Narration
-builds it a scene and the audio path runs end to end - script, cast, beats, takes, listening,
-quality control, and release planning are all verified against real local speech - but the video
-renderer assembles scenes from canonical timeline clips and refuses one that has no visual source:
-`video.timeline_scene_track_mismatch`.
+An episode written entirely as dialogue has no imported video, so it has nothing to look at, and
+every video deliverable needs a picture. This used to stop such an episode from rendering at all -
+`video.timeline_scene_track_mismatch` - which meant the audio path ran end to end while the video
+master, and everything derived from it, stayed permanently blocked.
 
-Because `export_episode_release` derives all three deliverables from the finished master, an
-audio-only episode currently cannot export a release even though its audio exists.
+soundAr now draws the picture rather than refusing to make one:
 
-This is not a Phase 12 gap so much as an open product question: what should an audio-only episode
-look like? Video Studio already has the pieces - registered visual assets with pan-and-zoom motion,
-cards, waveform motion, and the audiogram renderer added in 12.7 - and the honest resolutions are
-either to give a dialogue episode a default visual treatment from those, or to let the release
-export derive the audio episode and audiogram from the assembled dialogue rather than from a video
-master. Both change what a release means, so neither is chosen here.
+- **A cover is generated from what the episode already knows about itself** - its name, its cast,
+  and its canvas - using FFmpeg alone. No image model, no network, and no dependency on an external
+  generator, so it works on any machine that can already render.
+- **The card is derived, not invented.** The same episode always produces the same card, so it is
+  content-addressed and cacheable, and a renamed or recast episode redraws while keeping its
+  colour. Identity chooses the palette; the title chooses only the type.
+- **It is always recorded as generated.** A drawn card carries `generated_locally` provenance and a
+  `cover-` identity, so it is never mistaken for artwork the user supplied, and an episode that has
+  its own picture keeps it - a card is a floor, never an override.
+- **A performed scene is backed by the lines performed in it.** A conversation is many takes with
+  beats between them, so requiring one clip spanning the scene meant no spoken scene could ever
+  render. The contract now accepts a scene that begins where its first line begins, ends where its
+  last line ends, and contains only lines that have a published take.
+- **An episode is as long as it was performed.** It previously carried its show format's planning
+  target as its actual length, so a seventeen-second conversation rendered as ten minutes of
+  silence held under a picture.
 
-Until it is resolved, an audio-only episode should be given a visual asset or card before rendering,
-which is existing Video Studio behavior.
+The cover is drawn automatically once a script has been performed, so an episode is packageable
+without the user having to know that a picture was the missing piece. It is also reachable
+explicitly from the Shows episode screen, from the `ensure_episode_cover` agent tool, and therefore
+from the headless CLI.
 
 ## Version Numbering
 

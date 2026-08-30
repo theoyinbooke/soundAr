@@ -1,4 +1,4 @@
-import { ArrowLeft, CircleCheck, CircleDashed, Clapperboard, LoaderCircle, Plus, TriangleAlert, UsersRound } from "lucide-react";
+import { ArrowLeft, CircleCheck, CircleDashed, Clapperboard, Image as ImageIcon, LoaderCircle, Plus, TriangleAlert, UsersRound } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { EmptyState, PageHeader, Panel } from "../components/ui";
 import { useVideoIntegration, useVideoProjectSummaries } from "../components/video/VideoIntegrationContext";
@@ -24,6 +24,7 @@ export function ShowsView() {
   const [release, setRelease] = useState<VideoReleasePlan>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [drawing, setDrawing] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -62,6 +63,25 @@ export function ShowsView() {
 
   const dialogue = episode?.manifest.dialogue ?? [];
   const cast = episode?.manifest.cast ?? [];
+  // A drawn card records itself as generated, which is how the UI can tell soundAr's fallback
+  // apart from a picture the user chose.
+  const visuals = episode?.manifest.visual_assets ?? [];
+  const cover = visuals.find((asset) => asset.provenance?.kind === "generated_locally");
+  const ownPicture = visuals.find((asset) => asset.provenance?.kind !== "generated_locally");
+
+  const drawCover = useCallback(async (redraw: boolean) => {
+    if (!service || !selectedId) return;
+    setDrawing(true);
+    setError(undefined);
+    try {
+      await service.ensureEpisodeCover(selectedId, redraw);
+      await loadEpisode(selectedId);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setDrawing(false);
+    }
+  }, [service, selectedId, loadEpisode]);
   const performed = dialogue.filter((turn) => turn.narrated && !turn.draft).length;
   const drafts = dialogue.filter((turn) => turn.draft).length;
 
@@ -115,6 +135,31 @@ export function ShowsView() {
             </li>)}
           </ol>
         </> : <p className="shows-panel-empty">No script yet.</p>}
+      </Panel>
+
+      <Panel ariaLabel="Picture">
+        <h3 className="shows-section-heading"><ImageIcon aria-hidden="true" size={13} />Picture</h3>
+        {/* Voices produce sound and nothing to look at, and every video deliverable needs a
+            picture. This says which one this episode is packaging with. */}
+        {episode?.poster_url
+          ? <img className="episode-cover" src={episode.poster_url} alt={`Cover for ${episode.name}`} />
+          : null}
+        <p className="shows-panel-empty">
+          {ownPicture
+            ? "This episode has its own artwork, so no cover is drawn for it."
+            : cover
+              ? "Drawn by soundAr from this episode's name and cast, so it can be packaged as video."
+              : "No picture yet. Without one this episode cannot be rendered or packaged as video."}
+        </p>
+        <button
+          className="button button-secondary"
+          type="button"
+          disabled={drawing}
+          onClick={() => void drawCover(Boolean(cover || ownPicture))}
+        >
+          {drawing ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <ImageIcon aria-hidden="true" size={13} />}
+          {cover || ownPicture ? "Redraw cover" : "Draw cover"}
+        </button>
       </Panel>
 
       <Panel ariaLabel="Release">

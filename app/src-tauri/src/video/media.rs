@@ -2627,6 +2627,8 @@ mod tests {
     use std::{
         io::{Read, Write},
         sync::atomic::{AtomicU64, Ordering},
+        thread,
+        time::{Duration, Instant},
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2681,10 +2683,10 @@ mod tests {
         let mut file = fs::File::create(&candidate).expect("create candidate");
         file.write_all(b"#!/bin/sh\necho 'v99.2.1'\n")
             .expect("write candidate");
-        let mut permissions = file.metadata().expect("metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&candidate, permissions).expect("make executable");
+        // Close before making it executable: while any descriptor is open for writing, executing
+        // the file fails with ETXTBSY.
         drop(file);
+        make_test_executable(&candidate);
         let mut overrides = BTreeMap::new();
         overrides.insert(MediaToolKind::Node, candidate.clone());
         let context = DiscoveryContext {
@@ -2711,10 +2713,8 @@ mod tests {
         let mut file = fs::File::create(&candidate).expect("create managed yt-dlp");
         file.write_all(b"#!/bin/sh\necho '2026.06.09'\n")
             .expect("write managed yt-dlp");
-        let mut permissions = file.metadata().expect("metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&candidate, permissions).expect("make managed yt-dlp executable");
         drop(file);
+        make_test_executable(&candidate);
 
         let context = DiscoveryContext {
             path: Some(OsString::new()),
@@ -3265,9 +3265,37 @@ mod tests {
         (client, server)
     }
 
+    /// Make a script executable and wait until it can actually be executed.
+    ///
+    /// Sibling tests in this binary spawn processes. A child forked while this file was still open
+    /// for writing inherits that descriptor until it execs, and executing the file in that window
+    /// fails with ETXTBSY - a transient scheduling accident that says nothing about the code under
+    /// test. Running it once here closes that window before the assertions depend on it. Every
+    /// script this helper is used on is trivial and side-effect free, so running it is free.
     fn make_test_executable(path: &Path) {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match Command::new(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+            {
+                Ok(_) => return,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!(
+                    "test executable {} never became runnable: {error}",
+                    path.display()
+                ),
+            }
+        }
     }
 }

@@ -1,3 +1,4 @@
+use super::cover::CoverSpec;
 use super::media::{is_executable_file, local_media_input_args, MediaError};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -239,6 +240,103 @@ pub fn build_thumbnail_command(
         },
         software_fallback: None,
     })
+}
+
+/// Draw one episode's generated cover card.
+///
+/// The card is composed entirely from lavfi and text files, so it needs no source media and no
+/// image model: an episode that has nothing to look at still yields a real picture. Text arrives
+/// as files rather than as filter arguments because a title is user data, and user data does not
+/// belong in a filter string where a comma or a quote changes what the filter means.
+pub fn build_cover_image_command(
+    ffmpeg: &Path,
+    spec: &CoverSpec,
+    title_path: &Path,
+    subtitle_path: Option<&Path>,
+    output: &Path,
+) -> Result<RenderCommandPlan, MediaError> {
+    // The title file doubles as the plan input: it is the one regular file this render reads.
+    let paths = validate_plan_paths(ffmpeg, title_path, output)?;
+    let CoverSpec {
+        width,
+        height,
+        palette,
+        ..
+    } = spec;
+    let title_size = spec.title_font_size();
+    let accent = spec.accent_height();
+
+    let mut filters = vec![
+        // A rule along the top edge, so a generated card is recognisable as one at a glance.
+        format!(
+            "drawbox=x=0:y=0:w={width}:h={accent}:color={}:t=fill",
+            palette.accent
+        ),
+        format!(
+            "drawtext=textfile='{}':expansion=none:fontcolor={}:fontsize={title_size}:x=(w-text_w)/2:y=h*0.40",
+            escape_filter_text_path(&paths.input),
+            palette.foreground
+        ),
+    ];
+    if let Some(subtitle) = subtitle_path {
+        let subtitle = fs::canonicalize(subtitle).map_err(|error| {
+            MediaError::new(
+                "render_input_not_found",
+                "The cover subtitle could not be opened",
+            )
+            .detail(error.to_string())
+        })?;
+        filters.push(format!(
+            "drawtext=textfile='{}':expansion=none:fontcolor={}:fontsize={}:x=(w-text_w)/2:y=h*0.56",
+            escape_filter_text_path(&subtitle),
+            palette.muted,
+            spec.subtitle_font_size()
+        ));
+    }
+
+    let args = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-nostdin"),
+        OsString::from("-n"),
+        OsString::from("-f"),
+        OsString::from("lavfi"),
+        OsString::from("-i"),
+        OsString::from(format!("color=c={}:s={width}x{height}", palette.background)),
+        OsString::from("-vf"),
+        OsString::from(filters.join(",")),
+        OsString::from("-frames:v"),
+        OsString::from("1"),
+        // Name the encoder rather than letting it be inferred from the output filename. A card is
+        // written to a staging path first, and a staging name has no extension to infer from - so
+        // an inferred encoder silently produced a JPEG wearing a .png name.
+        OsString::from("-c:v"),
+        OsString::from("png"),
+        OsString::from("-f"),
+        OsString::from("image2"),
+        paths.output.as_os_str().to_os_string(),
+    ];
+    Ok(RenderCommandPlan {
+        profile: RenderProfile::Proxy,
+        workload_class: RenderWorkloadClass::Light,
+        primary: RenderCommand {
+            program: paths.ffmpeg,
+            args,
+            output: paths.output,
+            encoder: VideoEncoder::Image,
+            emits_progress: false,
+        },
+        software_fallback: None,
+    })
+}
+
+/// Escape a path for use inside a filter argument, where `:` separates options and `\'` quotes.
+fn escape_filter_text_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace('\'', "\\'")
 }
 
 pub fn build_waveform_command(
@@ -1225,6 +1323,49 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_generated_cover_is_a_real_image_at_the_requested_canvas() {
+        let Some(ffmpeg) = find_in_path("ffmpeg") else {
+            return;
+        };
+        let root = TestDirectory::new("cover");
+        // A title carrying filter metacharacters must reach the card as text, not as syntax.
+        let title_path = root.0.join("title.txt");
+        fs::write(&title_path, "Close to Home: it's 'quiet', mostly").expect("write title");
+        let subtitle_path = root.0.join("subtitle.txt");
+        fs::write(&subtitle_path, "Mara \u{b7} Tobi").expect("write subtitle");
+        // A staging name, as the service uses: the format must not depend on the extension.
+        let output = root.0.join("cover.partial");
+
+        let spec = crate::video::cover::cover_spec(
+            "project-1",
+            "Close to Home: it's 'quiet', mostly",
+            &[],
+            1280,
+            720,
+        );
+        let plan =
+            build_cover_image_command(&ffmpeg, &spec, &title_path, Some(&subtitle_path), &output)
+                .expect("cover plan");
+        assert!(is_executable_file(&plan.primary.program));
+        // No encoder fallback: a card has no video encode to fall back from.
+        assert!(plan.software_fallback.is_none());
+
+        let status = Command::new(&plan.primary.program)
+            .args(&plan.primary.args)
+            .status()
+            .expect("run cover render");
+        assert!(status.success(), "cover render failed");
+
+        // Read the PNG header directly: a still has no duration, so the media prober - which is
+        // built for timed media - is the wrong instrument to measure a card with.
+        let bytes = fs::read(&output).expect("read cover");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "cover is not a PNG");
+        let width = u32::from_be_bytes(bytes[16..20].try_into().expect("width bytes"));
+        let height = u32::from_be_bytes(bytes[20..24].try_into().expect("height bytes"));
+        assert_eq!((width, height), (1280, 720));
     }
 
     #[test]

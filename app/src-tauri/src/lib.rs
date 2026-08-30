@@ -6597,6 +6597,7 @@ pub fn run() {
             video_commands::save_show_format,
             video_commands::delete_show_format,
             video_commands::create_episode,
+            video_commands::ensure_episode_cover,
             video_commands::plan_episode_release,
             video_commands::export_episode_release,
             video_commands::check_episode_quality,

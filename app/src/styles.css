@@ -2707,8 +2707,13 @@ input[type="checkbox"]:checked::before { transform: translateX(12px); }
 .project-page .project-studio { width: 100%; }
 .projects-workspace { display: none; }
 
-.episode-screen { display: grid; gap: 16px; grid-template-columns: minmax(220px, 1fr) minmax(320px, 1.6fr) minmax(260px, 1fr); align-items: start; }
+.episode-screen { display: grid; gap: 16px; grid-template-columns: minmax(220px, 1fr) minmax(300px, 1.5fr) minmax(240px, 1fr) minmax(240px, 1fr); align-items: start; }
 .episode-screen > .panel { padding: 16px; }
 .shows-section-heading { display: flex; align-items: center; gap: 6px; margin: 0 0 12px; font-size: 13px; font-weight: 600; }
 
-@media (max-width: 1100px) { .episode-screen { grid-template-columns: 1fr; } }
+@media (max-width: 1500px) { .episode-screen { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 900px) { .episode-screen { grid-template-columns: 1fr; } }
+
+/* A drawn cover is shown at the shape it will be packaged at, so what the user sees here is what
+   the episode ships with. */
+.episode-cover { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 10px; background: var(--surface-2); }

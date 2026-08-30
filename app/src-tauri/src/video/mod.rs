@@ -8,6 +8,7 @@ pub mod assembly;
 pub mod cache;
 pub mod cast;
 pub mod contracts;
+pub mod cover;
 pub mod dialogue;
 pub mod editor;
 pub mod format;
@@ -30,8 +31,8 @@ pub mod visuals;
 
 pub use assembly::{
     build_ass_document, build_timeline_render_plan, plan_caption_preview_pages,
-    present_caption_presets, write_ass_document_atomic, AssemblyOptions, CaptionPreviewPage,
-    CaptionPreviewWord, CaptionTheme,
+    present_caption_presets, profile_dimensions, write_ass_document_atomic, AssemblyOptions,
+    CaptionPreviewPage, CaptionPreviewWord, CaptionTheme,
 };
 pub use cache::{
     CacheArtifactInput, CacheKey, CacheKeyBuilder, CacheKeyInput, CacheStage, InvalidationPlan,
@@ -43,6 +44,9 @@ pub use cast::{
     MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
+pub use cover::{
+    cover_palette, cover_spec, cover_subtitle, CoverPalette, CoverSpec, COVER_PALETTES,
+};
 pub use dialogue::{apply_dialogue_script, AppliedDialogueScript, DialogueScriptRequest};
 pub use editor::{
     apply_timeline_edit, AppliedVideoTimelineEdit, VideoTimelineChangeReceipt,
@@ -90,12 +94,13 @@ pub use release::{
     TRAILER_TARGET_US,
 };
 pub use renderer::{
-    build_audiogram_command, build_loudness_analysis_command, build_podcast_audio_command,
-    build_portrait_command, build_portrait_command_with_layout, build_proxy_command,
-    build_thumbnail_command, build_trailer_command, build_waveform_command, parse_ffmpeg_progress,
-    publish_atomic, should_fallback_from_nvenc, sibling_staging_path, terminate_process_group,
-    FfmpegProgress, FfmpegProgressParser, FfmpegProgressPhase, PortraitLayout, PublishedArtifact,
-    RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, VideoEncoder,
+    build_audiogram_command, build_cover_image_command, build_loudness_analysis_command,
+    build_podcast_audio_command, build_portrait_command, build_portrait_command_with_layout,
+    build_proxy_command, build_thumbnail_command, build_trailer_command, build_waveform_command,
+    parse_ffmpeg_progress, publish_atomic, should_fallback_from_nvenc, sibling_staging_path,
+    terminate_process_group, FfmpegProgress, FfmpegProgressParser, FfmpegProgressPhase,
+    PortraitLayout, PublishedArtifact, RenderCommand, RenderCommandPlan, RenderProfile,
+    RenderWorkloadClass, VideoEncoder,
 };
 pub use scheduler::{
     AdmissionBlock, AdmissionOutcome, ResourceCapacity, ResourceClass, ResourceLease,
