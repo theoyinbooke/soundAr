@@ -13,6 +13,7 @@ use super::{
     terminate_process_group, validate_import_url, write_ass_document_atomic, AdmissionOutcome,
     apply_lexicon, build_report, diff_spoken_words, effective_entries, episode_transcript,
     findings_for_dead_air, findings_for_loudness, findings_for_turn, identify_clip_candidates,
+    listen_to_episode,
     instantiate_format, plan_release, AssemblyOptions, CandidatePolicy, CacheKeyBuilder, CacheStage, CaptionTheme, CastMember,
     DialogueScriptRequest, FfmpegProgressParser, LayoutRole,
     MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance,
@@ -22,7 +23,7 @@ use super::{
     RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, SourceAsset,
     SourceAssetKind, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder,
     VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    LoudnessMeasurement, QcReport, ReleasePlan, ShowFormat, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    EpisodeListening, LoudnessMeasurement, QcReport, ReleasePlan, ShowFormat, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
     MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
     TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
@@ -12512,6 +12513,28 @@ impl VideoStudioService {
             job_id: job_id.to_string(),
             replayed: false,
         })
+    }
+
+    /// Describe the episode as rendered, so a revision responds to something measured.
+    ///
+    /// Strictly read-only. Every number comes from a published artifact with a measured duration;
+    /// a value that was never measured is absent rather than approximated, because an
+    /// approximation the assistant cannot distinguish from a measurement is worse than no value.
+    pub fn listen_to_episode(
+        &self,
+        project_id: &str,
+        loudness: Option<LoudnessMeasurement>,
+    ) -> ServiceResult<EpisodeListening> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+        Ok(listen_to_episode(&manifest, loudness)?)
     }
 
     /// Check a rendered episode against the script it was asked to speak.

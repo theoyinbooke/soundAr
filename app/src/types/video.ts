@@ -657,6 +657,53 @@ export interface VideoMusicCueInput {
   created_at: string;
 }
 
+/** How much of the episode one character actually speaks, measured from their takes. */
+export interface VideoSpeakerShare {
+  character_id: string;
+  display_name: string;
+  narrated_turns: number;
+  spoken_us: number;
+  /** Share of all spoken time, in basis points. */
+  share_bp: number;
+}
+
+export interface VideoGapSummary {
+  count: number;
+  total_us: number;
+  longest_us: number;
+  median_us: number;
+}
+
+/** One performed line, as it actually sits in the episode. */
+export interface VideoListenedLine {
+  turn_id: string;
+  character_id: string;
+  text: string;
+  start_us: number;
+  duration_us: number;
+  /** Silence between the previous line and this one, as rendered. */
+  lead_in_us: number;
+}
+
+/**
+ * The episode as rendered rather than as planned. A line with no measured take is reported as
+ * unnarrated rather than counted, and loudness is absent unless it was measured.
+ */
+export interface VideoEpisodeListening {
+  project_id: string;
+  timeline_duration_us: number;
+  spoken_us: number;
+  narrated_turns: number;
+  unnarrated_turns: string[];
+  speakers: VideoSpeakerShare[];
+  gaps: VideoGapSummary;
+  lines: VideoListenedLine[];
+  music_cues_placed: number;
+  music_cues_planned: number;
+  sound_placements: number;
+  loudness?: { integrated_lufs_milli: number; true_peak_db_milli: number } | null;
+}
+
 export type VideoQcFindingKind =
   | "skipped_word"
   | "inserted_word"
@@ -915,6 +962,11 @@ export interface VideoStudioService {
   deleteShowFormat(formatId: string): Promise<void>;
   createEpisode(formatId: string, episodeName: string, brief?: string): Promise<VideoProject>;
   planEpisodeRelease(projectId: string, hasShowNotes: boolean): Promise<VideoReleasePlan>;
+  listenToEpisode(
+    projectId: string,
+    integratedLufsMilli?: number,
+    truePeakDbMilli?: number,
+  ): Promise<VideoEpisodeListening>;
   checkEpisodeQuality(
     projectId: string,
     heard: Record<string, string>,

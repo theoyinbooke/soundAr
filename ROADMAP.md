@@ -1129,6 +1129,32 @@ Depends on: 12.8.
   proposes turn-level revisions through the existing revision-checked tools.
 - The assistant never claims a listening result it did not receive from this tool.
 
+### Current Evidence
+
+Slice 12.9's listening tool is implemented and locally verified. The director's pass is the
+assistant's own use of it and of the existing revision-checked tools; no separate mechanism was
+added for it, because one would only duplicate them.
+
+- `video/listening.rs` reports the episode as rendered rather than as planned: which lines were
+  performed, how long each one actually runs, how the speaking time divides between characters,
+  where the silences fall, and how much score and sound design is placed. Until now the assistant
+  revised from the plan it wrote, which says what was intended rather than what exists.
+- Every number comes from a published artifact with a measured duration. A line rendered but never
+  measured is reported as unnarrated rather than counted, so a summary never describes audio nobody
+  has. Nothing is estimated from word counts or reading speed.
+- Loudness is absent unless the caller supplies a measurement, and a partial measurement is treated
+  as none. An approximation the assistant cannot distinguish from a measurement is worse than no
+  value at all.
+- Speaker share is measured from takes, so a character with few but long lines is correctly
+  reported as dominating the episode. The gap summary reports a median rather than a mean, because
+  one long pause distorts a mean.
+- `listen_to_episode` is strictly read-only and is exposed as an assistant tool and a Tauri command.
+  The producer prompt now requires it before any judgment about pacing, balance, or length, and
+  forbids stating a listening result the tool did not return or estimating a value it reported as
+  unmeasured.
+- Verified locally: 457 native tests including six listening cases covering measured-only counting,
+  rendered lead-in, speaker share, and the unmeasured-loudness rule; plus 150 React tests.
+
 ### Slice 12.10: Draft Mode
 
 Depends on: 12.1, the existing preview renderer and segment cache.

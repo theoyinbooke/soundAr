@@ -32,6 +32,7 @@ import type {
   VideoPerformanceClock,
   VideoScene,
   VideoScriptResponse,
+  VideoEpisodeListening,
   VideoQcFinding,
   VideoQcFindingKind,
   VideoQcReport,
@@ -940,6 +941,42 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       rendered.manifest.artifacts.push({ id: `${projectId}-preview`, project_id: projectId, version_id: rendered.manifest.version_id, role: "preview", title: `${rendered.name} preview`, mime_type: "video/mp4", format: "mp4", url: FIXTURE_VIDEO_URL, download_name: `${projectId}-preview.mp4`, duration_ms: rendered.duration_ms, width: 540, height: 960, frame_rate: 30, codec: "H.264", file_size_bytes: 1_448, playable: true, created_at: FIXED_NOW });
       return store(rendered);
     },
+    async listenToEpisode(projectId, integratedLufsMilli, truePeakDbMilli) {
+      const project = projects.get(projectId);
+      if (!project) throw new Error("Video project was not found.");
+      const turns = project.manifest.dialogue ?? [];
+      // Only a performed line contributes a measured duration.
+      const lines = turns.filter((turn) => turn.narrated).map((turn, index) => ({
+        turn_id: turn.id, character_id: turn.character_id, text: turn.text,
+        start_us: index * 5_000_000, duration_us: 5_000_000, lead_in_us: index === 0 ? 0 : 0,
+      }));
+      const spoken = lines.reduce((total, line) => total + line.duration_us, 0);
+      const byCharacter = new Map<string, { turns: number; spoken: number }>();
+      for (const line of lines) {
+        const entry = byCharacter.get(line.character_id) ?? { turns: 0, spoken: 0 };
+        byCharacter.set(line.character_id, { turns: entry.turns + 1, spoken: entry.spoken + line.duration_us });
+      }
+      return {
+        project_id: projectId, timeline_duration_us: project.duration_ms * 1000, spoken_us: spoken,
+        narrated_turns: lines.length,
+        unnarrated_turns: turns.filter((turn) => !turn.narrated).map((turn) => turn.id),
+        speakers: [...byCharacter.entries()].map(([characterId, entry]) => ({
+          character_id: characterId,
+          display_name: (project.manifest.cast ?? []).find((member) => member.id === characterId)?.display_name ?? characterId,
+          narrated_turns: entry.turns, spoken_us: entry.spoken,
+          share_bp: spoken > 0 ? Math.floor((entry.spoken * 10_000) / spoken) : 0,
+        })).sort((left, right) => right.spoken_us - left.spoken_us),
+        gaps: { count: 0, total_us: 0, longest_us: 0, median_us: 0 },
+        lines,
+        music_cues_placed: (project.manifest.music_cues ?? []).filter((cue) => !cue.needs_generation).length,
+        music_cues_planned: (project.manifest.music_cues ?? []).filter((cue) => cue.needs_generation).length,
+        sound_placements: (project.manifest.sound_layers ?? []).length,
+        // Absent means unmeasured, never "fine".
+        loudness: integratedLufsMilli !== undefined && truePeakDbMilli !== undefined
+          ? { integrated_lufs_milli: integratedLufsMilli, true_peak_db_milli: truePeakDbMilli }
+          : null,
+      };
+    },
     async checkEpisodeQuality(projectId, heard, integratedLufsMilli, truePeakDbMilli) {
       const project = projects.get(projectId);
       if (!project) throw new Error("Video project was not found.");
@@ -1349,6 +1386,8 @@ function createNativeVideoService(): VideoStudioService {
     deleteShowFormat: (formatId) => invoke<void>("delete_show_format", { formatId }),
     createEpisode: (formatId, episodeName, brief) => invoke<VideoProject>("create_episode", { formatId, episodeName, brief }).then(withNativeProjectUrls),
     planEpisodeRelease: (projectId, hasShowNotes) => invoke<VideoReleasePlan>("plan_episode_release", { projectId, hasShowNotes }),
+    listenToEpisode: (projectId, integratedLufsMilli, truePeakDbMilli) =>
+      invoke<VideoEpisodeListening>("listen_to_episode", { projectId, integratedLufsMilli, truePeakDbMilli }),
     checkEpisodeQuality: (projectId, heard, integratedLufsMilli, truePeakDbMilli) =>
       invoke<VideoQcReport>("check_episode_quality", { projectId, heard, integratedLufsMilli, truePeakDbMilli }),
     addVideoVisualAsset: (request) => invoke<AddVisualAssetResponse>("add_video_visual_asset", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),

@@ -13,6 +13,7 @@ pub mod editor;
 pub mod format;
 pub mod intelligence;
 pub mod lexicon;
+pub mod listening;
 pub mod media;
 pub mod media_server;
 pub mod performance;
@@ -42,6 +43,7 @@ pub use cast::{
     MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
+pub use listening::{listen_to_episode, EpisodeListening, GapSummary, ListenedLine, SpeakerShare};
 pub use quality::{
     build_report, diff_spoken_words, findings_for_caption_drift, findings_for_dead_air,
     findings_for_loudness, findings_for_turn, CaptionAlignment, LoudnessMeasurement, QcFinding,
