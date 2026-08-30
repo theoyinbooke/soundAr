@@ -28,6 +28,7 @@ import type {
   VideoCastMember,
   VideoLexiconEntry,
   VideoLexiconScope,
+  VideoMusicCue,
   VideoPerformanceClock,
   VideoScene,
   VideoScriptResponse,
@@ -590,6 +591,32 @@ function applyBrowserTimelineOperations(project: VideoProject, request: VideoTim
         if (!character) return true;
         return (fingerprintByCharacter.get(character) ?? null) === (binding.lexicon_fingerprint ?? null);
       });
+    } else if (operation.type === "set_music_cue" || operation.type === "remove_music_cue") {
+      const cues = edited.manifest.music_cues ?? [];
+      if (operation.type === "set_music_cue") {
+        const { cue } = operation;
+        const isOutro = cue.role === "outro";
+        if (isOutro !== (cue.anchor.kind === "after_final_turn")) throw new Error("video.invalid_cue: Only an outro may play after the final line, and an outro must.");
+        if (cue.fade_in_us + cue.fade_out_us > cue.target_duration_us) throw new Error("video.invalid_cue: Cue fades cannot together exceed the cue's own length.");
+        if (cue.track_id && !cue.source_asset_id) throw new Error("video.invalid_cue: A cue cannot occupy a timeline track before its music exists.");
+        if (isOutro && !(edited.manifest.dialogue ?? []).length) throw new Error("video.missing_reference: An outro needs a script to play after.");
+        if (isOutro && cues.some((existing) => existing.role === "outro" && existing.id !== cue.id)) throw new Error("video.invalid_cue: An episode may end on only one outro.");
+        const presented: VideoMusicCue = {
+          id: cue.id, role: cue.role, anchor: cue.anchor,
+          target_duration_ms: microsecondsToMilliseconds(cue.target_duration_us, "target_duration_us"),
+          direction: cue.direction, source_asset_id: cue.source_asset_id ?? null, track_id: cue.track_id ?? null,
+          gain_db: cue.gain_db_milli / 1000,
+          fade_in_ms: microsecondsToMilliseconds(cue.fade_in_us, "fade_in_us"),
+          fade_out_ms: microsecondsToMilliseconds(cue.fade_out_us, "fade_out_us"),
+          needs_generation: !cue.source_asset_id, created_at: cue.created_at,
+        };
+        edited.manifest.music_cues = cues.some((existing) => existing.id === cue.id)
+          ? cues.map((existing) => (existing.id === cue.id ? presented : existing))
+          : [...cues, presented];
+      } else {
+        if (!cues.some((existing) => existing.id === operation.cue_id)) throw new Error("video.missing_reference: The music cue no longer exists.");
+        edited.manifest.music_cues = cues.filter((existing) => existing.id !== operation.cue_id);
+      }
     } else {
       const layerIndex = (edited.manifest.visual_layers ?? []).findIndex((layer) => layer.id === operation.layer_id);
       if (layerIndex < 0) throw new Error("video.missing_reference: The image layer no longer exists.");

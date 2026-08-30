@@ -323,6 +323,8 @@ export interface VideoProjectManifest {
   /** Present on current manifests; optional only for migration-era project compatibility. */
   lexicon?: VideoLexiconEntry[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
+  music_cues?: VideoMusicCue[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
   turn_beats?: VideoTurnBeat[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
   performance_clock?: VideoPerformanceClock;
@@ -498,6 +500,8 @@ export type VideoTimelineOperation =
   | { type: "clear_turn_beat"; turn_id: string }
   | { type: "set_lexicon_entry"; entry: VideoLexiconEntry }
   | { type: "remove_lexicon_entry"; entry_id: string }
+  | { type: "set_music_cue"; cue: VideoMusicCueInput }
+  | { type: "remove_music_cue"; cue_id: string }
   | {
     type: "update_visual_layer";
     layer_id: string;
@@ -546,6 +550,48 @@ export interface VideoDialogueTurn {
   /** 1-indexed line in the script this turn was parsed from. */
   source_line: number;
   revision: number;
+}
+
+/** `sting` opens, `bed` sits under dialogue and always ducks, `outro` resolves after the last line. */
+export type VideoCueRole = "sting" | "bed" | "transition" | "outro";
+
+/** Anchored to a scene or turn so the cue moves when the script is edited. */
+export type VideoCueAnchor =
+  | { kind: "scene"; scene_id: string }
+  | { kind: "turn"; turn_id: string }
+  | { kind: "after_final_turn" };
+
+/** One piece of score. Durations are targets until local generation has produced audio. */
+export interface VideoMusicCue {
+  id: string;
+  role: VideoCueRole;
+  anchor: VideoCueAnchor;
+  target_duration_ms: number;
+  direction: string;
+  source_asset_id?: string | null;
+  /** The audio track carrying this cue. A bed placed on a track always ducks against speech. */
+  track_id?: string | null;
+  gain_db: number;
+  fade_in_ms: number;
+  fade_out_ms: number;
+  /** True while the cue is planned but its music does not exist yet. */
+  needs_generation: boolean;
+  created_at: string;
+}
+
+/** The wire shape `set_music_cue` sends, in microseconds. */
+export interface VideoMusicCueInput {
+  id: string;
+  role: VideoCueRole;
+  anchor: VideoCueAnchor;
+  target_duration_us: number;
+  direction: string;
+  source_asset_id?: string | null;
+  track_id?: string | null;
+  gain_db_milli: number;
+  fade_in_us: number;
+  fade_out_us: number;
+  created_at: string;
 }
 
 /** Precedence runs character, then project, then global: the most specific rule wins. */

@@ -18,6 +18,7 @@ pub mod performance;
 pub mod presentation;
 pub mod renderer;
 pub mod scheduler;
+pub mod score;
 pub mod service;
 pub mod timeline;
 pub mod visuals;
@@ -37,6 +38,10 @@ pub use cast::{
     MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
+pub use score::{
+    bed_ducking, fit_cue, CueAnchor, CueFit, CueFitAction, CueRole, MusicCue,
+    CUE_FIT_TOLERANCE_US, MAX_MUSIC_CUES,
+};
 pub use lexicon::{
     apply_lexicon, effective_entries, fingerprint_for_character, lexicon_fingerprint,
     LexiconApplication, LexiconEntry, LexiconMatch, LexiconScope, MAX_LEXICON_ENTRIES,

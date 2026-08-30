@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createBrowserPreviewVideoService } from "./videoBridge";
+import type { VideoMusicCueInput } from "../types/video";
 import {
   initialVideoStudioState,
   phaseForProject,
@@ -187,6 +188,43 @@ describe("videoStudioReducer", () => {
         operations: [{ type: "remove_lexicon_entry", entry_id: "rule-absent" }],
       }),
     ).rejects.toThrow(/no longer exists/i);
+  });
+
+  it("scores an episode with cues and refuses ones that could not play", async () => {
+    const service = createBrowserPreviewVideoService();
+    const created = await service.createVideoProject({ prompt: "A short story about a missing letter." });
+    const cast = [{ id: "narrator", name: "NARRATOR", display_name: "Narrator", voice_id: "af-heart", model_id: "kokoro-82m", language: "en-US", delivery: { rate_milli: 1000, pitch_milli: 0, energy_milli: 1000 }, created_at: "2026-01-01T00:00:00Z" }];
+    const written = await service.writeVideoScript({
+      project_id: created.id, expected_revision: created.revision, base_version_id: created.manifest.version_id,
+      operation_id: "score-script", cast, script: "NARRATOR: The harmattan came early.\n",
+    });
+    const cue = (overrides: Partial<VideoMusicCueInput>): VideoMusicCueInput => ({
+      id: "cue-outro", role: "outro", anchor: { kind: "after_final_turn" }, target_duration_us: 20_000_000,
+      direction: "warm, resolving, low strings", gain_db_milli: -6_000, fade_in_us: 500_000, fade_out_us: 2_000_000,
+      created_at: "2026-01-01T00:00:00Z", ...overrides,
+    });
+
+    const scored = await service.editVideoTimeline({
+      project_id: created.id, expected_revision: written.project.revision, base_version_id: written.project.manifest.version_id,
+      operation_id: "cue-1", operations: [{ type: "set_music_cue", cue: cue({}) }],
+    });
+    expect(scored.project.manifest.music_cues).toEqual([
+      expect.objectContaining({ id: "cue-outro", role: "outro", needs_generation: true, target_duration_ms: 20_000 }),
+    ]);
+
+    const rejected = async (overrides: Partial<VideoMusicCueInput>, pattern: RegExp) =>
+      expect(
+        service.editVideoTimeline({
+          project_id: created.id, expected_revision: scored.project.revision, base_version_id: scored.project.manifest.version_id,
+          operation_id: `cue-${overrides.id}`, operations: [{ type: "set_music_cue", cue: cue(overrides) }],
+        }),
+      ).rejects.toThrow(pattern);
+
+    // A sting cannot claim the ending, and a second outro would leave the renderer to choose.
+    await rejected({ id: "cue-sting", role: "sting" }, /only an outro/i);
+    await rejected({ id: "cue-outro-2" }, /only one outro/i);
+    // Music cannot occupy the timeline before it exists.
+    await rejected({ id: "cue-early", track_id: "music" }, /before its music exists/i);
   });
 
   it("moves a durable project through intake, analysis, review, render, and export", async () => {

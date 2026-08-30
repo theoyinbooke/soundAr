@@ -308,6 +308,28 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             })
         })
         .collect::<Vec<_>>();
+    // A cue reports the length it was asked for. The fitted length is only real once local
+    // generation has produced audio, so a planned cue reports no duration of its own.
+    let music_cues = manifest
+        .music_cues
+        .iter()
+        .map(|cue| {
+            json!({
+                "id": cue.id,
+                "role": cue.role,
+                "anchor": cue.anchor,
+                "target_duration_ms": micros_to_millis(cue.target_duration_us),
+                "direction": cue.direction,
+                "source_asset_id": cue.source_asset_id,
+                "track_id": cue.track_id,
+                "gain_db": f64::from(cue.gain_db_milli) / 1000.0,
+                "fade_in_ms": micros_to_millis(cue.fade_in_us),
+                "fade_out_ms": micros_to_millis(cue.fade_out_us),
+                "needs_generation": cue.needs_generation(),
+                "created_at": cue.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
     // Beats are presented beside the dialogue because a pause is only meaningful next to the
     // lines it separates, and the UI must be able to show which ones the writer chose.
     let turn_beats = manifest
@@ -422,6 +444,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "cast": cast,
             "dialogue": dialogue,
             "lexicon": lexicon,
+            "music_cues": music_cues,
             "turn_beats": turn_beats,
             "performance_clock": {
                 "intra_exchange_ms": micros_to_millis(manifest.performance_clock.intra_exchange_us),

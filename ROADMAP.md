@@ -908,6 +908,36 @@ Depends on: 12.1, existing `AudioMix` ducking and loudness contracts.
   track, using the mix contract that already exists.
 - An `outro` cue resolves after the final turn and defines the episode's end.
 
+### Current Evidence
+
+Slice 12.4 is implemented and locally verified. The remaining work is the durable job that
+generates a planned cue's music and places it on the timeline.
+
+- `video/score.rs` holds the `MusicCue` contract. A cue's role - sting, bed, transition, or outro -
+  decides where it sits and how it is mixed, rather than treating four different jobs as one
+  generic audio file stapled to the end of an episode.
+- Cues anchor to a scene or a turn rather than to an absolute timestamp, so re-reading a line or
+  retiming a pause moves the cue with it. Only an outro may anchor after the final line, only an
+  outro may use that anchor, an outro needs a script to play after, and an episode may end on only
+  one outro.
+- A bed placed on a timeline track is given its ducking envelope automatically, sidechained to the
+  audio track that actually carries narration rather than to a default the renderer would have to
+  resolve. The manifest refuses a bed on a track that does not duck, and removing a cue takes its
+  mix entry with it so no envelope is left pointing at music the project no longer has.
+- `fit_cue` fits generated music to its target. A piece that runs long is trimmed with its fade-out
+  extended to carry a musical tail rather than cut off, and the tail is bounded by half the cue so
+  a short sting cannot become mostly fade. A piece that falls more than the tolerance short is
+  reported for regeneration: stretching would change its tempo, and padding with silence would put
+  dead air where the score should be.
+- A cue cannot occupy a timeline track before its music exists, and can only reference a registered
+  soundAr music artifact, so a planned cue never presents itself as rendered score.
+- `set_music_cue` and `remove_music_cue` join the existing revision-checked `edit_video_timeline`
+  batch and are exposed to the assistant through that tool.
+- Verified locally: 398 native tests including thirteen score cases covering roles, anchors, fit
+  behaviour, and asset binding, plus four editor cases proving a bed receives its envelope, cannot
+  be placed without narration to duck against, and takes its mix entry with it on removal. Plus 145
+  React tests including preview-bridge parity.
+
 ### Slice 12.5: Sound Design Library
 
 Depends on: 12.2 for placement, existing visual-asset registration for the pattern.

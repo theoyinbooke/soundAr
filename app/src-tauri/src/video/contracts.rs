@@ -10,6 +10,7 @@ use super::cast::{
 };
 use super::lexicon::{fingerprint_for_character, validate_lexicon, LexiconEntry};
 use super::performance::{index_turns, validate_turn_beats, PerformanceClock, TurnBeat};
+use super::score::{validate_cue_sheet, MusicCue};
 use super::visuals::{VisualAsset, VisualLayer, MAX_VISUAL_ASSETS, MAX_VISUAL_LAYERS};
 
 pub const VIDEO_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -42,6 +43,8 @@ pub enum VideoErrorCode {
     InvalidAudioMix,
     InvalidNarration,
     InvalidCast,
+    InvalidCue,
+    CueFitFailed,
     InvalidDialogue,
     InvalidLexicon,
     InvalidPerformance,
@@ -80,6 +83,8 @@ impl VideoErrorCode {
             Self::InvalidAudioMix => "video.invalid_audio_mix",
             Self::InvalidNarration => "video.invalid_narration",
             Self::InvalidCast => "video.invalid_cast",
+            Self::InvalidCue => "video.invalid_cue",
+            Self::CueFitFailed => "video.cue_fit_failed",
             Self::InvalidDialogue => "video.invalid_dialogue",
             Self::InvalidLexicon => "video.invalid_lexicon",
             Self::InvalidPerformance => "video.invalid_performance",
@@ -1502,6 +1507,8 @@ pub struct VideoProjectManifest {
     #[serde(default)]
     pub lexicon: Vec<LexiconEntry>,
     #[serde(default)]
+    pub music_cues: Vec<MusicCue>,
+    #[serde(default)]
     pub performance_clock: PerformanceClock,
     #[serde(default)]
     pub turn_beats: Vec<TurnBeat>,
@@ -1547,6 +1554,7 @@ impl VideoProjectManifest {
             cast: Vec::new(),
             dialogue: Vec::new(),
             lexicon: Vec::new(),
+            music_cues: Vec::new(),
             performance_clock: PerformanceClock::default(),
             turn_beats: Vec::new(),
             narration_bindings: Vec::new(),
@@ -1931,6 +1939,65 @@ impl Validate for VideoProjectManifest {
             .map(|member| member.id.as_str())
             .collect::<BTreeSet<_>>();
         validate_lexicon(&self.lexicon, &cast_ids)?;
+        let music_asset_ids = self
+            .source_assets
+            .iter()
+            .filter(|asset| matches!(asset.kind, SourceAssetKind::SoundArMusic))
+            .map(|asset| asset.id.as_str())
+            .collect::<BTreeSet<_>>();
+        validate_cue_sheet(
+            &self.music_cues,
+            &scene_by_id.keys().copied().collect(),
+            &self
+                .dialogue
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            &music_asset_ids,
+            !self.dialogue.is_empty(),
+        )?;
+        // A bed that does not duck buries the dialogue it is supposed to support. The mix contract
+        // can already express the envelope, so the only thing missing was refusing to render a bed
+        // without one.
+        for cue in &self.music_cues {
+            let Some(track_id) = cue.track_id.as_deref() else {
+                continue;
+            };
+            let track = self
+                .tracks
+                .iter()
+                .find(|track| track.id == track_id)
+                .ok_or_else(|| {
+                    VideoError::new(
+                        VideoErrorCode::MissingReference,
+                        "a music cue references a timeline track that does not exist",
+                    )
+                    .at("music_cues.track_id")
+                })?;
+            if !matches!(track.kind, TrackKind::Audio) {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidCue,
+                    "a music cue must occupy an audio track",
+                )
+                .at("music_cues.track_id"));
+            }
+            if !cue.role.is_underscore() {
+                continue;
+            }
+            let ducks = self
+                .audio_mix
+                .tracks
+                .iter()
+                .find(|mix| mix.track_id == track_id)
+                .is_some_and(|mix| mix.ducking.is_some());
+            if !ducks {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidCue,
+                    "a music bed must duck against the speech it plays under",
+                )
+                .at("music_cues.track_id"));
+            }
+        }
         // Resolved once per character rather than once per take: a long episode has thousands of
         // takes and only a handful of characters.
         let lexicon_by_character = self
@@ -2719,6 +2786,7 @@ mod tests {
             cast: vec![],
             dialogue: vec![],
             lexicon: vec![],
+            music_cues: vec![],
             performance_clock: PerformanceClock::default(),
             turn_beats: vec![],
             narration_bindings: vec![],

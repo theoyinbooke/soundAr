@@ -6,11 +6,12 @@
 //! and commit the returned manifest with the receipt's canonical diff.
 
 use super::contracts::{
-    validate_identifier, CaptionCue, Microseconds, ReviewedScene, RevisionStage, TimeRange,
-    TimelineClip, TimelineGap, Validate, VideoError, VideoErrorCode, VideoProjectManifest,
-    VideoResult,
+    validate_identifier, AudioMixTrack, CaptionCue, Microseconds, ReviewedScene, RevisionStage,
+    TimeRange, TimelineClip, TimelineGap, TrackKind, Validate, VideoError, VideoErrorCode,
+    VideoProjectManifest, VideoResult,
 };
 use super::lexicon::{fingerprint_for_character, LexiconEntry};
+use super::score::{bed_ducking, MusicCue};
 use super::performance::{derive_turn_beats, BeatSource, TurnBeat};
 use super::timeline::{
     map_source_endpoint_to_timeline, map_timeline_endpoint_to_source, QuantizeMode,
@@ -70,6 +71,11 @@ pub enum VideoTimelineOperation {
     SetLexiconEntry { entry: LexiconEntry },
     /// Removes one pronunciation rule, dropping the takes it governed.
     RemoveLexiconEntry { entry_id: String },
+    /// Adds or replaces one music cue. A bed placed on a track is given its ducking envelope here
+    /// rather than left for the author to remember.
+    SetMusicCue { cue: MusicCue },
+    /// Removes one music cue and the mix track it owned.
+    RemoveMusicCue { cue_id: String },
     /// Repositions or animates an existing managed visual without replacing its immutable bytes.
     UpdateVisualLayer {
         layer_id: String,
@@ -149,6 +155,10 @@ pub fn apply_timeline_edit(
             }
             VideoTimelineOperation::RemoveLexiconEntry { entry_id } => {
                 remove_lexicon_entry(&mut edited, entry_id)?
+            }
+            VideoTimelineOperation::SetMusicCue { cue } => set_music_cue(&mut edited, cue)?,
+            VideoTimelineOperation::RemoveMusicCue { cue_id } => {
+                remove_music_cue(&mut edited, cue_id)?
             }
             VideoTimelineOperation::UpdateVisualLayer {
                 layer_id,
@@ -268,6 +278,10 @@ fn validate_request(
             VideoTimelineOperation::SetLexiconEntry { entry } => entry.validate()?,
             VideoTimelineOperation::RemoveLexiconEntry { entry_id } => {
                 validate_identifier(entry_id, "operations.entry_id")?
+            }
+            VideoTimelineOperation::SetMusicCue { cue } => cue.validate()?,
+            VideoTimelineOperation::RemoveMusicCue { cue_id } => {
+                validate_identifier(cue_id, "operations.cue_id")?
             }
             VideoTimelineOperation::UpdateVisualLayer {
                 layer_id, scene_id, ..
@@ -465,6 +479,106 @@ fn drop_takes_with_stale_pronunciation(manifest: &mut VideoProjectManifest) {
             .flatten()
             == binding.lexicon_fingerprint
     });
+}
+
+fn set_music_cue(manifest: &mut VideoProjectManifest, cue: &MusicCue) -> VideoResult<()> {
+    cue.validate()?;
+    match manifest.music_cues.iter_mut().find(|it| it.id == cue.id) {
+        Some(existing) => *existing = cue.clone(),
+        None => manifest.music_cues.push(cue.clone()),
+    }
+    if let Some(track_id) = cue.track_id.as_deref() {
+        if cue.role.is_underscore() {
+            // The sidechain is the speech track this bed plays under. Choosing it here, from the
+            // takes that actually exist, is what makes the envelope real rather than a default the
+            // renderer would have to resolve later.
+            let speech_track_id = speech_track_id(manifest, track_id).ok_or_else(|| {
+                edit_error(
+                    VideoErrorCode::InvalidCue,
+                    "a music bed needs narration to duck against",
+                    "operations.cue",
+                )
+            })?;
+            let ducking = bed_ducking(&speech_track_id);
+            match manifest
+                .audio_mix
+                .tracks
+                .iter_mut()
+                .find(|mix| mix.track_id == track_id)
+            {
+                Some(mix) => {
+                    mix.gain_db_milli = cue.gain_db_milli;
+                    mix.ducking = Some(ducking);
+                }
+                None => manifest.audio_mix.tracks.push(AudioMixTrack {
+                    track_id: track_id.to_string(),
+                    gain_db_milli: cue.gain_db_milli,
+                    pan_milli: 0,
+                    ducking: Some(ducking),
+                }),
+            }
+        } else if let Some(mix) = manifest
+            .audio_mix
+            .tracks
+            .iter_mut()
+            .find(|mix| mix.track_id == track_id)
+        {
+            mix.gain_db_milli = cue.gain_db_milli;
+        }
+    }
+    Ok(())
+}
+
+fn remove_music_cue(manifest: &mut VideoProjectManifest, cue_id: &str) -> VideoResult<()> {
+    let Some(index) = manifest.music_cues.iter().position(|cue| cue.id == cue_id) else {
+        return Err(edit_error(
+            VideoErrorCode::MissingReference,
+            format!("music cue {cue_id} does not exist"),
+            "operations.cue_id",
+        ));
+    };
+    let removed = manifest.music_cues.remove(index);
+    // The mix entry existed only to carry this cue, so leaving it behind would leave a ducking
+    // envelope pointing at music the project no longer has.
+    if let Some(track_id) = removed.track_id.as_deref() {
+        if !manifest
+            .music_cues
+            .iter()
+            .any(|cue| cue.track_id.as_deref() == Some(track_id))
+        {
+            manifest
+                .audio_mix
+                .tracks
+                .retain(|mix| mix.track_id != track_id);
+        }
+    }
+    Ok(())
+}
+
+/// The audio track carrying narration, which is what a bed ducks against.
+///
+/// Preferring a track that actually holds a narration take avoids sidechaining a bed to music or
+/// to another bed, which would duck against the wrong thing and sound like a fault.
+fn speech_track_id(manifest: &VideoProjectManifest, exclude_track_id: &str) -> Option<String> {
+    let narration_artifacts = manifest
+        .narration_bindings
+        .iter()
+        .map(|binding| binding.render_artifact_id.as_str())
+        .collect::<BTreeSet<_>>();
+    manifest
+        .tracks
+        .iter()
+        .find(|track| {
+            track.id != exclude_track_id
+                && matches!(track.kind, TrackKind::Audio)
+                && track.clips.iter().any(|clip| {
+                    clip.media
+                        .render_artifact_id
+                        .as_deref()
+                        .is_some_and(|id| narration_artifacts.contains(id))
+                })
+        })
+        .map(|track| track.id.clone())
 }
 
 fn validate_editable_scene_references(manifest: &VideoProjectManifest) -> VideoResult<()> {
@@ -2668,6 +2782,194 @@ mod tests {
             &manifest,
             &request(vec![VideoTimelineOperation::RemoveLexiconEntry {
                 entry_id: "rule-absent".into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+    }
+
+    /// Place a narration take on its own audio track and add an empty music track beside it, so a
+    /// bed cue has something real to duck against and somewhere real to sit.
+    fn with_music_track(manifest: &VideoProjectManifest) -> VideoProjectManifest {
+        use super::super::contracts::{MediaReference, RationalRate, TimelineTrack};
+
+        let mut manifest = with_takes(manifest);
+        let narration_artifact = manifest.narration_bindings[0].render_artifact_id.clone();
+        manifest.tracks.push(TimelineTrack {
+            id: "speech".into(),
+            kind: TrackKind::Audio,
+            preserve_gaps: false,
+            clips: vec![TimelineClip {
+                id: "speech-clip".into(),
+                scene_id: None,
+                turn_id: manifest.narration_bindings[0].turn_id.clone(),
+                media: MediaReference {
+                    source_asset_id: None,
+                    render_artifact_id: Some(narration_artifact),
+                },
+                source_range: range(0, 1_500_000),
+                timeline_start_us: Microseconds::ZERO,
+                timeline_duration_us: Microseconds(1_500_000),
+                playback_rate: RationalRate {
+                    numerator: 1,
+                    denominator: 1,
+                },
+                gain_db_milli: 0,
+                muted: false,
+                crop: None,
+            }],
+        });
+        manifest.tracks.push(TimelineTrack {
+            id: "music".into(),
+            kind: TrackKind::Audio,
+            preserve_gaps: false,
+            clips: Vec::new(),
+        });
+        manifest.validate_strict().unwrap();
+        manifest
+    }
+
+    /// A registered soundAr music artifact for a cue to point at.
+    fn music_asset() -> super::super::contracts::SourceAsset {
+        use super::super::contracts::{MediaProbe, Provenance, ProvenanceKind, SourceAsset, SourceAssetKind};
+        SourceAsset {
+            id: "music-one".into(),
+            kind: SourceAssetKind::SoundArMusic,
+            managed_path: "sources/music-one.wav".into(),
+            sha256: "c".repeat(64),
+            probe: MediaProbe {
+                duration_us: Microseconds(45_000_000),
+                width: None,
+                height: None,
+                frame_rate: None,
+                has_video: false,
+                has_audio: true,
+                format_name: "wav".into(),
+            },
+            provenance: Provenance {
+                kind: ProvenanceKind::UserUpload,
+                original_uri: None,
+                imported_at: NOW.into(),
+                producer: "editor-test".into(),
+                producer_version: None,
+                metadata: BTreeMap::new(),
+            },
+            rights_confirmation_id: None,
+        }
+    }
+
+    fn bed_cue(track_id: Option<&str>) -> MusicCue {
+        use super::super::score::{CueAnchor, CueRole};
+        MusicCue {
+            id: "cue-bed".into(),
+            role: CueRole::Bed,
+            anchor: CueAnchor::Turn {
+                turn_id: "turn-a".into(),
+            },
+            target_duration_us: Microseconds(30_000_000),
+            direction: "warm, restrained, low strings".into(),
+            source_asset_id: track_id.map(|_| "music-one".into()),
+            track_id: track_id.map(str::to_string),
+            gain_db_milli: -9_000,
+            fade_in_us: Microseconds(500_000),
+            fade_out_us: Microseconds(1_000_000),
+            created_at: NOW.into(),
+        }
+    }
+
+    #[test]
+    fn a_bed_placed_on_a_track_is_given_its_ducking_envelope() {
+        use super::super::score::DEFAULT_BED_DUCK_DB_MILLI;
+
+        let mut manifest = with_music_track(&with_dialogue(&manifest()));
+        manifest.source_assets.push(music_asset());
+        manifest.validate_strict().unwrap();
+
+        let edited = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetMusicCue {
+                cue: bed_cue(Some("music")),
+            }]),
+        )
+        .unwrap();
+
+        let mix = edited
+            .manifest
+            .audio_mix
+            .tracks
+            .iter()
+            .find(|mix| mix.track_id == "music")
+            .expect("the bed has a mix entry");
+        let ducking = mix.ducking.as_ref().expect("a bed always ducks");
+        assert_eq!(ducking.sidechain_track_id, "speech");
+        assert_eq!(ducking.reduction_db_milli, DEFAULT_BED_DUCK_DB_MILLI);
+        assert_eq!(mix.gain_db_milli, -9_000);
+
+        // Removing the cue takes its mix entry with it, so no envelope is left pointing at music
+        // the project no longer has.
+        let removed = apply_timeline_edit(
+            &edited.manifest,
+            &request(vec![VideoTimelineOperation::RemoveMusicCue {
+                cue_id: "cue-bed".into(),
+            }]),
+        )
+        .unwrap();
+        assert!(removed.manifest.music_cues.is_empty());
+        assert!(!removed
+            .manifest
+            .audio_mix
+            .tracks
+            .iter()
+            .any(|mix| mix.track_id == "music"));
+    }
+
+    #[test]
+    fn a_bed_cannot_be_placed_without_narration_to_duck_against() {
+        use super::super::contracts::TimelineTrack;
+
+        let mut manifest = with_dialogue(&manifest());
+        manifest.source_assets.push(music_asset());
+        manifest.tracks.push(TimelineTrack {
+            id: "music".into(),
+            kind: TrackKind::Audio,
+            preserve_gaps: false,
+            clips: Vec::new(),
+        });
+        manifest.validate_strict().unwrap();
+
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetMusicCue {
+                cue: bed_cue(Some("music")),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidCue);
+    }
+
+    #[test]
+    fn a_planned_cue_needs_no_track_and_no_mix_entry() {
+        let manifest = with_dialogue(&manifest());
+        let edited = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetMusicCue {
+                cue: bed_cue(None),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(edited.manifest.music_cues.len(), 1);
+        assert!(edited.manifest.music_cues[0].needs_generation());
+        // Nothing is placed in the mix until there is music to place.
+        assert_eq!(edited.manifest.audio_mix.tracks, manifest.audio_mix.tracks);
+    }
+
+    #[test]
+    fn removing_a_cue_that_does_not_exist_is_rejected() {
+        let manifest = with_dialogue(&manifest());
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::RemoveMusicCue {
+                cue_id: "cue-absent".into(),
             }]),
         )
         .unwrap_err();

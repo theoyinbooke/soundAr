@@ -1244,7 +1244,7 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "edit_video_timeline",
-            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, set or remove a pronunciation rule, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line; changing a pronunciation rule re-reads only the lines that rule governs. Use one stable operation_id for retries. Requires Studio or Full access.",
+            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, set or remove a pronunciation rule, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line; changing a pronunciation rule re-reads only the lines that rule governs; a music bed placed on a track always ducks against the speech beneath it. Use one stable operation_id for retries. Requires Studio or Full access.",
             timeline_edit_schema(),
         ),
         tool(
@@ -1604,6 +1604,48 @@ fn timeline_edit_schema() -> Value {
                                 "properties":{
                                     "type":{"const":"remove_lexicon_entry"},
                                     "entry_id":{"type":"string","minLength":1}
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","cue"],
+                                "properties":{
+                                    "type":{"const":"set_music_cue"},
+                                    "cue":{
+                                        "type":"object",
+                                        "additionalProperties":false,
+                                        "required":["id","role","anchor","target_duration_us","direction","gain_db_milli","fade_in_us","fade_out_us","created_at"],
+                                        "properties":{
+                                            "id":{"type":"string","minLength":1},
+                                            "role":{"type":"string","enum":["sting","bed","transition","outro"],"description":"sting opens, bed sits under dialogue and always ducks, transition covers a cut, outro resolves after the final line"},
+                                            "anchor":{
+                                                "oneOf":[
+                                                    {"type":"object","additionalProperties":false,"required":["kind","scene_id"],"properties":{"kind":{"const":"scene"},"scene_id":{"type":"string","minLength":1}}},
+                                                    {"type":"object","additionalProperties":false,"required":["kind","turn_id"],"properties":{"kind":{"const":"turn"},"turn_id":{"type":"string","minLength":1}}},
+                                                    {"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"const":"after_final_turn"}}}
+                                                ],
+                                                "description":"Anchor to a scene or turn so the cue moves when the script is edited. Only an outro may use after_final_turn, and an outro must use it."
+                                            },
+                                            "target_duration_us":{"type":"integer","minimum":500000,"maximum":900000000,"description":"Ask the local music engine for this length; the rendered result is fitted to it"},
+                                            "direction":{"type":"string","minLength":1,"maxLength":2000},
+                                            "source_asset_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"The registered soundAr music artifact once generated; null while the cue is only planned"},
+                                            "track_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"The audio track carrying this cue. Requires source_asset_id. A bed placed on a track is given its ducking envelope automatically."},
+                                            "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000},
+                                            "fade_in_us":{"type":"integer","minimum":0},
+                                            "fade_out_us":{"type":"integer","minimum":0},
+                                            "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","cue_id"],
+                                "properties":{
+                                    "type":{"const":"remove_music_cue"},
+                                    "cue_id":{"type":"string","minLength":1}
                                 }
                             },
                             {
@@ -2013,7 +2055,7 @@ mod tests {
             schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(9)
+            Some(11)
         );
 
         // Retiming a conversation goes through the same version-bound batch as every other edit.
