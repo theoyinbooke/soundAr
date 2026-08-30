@@ -59,6 +59,23 @@ export function VideoMasterCard({
   );
 }
 
+/**
+ * How a production's state reads to a person.
+ *
+ * The stored status is an internal state name; showing it raw leaks words like "failed" that mean
+ * something narrower than a reader assumes.
+ */
+export function videoProjectStatusLabel(project: { status: string; master?: unknown }): string {
+  if (project.master) return "Final master";
+  return {
+    editing: "Draft",
+    review: "In review",
+    rendering: "Rendering",
+    exporting: "Exporting",
+    failed: "Needs attention",
+  }[project.status] ?? project.status;
+}
+
 export function sortVideoProjectsForLibrary(projects: VideoProjectSummary[]) {
   return [...projects].sort((left, right) => {
     if (Boolean(left.master) !== Boolean(right.master)) return left.master ? -1 : 1;

@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import packageMetadata from "../../package.json" with { type: "json" };
 
-const routes = ["Generate", "Video Studio", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History"];
+const routes = ["Generate", "Video Studio", "Shows", "Projects", "Voices", "Models", "Compare", "Benchmarks", "History"];
 const allRoutes = [...routes, "Settings", "About"];
 const mobileDirectRoutes = new Set(["Generate", "Video Studio", "Projects", "History"]);
 
@@ -353,8 +353,8 @@ test("projects support create, edit, undo, redo, and local save", async ({ page 
   await page.getByRole("button", { name: "Redo chapter edit" }).click();
   await expect(page.getByLabel("Script")).toHaveValue("A durable chapter edited through the real workspace.");
   await page.getByRole("button", { name: "Save", exact: true }).click();
-  const savedProject = page.locator(".project-row").filter({ hasText: "Responsive release narration" });
-  await expect(savedProject).toContainText("1 chapter / 0 rendered");
+  const savedProject = page.locator(".project-table tbody tr").filter({ hasText: "Responsive release narration" });
+  await expect(savedProject).toContainText("1 chapter · 0 rendered");
   await expect(page.getByLabel("Not saved yet")).toHaveCount(0);
   await page.getByText("Production and export").click();
   await page.getByRole("button", { name: "Render changed (1)" }).click();
