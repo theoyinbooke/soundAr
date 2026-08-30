@@ -32,6 +32,7 @@ import type {
   VideoPerformanceClock,
   VideoScene,
   VideoScriptResponse,
+  VideoSoundAsset,
   VideoSoundLayer,
   VideoStudioService,
   VideoTimelineManifest,
@@ -648,6 +649,40 @@ function applyBrowserTimelineOperations(project: VideoProject, request: VideoTim
       } else {
         if (!layers.some((existing) => existing.id === operation.layer_id)) throw new Error("video.missing_reference: The sound placement no longer exists.");
         edited.manifest.sound_layers = layers.filter((existing) => existing.id !== operation.layer_id);
+      }
+    } else if (operation.type === "register_sound_asset" || operation.type === "remove_sound_asset" || operation.type === "place_music_cue") {
+      const assets = edited.manifest.sound_assets ?? [];
+      if (operation.type === "register_sound_asset") {
+        // Sound design labels media the project already imported; it never names a path.
+        if (operation.source_asset_id !== edited.manifest.source.id) {
+          throw new Error("video.missing_reference: That managed source is not registered in this project.");
+        }
+        if (assets.some((asset) => asset.source_asset_id === operation.source_asset_id && asset.id !== operation.asset_id)) {
+          throw new Error("video.duplicate_id: That managed source is already registered as a sound asset.");
+        }
+        const registered: VideoSoundAsset = {
+          id: operation.asset_id, name: operation.name, source_asset_id: operation.source_asset_id,
+          local_path: edited.manifest.source.local_path ?? null,
+          duration_ms: edited.manifest.source.duration_ms ?? null,
+          tags: [...operation.tags], created_at: FIXED_NOW,
+        };
+        edited.manifest.sound_assets = assets.some((asset) => asset.id === operation.asset_id)
+          ? assets.map((asset) => (asset.id === operation.asset_id ? registered : asset))
+          : [...assets, registered];
+      } else if (operation.type === "remove_sound_asset") {
+        if (!assets.some((asset) => asset.id === operation.asset_id)) throw new Error("video.missing_reference: The sound asset no longer exists.");
+        edited.manifest.sound_assets = assets.filter((asset) => asset.id !== operation.asset_id);
+        // A placement without its audio cannot be rendered, so it goes with the sound.
+        edited.manifest.sound_layers = (edited.manifest.sound_layers ?? []).filter((layer) => layer.asset_id !== operation.asset_id);
+      } else {
+        const cues = edited.manifest.music_cues ?? [];
+        const cue = cues.find((existing) => existing.id === operation.cue_id);
+        if (!cue) throw new Error("video.missing_reference: The music cue no longer exists.");
+        if (!cue.needs_generation) throw new Error("video.invalid_cue: That cue already has music placed.");
+        edited.manifest.music_cues = cues.map((existing) =>
+          existing.id === operation.cue_id
+            ? { ...existing, source_asset_id: operation.source_asset_id, track_id: `music-${operation.cue_id}`, needs_generation: false }
+            : existing);
       }
     } else {
       const layerIndex = (edited.manifest.visual_layers ?? []).findIndex((layer) => layer.id === operation.layer_id);

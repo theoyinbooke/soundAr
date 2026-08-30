@@ -910,8 +910,7 @@ Depends on: 12.1, existing `AudioMix` ducking and loudness contracts.
 
 ### Current Evidence
 
-Slice 12.4 is implemented and locally verified. The remaining work is the durable job that
-generates a planned cue's music and places it on the timeline.
+Slice 12.4 is implemented and locally verified, end to end.
 
 - `video/score.rs` holds the `MusicCue` contract. A cue's role - sting, bed, transition, or outro -
   decides where it sits and how it is mixed, rather than treating four different jobs as one
@@ -931,8 +930,17 @@ generates a planned cue's music and places it on the timeline.
   dead air where the score should be.
 - A cue cannot occupy a timeline track before its music exists, and can only reference a registered
   soundAr music artifact, so a planned cue never presents itself as rendered score.
-- `set_music_cue` and `remove_music_cue` join the existing revision-checked `edit_video_timeline`
-  batch and are exposed to the assistant through that tool.
+- `set_music_cue`, `remove_music_cue`, and `place_music_cue` join the existing revision-checked
+  `edit_video_timeline` batch and are exposed to the assistant through that tool.
+- `generate_cue_music` is the durable job that closes the loop: it asks the installed local music
+  model for the cue's exact target length, registers the result through the ordinary managed import
+  so a cue can only point at bytes soundAr owns, fits it, and places it at its anchor. It uses the
+  same parent/child idempotency as prompt-to-video, so a crash between composing and placing adopts
+  the existing History rather than asking the GPU for the same piece twice, and the generation seed
+  is derived from the direction so a resume produces the piece the user approved.
+- Anchors resolve at placement time from the timeline as it stands, so a cue can be authored before
+  the scenes and takes it refers to are final. An outro cannot be placed before there is narration
+  to resolve after, and a cue that will not fit inside the timeline at its anchor is refused.
 - Verified locally: 398 native tests including thirteen score cases covering roles, anchors, fit
   behaviour, and asset binding, plus four editor cases proving a bed receives its envelope, cannot
   be placed without narration to duck against, and takes its mix entry with it on removal. Plus 145
@@ -951,8 +959,7 @@ Depends on: 12.2 for placement, existing visual-asset registration for the patte
 
 ### Current Evidence
 
-Slice 12.5 is implemented and locally verified. The remaining work is the durable registration job
-that copies, hashes, and probes a user-selected file into the managed sound library.
+Slice 12.5 is implemented and locally verified, end to end.
 
 - `video/sound.rs` holds the `SoundAsset` and `SoundLayer` contracts. Nothing here generates audio:
   assets are files the user already has, carrying the same rights and provenance record as any
@@ -967,9 +974,19 @@ that copies, hashes, and probes a user-selected file into the managed sound libr
   to a scene rather than to one line. No placement may spill past its scene into the next cut.
 - Assets are found by normalized tag rather than filename, because the assistant proposes
   placements from written stage directions rather than from a controlled vocabulary.
-- `set_sound_layer` and `remove_sound_layer` join the existing revision-checked
-  `edit_video_timeline` batch. A placement can only reference an already registered asset, so a
-  proposal from a stage direction can never invent audio the project does not have.
+- Registration reuses the ordinary local-import pipeline rather than duplicating it. The media is
+  imported as managed media - copied, checksummed, and probed by the proven path - and
+  `register_sound_asset` then labels that managed source. A `SoundAsset` therefore carries only a
+  name and its tags; duplicating the path, checksum, or duration would create a second copy of
+  facts that could disagree with the source they describe. Because only the native import path can
+  create a managed source, the assistant can never name an arbitrary file on the machine.
+- Media with no audio track cannot become sound design, one managed source is registered as exactly
+  one sound, and removing a sound removes its placements rather than leaving the manifest with a
+  placement that has no audio.
+- `register_sound_asset`, `remove_sound_asset`, `set_sound_layer`, and `remove_sound_layer` join the
+  existing revision-checked `edit_video_timeline` batch. A placement can only reference an already
+  registered asset, so a proposal from a stage direction can never invent audio the project does
+  not have.
 - The `edit_video_timeline` operation union outgrew a single `json!` literal and now builds from one
   schema function per operation.
 - Verified locally: 415 native tests including thirteen sound cases and four editor cases, plus 146

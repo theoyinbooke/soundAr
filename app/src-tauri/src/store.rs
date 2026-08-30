@@ -2432,6 +2432,7 @@ impl Store {
                      WHERE kind IN (
                         'video_analyze', 'video_plan', 'video_regenerate_narration',
                         'video_create_from_prompt', 'video_apply_script',
+                        'video_generate_cue_music', 'video_register_sound',
                         'video_import_local', 'video_import_link',
                         'video_render_preview', 'video_render_final',
                         'video_render_timeline_preview', 'video_render_timeline_final',

@@ -1987,6 +1987,12 @@ impl Validate for VideoProjectManifest {
                 .iter()
                 .map(|turn| turn.id.as_str())
                 .collect::<BTreeSet<_>>(),
+            &self
+                .source_assets
+                .iter()
+                .filter(|asset| asset.probe.has_audio)
+                .map(|asset| asset.id.as_str())
+                .collect::<BTreeSet<_>>(),
         )?;
 
         // A bed that does not duck buries the dialogue it is supposed to support. The mix contract

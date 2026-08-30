@@ -40,8 +40,8 @@ pub use cast::{
 };
 pub use contracts::*;
 pub use sound::{
-    assets_matching_tag, SoundAsset, SoundLayer, SoundMimeType, SoundPlacementKind,
-    MAX_SOUND_ASSETS, MAX_SOUND_LAYERS,
+    assets_matching_tag, SoundAsset, SoundLayer, SoundPlacementKind, MAX_SOUND_ASSETS,
+    MAX_SOUND_LAYERS,
 };
 pub use score::{
     bed_ducking, fit_cue, CueAnchor, CueFit, CueFitAction, CueRole, MusicCue,

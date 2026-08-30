@@ -190,6 +190,25 @@ struct DurablePromptVideoRequest {
     priority: String,
 }
 
+/// Owns the complete cue -> local music -> registered timeline placement pipeline.
+///
+/// The parent is created before generation and every child is idempotently bound to its id, so a
+/// crash between generating the music and placing it adopts the existing History and import rather
+/// than asking the GPU for the same piece twice.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DurableCueMusicRequest {
+    project_id: String,
+    cue_id: String,
+    direction: String,
+    direction_sha256: String,
+    target_duration_us: i64,
+    model_id: String,
+    title: String,
+    actor: String,
+    priority: String,
+}
+
 /// Single native dispatcher shared by the authenticated Codex dynamic tools and Tauri commands.
 /// Every branch delegates to the same service-backed operation helpers below; there is no
 /// assistant-only media runner or alternate persistence path.
@@ -347,11 +366,31 @@ pub(crate) fn dispatch_video_operation(
                 VideoAgentResultStatus::Completed,
                 // Saying which turns survived is what stops the agent re-reading lines that
                 // already have a valid take.
-                &format!(
+                format!(
                     "Cast and script committed: {fresh} turn(s) need narration, {retained} existing take(s) remain valid"
                 ),
                 project,
                 Some(result.job_id),
+            )
+        }
+        VideoAgentOperation::GenerateCueMusic(request) => {
+            let record = generate_cue_music(
+                runtime,
+                &request.project_id,
+                &request.cue_id,
+                request.model_id,
+                progress.as_ref(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            let project =
+                video::present_video_project(&record, &runtime.store.video_artifacts_root())
+                    .map_err(VideoAgentToolError::from)?;
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                "The cue is composed locally, fitted to its length, and placed at its anchor",
+                project,
+                None,
             )
         }
         VideoAgentOperation::EditVideoTimeline(request) => {
@@ -748,6 +787,23 @@ pub(crate) async fn revise_video(
 /// Resolve exactly what a voice would say for a sample line, so one pronunciation rule can be
 /// auditioned without re-rendering the work around it. The caller synthesizes the returned text
 /// with the character's own voice through the ordinary speech queue.
+#[tauri::command]
+pub(crate) async fn generate_video_cue_music(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    cue_id: String,
+    model_id: Option<String>,
+) -> Result<Value, String> {
+    let runtime = state.inner().clone();
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let record = generate_cue_music(&runtime, &project_id, &cue_id, model_id, None)?;
+        video::present_video_project(&record, &video_root).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Cue music worker failed: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn preview_video_pronunciation(
     state: tauri::State<'_, RuntimeState>,
@@ -4408,6 +4464,340 @@ fn validate_prompt_history(
         );
     }
     Ok(())
+}
+
+/// The recommended local music route. ACE-Step is the only installed engine that takes a written
+/// direction and returns a full-band 48 kHz stereo piece, which is what score needs; MusicGen
+/// remains available for short instrumental drafts by passing `model_id` explicitly.
+const DEFAULT_CUE_MUSIC_MODEL: &str = "ACE-Step/Ace-Step1.5";
+
+fn run_cue_music_job_guarded(
+    runtime: &RuntimeState,
+    parent_job_id: &str,
+    request: &DurableCueMusicRequest,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<Value, String> {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        run_cue_music_job(runtime, parent_job_id, request, progress)
+    }))
+    .unwrap_or_else(|_| {
+        Err("video.worker_panicked: The cue music worker stopped unexpectedly".into())
+    });
+    if let Err(error) = &result {
+        persist_command_job_failure(runtime, parent_job_id, error);
+    }
+    result
+}
+
+/// Compose and place one planned cue.
+///
+/// The cue is the request: its direction, target length, and anchor are already committed, so this
+/// takes only the project and the cue and reads the rest from the durable manifest.
+pub(crate) fn generate_cue_music(
+    runtime: &RuntimeState,
+    project_id: &str,
+    cue_id: &str,
+    model_id: Option<String>,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<Value, String> {
+    let record = runtime.video.get_project(project_id).map_err(service_error)?;
+    let manifest: video::VideoProjectManifest = serde_json::from_value(
+        record
+            .get("manifest")
+            .cloned()
+            .ok_or("video.invalid_manifest: Project manifest is missing")?,
+    )
+    .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+    let cue = manifest
+        .music_cues
+        .iter()
+        .find(|cue| cue.id == cue_id)
+        .ok_or("video.missing_reference: That music cue is not in this project")?;
+    if !cue.needs_generation() {
+        return Err(
+            "video.invalid_cue: That cue already has music placed; remove it before regenerating"
+                .into(),
+        );
+    }
+    let direction = cue.direction.trim().to_string();
+    let durable = DurableCueMusicRequest {
+        project_id: project_id.to_string(),
+        cue_id: cue_id.to_string(),
+        direction_sha256: sha256_text(&direction),
+        direction,
+        target_duration_us: cue.target_duration_us.0,
+        model_id: model_id.unwrap_or_else(|| DEFAULT_CUE_MUSIC_MODEL.to_string()),
+        title: format!("{} · {}", manifest.name, cue.id),
+        actor: "video-studio-composer".to_string(),
+        priority: "normal".to_string(),
+    };
+    let durable_value =
+        serde_json::to_value(&durable).map_err(|error| format!("video.invalid_request: {error}"))?;
+    let parent_job_id = runtime
+        .store
+        .create_job("video_generate_cue_music", &durable_value)?;
+    run_cue_music_job_guarded(runtime, &parent_job_id, &durable, progress)
+}
+
+/// Generate a planned cue's music locally and place it on the timeline.
+///
+/// The cue already declares what it wants: a direction, a target length, and an anchor. This asks
+/// the installed local music engine for exactly that, registers the result as managed project
+/// media, and commits the placement through the same revision-checked edit path the UI uses.
+fn run_cue_music_job(
+    runtime: &RuntimeState,
+    parent_job_id: &str,
+    request: &DurableCueMusicRequest,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<Value, String> {
+    let status = runtime.store.start_job(parent_job_id)?;
+    if status == "cancelled" {
+        return Err("video.cancelled: Cue music generation was cancelled".into());
+    }
+    ensure_command_job_active(runtime, parent_job_id)?;
+    if sha256_text(request.direction.trim()) != request.direction_sha256 {
+        return Err(
+            "video.resume_invalid: The durable cue identity no longer matches its direction".into(),
+        );
+    }
+
+    emit_operation_progress(
+        progress,
+        parent_job_id,
+        &request.project_id,
+        "review",
+        0.08,
+        "Composing the cue with the installed local music model",
+        None,
+    );
+    let generation_request = cue_music_request(request);
+    let (history, _generation_job_id) =
+        run_cue_music_child(runtime, parent_job_id, request, &generation_request, progress)?;
+    let audio_path = history
+        .get("audio_path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or("video.music_failed: The generated cue has no registered audio artifact")?;
+
+    // Registering before placing keeps the media managed and checksummed, so a cue can only ever
+    // point at bytes soundAr owns.
+    ensure_command_job_active(runtime, parent_job_id)?;
+    runtime.store.update_job(parent_job_id, "running", 0.62)?;
+    let before = video_source_asset_ids(runtime, &request.project_id)?;
+    let queued = runtime
+        .video
+        .queue_local_import_idempotent(
+            video::LocalImportRequest {
+                project_id: request.project_id.clone(),
+                source_path: audio_path,
+                actor: request.actor.clone(),
+                title: Some(format!("{} music", request.title)),
+            },
+            parent_job_id,
+            None,
+        )
+        .map_err(service_error)?;
+    if let Err(error) = ensure_command_job_active(runtime, parent_job_id) {
+        runtime.video.cancel_job(&queued.job_id).ok();
+        return Err(error);
+    }
+    let completed = runtime
+        .video
+        .wait_for_job(&queued.job_id, &request.project_id, VIDEO_COMMAND_TIMEOUT)
+        .map_err(service_error)?;
+    ensure_command_job_active(runtime, parent_job_id)?;
+
+    let source_asset_id = new_video_source_asset_id(&completed.project, &before)?;
+    runtime.store.update_job(parent_job_id, "running", 0.85)?;
+    emit_operation_progress(
+        progress,
+        parent_job_id,
+        &request.project_id,
+        "review",
+        0.85,
+        "Fitting the cue to its length and placing it on the timeline",
+        None,
+    );
+
+    let revision = completed
+        .project
+        .get("revision")
+        .and_then(Value::as_i64)
+        .ok_or("video.invalid_project: Project revision is missing")?;
+    let placed = runtime
+        .video
+        .edit_timeline(video::VideoTimelineEditRequest {
+            project_id: request.project_id.clone(),
+            expected_revision: u64::try_from(revision)
+                .map_err(|_| "video.invalid_revision: Project revision is out of range")?,
+            base_version_id: project_version_id(&completed.project)?.to_string(),
+            operation_id: format!("place-cue-{}", request.cue_id),
+            operations: vec![video::VideoTimelineOperation::PlaceMusicCue {
+                cue_id: request.cue_id.clone(),
+                source_asset_id,
+            }],
+        })
+        .map_err(service_error)?;
+
+    if !runtime.store.complete_job(parent_job_id)? {
+        return Err(
+            "video.parent_job_inactive: Cue music generation did not remain active through completion"
+                .into(),
+        );
+    }
+    emit_operation_progress(
+        progress,
+        parent_job_id,
+        &request.project_id,
+        "review",
+        1.0,
+        "The cue is composed, fitted, and placed",
+        None,
+    );
+    Ok(placed.project)
+}
+
+fn cue_music_request(request: &DurableCueMusicRequest) -> Value {
+    // A content-derived seed makes an interrupted job regenerate the same piece on resume rather
+    // than a different one that no longer matches the cue the user approved.
+    let seed = u32::from_str_radix(&request.direction_sha256[..8], 16).unwrap_or(42_817);
+    json!({
+        "operation": "generate_music",
+        "generation_kind": "music",
+        "model_id": request.model_id,
+        "prompt": request.direction,
+        // Generation is asked for the cue's exact target; `fit_cue` reconciles what it returns.
+        "duration_seconds": (request.target_duration_us as f64 / 1_000_000.0).ceil(),
+        "seed": seed,
+        "output_format": "wav",
+        "title": request.title,
+        "priority": request.priority,
+    })
+}
+
+fn run_cue_music_child(
+    runtime: &RuntimeState,
+    parent_job_id: &str,
+    request: &DurableCueMusicRequest,
+    generation_request: &Value,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<(Value, String), String> {
+    let Some((child_job_id, created)) = runtime.store.create_idempotent_job(
+        "synthesis",
+        &format!("video-cue-music-{parent_job_id}"),
+        generation_request,
+    )?
+    else {
+        return Err(
+            "video.resume_conflict: The cue parent is already bound to different music inputs"
+                .into(),
+        );
+    };
+    ensure_command_job_active(runtime, parent_job_id).map_err(|error| {
+        runtime.cancel_job(&child_job_id).ok();
+        error
+    })?;
+
+    let run_child = |child_request: Value| -> Result<Value, String> {
+        emit_operation_progress(
+            progress,
+            parent_job_id,
+            &request.project_id,
+            "review",
+            0.24,
+            "Rendering the cue locally",
+            None,
+        );
+        let outcome = runtime
+            .request_for_job(child_request.clone(), &child_job_id)
+            .and_then(|result| {
+                runtime
+                    .store
+                    .complete_synthesis(&child_job_id, &child_request, &result)
+            });
+        if let Err(error) = &outcome {
+            if runtime.store.job_status(&child_job_id)?.as_deref() != Some("cancelled") {
+                runtime.store.fail_job(&child_job_id, error)?;
+            }
+        }
+        outcome.map_err(|error| format!("video.music_failed: {error}"))
+    };
+
+    let history = if created {
+        run_child(generation_request.clone())?
+    } else {
+        match runtime.store.job_status(&child_job_id)?.as_deref() {
+            Some("completed") => runtime
+                .store
+                .get_history_by_job_id(&child_job_id)?
+                .ok_or("video.music_failed: The completed cue music has no History artifact")?,
+            Some("failed" | "cancelled") => {
+                let (_, stored_request) = runtime.store.retry_synthesis_job(&child_job_id)?;
+                if stored_request != *generation_request {
+                    return Err(
+                        "video.resume_conflict: The stored cue music inputs changed".into(),
+                    );
+                }
+                run_child(stored_request)?
+            }
+            _ => run_child(generation_request.clone())?,
+        }
+    };
+    if history.get("generation_kind").and_then(Value::as_str) != Some("music") {
+        return Err("video.music_failed: The cue child produced a non-music artifact".into());
+    }
+    Ok((history, child_job_id))
+}
+
+/// The source assets a project already owns, so the newly imported one can be identified without
+/// guessing from a filename.
+fn video_source_asset_ids(
+    runtime: &RuntimeState,
+    project_id: &str,
+) -> Result<BTreeSet<String>, String> {
+    let record = runtime
+        .video
+        .get_project(project_id)
+        .map_err(service_error)?;
+    let manifest: video::VideoProjectManifest = serde_json::from_value(
+        record
+            .get("manifest")
+            .cloned()
+            .ok_or("video.invalid_manifest: Project manifest is missing")?,
+    )
+    .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+    Ok(manifest
+        .source_assets
+        .into_iter()
+        .map(|asset| asset.id)
+        .collect())
+}
+
+fn new_video_source_asset_id(
+    project: &Value,
+    before: &BTreeSet<String>,
+) -> Result<String, String> {
+    let manifest: video::VideoProjectManifest = serde_json::from_value(
+        project
+            .get("manifest")
+            .cloned()
+            .ok_or("video.invalid_manifest: Project manifest is missing")?,
+    )
+    .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+    let mut added = manifest
+        .source_assets
+        .into_iter()
+        .filter(|asset| !before.contains(&asset.id))
+        .map(|asset| asset.id)
+        .collect::<Vec<_>>();
+    match added.len() {
+        1 => Ok(added.remove(0)),
+        0 => Err("video.import_missing: The cue import registered no new source asset".into()),
+        _ => Err(
+            "video.import_ambiguous: The cue import registered more than one source asset".into(),
+        ),
+    }
 }
 
 fn adopt_or_resume_prompt_import(

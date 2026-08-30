@@ -308,19 +308,23 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             })
         })
         .collect::<Vec<_>>();
+    // The managed source carries the media facts, so they are resolved rather than duplicated.
+    let source_by_id = manifest
+        .source_assets
+        .iter()
+        .map(|source| (source.id.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
     let sound_assets = manifest
         .sound_assets
         .iter()
         .map(|asset| {
+            let source = source_by_id.get(asset.source_asset_id.as_str());
             json!({
                 "id": asset.id,
                 "name": asset.name,
-                "mime_type": asset.mime_type.as_mime(),
-                "local_path": managed_path(video_root, &asset.managed_path),
-                "duration_ms": micros_to_millis(asset.duration_us),
-                "sample_rate": asset.sample_rate,
-                "channels": asset.channels,
-                "size_bytes": asset.size_bytes,
+                "source_asset_id": asset.source_asset_id,
+                "local_path": source.map(|source| managed_path(video_root, &source.managed_path)),
+                "duration_ms": source.map(|source| micros_to_millis(source.probe.duration_us)),
                 "tags": asset.tags,
                 "created_at": asset.created_at,
             })

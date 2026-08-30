@@ -506,6 +506,9 @@ export type VideoTimelineOperation =
   | { type: "remove_lexicon_entry"; entry_id: string }
   | { type: "set_music_cue"; cue: VideoMusicCueInput }
   | { type: "remove_music_cue"; cue_id: string }
+  | { type: "place_music_cue"; cue_id: string; source_asset_id: string }
+  | { type: "register_sound_asset"; asset_id: string; source_asset_id: string; name: string; tags: string[] }
+  | { type: "remove_sound_asset"; asset_id: string }
   | { type: "set_sound_layer"; layer: VideoSoundLayerInput }
   | { type: "remove_sound_layer"; layer_id: string }
   | {
@@ -564,16 +567,17 @@ export interface VideoDialogueTurn {
  */
 export type VideoSoundPlacementKind = "one_shot" | "ambience" | "room_tone";
 
-/** One registered sound-design file. soundAr never generates these; the user supplies them. */
+/**
+ * One registered sound-design file. soundAr never generates these; the user supplies them, and the
+ * media itself is managed media imported through the ordinary path. Path and duration are resolved
+ * from that managed source rather than duplicated here.
+ */
 export interface VideoSoundAsset {
   id: string;
   name: string;
-  mime_type: string;
-  local_path: string;
-  duration_ms: number;
-  sample_rate: number;
-  channels: number;
-  size_bytes: number;
+  source_asset_id: string;
+  local_path: string | null;
+  duration_ms: number | null;
   tags: string[];
   created_at: string;
 }

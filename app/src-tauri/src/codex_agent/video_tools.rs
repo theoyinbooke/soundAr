@@ -56,6 +56,7 @@ pub(crate) enum VideoAgentOperationKind {
     GetVideoProject,
     EditVideoTimeline,
     WriteVideoScript,
+    GenerateCueMusic,
     RegisterGeneratedVisual,
     AddVisualAsset,
     RenderVideoPreview,
@@ -80,6 +81,7 @@ impl VideoAgentOperationKind {
             Self::GetVideoProject => "get_video_project",
             Self::EditVideoTimeline => "edit_video_timeline",
             Self::WriteVideoScript => "write_video_script",
+            Self::GenerateCueMusic => "generate_cue_music",
             Self::RegisterGeneratedVisual => "register_generated_visual",
             Self::AddVisualAsset => "add_visual_asset",
             Self::RenderVideoPreview => "render_video_preview",
@@ -103,6 +105,7 @@ impl VideoAgentOperationKind {
             | Self::ReviseVideo
             | Self::EditVideoTimeline
             | Self::WriteVideoScript
+            | Self::GenerateCueMusic
             | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
             Self::ExportVideo | Self::ExportPublishPackage => VideoProductionPhase::Export,
@@ -127,6 +130,7 @@ pub(crate) enum VideoAgentOperation {
     GetVideoProject(GetVideoProjectRequest),
     EditVideoTimeline(video::VideoTimelineEditRequest),
     WriteVideoScript(video::VideoScriptRequest),
+    GenerateCueMusic(GenerateCueMusicRequest),
     RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
     AddVisualAsset(video::AddVisualAssetRequest),
     RenderVideoPreview(RenderVideoPreviewRequest),
@@ -150,6 +154,7 @@ impl VideoAgentOperation {
             Self::GetVideoProject(_) => VideoAgentOperationKind::GetVideoProject,
             Self::EditVideoTimeline(_) => VideoAgentOperationKind::EditVideoTimeline,
             Self::WriteVideoScript(_) => VideoAgentOperationKind::WriteVideoScript,
+            Self::GenerateCueMusic(_) => VideoAgentOperationKind::GenerateCueMusic,
             Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
             Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
             Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
@@ -174,6 +179,7 @@ impl VideoAgentOperation {
             "get_video_project" => Self::GetVideoProject(decode(arguments)?),
             "edit_video_timeline" => Self::EditVideoTimeline(decode(arguments)?),
             "write_video_script" => Self::WriteVideoScript(decode(arguments)?),
+            "generate_cue_music" => Self::GenerateCueMusic(decode(arguments)?),
             "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
             "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
             "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
@@ -349,6 +355,11 @@ impl VideoAgentOperation {
                 }
                 Ok(())
             }
+            Self::GenerateCueMusic(request) => {
+                require_text(&request.project_id, "project_id")?;
+                require_text(&request.cue_id, "cue_id")?;
+                Ok(())
+            }
             Self::RegisterGeneratedVisual(request) => {
                 require_text(&request.project_id, "project_id")?;
                 require_text(&request.expected_version_id, "expected_version_id")?;
@@ -502,6 +513,15 @@ pub(crate) struct CreateVideoProjectRequest {
     pub audio_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GenerateCueMusicRequest {
+    pub(crate) project_id: String,
+    pub(crate) cue_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1084,6 +1104,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "get_video_project" => VideoAgentOperationKind::GetVideoProject,
         "edit_video_timeline" => VideoAgentOperationKind::EditVideoTimeline,
         "write_video_script" => VideoAgentOperationKind::WriteVideoScript,
+        "generate_cue_music" => VideoAgentOperationKind::GenerateCueMusic,
         "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
         "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
         "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
@@ -1106,6 +1127,7 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::CreateVideoProject
                 | VideoAgentOperationKind::EditVideoTimeline
                 | VideoAgentOperationKind::WriteVideoScript
+                | VideoAgentOperationKind::GenerateCueMusic
                 | VideoAgentOperationKind::RegisterGeneratedVisual
                 | VideoAgentOperationKind::AddVisualAsset
                 | VideoAgentOperationKind::RenderVideoPreview
@@ -1251,6 +1273,18 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
             "write_video_script",
             "Declare the cast and write the speaker-attributed script for one project version. Each character is bound to one voice, and each `NAME: line` becomes one durable dialogue turn. Re-applying a script keeps every turn whose words are unchanged, so revising one line re-reads only that line. Use one stable operation_id for retries. Requires Studio or Full access.",
             video_script_schema(),
+        ),
+        tool(
+            "generate_cue_music",
+            "Compose one planned music cue with the installed local music model, register the result as managed project media, fit it to the cue's target length, and place it at the cue's anchor. A bed receives its ducking envelope automatically. The cue already declares its direction, length, and anchor, so this takes only the project and the cue. Requires Studio or Full access.",
+            object_schema(
+                &["project_id", "cue_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("cue_id", string("A music cue in this project that has no music yet")),
+                    ("model_id", nullable_string("Installed local music model; defaults to the recommended ACE-Step Studio route")),
+                ]),
+            ),
         ),
         tool(
             "register_generated_visual",
@@ -1534,6 +1568,9 @@ fn timeline_operation_schemas() -> Vec<Value> {
         remove_lexicon_entry_operation_schema(),
         set_music_cue_operation_schema(),
         remove_music_cue_operation_schema(),
+        place_music_cue_operation_schema(),
+        register_sound_asset_operation_schema(),
+        remove_sound_asset_operation_schema(),
         set_sound_layer_operation_schema(),
         remove_sound_layer_operation_schema(),
         update_visual_layer_operation_schema(),
@@ -1703,6 +1740,46 @@ fn remove_music_cue_operation_schema() -> Value {
                                     "cue_id":{"type":"string","minLength":1}
                                 }
                             })
+}
+
+fn register_sound_asset_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","asset_id","source_asset_id","name","tags"],
+        "properties":{
+            "type":{"const":"register_sound_asset"},
+            "asset_id":{"type":"string","minLength":1},
+            "source_asset_id":{"type":"string","minLength":1,"description":"Managed media already imported into this project. Sound design labels imported media; it never names a path on the machine."},
+            "name":{"type":"string","minLength":1,"maxLength":256},
+            "tags":{"type":"array","maxItems":16,"items":{"type":"string","minLength":1,"maxLength":48},"description":"How this sound is found, e.g. rain, door, room tone. Matched loosely, so written stage directions can locate it."}
+        }
+    })
+}
+
+fn remove_sound_asset_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","asset_id"],
+        "properties":{
+            "type":{"const":"remove_sound_asset"},
+            "asset_id":{"type":"string","minLength":1}
+        }
+    })
+}
+
+fn place_music_cue_operation_schema() -> Value {
+    json!({
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","cue_id","source_asset_id"],
+        "properties":{
+            "type":{"const":"place_music_cue"},
+            "cue_id":{"type":"string","minLength":1},
+            "source_asset_id":{"type":"string","minLength":1,"description":"Registered soundAr music already imported into this project. Prefer generate_cue_music, which composes and places in one durable job."}
+        }
+    })
 }
 
 fn set_sound_layer_operation_schema() -> Value {
@@ -2067,8 +2144,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 18);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 18);
+        assert_eq!(names.len(), 19);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 19);
         for required in [
             "preview_link",
             "import_link",
@@ -2079,6 +2156,7 @@ mod tests {
             "get_video_project",
             "edit_video_timeline",
             "write_video_script",
+            "generate_cue_music",
             "register_generated_visual",
             "add_visual_asset",
             "render_video_preview",
@@ -2148,7 +2226,7 @@ mod tests {
             schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(13)
+            Some(16)
         );
 
         // Retiming a conversation goes through the same version-bound batch as every other edit.

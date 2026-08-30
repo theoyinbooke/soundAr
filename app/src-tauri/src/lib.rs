@@ -6592,6 +6592,7 @@ pub fn run() {
             video_commands::edit_video_timeline,
             video_commands::write_video_script,
             video_commands::preview_video_pronunciation,
+            video_commands::generate_video_cue_music,
             video_commands::choose_video_visual_asset,
             video_commands::add_video_visual_asset,
             video_commands::render_video_preview,

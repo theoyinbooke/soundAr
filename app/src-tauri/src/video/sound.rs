@@ -11,17 +11,14 @@
 //! raise, while delivering the part that actually changes how an episode sounds.
 
 use super::contracts::{
-    validate_identifier, validate_managed_path, validate_nonempty, validate_sha256,
-    validate_timestamp_text, Microseconds, Provenance, TimeRange, Validate, VideoError,
-    VideoErrorCode, VideoResult,
+    validate_identifier, validate_nonempty, validate_timestamp_text, Microseconds, TimeRange,
+    Validate, VideoError, VideoErrorCode, VideoResult,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_SOUND_ASSETS: usize = 256;
 pub const MAX_SOUND_LAYERS: usize = 512;
-pub const MAX_SOUND_ASSET_BYTES: u64 = 512 * 1024 * 1024;
-pub const MAX_SOUND_DURATION_US: i64 = 60 * 60 * 1_000_000;
 pub const MAX_TAGS_PER_ASSET: usize = 16;
 pub const MAX_TAG_BYTES: usize = 48;
 
@@ -29,45 +26,25 @@ pub const MAX_TAG_BYTES: usize = 48;
 /// the sound of a room and starts reading as noise.
 pub const MAX_ROOM_TONE_GAIN_DB_MILLI: i32 = -18_000;
 
-/// Container formats soundAr's local pipeline decodes for sound design.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SoundMimeType {
-    Wav,
-    Flac,
-    Ogg,
-    Mp3,
-}
-
-impl SoundMimeType {
-    pub const fn as_mime(self) -> &'static str {
-        match self {
-            Self::Wav => "audio/wav",
-            Self::Flac => "audio/flac",
-            Self::Ogg => "audio/ogg",
-            Self::Mp3 => "audio/mpeg",
-        }
-    }
-}
-
 /// One registered sound-design file.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+///
+/// The media itself is a managed `SourceAsset`, registered through the same import pipeline as any
+/// other local media, which is what copies it, checksums it, and probes it. This record adds only
+/// what sound design needs on top: a name and the tags a placement is found by. Duplicating the
+/// path, checksum, or duration here would create a second copy of facts that could disagree with
+/// the managed source they describe.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SoundAsset {
     pub id: String,
     pub name: String,
-    pub managed_path: String,
-    pub sha256: String,
-    pub mime_type: SoundMimeType,
-    pub duration_us: Microseconds,
-    pub sample_rate: u32,
-    pub channels: u8,
-    pub size_bytes: u64,
+    /// The managed source this sound comes from. Only the native import path can create one, so a
+    /// placement can never name an arbitrary file on the machine.
+    pub source_asset_id: String,
     /// Searchable labels - `rain`, `door`, `market`, `room-tone` - so a placement can be found by
     /// what it sounds like rather than by filename.
     #[serde(default)]
     pub tags: Vec<String>,
-    pub provenance: Provenance,
     pub created_at: String,
 }
 
@@ -75,33 +52,7 @@ impl Validate for SoundAsset {
     fn validate(&self) -> VideoResult<()> {
         validate_identifier(&self.id, "sound_assets.id")?;
         validate_nonempty(&self.name, "sound_assets.name", 256)?;
-        validate_managed_path(&self.managed_path, "sound_assets.managed_path")?;
-        validate_sha256(
-            &self.sha256,
-            "sound_assets.sha256",
-            VideoErrorCode::InvalidAsset,
-        )?;
-        if !(1..=MAX_SOUND_DURATION_US).contains(&self.duration_us.0) {
-            return Err(VideoError::new(
-                VideoErrorCode::InvalidAsset,
-                "a sound asset must be positive and no longer than one hour",
-            )
-            .at("sound_assets.duration_us"));
-        }
-        if !(8_000..=192_000).contains(&self.sample_rate) || !(1..=8).contains(&self.channels) {
-            return Err(VideoError::new(
-                VideoErrorCode::InvalidAsset,
-                "sound asset sample rate or channel count is outside the supported envelope",
-            )
-            .at("sound_assets.sample_rate"));
-        }
-        if !(16..=MAX_SOUND_ASSET_BYTES).contains(&self.size_bytes) {
-            return Err(VideoError::new(
-                VideoErrorCode::InvalidAsset,
-                "sound asset size is outside the supported envelope",
-            )
-            .at("sound_assets.size_bytes"));
-        }
+        validate_identifier(&self.source_asset_id, "sound_assets.source_asset_id")?;
         if self.tags.len() > MAX_TAGS_PER_ASSET {
             return Err(VideoError::new(
                 VideoErrorCode::InvalidAsset,
@@ -127,15 +78,6 @@ impl Validate for SoundAsset {
                 .at("sound_assets.tags"));
             }
         }
-        validate_timestamp_text(
-            &self.provenance.imported_at,
-            "sound_assets.provenance.imported_at",
-        )?;
-        validate_nonempty(
-            &self.provenance.producer,
-            "sound_assets.provenance.producer",
-            256,
-        )?;
         validate_timestamp_text(&self.created_at, "sound_assets.created_at")?;
         Ok(())
     }
@@ -307,6 +249,7 @@ pub(crate) fn validate_sound_design(
     layers: &[SoundLayer],
     scene_ranges: &BTreeMap<&str, TimeRange>,
     turn_ids: &BTreeSet<&str>,
+    audio_source_ids: &BTreeSet<&str>,
 ) -> VideoResult<()> {
     if assets.len() > MAX_SOUND_ASSETS {
         return Err(VideoError::new(
@@ -332,6 +275,15 @@ pub(crate) fn validate_sound_design(
                 format!("duplicate identifier {}", asset.id),
             )
             .at("sound_assets.id"));
+        }
+        // Only the native import path creates a managed source, so requiring one here is what
+        // keeps a placement from naming an arbitrary file on the machine.
+        if !audio_source_ids.contains(asset.source_asset_id.as_str()) {
+            return Err(VideoError::new(
+                VideoErrorCode::MissingReference,
+                "a sound asset must come from registered managed media that contains audio",
+            )
+            .at("sound_assets.source_asset_id"));
         }
     }
 
@@ -405,32 +357,13 @@ pub(crate) fn validate_sound_design(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video::contracts::{Provenance, ProvenanceKind};
-
-    fn provenance() -> Provenance {
-        Provenance {
-            kind: ProvenanceKind::UserUpload,
-            original_uri: None,
-            imported_at: "2026-01-01T00:00:00Z".into(),
-            producer: "sound-test".into(),
-            producer_version: None,
-            metadata: BTreeMap::new(),
-        }
-    }
 
     fn asset(id: &str, tags: &[&str]) -> SoundAsset {
         SoundAsset {
             id: id.into(),
             name: "Rain on a tin roof".into(),
-            managed_path: format!("sounds/{id}.wav"),
-            sha256: "a".repeat(64),
-            mime_type: SoundMimeType::Wav,
-            duration_us: Microseconds(8_000_000),
-            sample_rate: 48_000,
-            channels: 2,
-            size_bytes: 1_536_000,
+            source_asset_id: format!("source-{id}"),
             tags: tags.iter().map(|tag| tag.to_string()).collect(),
-            provenance: provenance(),
             created_at: "2026-01-01T00:00:00Z".into(),
         }
     }
@@ -461,6 +394,7 @@ mod tests {
             layers,
             &scene_ranges(),
             &BTreeSet::from(["turn-a"]),
+            &BTreeSet::from(["source-sound-rain"]),
         )
     }
 
@@ -579,6 +513,20 @@ mod tests {
         assert_eq!(assets_matching_tag(&assets, "  ROOM TONE  ").len(), 1);
         assert!(assets_matching_tag(&assets, "market").is_empty());
         assert!(assets_matching_tag(&assets, "   ").is_empty());
+    }
+
+    #[test]
+    fn a_sound_asset_must_come_from_registered_managed_media() {
+        let error = validate_sound_design(
+            &[asset("sound-rain", &["rain"])],
+            &[],
+            &scene_ranges(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+        assert_eq!(error.field.as_deref(), Some("sound_assets.source_asset_id"));
     }
 
     #[test]

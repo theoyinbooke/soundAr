@@ -227,6 +227,44 @@ describe("videoStudioReducer", () => {
     await rejected({ id: "cue-early", track_id: "music" }, /before its music exists/i);
   });
 
+  it("registers imported media as sound design and drops placements with it", async () => {
+    const service = createBrowserPreviewVideoService();
+    const project = await service.getVideoProject("creator-update");
+    const scene = project.manifest.scenes[0];
+
+    const registered = await service.editVideoTimeline({
+      project_id: project.id, expected_revision: project.revision, base_version_id: project.manifest.version_id,
+      operation_id: "register-sound",
+      operations: [
+        { type: "register_sound_asset", asset_id: "sound-tone", source_asset_id: project.manifest.source.id, name: "Quiet room", tags: ["room tone"] },
+        { type: "set_sound_layer", layer: {
+          id: "tone", asset_id: "sound-tone", kind: "room_tone", scene_id: scene.id,
+          range: { start_us: scene.timeline_start_ms * 1000, end_us: scene.timeline_end_ms * 1000 },
+          gain_db_milli: -26_000, fade_in_us: 250_000, fade_out_us: 250_000, loop_to_fill: true,
+        } },
+      ],
+    });
+    expect(registered.project.manifest.sound_assets).toHaveLength(1);
+    expect(registered.project.manifest.sound_layers).toHaveLength(1);
+
+    // Removing the sound removes its uses rather than leaving a placement with no audio.
+    const removed = await service.editVideoTimeline({
+      project_id: project.id, expected_revision: registered.project.revision, base_version_id: registered.project.manifest.version_id,
+      operation_id: "remove-sound", operations: [{ type: "remove_sound_asset", asset_id: "sound-tone" }],
+    });
+    expect(removed.project.manifest.sound_assets).toHaveLength(0);
+    expect(removed.project.manifest.sound_layers).toHaveLength(0);
+
+    // Sound design can only label media the project already imported.
+    await expect(
+      service.editVideoTimeline({
+        project_id: project.id, expected_revision: removed.project.revision, base_version_id: removed.project.manifest.version_id,
+        operation_id: "register-stray",
+        operations: [{ type: "register_sound_asset", asset_id: "sound-stray", source_asset_id: "source-absent", name: "Nowhere", tags: [] }],
+      }),
+    ).rejects.toThrow(/not registered/i);
+  });
+
   it("refuses sound placements that would sound wrong or invent audio", async () => {
     const service = createBrowserPreviewVideoService();
     const project = await service.getVideoProject("creator-update");

@@ -7,12 +7,12 @@
 
 use super::contracts::{
     validate_identifier, AudioMixTrack, CaptionCue, Microseconds, ReviewedScene, RevisionStage,
-    TimeRange, TimelineClip, TimelineGap, TrackKind, Validate, VideoError, VideoErrorCode,
-    VideoProjectManifest, VideoResult,
+    SourceAssetKind, TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate,
+    VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
 };
 use super::lexicon::{fingerprint_for_character, LexiconEntry};
-use super::score::{bed_ducking, MusicCue};
-use super::sound::SoundLayer;
+use super::score::{bed_ducking, fit_cue, MusicCue};
+use super::sound::{SoundAsset, SoundLayer};
 use super::performance::{derive_turn_beats, BeatSource, TurnBeat};
 use super::timeline::{
     map_source_endpoint_to_timeline, map_timeline_endpoint_to_source, QuantizeMode,
@@ -77,6 +77,22 @@ pub enum VideoTimelineOperation {
     SetMusicCue { cue: MusicCue },
     /// Removes one music cue and the mix track it owned.
     RemoveMusicCue { cue_id: String },
+    /// Places generated music on the timeline for a planned cue: fits it to the cue's target,
+    /// positions it at the cue's anchor, and gives a bed its ducking envelope.
+    PlaceMusicCue {
+        cue_id: String,
+        source_asset_id: String,
+    },
+    /// Registers already-imported managed media as a tagged sound-design asset. The media must
+    /// have arrived through the native import path; this operation only labels it.
+    RegisterSoundAsset {
+        asset_id: String,
+        source_asset_id: String,
+        name: String,
+        tags: Vec<String>,
+    },
+    /// Removes one sound-design asset and every placement that used it.
+    RemoveSoundAsset { asset_id: String },
     /// Adds or replaces one sound-design placement. The assistant may propose a placement from a
     /// stage direction, but it only ever takes effect through this revision-checked path.
     SetSoundLayer { layer: SoundLayer },
@@ -165,6 +181,19 @@ pub fn apply_timeline_edit(
             VideoTimelineOperation::SetMusicCue { cue } => set_music_cue(&mut edited, cue)?,
             VideoTimelineOperation::RemoveMusicCue { cue_id } => {
                 remove_music_cue(&mut edited, cue_id)?
+            }
+            VideoTimelineOperation::PlaceMusicCue {
+                cue_id,
+                source_asset_id,
+            } => place_music_cue(&mut edited, cue_id, source_asset_id)?,
+            VideoTimelineOperation::RegisterSoundAsset {
+                asset_id,
+                source_asset_id,
+                name,
+                tags,
+            } => register_sound_asset(&mut edited, asset_id, source_asset_id, name, tags)?,
+            VideoTimelineOperation::RemoveSoundAsset { asset_id } => {
+                remove_sound_asset(&mut edited, asset_id)?
             }
             VideoTimelineOperation::SetSoundLayer { layer } => set_sound_layer(&mut edited, layer)?,
             VideoTimelineOperation::RemoveSoundLayer { layer_id } => {
@@ -292,6 +321,24 @@ fn validate_request(
             VideoTimelineOperation::SetMusicCue { cue } => cue.validate()?,
             VideoTimelineOperation::RemoveMusicCue { cue_id } => {
                 validate_identifier(cue_id, "operations.cue_id")?
+            }
+            VideoTimelineOperation::PlaceMusicCue {
+                cue_id,
+                source_asset_id,
+            } => {
+                validate_identifier(cue_id, "operations.cue_id")?;
+                validate_identifier(source_asset_id, "operations.source_asset_id")?;
+            }
+            VideoTimelineOperation::RegisterSoundAsset {
+                asset_id,
+                source_asset_id,
+                ..
+            } => {
+                validate_identifier(asset_id, "operations.asset_id")?;
+                validate_identifier(source_asset_id, "operations.source_asset_id")?;
+            }
+            VideoTimelineOperation::RemoveSoundAsset { asset_id } => {
+                validate_identifier(asset_id, "operations.asset_id")?
             }
             VideoTimelineOperation::SetSoundLayer { layer } => layer.validate()?,
             VideoTimelineOperation::RemoveSoundLayer { layer_id } => {
@@ -593,6 +640,247 @@ fn speech_track_id(manifest: &VideoProjectManifest, exclude_track_id: &str) -> O
                 })
         })
         .map(|track| track.id.clone())
+}
+
+/// Where a cue begins on the project clock.
+///
+/// Resolving the anchor at placement time, from the timeline as it stands, is what lets a cue be
+/// authored before the scenes and takes it refers to are final.
+fn cue_timeline_start(
+    manifest: &VideoProjectManifest,
+    anchor: &super::score::CueAnchor,
+) -> VideoResult<Microseconds> {
+    use super::score::CueAnchor;
+    match anchor {
+        CueAnchor::Scene { scene_id } => manifest
+            .reviewed_scenes
+            .iter()
+            .find(|scene| &scene.id == scene_id)
+            .map(|scene| scene.timeline_start_us)
+            .ok_or_else(|| {
+                edit_error(
+                    VideoErrorCode::MissingReference,
+                    format!("scene {scene_id} does not exist"),
+                    "operations.cue_id",
+                )
+            }),
+        CueAnchor::Turn { turn_id } => manifest
+            .tracks
+            .iter()
+            .flat_map(|track| track.clips.iter())
+            .find(|clip| clip.turn_id.as_deref() == Some(turn_id.as_str()))
+            .map(|clip| clip.timeline_start_us)
+            .ok_or_else(|| {
+                // A turn with no clip has not been narrated, so there is no moment to start on.
+                edit_error(
+                    VideoErrorCode::MissingReference,
+                    format!("dialogue turn {turn_id} has no narration on the timeline yet"),
+                    "operations.cue_id",
+                )
+            }),
+        CueAnchor::AfterFinalTurn => {
+            let narrated = manifest
+                .narration_bindings
+                .iter()
+                .filter(|binding| binding.turn_id.is_some())
+                .map(|binding| binding.render_artifact_id.as_str())
+                .collect::<BTreeSet<_>>();
+            manifest
+                .tracks
+                .iter()
+                .flat_map(|track| track.clips.iter())
+                .filter(|clip| {
+                    clip.media
+                        .render_artifact_id
+                        .as_deref()
+                        .is_some_and(|id| narrated.contains(id))
+                })
+                .map(|clip| {
+                    clip.timeline_start_us
+                        .checked_add(clip.timeline_duration_us)
+                })
+                .collect::<VideoResult<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .ok_or_else(|| {
+                    edit_error(
+                        VideoErrorCode::MissingReference,
+                        "an outro needs narration on the timeline to resolve after",
+                        "operations.cue_id",
+                    )
+                })
+        }
+    }
+}
+
+fn place_music_cue(
+    manifest: &mut VideoProjectManifest,
+    cue_id: &str,
+    source_asset_id: &str,
+) -> VideoResult<()> {
+    let cue = manifest
+        .music_cues
+        .iter()
+        .find(|cue| cue.id == cue_id)
+        .cloned()
+        .ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::MissingReference,
+                format!("music cue {cue_id} does not exist"),
+                "operations.cue_id",
+            )
+        })?;
+    if !cue.needs_generation() {
+        return Err(edit_error(
+            VideoErrorCode::InvalidCue,
+            format!("music cue {cue_id} already has music placed"),
+            "operations.cue_id",
+        ));
+    }
+    let source = manifest
+        .source_assets
+        .iter()
+        .find(|asset| asset.id == source_asset_id)
+        .ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::MissingReference,
+                format!("source asset {source_asset_id} does not exist"),
+                "operations.source_asset_id",
+            )
+        })?;
+    if !matches!(source.kind, SourceAssetKind::SoundArMusic) {
+        return Err(edit_error(
+            VideoErrorCode::InvalidCue,
+            "a music cue can only be placed from registered soundAr music",
+            "operations.source_asset_id",
+        ));
+    }
+
+    // Fitting before placing means a cue that could not be made to land on its target is reported
+    // for regeneration rather than placed at the wrong length.
+    let fit = fit_cue(&cue, source.probe.duration_us)?;
+    let timeline_start = cue_timeline_start(manifest, &cue.anchor)?;
+    let span = fit.source_end_us.0.saturating_sub(fit.source_start_us.0);
+    let track_id = format!("music-{cue_id}");
+    if manifest.tracks.iter().any(|track| track.id == track_id) {
+        return Err(edit_error(
+            VideoErrorCode::DuplicateId,
+            format!("timeline track {track_id} already exists"),
+            "operations.cue_id",
+        ));
+    }
+    let timeline_end = timeline_start.checked_add(Microseconds(span))?;
+    if timeline_end > manifest.timeline_duration_us {
+        return Err(edit_error(
+            VideoErrorCode::InvalidCue,
+            "the cue does not fit inside the project timeline at its anchor",
+            "operations.cue_id",
+        ));
+    }
+
+    manifest.tracks.push(TimelineTrack {
+        id: track_id.clone(),
+        kind: TrackKind::Audio,
+        clips: vec![TimelineClip {
+            id: format!("music-clip-{cue_id}"),
+            scene_id: None,
+            turn_id: None,
+            media: super::contracts::MediaReference {
+                source_asset_id: Some(source_asset_id.to_string()),
+                render_artifact_id: None,
+            },
+            source_range: TimeRange::new(fit.source_start_us.0, fit.source_end_us.0)?,
+            timeline_start_us: timeline_start,
+            timeline_duration_us: Microseconds(span),
+            playback_rate: super::contracts::RationalRate::ONE,
+            gain_db_milli: 0,
+            muted: false,
+            crop: None,
+        }],
+        // Music occupies part of the timeline, so this track deliberately does not partition it.
+        preserve_gaps: false,
+    });
+
+    let mut placed = cue;
+    placed.source_asset_id = Some(source_asset_id.to_string());
+    placed.track_id = Some(track_id);
+    placed.fade_out_us = fit.fade_out_us;
+    set_music_cue(manifest, &placed)
+}
+
+fn register_sound_asset(
+    manifest: &mut VideoProjectManifest,
+    asset_id: &str,
+    source_asset_id: &str,
+    name: &str,
+    tags: &[String],
+) -> VideoResult<()> {
+    let source = manifest
+        .source_assets
+        .iter()
+        .find(|source| source.id == source_asset_id)
+        .ok_or_else(|| {
+            edit_error(
+                VideoErrorCode::MissingReference,
+                format!("source asset {source_asset_id} is not registered in this project"),
+                "operations.source_asset_id",
+            )
+        })?;
+    if !source.probe.has_audio {
+        return Err(edit_error(
+            VideoErrorCode::InvalidAsset,
+            "sound design needs media that actually contains audio",
+            "operations.source_asset_id",
+        ));
+    }
+    // One managed source is one sound. Registering it twice would let two labels drift apart while
+    // describing identical audio.
+    if manifest
+        .sound_assets
+        .iter()
+        .any(|asset| asset.source_asset_id == source_asset_id && asset.id != asset_id)
+    {
+        return Err(edit_error(
+            VideoErrorCode::DuplicateId,
+            "that managed source is already registered as a sound asset",
+            "operations.source_asset_id",
+        ));
+    }
+    let asset = SoundAsset {
+        id: asset_id.to_string(),
+        name: name.to_string(),
+        source_asset_id: source_asset_id.to_string(),
+        tags: tags.to_vec(),
+        created_at: source.provenance.imported_at.clone(),
+    };
+    asset.validate()?;
+    match manifest
+        .sound_assets
+        .iter_mut()
+        .find(|existing| existing.id == asset_id)
+    {
+        Some(existing) => *existing = asset,
+        None => manifest.sound_assets.push(asset),
+    }
+    Ok(())
+}
+
+fn remove_sound_asset(manifest: &mut VideoProjectManifest, asset_id: &str) -> VideoResult<()> {
+    let before = manifest.sound_assets.len();
+    manifest.sound_assets.retain(|asset| asset.id != asset_id);
+    if manifest.sound_assets.len() == before {
+        return Err(edit_error(
+            VideoErrorCode::MissingReference,
+            format!("sound asset {asset_id} does not exist"),
+            "operations.asset_id",
+        ));
+    }
+    // A placement without its asset cannot be rendered, so removing the sound removes its uses
+    // rather than leaving the manifest unvalidatable.
+    manifest
+        .sound_layers
+        .retain(|layer| layer.asset_id != asset_id);
+    Ok(())
 }
 
 fn set_sound_layer(manifest: &mut VideoProjectManifest, layer: &SoundLayer) -> VideoResult<()> {
@@ -3001,6 +3289,149 @@ mod tests {
     }
 
     #[test]
+    fn placing_a_cue_fits_it_anchors_it_and_gives_a_bed_its_envelope() {
+        use super::super::score::CueAnchor;
+
+        let mut manifest = with_music_track(&with_dialogue(&manifest()));
+        manifest.source_assets.push(music_asset());
+        // A bed anchored to the first narrated turn, shorter than the 45s generated piece.
+        let mut cue = bed_cue(None);
+        cue.anchor = CueAnchor::Turn {
+            turn_id: "turn-a".into(),
+        };
+        cue.target_duration_us = Microseconds(1_000_000);
+        cue.fade_in_us = Microseconds(200_000);
+        cue.fade_out_us = Microseconds(200_000);
+        manifest.music_cues.push(cue);
+        manifest.validate_strict().unwrap();
+
+        let placed = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::PlaceMusicCue {
+                cue_id: "cue-bed".into(),
+                source_asset_id: "music-one".into(),
+            }]),
+        )
+        .unwrap();
+
+        let cue = &placed.manifest.music_cues[0];
+        assert_eq!(cue.source_asset_id.as_deref(), Some("music-one"));
+        assert_eq!(cue.track_id.as_deref(), Some("music-cue-bed"));
+        assert!(!cue.needs_generation());
+
+        let track = placed
+            .manifest
+            .tracks
+            .iter()
+            .find(|track| track.id == "music-cue-bed")
+            .expect("the cue has a timeline track");
+        assert!(matches!(track.kind, TrackKind::Audio));
+        // The generated piece is trimmed to the cue's target and starts at its anchored turn.
+        assert_eq!(track.clips[0].timeline_duration_us, Microseconds(1_000_000));
+        assert_eq!(track.clips[0].timeline_start_us, Microseconds::ZERO);
+
+        let ducking = placed
+            .manifest
+            .audio_mix
+            .tracks
+            .iter()
+            .find(|mix| mix.track_id == "music-cue-bed")
+            .and_then(|mix| mix.ducking.clone())
+            .expect("a placed bed always ducks");
+        assert_eq!(ducking.sidechain_track_id, "speech");
+
+        // Placing the same cue twice would put its music on the timeline a second time.
+        let error = apply_timeline_edit(
+            &placed.manifest,
+            &request(vec![VideoTimelineOperation::PlaceMusicCue {
+                cue_id: "cue-bed".into(),
+                source_asset_id: "music-one".into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidCue);
+    }
+
+    #[test]
+    fn a_cue_whose_music_is_too_short_is_reported_rather_than_placed() {
+        use super::super::score::CueAnchor;
+
+        let mut manifest = with_music_track(&with_dialogue(&manifest()));
+        manifest.source_assets.push(music_asset());
+        let mut cue = bed_cue(None);
+        cue.anchor = CueAnchor::Turn {
+            turn_id: "turn-a".into(),
+        };
+        // The registered music is 45 seconds; this cue asks for two minutes.
+        cue.target_duration_us = Microseconds(120_000_000);
+        manifest.music_cues.push(cue);
+        manifest.validate_strict().unwrap();
+
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::PlaceMusicCue {
+                cue_id: "cue-bed".into(),
+                source_asset_id: "music-one".into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::CueFitFailed);
+    }
+
+    #[test]
+    fn a_cue_can_only_be_placed_from_registered_music() {
+        use super::super::score::CueAnchor;
+
+        let mut manifest = with_music_track(&with_dialogue(&manifest()));
+        let mut cue = bed_cue(None);
+        cue.anchor = CueAnchor::Turn {
+            turn_id: "turn-a".into(),
+        };
+        cue.target_duration_us = Microseconds(1_000_000);
+        cue.fade_in_us = Microseconds(200_000);
+        cue.fade_out_us = Microseconds(200_000);
+        manifest.music_cues.push(cue);
+
+        // The project's only other source is video, not soundAr music.
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::PlaceMusicCue {
+                cue_id: "cue-bed".into(),
+                source_asset_id: SOURCE_ID.into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidCue);
+    }
+
+    #[test]
+    fn an_outro_cannot_be_placed_before_there_is_narration_to_follow() {
+        use super::super::score::{CueAnchor, CueRole};
+
+        let mut manifest = with_dialogue(&manifest());
+        manifest.source_assets.push(music_asset());
+        let mut outro = bed_cue(None);
+        outro.id = "cue-outro".into();
+        outro.role = CueRole::Outro;
+        outro.anchor = CueAnchor::AfterFinalTurn;
+        outro.target_duration_us = Microseconds(1_000_000);
+        outro.fade_in_us = Microseconds(200_000);
+        outro.fade_out_us = Microseconds(200_000);
+        manifest.music_cues.push(outro);
+        manifest.validate_strict().unwrap();
+
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::PlaceMusicCue {
+                cue_id: "cue-outro".into(),
+                source_asset_id: "music-one".into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+    }
+
+    #[test]
     fn a_planned_cue_needs_no_track_and_no_mix_entry() {
         let manifest = with_dialogue(&manifest());
         let edited = apply_timeline_edit(
@@ -3030,27 +3461,12 @@ mod tests {
     }
 
     fn sound_asset() -> super::super::sound::SoundAsset {
-        use super::super::contracts::{Provenance, ProvenanceKind};
-        use super::super::sound::{SoundAsset, SoundMimeType};
+        use super::super::sound::SoundAsset;
         SoundAsset {
             id: "sound-tone".into(),
             name: "Quiet room".into(),
-            managed_path: "sounds/sound-tone.wav".into(),
-            sha256: "d".repeat(64),
-            mime_type: SoundMimeType::Wav,
-            duration_us: Microseconds(8_000_000),
-            sample_rate: 48_000,
-            channels: 2,
-            size_bytes: 1_536_000,
+            source_asset_id: "music-one".into(),
             tags: vec!["room tone".into()],
-            provenance: Provenance {
-                kind: ProvenanceKind::UserUpload,
-                original_uri: None,
-                imported_at: NOW.into(),
-                producer: "editor-test".into(),
-                producer_version: None,
-                metadata: BTreeMap::new(),
-            },
             created_at: NOW.into(),
         }
     }
@@ -3075,6 +3491,7 @@ mod tests {
     #[test]
     fn room_tone_runs_under_a_whole_scene_and_can_be_removed() {
         let mut manifest = manifest();
+        manifest.source_assets.push(music_asset());
         manifest.sound_assets.push(sound_asset());
         manifest.validate_strict().unwrap();
         let scene = manifest.reviewed_scenes[0].clone();
@@ -3100,6 +3517,111 @@ mod tests {
     }
 
     #[test]
+    fn registering_a_sound_labels_imported_media_and_removing_it_takes_its_placements() {
+        let mut manifest = manifest();
+        manifest.source_assets.push(music_asset());
+        manifest.validate_strict().unwrap();
+        let scene = manifest.reviewed_scenes[0].clone();
+        let scene_end = scene.timeline_start_us.0 + scene.timeline_duration_us.0;
+
+        let registered = apply_timeline_edit(
+            &manifest,
+            &request(vec![
+                VideoTimelineOperation::RegisterSoundAsset {
+                    asset_id: "sound-tone".into(),
+                    source_asset_id: "music-one".into(),
+                    name: "Quiet room".into(),
+                    tags: vec!["room tone".into()],
+                },
+                VideoTimelineOperation::SetSoundLayer {
+                    layer: room_tone_layer(&scene.id, scene.timeline_start_us.0, scene_end),
+                },
+            ]),
+        )
+        .unwrap();
+        assert_eq!(registered.manifest.sound_assets.len(), 1);
+        assert_eq!(registered.manifest.sound_layers.len(), 1);
+
+        // Removing the sound removes its uses rather than leaving a placement with no audio.
+        let removed = apply_timeline_edit(
+            &registered.manifest,
+            &request(vec![VideoTimelineOperation::RemoveSoundAsset {
+                asset_id: "sound-tone".into(),
+            }]),
+        )
+        .unwrap();
+        assert!(removed.manifest.sound_assets.is_empty());
+        assert!(removed.manifest.sound_layers.is_empty());
+    }
+
+    #[test]
+    fn sound_design_can_only_label_media_the_project_already_imported() {
+        let manifest = manifest();
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::RegisterSoundAsset {
+                asset_id: "sound-tone".into(),
+                source_asset_id: "source-absent".into(),
+                name: "Quiet room".into(),
+                tags: vec![],
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+
+        // Media with no audio track cannot become sound design, however it was imported.
+        let mut silent = manifest.clone();
+        let mut silent_source = music_asset();
+        silent_source.id = "silent-clip".into();
+        // A silent video: it has picture and no audio, so it can never be sound design.
+        silent_source.probe.has_audio = false;
+        silent_source.probe.has_video = true;
+        silent_source.probe.width = Some(1920);
+        silent_source.probe.height = Some(1080);
+        silent_source.probe.frame_rate = Some(RationalFrameRate::FPS_30);
+        silent.source_assets.push(silent_source);
+        silent.validate_strict().unwrap();
+        let error = apply_timeline_edit(
+            &silent,
+            &request(vec![VideoTimelineOperation::RegisterSoundAsset {
+                asset_id: "sound-tone".into(),
+                source_asset_id: "silent-clip".into(),
+                name: "Quiet room".into(),
+                tags: vec![],
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidAsset);
+    }
+
+    #[test]
+    fn one_managed_source_is_registered_as_one_sound() {
+        let mut manifest = manifest();
+        manifest.source_assets.push(music_asset());
+        let first = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::RegisterSoundAsset {
+                asset_id: "sound-tone".into(),
+                source_asset_id: "music-one".into(),
+                name: "Quiet room".into(),
+                tags: vec![],
+            }]),
+        )
+        .unwrap();
+        let error = apply_timeline_edit(
+            &first.manifest,
+            &request(vec![VideoTimelineOperation::RegisterSoundAsset {
+                asset_id: "sound-other".into(),
+                source_asset_id: "music-one".into(),
+                name: "Same audio, different label".into(),
+                tags: vec![],
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::DuplicateId);
+    }
+
+    #[test]
     fn a_placement_cannot_invent_a_sound_the_project_does_not_have() {
         let manifest = manifest();
         let scene = manifest.reviewed_scenes[0].clone();
@@ -3117,6 +3639,7 @@ mod tests {
     #[test]
     fn room_tone_that_stops_early_is_rejected_by_the_manifest() {
         let mut manifest = manifest();
+        manifest.source_assets.push(music_asset());
         manifest.sound_assets.push(sound_asset());
         let scene = manifest.reviewed_scenes[0].clone();
         let short_end = scene.timeline_start_us.0 + scene.timeline_duration_us.0 / 2;
