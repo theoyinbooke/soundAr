@@ -1087,6 +1087,37 @@ Depends on: 12.1, Phase 9 transcription and alignment evidence.
 - Report every finding as reviewable evidence linked to a turn. Quality control
   flags work; it never silently rewrites or re-renders it.
 
+### Current Evidence
+
+Slice 12.8 is implemented and locally verified. The remaining work is the runtime that transcribes
+the rendered narration and measures the master's loudness and true peak; the checks themselves take
+those measurements as input.
+
+- `video/quality.rs` compares what a take was asked to say with what a local recognizer actually
+  heard. Comparison is on normalized words, because a recognizer does not reproduce punctuation or
+  capitalization and reporting those would bury the real findings.
+- The comparison is aligned rather than positional, so a mispronounced invented name reads as one
+  replacement - "the take says Adaze where the script says Adaeze" - instead of a deletion and an
+  insertion nobody can act on. That is the exact failure this slice exists to catch.
+- The line is compared against what the voice was actually asked to say, which is the scripted text
+  after its pronunciation rules were applied, so a working lexicon entry is never reported as an
+  error.
+- Everything reports. Nothing rewrites a script, re-renders a take, or adjusts a mix. A check that
+  silently repaired what it found would destroy the only thing it exists to provide.
+- A turn nobody listened back to is reported as unchecked rather than as passed, and without a
+  loudness measurement the report says the master was not checked instead of claiming it is within
+  target. A partial measurement is treated as no measurement, so half a check cannot read as a whole
+  one. An episode is only clear when there are no blocking findings, no unchecked turns, and the
+  master was measured.
+- Severity is assigned by consequence: a misstated script and an off-target master block, because
+  the episode does not say what it was asked to say or a platform will change how it sounds after it
+  leaves soundAr. Caption drift and dead air warn.
+- `check_episode_quality` is exposed as an assistant tool and a Tauri command, and the producer
+  prompt now directs the assistant to transcribe the rendered narration and run it before declaring
+  an episode finished.
+- Verified locally: 451 native tests including thirteen quality cases covering alignment, severity,
+  and the unchecked-is-not-passed rule; plus 150 React tests.
+
 ### Slice 12.9: Assistant Listening and Director's Pass
 
 Depends on: 12.8.

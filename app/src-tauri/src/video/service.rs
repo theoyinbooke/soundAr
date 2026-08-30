@@ -11,8 +11,9 @@ use super::{
     build_waveform_command, discover_media_runtime, local_media_input_args,
     preflight_import_url_destination, probe_media, publish_atomic, sibling_staging_path,
     terminate_process_group, validate_import_url, write_ass_document_atomic, AdmissionOutcome,
-    episode_transcript, identify_clip_candidates, instantiate_format, plan_release, AssemblyOptions,
-    CandidatePolicy, CacheKeyBuilder, CacheStage, CaptionTheme, CastMember,
+    apply_lexicon, build_report, diff_spoken_words, effective_entries, episode_transcript,
+    findings_for_dead_air, findings_for_loudness, findings_for_turn, identify_clip_candidates,
+    instantiate_format, plan_release, AssemblyOptions, CandidatePolicy, CacheKeyBuilder, CacheStage, CaptionTheme, CastMember,
     DialogueScriptRequest, FfmpegProgressParser, LayoutRole,
     MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance,
     ProvenanceKind, PublicHttpsProxy, PublicationState, RationalFrameRate, RationalRate,
@@ -21,7 +22,7 @@ use super::{
     RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, SourceAsset,
     SourceAssetKind, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder,
     VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    ReleasePlan, ShowFormat, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    LoudnessMeasurement, QcReport, ReleasePlan, ShowFormat, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
     MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
     TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
@@ -12511,6 +12512,102 @@ impl VideoStudioService {
             job_id: job_id.to_string(),
             replayed: false,
         })
+    }
+
+    /// Check a rendered episode against the script it was asked to speak.
+    ///
+    /// `heard` maps a turn id to what a local recognizer actually heard in that turn's take. A turn
+    /// missing from that map is reported as unchecked rather than as passed, because nobody
+    /// listened back to it. `loudness` is a measurement the runtime made; without one the report
+    /// says the master was not checked instead of claiming it is within target.
+    ///
+    /// This reports. It never rewrites a script, re-renders a take, or adjusts a mix.
+    pub fn check_episode_quality(
+        &self,
+        project_id: &str,
+        heard: &BTreeMap<String, String>,
+        loudness: Option<LoudnessMeasurement>,
+    ) -> ServiceResult<QcReport> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+
+        let mut findings = Vec::new();
+        let mut checked_turns = Vec::new();
+        let mut unchecked_turns = Vec::new();
+
+        // Only a turn with a take can be listened back to; a turn nobody narrated is not a turn
+        // that failed a check, it is a turn with no audio to check.
+        let narrated_turns = manifest
+            .narration_bindings
+            .iter()
+            .filter_map(|binding| binding.turn_id.as_deref())
+            .collect::<BTreeSet<_>>();
+        for turn in &manifest.dialogue {
+            if !narrated_turns.contains(turn.id.as_str()) {
+                continue;
+            }
+            match heard.get(&turn.id) {
+                Some(spoken) => {
+                    // The comparison is against what the voice was asked to say, which is the
+                    // scripted line after its pronunciation rules were applied.
+                    let asked = apply_lexicon(
+                        turn.spoken_text(),
+                        &effective_entries(&manifest.lexicon, &turn.character_id),
+                    )
+                    .spoken_text;
+                    findings.extend(findings_for_turn(
+                        &turn.id,
+                        &diff_spoken_words(&asked, spoken),
+                    ));
+                    checked_turns.push(turn.id.clone());
+                }
+                None => unchecked_turns.push(turn.id.clone()),
+            }
+        }
+
+        if let Some(measured) = loudness {
+            findings.extend(findings_for_loudness(
+                measured,
+                manifest.audio_mix.target_lufs_milli,
+                manifest.audio_mix.true_peak_db_milli,
+            ));
+        }
+
+        // Silence a listener actually hears: the gaps between what the speech track occupies.
+        let speech_spans = manifest
+            .tracks
+            .iter()
+            .filter(|track| matches!(track.kind, TrackKind::Audio))
+            .flat_map(|track| track.clips.iter())
+            .filter(|clip| clip.turn_id.is_some())
+            .map(|clip| {
+                Ok((
+                    clip.timeline_start_us,
+                    clip.timeline_start_us
+                        .checked_add(clip.timeline_duration_us)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, VideoError>>()?;
+        if !speech_spans.is_empty() {
+            findings.extend(findings_for_dead_air(
+                &speech_spans,
+                manifest.timeline_duration_us,
+            ));
+        }
+
+        Ok(build_report(
+            findings,
+            checked_turns,
+            unchecked_turns,
+            loudness.is_some(),
+        )?)
     }
 
     /// What this episode's release would contain, and what is still missing.

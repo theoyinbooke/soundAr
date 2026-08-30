@@ -32,6 +32,9 @@ import type {
   VideoPerformanceClock,
   VideoScene,
   VideoScriptResponse,
+  VideoQcFinding,
+  VideoQcFindingKind,
+  VideoQcReport,
   VideoReleaseMemberKind,
   VideoReleaseMemberPlan,
   VideoReleasePlan,
@@ -453,6 +456,37 @@ function previewLexiconFingerprint(lexicon: VideoLexiconEntry[], characterId: st
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash.toString(16).padStart(8, "0");
+}
+
+/**
+ * Preview-side word comparison. Punctuation and capitalization are not errors, because a recognizer
+ * does not reproduce them and reporting them would bury the real findings.
+ */
+function previewWordDifferences(expected: string, heard: string): { kind: VideoQcFindingKind; detail: string }[] {
+  const normalize = (text: string) => text.split(/\s+/)
+    .map((word) => word.replace(/[^\p{L}\p{N}']/gu, "").toLowerCase())
+    .filter(Boolean);
+  const wanted = normalize(expected);
+  const said = normalize(heard);
+  const differences: { kind: VideoQcFindingKind; detail: string }[] = [];
+  let index = 0;
+  let cursor = 0;
+  while (index < wanted.length && cursor < said.length) {
+    if (wanted[index] === said[cursor]) { index += 1; cursor += 1; continue; }
+    if (wanted[index + 1] === said[cursor + 1]) {
+      differences.push({ kind: "replaced_word", detail: `The take says "${said[cursor]}" where the script says "${wanted[index]}"` });
+      index += 1; cursor += 1;
+    } else if (wanted[index + 1] === said[cursor]) {
+      differences.push({ kind: "skipped_word", detail: `The take does not say "${wanted[index]}"` });
+      index += 1;
+    } else {
+      differences.push({ kind: "inserted_word", detail: `The take says "${said[cursor]}", which the script does not contain` });
+      cursor += 1;
+    }
+  }
+  for (; index < wanted.length; index += 1) differences.push({ kind: "skipped_word", detail: `The take does not say "${wanted[index]}"` });
+  for (; cursor < said.length; cursor += 1) differences.push({ kind: "inserted_word", detail: `The take says "${said[cursor]}", which the script does not contain` });
+  return differences;
 }
 
 const DEFAULT_PERFORMANCE_CLOCK: VideoPerformanceClock = { intra_exchange_ms: 220, turn_of_thought_ms: 600, pre_reveal_ms: 1_200, scene_boundary_ms: 900 };
@@ -906,6 +940,21 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       rendered.manifest.artifacts.push({ id: `${projectId}-preview`, project_id: projectId, version_id: rendered.manifest.version_id, role: "preview", title: `${rendered.name} preview`, mime_type: "video/mp4", format: "mp4", url: FIXTURE_VIDEO_URL, download_name: `${projectId}-preview.mp4`, duration_ms: rendered.duration_ms, width: 540, height: 960, frame_rate: 30, codec: "H.264", file_size_bytes: 1_448, playable: true, created_at: FIXED_NOW });
       return store(rendered);
     },
+    async checkEpisodeQuality(projectId, heard, integratedLufsMilli, truePeakDbMilli) {
+      const project = projects.get(projectId);
+      if (!project) throw new Error("Video project was not found.");
+      const narrated = (project.manifest.dialogue ?? []).filter((turn) => turn.narrated);
+      const checked = narrated.filter((turn) => turn.id in heard);
+      // A turn nobody listened back to is not a turn that passed.
+      const unchecked = narrated.filter((turn) => !(turn.id in heard)).map((turn) => turn.id);
+      const findings: VideoQcFinding[] = checked.flatMap((turn) =>
+        previewWordDifferences(turn.text, heard[turn.id]).map((detail, index) => ({
+          id: `qc-${turn.id}-${String(index).padStart(3, "0")}`,
+          kind: detail.kind, severity: "blocking" as const, turn_id: turn.id, detail: detail.detail, at_us: null,
+        })));
+      const loudnessChecked = integratedLufsMilli !== undefined && truePeakDbMilli !== undefined;
+      return { findings, checked_turns: checked.map((turn) => turn.id), unchecked_turns: unchecked, loudness_checked: loudnessChecked };
+    },
     async planEpisodeRelease(projectId, hasShowNotes) {
       const project = projects.get(projectId);
       if (!project) throw new Error("Video project was not found.");
@@ -1300,6 +1349,8 @@ function createNativeVideoService(): VideoStudioService {
     deleteShowFormat: (formatId) => invoke<void>("delete_show_format", { formatId }),
     createEpisode: (formatId, episodeName, brief) => invoke<VideoProject>("create_episode", { formatId, episodeName, brief }).then(withNativeProjectUrls),
     planEpisodeRelease: (projectId, hasShowNotes) => invoke<VideoReleasePlan>("plan_episode_release", { projectId, hasShowNotes }),
+    checkEpisodeQuality: (projectId, heard, integratedLufsMilli, truePeakDbMilli) =>
+      invoke<VideoQcReport>("check_episode_quality", { projectId, heard, integratedLufsMilli, truePeakDbMilli }),
     addVideoVisualAsset: (request) => invoke<AddVisualAssetResponse>("add_video_visual_asset", { request }).then((response) => ({ ...response, project: withNativeProjectUrls(response.project) })),
     reviseVideo: (request: ReviseVideoRequest) => invoke<VideoProject>("revise_video", { request }).then(withNativeProjectUrls),
     exportVideo: (request: VideoExportRequest, onProgress) => nativeWithProgress<VideoProject>(request.project_id, "export_video", { request }, onProgress).then(withNativeProjectUrls),

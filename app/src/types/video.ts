@@ -657,6 +657,38 @@ export interface VideoMusicCueInput {
   created_at: string;
 }
 
+export type VideoQcFindingKind =
+  | "skipped_word"
+  | "inserted_word"
+  | "replaced_word"
+  | "loudness_off_target"
+  | "true_peak_exceeded"
+  | "caption_drift"
+  | "dead_air";
+
+export type VideoQcSeverity = "notice" | "warning" | "blocking";
+
+/** One reviewable finding. Quality control reports; it never repairs what it finds. */
+export interface VideoQcFinding {
+  id: string;
+  kind: VideoQcFindingKind;
+  severity: VideoQcSeverity;
+  turn_id?: string | null;
+  detail: string;
+  at_us?: number | null;
+}
+
+/**
+ * The result of checking one episode. A turn nobody listened back to is reported as unchecked
+ * rather than as passed, and without a measurement the master is not claimed to be within target.
+ */
+export interface VideoQcReport {
+  findings: VideoQcFinding[];
+  checked_turns: string[];
+  unchecked_turns: string[];
+  loudness_checked: boolean;
+}
+
 /** What a finished release contains. */
 export type VideoReleaseMemberKind =
   | "podcast_audio"
@@ -883,6 +915,12 @@ export interface VideoStudioService {
   deleteShowFormat(formatId: string): Promise<void>;
   createEpisode(formatId: string, episodeName: string, brief?: string): Promise<VideoProject>;
   planEpisodeRelease(projectId: string, hasShowNotes: boolean): Promise<VideoReleasePlan>;
+  checkEpisodeQuality(
+    projectId: string,
+    heard: Record<string, string>,
+    integratedLufsMilli?: number,
+    truePeakDbMilli?: number,
+  ): Promise<VideoQcReport>;
   addVideoVisualAsset(request: AddVisualAssetRequest): Promise<AddVisualAssetResponse>;
   reviseVideo(request: ReviseVideoRequest): Promise<VideoProject>;
   exportVideo(request: VideoExportRequest, onProgress?: (update: VideoProgressUpdate) => void): Promise<VideoProject>;

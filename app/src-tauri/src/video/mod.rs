@@ -17,6 +17,7 @@ pub mod media;
 pub mod media_server;
 pub mod performance;
 pub mod presentation;
+pub mod quality;
 pub mod release;
 pub mod renderer;
 pub mod scheduler;
@@ -41,6 +42,11 @@ pub use cast::{
     MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
+pub use quality::{
+    build_report, diff_spoken_words, findings_for_caption_drift, findings_for_dead_air,
+    findings_for_loudness, findings_for_turn, CaptionAlignment, LoudnessMeasurement, QcFinding,
+    QcFindingKind, QcReport, QcSeverity, WordDifference,
+};
 pub use release::{
     episode_chapters, episode_transcript, plan_release, ReleaseChapter, ReleaseMemberKind,
     ReleaseMemberPlan, ReleasePlan, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,

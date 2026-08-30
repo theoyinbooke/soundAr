@@ -420,6 +420,42 @@ pub(crate) fn dispatch_video_operation(
                 None,
             )
         }
+        VideoAgentOperation::CheckEpisodeQuality(request) => {
+            // A partial measurement is no measurement: reporting loudness without its true peak
+            // would let half a check read as a whole one.
+            let loudness = match (request.integrated_lufs_milli, request.true_peak_db_milli) {
+                (Some(integrated_lufs_milli), Some(true_peak_db_milli)) => {
+                    Some(video::LoudnessMeasurement {
+                        integrated_lufs_milli,
+                        true_peak_db_milli,
+                    })
+                }
+                _ => None,
+            };
+            let report = runtime
+                .video
+                .check_episode_quality(&request.project_id, &request.heard, loudness)
+                .map_err(VideoAgentToolError::from)?;
+            let summary = if report.is_clear() {
+                "Every narrated line matches its script and the master is within target".to_string()
+            } else {
+                format!(
+                    "{} blocking finding(s), {} unchecked line(s)",
+                    report.blocking().len(),
+                    report.unchecked_turns.len()
+                )
+            };
+            Ok(VideoAgentResult::ready(
+                kind,
+                &summary,
+                serde_json::to_value(&report).map_err(|error| {
+                    VideoAgentToolError::new(
+                        "video.agent_result_encode_failed",
+                        format!("The quality report could not be encoded: {error}"),
+                    )
+                })?,
+            ))
+        }
         VideoAgentOperation::PlanEpisodeRelease(request) => {
             let plan = runtime
                 .video
@@ -858,6 +894,34 @@ pub(crate) async fn revise_video(
 /// Resolve exactly what a voice would say for a sample line, so one pronunciation rule can be
 /// auditioned without re-rendering the work around it. The caller synthesizes the returned text
 /// with the character's own voice through the ordinary speech queue.
+#[tauri::command]
+pub(crate) async fn check_episode_quality(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    heard: std::collections::BTreeMap<String, String>,
+    integrated_lufs_milli: Option<i32>,
+    true_peak_db_milli: Option<i32>,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    tauri::async_runtime::spawn_blocking(move || {
+        let loudness = match (integrated_lufs_milli, true_peak_db_milli) {
+            (Some(integrated_lufs_milli), Some(true_peak_db_milli)) => {
+                Some(video::LoudnessMeasurement {
+                    integrated_lufs_milli,
+                    true_peak_db_milli,
+                })
+            }
+            _ => None,
+        };
+        let report = service
+            .check_episode_quality(&project_id, &heard, loudness)
+            .map_err(service_error)?;
+        serde_json::to_value(report).map_err(|error| format!("video.invalid_request: {error}"))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Quality worker failed: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn plan_episode_release(
     state: tauri::State<'_, RuntimeState>,

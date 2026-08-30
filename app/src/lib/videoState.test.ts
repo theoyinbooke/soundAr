@@ -344,6 +344,21 @@ describe("videoStudioReducer", () => {
     expect(plan.chapters).toHaveLength(project.manifest.scenes.length);
   });
 
+  it("reports what a take actually said and never claims an unchecked line passed", async () => {
+    const service = createBrowserPreviewVideoService();
+    const created = await service.createVideoProject({ prompt: "A short story about a missing letter." });
+    const cast = [{ id: "narrator", name: "NARRATOR", display_name: "Narrator", voice_id: "af-heart", model_id: "kokoro-82m", language: "en-US", delivery: { rate_milli: 1000, pitch_milli: 0, energy_milli: 1000 }, created_at: "2026-01-01T00:00:00Z" }];
+    const written = await service.writeVideoScript({
+      project_id: created.id, expected_revision: created.revision, base_version_id: created.manifest.version_id,
+      operation_id: "qc-script", cast, script: "NARRATOR: Adaeze came home.\n\nNARRATOR: She said nothing at all.\n",
+    });
+
+    // Nothing has a take yet, so there is nothing to check and nothing to claim.
+    const untouched = await service.checkEpisodeQuality(written.project.id, {});
+    expect(untouched.checked_turns).toHaveLength(0);
+    expect(untouched.loudness_checked).toBe(false);
+  });
+
   it("moves a durable project through intake, analysis, review, render, and export", async () => {
     const service = createBrowserPreviewVideoService();
     let state: VideoStudioState = initialVideoStudioState;

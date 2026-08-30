@@ -61,6 +61,7 @@ pub(crate) enum VideoAgentOperationKind {
     ListShowFormats,
     CreateEpisode,
     PlanEpisodeRelease,
+    CheckEpisodeQuality,
     RegisterGeneratedVisual,
     AddVisualAsset,
     RenderVideoPreview,
@@ -90,6 +91,7 @@ impl VideoAgentOperationKind {
             Self::ListShowFormats => "list_show_formats",
             Self::CreateEpisode => "create_episode",
             Self::PlanEpisodeRelease => "plan_episode_release",
+            Self::CheckEpisodeQuality => "check_episode_quality",
             Self::RegisterGeneratedVisual => "register_generated_visual",
             Self::AddVisualAsset => "add_visual_asset",
             Self::RenderVideoPreview => "render_video_preview",
@@ -117,9 +119,10 @@ impl VideoAgentOperationKind {
             | Self::GenerateCueMusic
             | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
-            Self::ExportVideo | Self::ExportPublishPackage | Self::PlanEpisodeRelease => {
-                VideoProductionPhase::Export
-            }
+            Self::ExportVideo
+            | Self::ExportPublishPackage
+            | Self::PlanEpisodeRelease
+            | Self::CheckEpisodeQuality => VideoProductionPhase::Export,
             Self::ListVideoProjects
             | Self::GetVideoProject
             | Self::SaveShowFormat
@@ -148,6 +151,7 @@ pub(crate) enum VideoAgentOperation {
     ListShowFormats(EmptyRequest),
     CreateEpisode(CreateEpisodeRequest),
     PlanEpisodeRelease(PlanEpisodeReleaseRequest),
+    CheckEpisodeQuality(CheckEpisodeQualityRequest),
     RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
     AddVisualAsset(video::AddVisualAssetRequest),
     RenderVideoPreview(RenderVideoPreviewRequest),
@@ -176,6 +180,7 @@ impl VideoAgentOperation {
             Self::ListShowFormats(_) => VideoAgentOperationKind::ListShowFormats,
             Self::CreateEpisode(_) => VideoAgentOperationKind::CreateEpisode,
             Self::PlanEpisodeRelease(_) => VideoAgentOperationKind::PlanEpisodeRelease,
+            Self::CheckEpisodeQuality(_) => VideoAgentOperationKind::CheckEpisodeQuality,
             Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
             Self::AddVisualAsset(_) => VideoAgentOperationKind::AddVisualAsset,
             Self::RenderVideoPreview(_) => VideoAgentOperationKind::RenderVideoPreview,
@@ -205,6 +210,7 @@ impl VideoAgentOperation {
             "list_show_formats" => Self::ListShowFormats(decode(arguments)?),
             "create_episode" => Self::CreateEpisode(decode(arguments)?),
             "plan_episode_release" => Self::PlanEpisodeRelease(decode(arguments)?),
+            "check_episode_quality" => Self::CheckEpisodeQuality(decode(arguments)?),
             "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
             "add_visual_asset" => Self::AddVisualAsset(decode(arguments)?),
             "render_video_preview" => Self::RenderVideoPreview(decode(arguments)?),
@@ -236,6 +242,7 @@ impl VideoAgentOperation {
                 require_text(&request.episode_name, "episode_name")
             }
             Self::PlanEpisodeRelease(request) => require_text(&request.project_id, "project_id"),
+            Self::CheckEpisodeQuality(request) => require_text(&request.project_id, "project_id"),
             Self::PreviewLink(request) => {
                 require_text(&request.exact_url, "exact_url")?;
                 video::validate_import_url(&request.exact_url)
@@ -547,6 +554,20 @@ pub(crate) struct CreateVideoProjectRequest {
     pub audio_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CheckEpisodeQualityRequest {
+    pub(crate) project_id: String,
+    /// What a local recognizer actually heard, keyed by turn id. A turn left out is reported as
+    /// unchecked rather than as passed.
+    #[serde(default)]
+    pub(crate) heard: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) integrated_lufs_milli: Option<i32>,
+    #[serde(default)]
+    pub(crate) true_peak_db_milli: Option<i32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1161,6 +1182,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "list_show_formats" => VideoAgentOperationKind::ListShowFormats,
         "create_episode" => VideoAgentOperationKind::CreateEpisode,
         "plan_episode_release" => VideoAgentOperationKind::PlanEpisodeRelease,
+        "check_episode_quality" => VideoAgentOperationKind::CheckEpisodeQuality,
         "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
         "add_visual_asset" => VideoAgentOperationKind::AddVisualAsset,
         "render_video_preview" => VideoAgentOperationKind::RenderVideoPreview,
@@ -1351,6 +1373,19 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                     ("format_id", string("A saved show format id")),
                     ("episode_name", string("This episode's name")),
                     ("brief", nullable_string("What this episode is about, recorded as its initial intent")),
+                ]),
+            ),
+        ),
+        tool(
+            "check_episode_quality",
+            "Check a rendered episode against the script it was asked to speak. Supply what a local recognizer actually heard for each turn, keyed by turn id, and optionally the measured loudness of the master. Reports skipped, inserted, and mispronounced words per line, an off-target master, and silence long enough to read as a fault. A turn you do not supply is reported as unchecked rather than as passed, and without a measurement the master is reported as unchecked rather than as within target. This reports only: it never rewrites a script, re-renders a take, or adjusts a mix. Read-only.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("heard", json!({"type":"object","additionalProperties":{"type":"string"},"description":"Turn id to the text a local recognizer heard in that turn's take"})),
+                    ("integrated_lufs_milli", json!({"type":["integer","null"],"description":"Measured integrated loudness of the master, in milli-LUFS. Never estimate this."})),
+                    ("true_peak_db_milli", json!({"type":["integer","null"],"description":"Measured true peak of the master, in milli-dBTP"})),
                 ]),
             ),
         ),
@@ -2327,8 +2362,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 23);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 23);
+        assert_eq!(names.len(), 24);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 24);
         for required in [
             "preview_link",
             "import_link",
@@ -2344,6 +2379,7 @@ mod tests {
             "list_show_formats",
             "create_episode",
             "plan_episode_release",
+            "check_episode_quality",
             "register_generated_visual",
             "add_visual_asset",
             "render_video_preview",
