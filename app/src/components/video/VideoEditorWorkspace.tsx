@@ -6,10 +6,11 @@ import type { VideoCanvasBounds, VideoCaptionPreset, VideoCaptionStyle, VideoJob
 import { formatVideoClock, formatVideoUpdatedAt, selectPreviewArtifact } from "../../lib/videoState";
 import { previewCaptionPresets } from "../../lib/captionPresets";
 import { VideoPreviewPlayer } from "./VideoPreviewPlayer";
+import { VideoCastPanel } from "./VideoCastPanel";
 import { VideoProductionSteps } from "./VideoProductionSteps";
 import { millisecondsToMicroseconds, VideoTimeline, type VideoTimelineMode } from "./VideoTimeline";
 
-type VideoInspectorTab = "layout" | "captions" | "audio" | "visuals";
+type VideoInspectorTab = "layout" | "captions" | "audio" | "cast" | "visuals";
 
 export function VideoEditorWorkspace({
   project,
@@ -33,6 +34,7 @@ export function VideoEditorWorkspace({
   onUndoTimeline,
   onRedoTimeline,
   onCancelWorking,
+  onNarrate,
   bootstrap,
   voices = [],
 }: {
@@ -57,6 +59,7 @@ export function VideoEditorWorkspace({
   onUndoTimeline: () => void;
   onRedoTimeline: () => void;
   onCancelWorking: () => void;
+  onNarrate: (turnIds: string[], draft: boolean) => Promise<void>;
   bootstrap?: BootstrapState;
   voices?: VoiceProfile[];
 }) {
@@ -76,11 +79,18 @@ export function VideoEditorWorkspace({
   ));
   const activeVisualLayer = selectedVisualLayer ?? fallbackVisualLayer;
   const activeVisualAsset = (project.manifest.visual_assets ?? []).find((asset) => asset.id === activeVisualLayer?.asset_id);
-  const inspectorTabs: readonly VideoInspectorTab[] = activeVisualLayer
-    ? ["layout", "captions", "audio", "visuals"]
-    : ["layout", "captions", "audio"];
+  // Cast is always offered, so a user can find where a multi-character episode is authored rather
+  // than having to already have one before the surface appears.
+  const inspectorTabs: readonly VideoInspectorTab[] = [
+    "layout" as const,
+    "captions" as const,
+    "audio" as const,
+    "cast" as const,
+    ...(activeVisualLayer ? (["visuals"] as const) : []),
+  ];
   const [activeTab, setActiveTab] = useState<VideoInspectorTab>("captions");
   const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [narrating, setNarrating] = useState(false);
   const [scenePaneWidth, setScenePaneWidth] = useState(190);
   const [inspectorPaneWidth, setInspectorPaneWidth] = useState(270);
   const [timelineMode, setTimelineMode] = useState<VideoTimelineMode>(() => readTimelineMode());
@@ -321,6 +331,17 @@ export function VideoEditorWorkspace({
               </fieldset>
               <fieldset><legend>Audio mix</legend><label><span>Voice <b>{draft.voice_gain_db.toFixed(1)} dB</b></span><input aria-label="Voice gain" type="range" min={-24} max={6} step={1} value={draft.voice_gain_db} onChange={(event) => updateDraft({ ...draft, voice_gain_db: Number(event.target.value) })} /></label><label><span>Music <b>{draft.music_gain_db.toFixed(1)} dB</b></span><input aria-label="Music gain" type="range" min={-30} max={0} step={1} value={draft.music_gain_db} onChange={(event) => updateDraft({ ...draft, music_gain_db: Number(event.target.value) })} /></label></fieldset>
             </div> : null}
+            {activeTab === "cast" ? <VideoCastPanel project={project} narrating={narrating} panelId={`${tabId}-cast-panel`} labelledBy={`${tabId}-cast-tab`} onNarrate={async (turnIds, draft) => {
+              setNarrating(true);
+              try { await onNarrate(turnIds, draft); } finally { setNarrating(false); }
+            }} onPromote={async (turnIds) => {
+              setNarrating(true);
+              // Promotion drops the stand-in takes, then the same lines are read for real.
+              try {
+                await onEditTimeline([{ type: "promote_turns_to_final", turn_ids: turnIds }], "Promote draft lines");
+                await onNarrate(turnIds, false);
+              } finally { setNarrating(false); }
+            }} /> : null}
             {activeTab === "visuals" && activeVisualLayer && activeVisualAsset ? <fieldset id={`${tabId}-visuals-panel`} role="tabpanel" aria-labelledby={`${tabId}-visuals-tab`} className="video-visual-inspector">
               <legend>Image layer</legend>
               <div className="video-visual-inspector-card" aria-label="Selected image layer">{activeVisualAsset.url ? <img src={activeVisualAsset.url} alt="" /> : <ImagePlus aria-hidden="true" size={18} />}<span><strong>Imported image</strong><small title={activeVisualAsset.local_path}>{activeVisualAsset.mime_type.replace("image/", "").toUpperCase()} · {activeVisualAsset.width}×{activeVisualAsset.height}</small></span></div>

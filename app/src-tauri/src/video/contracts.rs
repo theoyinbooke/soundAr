@@ -1301,7 +1301,7 @@ impl Validate for AudioMix {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RenderArtifactRole {
     Proxy,
@@ -1312,7 +1312,24 @@ pub enum RenderArtifactRole {
     FinalMaster,
     Captions,
     Transcript,
+    /// The episode as audio, with its chapter marks.
+    PodcastAudio,
+    /// A short vertical cut of the episode's strongest moment.
+    Trailer,
+    /// A square waveform video, for feeds where only video plays.
+    Audiogram,
     PublishPackage,
+}
+
+impl RenderArtifactRole {
+    /// Whether this artifact is something the audience receives, rather than working media the
+    /// production needed along the way. A release is assembled from exactly these.
+    pub const fn is_release_member(self) -> bool {
+        matches!(
+            self,
+            Self::FinalMaster | Self::PodcastAudio | Self::Trailer | Self::Audiogram
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1371,9 +1388,6 @@ impl Validate for RenderArtifact {
     }
 }
 
-/// Binds the active generated narration for a scene to both its soundAr History
-/// provenance and the immutable managed artifact used by the canonical timeline.
-///
 /// Whether a take is the finished performance or a fast stand-in.
 ///
 /// Draft mode exists so a whole episode can be heard in about a minute with the fastest installed
@@ -1390,6 +1404,9 @@ pub enum TakeFidelity {
     Final,
 }
 
+/// Binds the active generated narration for a scene or turn to both its soundAr History
+/// provenance and the immutable managed artifact used by the canonical timeline.
+///
 /// The generation route is stored explicitly so a later voice revision can be
 /// reproduced without guessing which model, speaker, or consent-backed voice was
 /// used. `script_sha256` prevents a narration take from silently surviving a
@@ -1417,7 +1434,14 @@ pub struct NarrationBinding {
     pub generation_job_id: String,
     pub voice_id: String,
     pub model_id: String,
+    /// The engine's speaker selection - a preset voice id for a preset route. This is what the
+    /// model was told to sound like, not who is speaking in the story.
     pub speaker: String,
+    /// The character who performs this line, for a turn-scoped take. Recorded separately from
+    /// `speaker` because the engine's speaker is a voice and this is a person in the script;
+    /// conflating them would make a preset route and a character name fight over one field.
+    #[serde(default)]
+    pub character_id: Option<String>,
     pub language: String,
     pub script_sha256: String,
     pub created_at: String,
@@ -1444,6 +1468,9 @@ impl Validate for NarrationBinding {
         validate_identifier(&self.voice_id, "narration_bindings.voice_id")?;
         validate_nonempty(&self.model_id, "narration_bindings.model_id", 256)?;
         validate_nonempty(&self.speaker, "narration_bindings.speaker", 128)?;
+        if let Some(character_id) = &self.character_id {
+            validate_identifier(character_id, "narration_bindings.character_id")?;
+        }
         validate_language_tag(&self.language, "narration_bindings.language")?;
         validate_sha256(
             &self.script_sha256,
@@ -1949,7 +1976,10 @@ impl Validate for VideoProjectManifest {
 
         // `index_cast_by_name` validates each member and rejects two characters whose script
         // names cannot be told apart, which would make the written script ambiguous.
-        let cast_by_name = index_cast_by_name(&self.cast)?;
+        // The map itself is no longer needed - a take records its character directly - but the
+        // ambiguity check is: two characters whose script names cannot be told apart would make
+        // every script written against this cast ambiguous.
+        index_cast_by_name(&self.cast)?;
         let cast_by_id = self
             .cast
             .iter()
@@ -2178,16 +2208,12 @@ impl Validate for VideoProjectManifest {
                     )
                     .at("narration_bindings.turn_id")
                 })?;
-                if cast_by_name
-                    .get(&super::cast::normalize_speaker_name(&binding.speaker))
-                    .map(|matched| matched.id.as_str())
-                    != Some(member.id.as_str())
-                {
+                if binding.character_id.as_deref() != Some(member.id.as_str()) {
                     return Err(VideoError::new(
                         VideoErrorCode::InvalidNarration,
-                        "narration speaker does not match the character who speaks this turn",
+                        "narration does not record the character who speaks this turn",
                     )
-                    .at("narration_bindings.speaker"));
+                    .at("narration_bindings.character_id"));
                 }
                 // Changing a rule that governs this character's lines makes this take stale in
                 // exactly the way changing the line's words does.
@@ -3198,6 +3224,7 @@ mod tests {
             id: "turn-binding".into(),
             scene_id: None,
             turn_id: Some("turn-1".into()),
+            character_id: Some("narrator".into()),
             lexicon_fingerprint: None,
             fidelity: TakeFidelity::Final,
             render_artifact_id: "turn-audio".into(),
@@ -3380,11 +3407,21 @@ mod tests {
 
     #[test]
     fn a_take_must_record_the_character_who_speaks_its_turn() {
+        // The engine speaker is a voice route; the character is a person in the script. A take
+        // claiming the wrong character would survive a voice reassignment it should not.
         let mut manifest = dialogue_manifest();
-        manifest.narration_bindings[0].speaker = "ADAEZE".into();
+        manifest.narration_bindings[0].character_id = Some("adaeze".into());
         let error = manifest.validate_strict().unwrap_err();
         assert_eq!(error.code, VideoErrorCode::InvalidNarration);
-        assert_eq!(error.field.as_deref(), Some("narration_bindings.speaker"));
+        assert_eq!(
+            error.field.as_deref(),
+            Some("narration_bindings.character_id")
+        );
+
+        // Changing only the engine speaker is not a character mismatch.
+        let mut retuned = dialogue_manifest();
+        retuned.narration_bindings[0].speaker = "am_adam".into();
+        retuned.validate_strict().unwrap();
     }
 
     #[test]
@@ -3468,6 +3505,7 @@ mod tests {
             id: "narration-binding".into(),
             scene_id: Some("scene-narration".into()),
             turn_id: None,
+            character_id: None,
             lexicon_fingerprint: None,
             fidelity: TakeFidelity::Final,
             render_artifact_id: "narration-audio".into(),

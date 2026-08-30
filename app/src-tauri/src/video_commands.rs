@@ -152,7 +152,10 @@ struct DurablePlanRequest {
 #[serde(deny_unknown_fields)]
 struct DurableNarrationRevisionRequest {
     project_id: String,
-    scene_id: String,
+    /// Absent for a turn-scoped narration. A line belongs to its turn, not to a scene, and naming
+    /// a scene it does not have would fail the identity check the job runs before synthesizing.
+    #[serde(default)]
+    scene_id: Option<String>,
     /// Whether this re-read is the finished performance or a fast stand-in.
     #[serde(default)]
     fidelity: video::TakeFidelity,
@@ -362,15 +365,16 @@ pub(crate) fn dispatch_video_operation(
                 &runtime.store.video_artifacts_root(),
             )
             .map_err(VideoAgentToolError::from)?;
-            let retained = result.receipt.retained_turn_ids.len();
+            let unchanged = result.receipt.retained_turn_ids.len();
             let fresh = result.receipt.new_turn_ids.len();
+            let dropped = result.receipt.dropped_binding_ids.len();
             VideoAgentResult::project(
                 kind,
                 VideoAgentResultStatus::Completed,
-                // Saying which turns survived is what stops the agent re-reading lines that
-                // already have a valid take.
+                // A retained line kept its identity, which is not the same as having a take.
+                // Reporting it as a valid take would tell the agent work exists that does not.
                 format!(
-                    "Cast and script committed: {fresh} turn(s) need narration, {retained} existing take(s) remain valid"
+                    "Cast and script committed: {fresh} new line(s), {unchanged} unchanged, {dropped} take(s) dropped. Narrate the lines that have no take yet."
                 ),
                 project,
                 Some(result.job_id),
@@ -454,6 +458,34 @@ pub(crate) fn dispatch_video_operation(
                 })?,
             ))
         }
+        VideoAgentOperation::TranscribeAndCheckEpisode(request) => {
+            let report =
+                transcribe_and_check_episode(runtime, &request.project_id, &request.model_id)
+                    .map_err(VideoAgentToolError::from)?;
+            let blocking = report
+                .get("findings")
+                .and_then(Value::as_array)
+                .map(|findings| {
+                    findings
+                        .iter()
+                        .filter(|finding| {
+                            finding.get("severity").and_then(Value::as_str) == Some("blocking")
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            let unchecked = report
+                .get("unchecked_turns")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default();
+            let summary = if blocking == 0 && unchecked == 0 {
+                "Every narrated line matches its script".to_string()
+            } else {
+                format!("{blocking} blocking finding(s), {unchecked} unchecked line(s)")
+            };
+            Ok(VideoAgentResult::ready(kind, &summary, report))
+        }
         VideoAgentOperation::CheckEpisodeQuality(request) => {
             // A partial measurement is no measurement: reporting loudness without its true peak
             // would let half a check read as a whole one.
@@ -490,6 +522,35 @@ pub(crate) fn dispatch_video_operation(
                 })?,
             ))
         }
+        VideoAgentOperation::ExportEpisodeRelease(request) => {
+            let exported = runtime
+                .video
+                .export_episode_release(
+                    &request.project_id,
+                    "video-studio-producer",
+                    request.has_show_notes,
+                )
+                .map_err(VideoAgentToolError::from)?;
+            let project = video::present_video_project(
+                &exported.project,
+                &runtime.store.video_artifacts_root(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            // Saying what was skipped is the difference between a partial release and one that
+            // looks complete.
+            let summary = format!(
+                "Registered {} deliverable(s); {} member(s) could not be produced",
+                exported.produced.len(),
+                exported.skipped.len()
+            );
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                &summary,
+                project,
+                Some(exported.job_id),
+            )
+        }
         VideoAgentOperation::PlanEpisodeRelease(request) => {
             let plan = runtime
                 .video
@@ -513,6 +574,37 @@ pub(crate) fn dispatch_video_operation(
                     )
                 })?,
             ))
+        }
+        VideoAgentOperation::NarrateTurns(request) => {
+            let fidelity = if request.draft {
+                video::TakeFidelity::Draft
+            } else {
+                video::TakeFidelity::Final
+            };
+            let project = narrate_turns(
+                runtime,
+                &request.project_id,
+                &request.turn_ids,
+                fidelity,
+                progress.as_ref(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            let summary = format!(
+                "Performed {} line(s){}",
+                request.turn_ids.len(),
+                if request.draft {
+                    " as draft stand-ins"
+                } else {
+                    ""
+                }
+            );
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                &summary,
+                project,
+                None,
+            )
         }
         VideoAgentOperation::GenerateCueMusic(request) => {
             let record = generate_cue_music(
@@ -955,6 +1047,84 @@ pub(crate) async fn listen_to_episode(
     .map_err(|error| format!("video.worker_failed: Listening worker failed: {error}"))?
 }
 
+/// Listen back to every narrated line with a local recognizer, then check what was heard against
+/// the script each take was asked to speak.
+///
+/// This is the measuring half of quality control. A line whose take cannot be transcribed is left
+/// out of `heard`, which the check then reports as unchecked rather than as passed - a failed
+/// recognition must never read as a clean line.
+pub(crate) fn transcribe_and_check_episode(
+    runtime: &RuntimeState,
+    project_id: &str,
+    model_id: &str,
+) -> Result<Value, String> {
+    let record = runtime
+        .video
+        .get_project(project_id)
+        .map_err(service_error)?;
+    let manifest: video::VideoProjectManifest = serde_json::from_value(
+        record
+            .get("manifest")
+            .cloned()
+            .ok_or("video.invalid_manifest: Project manifest is missing")?,
+    )
+    .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+
+    let artifact_paths = manifest
+        .render_artifacts
+        .iter()
+        .map(|artifact| (artifact.id.as_str(), artifact.managed_path.as_str()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let video_root = runtime.store.video_artifacts_root();
+    let mut heard = std::collections::BTreeMap::new();
+    for binding in &manifest.narration_bindings {
+        let Some(turn_id) = binding.turn_id.as_deref() else {
+            continue;
+        };
+        let Some(relative) = artifact_paths.get(binding.render_artifact_id.as_str()) else {
+            continue;
+        };
+        let audio_path = video_root.join(relative);
+        if !audio_path.is_file() {
+            continue;
+        }
+        let transcribed = runtime.request(json!({
+            "operation": "transcribe",
+            "model_id": model_id,
+            "audio_path": audio_path,
+            "original_audio_path": audio_path,
+            "processing": { "schema_version": 1, "algorithm": "none" },
+        }));
+        // A recognizer that could not read this take leaves the line unchecked, which the report
+        // states explicitly. Substituting the script here would make every line pass by default.
+        if let Ok(result) = transcribed {
+            if let Some(text) = result.get("text").and_then(Value::as_str) {
+                heard.insert(turn_id.to_string(), text.to_string());
+            }
+        }
+    }
+
+    let report = runtime
+        .video
+        .check_episode_quality(project_id, &heard, None)
+        .map_err(service_error)?;
+    serde_json::to_value(report).map_err(|error| format!("video.invalid_request: {error}"))
+}
+
+#[tauri::command]
+pub(crate) async fn transcribe_and_check_episode_quality(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    model_id: String,
+) -> Result<Value, String> {
+    let runtime = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        transcribe_and_check_episode(&runtime, &project_id, &model_id)
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Quality worker failed: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn check_episode_quality(
     state: tauri::State<'_, RuntimeState>,
@@ -981,6 +1151,31 @@ pub(crate) async fn check_episode_quality(
     })
     .await
     .map_err(|error| format!("video.worker_failed: Quality worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn export_episode_release(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    has_show_notes: bool,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let exported = service
+            .export_episode_release(&project_id, "video-studio-producer", has_show_notes)
+            .map_err(service_error)?;
+        let project = video::present_video_project(&exported.project, &video_root)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "project": project,
+            "produced": exported.produced,
+            "skipped": exported.skipped,
+            "job_id": exported.job_id,
+        }))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Release export worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -1359,7 +1554,7 @@ fn revise_project(
             .map(|binding| binding.id.clone());
         let durable = DurableNarrationRevisionRequest {
             project_id: request.project_id.clone(),
-            scene_id: scene.id.clone(),
+            scene_id: Some(scene.id.clone()),
             fidelity: video::TakeFidelity::Final,
             // This command revises a whole scene's narration. Turn-scoped re-reads arrive
             // through the dialogue path, which resolves its own binding.
@@ -1391,6 +1586,141 @@ fn revise_project(
     let project = video::present_video_project(&record, &runtime.store.video_artifacts_root())
         .map_err(|error| error.to_string())?;
     Ok(ProjectOperationResult { project, job_id })
+}
+
+/// Perform the named lines with their characters' own voices.
+///
+/// Each line is one durable narration job, so a long episode narrates through the same GPU-aware
+/// scheduler as every other generation and an interrupted run resumes line by line rather than
+/// starting over. Turns are performed in script order because a partly narrated episode should read
+/// from the top rather than in whatever order the caller happened to list.
+///
+/// The text handed to the engine is the line after its pronunciation rules are applied; the take
+/// still records the words the writer actually wrote.
+pub(crate) fn narrate_turns(
+    runtime: &RuntimeState,
+    project_id: &str,
+    turn_ids: &[String],
+    fidelity: video::TakeFidelity,
+    progress: Option<&video::ProgressCallback>,
+) -> Result<Value, String> {
+    if turn_ids.is_empty() {
+        return Err("video.invalid_request: Name at least one line to narrate".into());
+    }
+    let wanted = turn_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut record = runtime
+        .video
+        .get_project(project_id)
+        .map_err(service_error)?;
+
+    // Resolved fresh from the committed manifest on every line, because each narration commits a
+    // revision and the next one must build on it rather than on a stale copy.
+    loop {
+        let manifest: video::VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or("video.invalid_manifest: Project manifest is missing")?,
+        )
+        .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+        let narrated = manifest
+            .narration_bindings
+            .iter()
+            .filter_map(|binding| binding.turn_id.clone())
+            .collect::<BTreeSet<_>>();
+        let Some(turn) = manifest
+            .dialogue
+            .iter()
+            .find(|turn| wanted.contains(&turn.id) && !narrated.contains(&turn.id))
+            .cloned()
+        else {
+            break;
+        };
+        let member = manifest
+            .cast
+            .iter()
+            .find(|member| member.id == turn.character_id)
+            .cloned()
+            .ok_or("video.unknown_speaker: That line's character is not in the cast")?;
+
+        // What the voice is actually asked to say.
+        let spoken = video::apply_lexicon(
+            turn.spoken_text(),
+            &video::effective_entries(&manifest.lexicon, &member.id),
+        )
+        .spoken_text;
+        // The engine speaker is resolved from the installed voice library rather than assumed: a
+        // preset route must name its preset voice, and a cloned one carries its reference.
+        let route = resolve_voice_revision_route(
+            runtime,
+            VoiceRevisionSelection {
+                voice_id: member.voice_id.clone(),
+                model_id: member.model_id.clone(),
+                speaker: member.voice_id.clone(),
+                language: member.language.clone(),
+            },
+        )?;
+        let durable = DurableNarrationRevisionRequest {
+            project_id: project_id.to_string(),
+            // A turn-scoped narration has no scene; the line is its own identity.
+            scene_id: None,
+            fidelity,
+            turn_id: Some(turn.id.clone()),
+            binding_id: None,
+            script_sha256: sha256_text(&spoken),
+            script: spoken,
+            voice_id: route.selection.voice_id,
+            model_id: route.selection.model_id,
+            speaker: route.selection.speaker,
+            language: route.selection.language,
+            voice_name: route.voice_name,
+            reference_audio_path: route.reference_audio_path,
+            expected_revision: record
+                .get("revision")
+                .and_then(Value::as_i64)
+                .ok_or("video.invalid_project: Project revision is missing")?,
+            expected_version_id: project_version_id(&record)?.to_string(),
+            actor: "video-studio-performer".to_string(),
+            priority: "normal".into(),
+            title: format!("{} · {}", member.display_name, turn.id),
+        };
+        let durable_value = serde_json::to_value(&durable)
+            .map_err(|error| format!("video.invalid_request: {error}"))?;
+        let parent_job_id = runtime
+            .store
+            .create_job("video_regenerate_narration", &durable_value)?;
+        record = run_narration_revision_job_guarded(runtime, &parent_job_id, durable, progress)?;
+    }
+
+    // A script written as dialogue has no scenes, and rendering, captions, and chapters are all
+    // scene-shaped. Building one once the lines are performed is what makes the episode renderable.
+    let record = runtime
+        .video
+        .ensure_dialogue_scene(project_id, "video-studio-performer")
+        .map_err(service_error)?;
+
+    video::present_video_project(&record, &runtime.store.video_artifacts_root())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub(crate) async fn narrate_video_turns(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    turn_ids: Vec<String>,
+    draft: Option<bool>,
+) -> Result<Value, String> {
+    let runtime = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let fidelity = if draft.unwrap_or(false) {
+            video::TakeFidelity::Draft
+        } else {
+            video::TakeFidelity::Final
+        };
+        narrate_turns(&runtime, &project_id, &turn_ids, fidelity, None)
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Narration worker failed: {error}"))?
 }
 
 fn run_narration_revision_job_guarded(
@@ -1458,11 +1788,9 @@ fn run_narration_revision_job(
     manifest
         .validate_strict()
         .map_err(|error| error.to_string())?;
-    let scene = selected_revision_scene(&manifest, Some(&request.scene_id))?;
-    if scene.script.trim() != request.script
-        || sha256_text(scene.script.trim()) != request.script_sha256
-    {
-        return Err("video.narration_script_changed: The reviewed scene script changed after this durable narration task was queued".into());
+    let source_text = durable_narration_source_text(&manifest, request)?;
+    if source_text != request.script || sha256_text(&source_text) != request.script_sha256 {
+        return Err("video.narration_script_changed: The script changed after this durable narration task was queued".into());
     }
     let resolved = resolve_voice_revision_route(
         runtime,
@@ -1801,7 +2129,7 @@ fn narration_replacement_request(
             scene_id: if request.turn_id.is_some() {
                 None
             } else {
-                Some(request.scene_id.clone())
+                request.scene_id.clone()
             },
             turn_id: request.turn_id.clone(),
             clip_id: None,
@@ -1847,11 +2175,12 @@ fn validate_committed_narration_result(
                 .into(),
         );
     }
-    let scene = selected_revision_scene(&manifest, Some(&request.scene_id))?;
-    if scene.script.trim() != request.script
-        || sha256_text(scene.script.trim()) != request.script_sha256
-    {
-        return Err("video.narration_result_changed: The completed narration no longer matches the reviewed scene script".into());
+    let source_text = durable_narration_source_text(&manifest, request)?;
+    if source_text != request.script || sha256_text(&source_text) != request.script_sha256 {
+        return Err(
+            "video.narration_result_changed: The completed narration no longer matches its script"
+                .into(),
+        );
     }
     let binding = manifest.narration_bindings.iter().find(|binding| {
         request
@@ -1859,12 +2188,16 @@ fn validate_committed_narration_result(
             .as_deref()
             .is_some_and(|id| binding.id == id)
             || (request.binding_id.is_none()
-                && binding.scene_id.as_deref() == Some(request.scene_id.as_str()))
+                && match request.turn_id.as_deref() {
+                    Some(turn_id) => binding.turn_id.as_deref() == Some(turn_id),
+                    None => binding.scene_id.as_deref() == request.scene_id.as_deref(),
+                })
     });
     let binding = binding.ok_or(
         "video.narration_result_missing: The completed narration binding is not present in the current timeline",
     )?;
-    if binding.scene_id.as_deref() != Some(request.scene_id.as_str())
+    if binding.scene_id.as_deref() != request.scene_id.as_deref()
+        || binding.turn_id.as_deref() != request.turn_id.as_deref()
         || binding.voice_id != request.voice_id
         || binding.model_id != request.model_id
         || binding.speaker != request.speaker
@@ -2157,7 +2490,8 @@ fn narration_stage_checkpoint(
             stage.get("version_id").and_then(Value::as_str)
                 == Some(request.expected_version_id.as_str())
                 && stage.get("stage_key").and_then(Value::as_str) == Some("narration_regeneration")
-                && stage.get("scope_key").and_then(Value::as_str) == Some(request.scene_id.as_str())
+                && stage.get("scope_key").and_then(Value::as_str)
+                    == Some(narration_scope_key(request).as_str())
                 && stage.get("job_id").and_then(Value::as_str) == Some(parent_job_id)
         })
         .and_then(|stage| stage.get("checkpoint").cloned())
@@ -2186,7 +2520,7 @@ fn checkpoint_narration_stage(
         "project_id": request.project_id,
         "version_id": request.expected_version_id,
         "stage_key": "narration_regeneration",
-        "scope_key": request.scene_id,
+        "scope_key": narration_scope_key(request),
         "job_id": parent_job_id,
         "status": status,
         "resource_class": "heavy",
@@ -2795,6 +3129,47 @@ fn narration_route_matches_manifest(
             && binding.language == selection.language
             && binding.script_sha256 == script_sha256
     })
+}
+
+/// The exact words this durable narration was queued to speak.
+///
+/// A turn-scoped request follows its line - after its pronunciation rules, which is what the engine
+/// was actually asked to say - and a scene-scoped one follows its scene script. Resolving the wrong
+/// one would either reject a valid narration or let a stale one through.
+/// The unit this narration belongs to: its line when turn-scoped, otherwise its scene.
+///
+/// Checkpoints are scoped by this, so two lines in the same scene never adopt each other's
+/// in-flight work.
+fn narration_scope_key(request: &DurableNarrationRevisionRequest) -> String {
+    request
+        .turn_id
+        .clone()
+        .or_else(|| request.scene_id.clone())
+        .unwrap_or_else(|| "project".to_string())
+}
+
+fn durable_narration_source_text(
+    manifest: &video::VideoProjectManifest,
+    request: &DurableNarrationRevisionRequest,
+) -> Result<String, String> {
+    if let Some(turn_id) = request.turn_id.as_deref() {
+        let turn = manifest
+            .dialogue
+            .iter()
+            .find(|turn| turn.id == turn_id)
+            .ok_or("video.turn_not_found: The narrated line is no longer in this version")?;
+        return Ok(video::apply_lexicon(
+            turn.spoken_text(),
+            &video::effective_entries(&manifest.lexicon, &turn.character_id),
+        )
+        .spoken_text);
+    }
+    Ok(
+        selected_revision_scene(manifest, request.scene_id.as_deref())?
+            .script
+            .trim()
+            .to_string(),
+    )
 }
 
 fn selected_revision_scene<'a>(
@@ -3482,7 +3857,11 @@ fn discard_invalidated_render_artifacts(
             video::RenderArtifactRole::FinalMaster => {
                 stages.contains(&video::RevisionStage::FinalRender)
             }
-            video::RenderArtifactRole::PublishPackage => {
+            // Every deliverable is assembled from the master, so a re-render invalidates them all.
+            video::RenderArtifactRole::PublishPackage
+            | video::RenderArtifactRole::PodcastAudio
+            | video::RenderArtifactRole::Trailer
+            | video::RenderArtifactRole::Audiogram => {
                 stages.contains(&video::RevisionStage::PublishPackage)
             }
             _ => false,
@@ -5972,7 +6351,7 @@ mod tests {
     fn durable_narration_request_binds_route_script_reference_and_parent_child_payload() {
         let durable = DurableNarrationRevisionRequest {
             project_id: "project-1".into(),
-            scene_id: "scene-opening".into(),
+            scene_id: Some("scene-opening".into()),
             fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),
@@ -6052,6 +6431,7 @@ mod tests {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
             turn_id: None,
+            character_id: None,
             lexicon_fingerprint: None,
             fidelity: video::TakeFidelity::Final,
             render_artifact_id: artifact.id.clone(),
@@ -6083,7 +6463,7 @@ mod tests {
             .expect("valid exact narration result");
         let request = DurableNarrationRevisionRequest {
             project_id: manifest.project_id.clone(),
-            scene_id: "scene-opening".into(),
+            scene_id: Some("scene-opening".into()),
             fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),
@@ -6230,7 +6610,7 @@ mod tests {
         let script = base_manifest.reviewed_scenes[0].script.clone();
         let request = DurableNarrationRevisionRequest {
             project_id: project_id.clone(),
-            scene_id: "scene-opening".into(),
+            scene_id: Some("scene-opening".into()),
             fidelity: video::TakeFidelity::Final,
             turn_id: None,
             binding_id: Some("binding-opening".into()),
@@ -6366,6 +6746,7 @@ mod tests {
                 id: "binding-opening".into(),
                 scene_id: Some("scene-opening".into()),
                 turn_id: None,
+                character_id: None,
                 lexicon_fingerprint: None,
                 fidelity: video::TakeFidelity::Final,
                 render_artifact_id: artifact_id.into(),
@@ -7371,6 +7752,7 @@ mod tests {
             id: "binding-opening".into(),
             scene_id: Some("scene-opening".into()),
             turn_id: None,
+            character_id: None,
             lexicon_fingerprint: None,
             fidelity: video::TakeFidelity::Final,
             render_artifact_id: "speech-opening".into(),

@@ -1122,7 +1122,7 @@ fn render_output_arguments(
                 RenderProfile::Final => "19",
             }),
         ]),
-        VideoEncoder::Image => {}
+        VideoEncoder::Image | VideoEncoder::AudioOnly => {}
     }
     args.extend([
         OsString::from("-pix_fmt"),

@@ -81,19 +81,21 @@ pub use presentation::{
 };
 pub use quality::{
     build_report, diff_spoken_words, findings_for_caption_drift, findings_for_dead_air,
-    findings_for_loudness, findings_for_turn, CaptionAlignment, LoudnessMeasurement, QcFinding,
-    QcFindingKind, QcReport, QcSeverity, WordDifference,
+    findings_for_loudness, findings_for_turn, parse_loudness_analysis, CaptionAlignment,
+    LoudnessMeasurement, QcFinding, QcFindingKind, QcReport, QcSeverity, WordDifference,
 };
 pub use release::{
-    episode_chapters, episode_transcript, plan_release, ReleaseChapter, ReleaseMemberKind,
-    ReleaseMemberPlan, ReleasePlan, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
+    episode_chapters, episode_transcript, ffmetadata_chapters, plan_release, ReleaseChapter,
+    ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US,
+    TRAILER_TARGET_US,
 };
 pub use renderer::{
+    build_audiogram_command, build_loudness_analysis_command, build_podcast_audio_command,
     build_portrait_command, build_portrait_command_with_layout, build_proxy_command,
-    build_thumbnail_command, build_waveform_command, parse_ffmpeg_progress, publish_atomic,
-    should_fallback_from_nvenc, sibling_staging_path, terminate_process_group, FfmpegProgress,
-    FfmpegProgressParser, FfmpegProgressPhase, PortraitLayout, PublishedArtifact, RenderCommand,
-    RenderCommandPlan, RenderProfile, RenderWorkloadClass, VideoEncoder,
+    build_thumbnail_command, build_trailer_command, build_waveform_command, parse_ffmpeg_progress,
+    publish_atomic, should_fallback_from_nvenc, sibling_staging_path, terminate_process_group,
+    FfmpegProgress, FfmpegProgressParser, FfmpegProgressPhase, PortraitLayout, PublishedArtifact,
+    RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, VideoEncoder,
 };
 pub use scheduler::{
     AdmissionBlock, AdmissionOutcome, ResourceCapacity, ResourceClass, ResourceLease,
@@ -111,12 +113,13 @@ pub use service::{
     CreateVideoProjectRequest as ServiceCreateVideoProjectRequest, LinkImportRequest, LinkPreview,
     LinkRightsRequest, LocalImportRequest, NarrationReplacement, PortraitRenderRequest,
     PortraitSourceLayout, ProgressCallback, PublishPackageRequest, QueuedVideoJob,
-    ReplaceNarrationRequest, ReviseVideoManifestRequest, ScriptServiceResult, ServiceResult,
-    SharedGpuAdmissionGate, SharedGpuAdmissionLease, SharedGpuAdmissionOutcome,
-    SharedGpuAdmissionRequest, SharedGpuAdmissionWait, TimelineEditServiceResult,
-    TimelineRenderBatchRequest, TimelineRenderProfile, TimelineRenderRequest, VideoJobResult,
-    VideoScriptReceipt, VideoScriptRequest, VideoServiceError, VideoServiceProgress,
-    VideoStudioService, VisualAssetOrigin, VisualSourceReceipt,
+    ReleaseExportResult, ReleaseMemberArtifact, ReplaceNarrationRequest,
+    ReviseVideoManifestRequest, ScriptServiceResult, ServiceResult, SharedGpuAdmissionGate,
+    SharedGpuAdmissionLease, SharedGpuAdmissionOutcome, SharedGpuAdmissionRequest,
+    SharedGpuAdmissionWait, TimelineEditServiceResult, TimelineRenderBatchRequest,
+    TimelineRenderProfile, TimelineRenderRequest, VideoJobResult, VideoScriptReceipt,
+    VideoScriptRequest, VideoServiceError, VideoServiceProgress, VideoStudioService,
+    VisualAssetOrigin, VisualSourceReceipt,
 };
 pub use sound::{
     assets_matching_tag, SoundAsset, SoundLayer, SoundPlacementKind, MAX_SOUND_ASSETS,

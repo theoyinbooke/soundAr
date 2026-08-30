@@ -806,12 +806,21 @@ Slice 12.1 is implemented and locally verified.
   new ones so the caller renders only what changed.
 - The `write_video_script` agent tool, its Tauri command, the headless `agent video` dispatch, the
   presented project shape, and the typed frontend bridge all use that one service operation.
-- Verified locally: 338 native tests including cast-parser, manifest-contract, and
-  dialogue-application cases plus one durable service case proving version binding, idempotent
-  replay, stale-write rejection, and turn reuse; and 142 React tests including preview-bridge
-  coverage of the same reuse behaviour.
-- Remaining for this slice: the desktop cast and script editing surface, and per-turn narration
-  rendering through the scheduler.
+- Verified locally: cast-parser, manifest-contract, and dialogue-application cases plus one durable
+  service case proving version binding, idempotent replay, stale-write rejection, and turn reuse;
+  and a rendered UI case proving the Cast tab names all three line states and narrates only the
+  lines that need it.
+- `narrate_turns` performs the named lines with their characters' own voices, one durable job per
+  line, so a long episode narrates through the same GPU-aware scheduler as every other generation
+  and an interrupted run resumes line by line rather than starting over. A line that already has a
+  take is skipped rather than re-read, and lines are performed in script order so a partly narrated
+  episode reads from the top.
+- The desktop Cast tab shows each line's take state - performed, standing in, or not yet read -
+  because those three states are what decide what to do next and none of them is visible anywhere
+  else in the editor. It narrates only the lines that need it, drafts the remainder in one action,
+  and promotes stand-ins by dropping their takes and reading those lines for real. The tab appears
+  only once a project has a cast, so an imported-video project is never given a tab that could not
+  say anything.
 
 ### Slice 12.2: Performance Timing
 
@@ -1052,8 +1061,7 @@ Depends on: 12.6, the existing publish package and candidate analyst.
 
 ### Current Evidence
 
-Slice 12.7's planning layer is implemented and locally verified. The remaining work is the FFmpeg
-rendering of the audio episode with embedded chapters, the vertical trailer cut, and the audiogram.
+Slice 12.7 is implemented and locally verified, end to end.
 
 - `video/release.rs` holds the release contract. A blocked member always names its missing
   prerequisite, because a release that quietly omits its trailer looks identical to one that never
@@ -1070,10 +1078,32 @@ rendering of the audio episode with embedded chapters, the vertical trailer cut,
   built for imported video, pointed at soundAr's own output.
 - Scenes are the episode's chapters, because they are the author's own divisions. An episode with
   no scenes has no chapters rather than one invented per line.
-- `plan_episode_release` is exposed as an assistant tool and a Tauri command, and the producer
-  prompt now directs the assistant to call it before declaring an episode finished.
-- Verified locally: 438 native tests including six release cases - one proving the existing analyst
-  picks a bounded, on-clock moment from generated narration - plus 149 React tests.
+- `export_episode_release` produces and registers the deliverables. The audio episode is M4A rather
+  than MP3 so chapter marks are a first-class part of the container, and the chapter document is
+  written through the same atomic path as any other managed file so a crash cannot leave a truncated
+  document FFmpeg would still parse. A chapter title containing FFmetadata syntax is escaped, since
+  unescaped it would truncate the document or silently move a chapter boundary.
+- The trailer seeks before decoding rather than after, because a trailer is usually taken from the
+  middle of a long episode, and scales to cover then centre-crops so a landscape master yields a
+  portrait cut without letterboxing. The audiogram draws its waveform from the audio itself, so what
+  a viewer sees is what they are hearing.
+- Each deliverable is validated against the published file rather than the staged one, so it becomes
+  addressable only after being proved to be the media it claims to be, and all of them commit as one
+  revision so a release is registered whole or not at all. A previous export's members are replaced
+  rather than appended, so two different episodes can never be downloaded from one project.
+- A release cannot be exported while any line is a draft take, and the missing master is named
+  outright rather than failing later on a checksum.
+- `plan_episode_release` and `export_episode_release` are exposed as assistant tools and Tauri
+  commands, and the producer prompt now directs the assistant through both before declaring an
+  episode finished.
+- Verified locally with real FFmpeg: the three deliverable commands are each executed against
+  generated media and the results probed - the podcast carries no picture and reads back both of its
+  chapter titles including one containing FFmetadata syntax, the trailer is cut to its range and is
+  portrait, and the audiogram is square with both picture and sound. One service case exports a
+  release end to end and proves every produced member is checksum-matched, playable, and addressable
+  on the committed project, while the trailer is reported as skipped with its reason because the
+  fixture has no narration to cut from.
+- Verified locally: 470 native tests and 152 React tests.
 
 ### Slice 12.8: Production Quality Control
 
@@ -1089,9 +1119,7 @@ Depends on: 12.1, Phase 9 transcription and alignment evidence.
 
 ### Current Evidence
 
-Slice 12.8 is implemented and locally verified. The remaining work is the runtime that transcribes
-the rendered narration and measures the master's loudness and true peak; the checks themselves take
-those measurements as input.
+Slice 12.8 is implemented and locally verified, end to end.
 
 - `video/quality.rs` compares what a take was asked to say with what a local recognizer actually
   heard. Comparison is on normalized words, because a recognizer does not reproduce punctuation or
@@ -1112,11 +1140,23 @@ those measurements as input.
 - Severity is assigned by consequence: a misstated script and an off-target master block, because
   the episode does not say what it was asked to say or a platform will change how it sounds after it
   leaves soundAr. Caption drift and dead air warn.
-- `check_episode_quality` is exposed as an assistant tool and a Tauri command, and the producer
-  prompt now directs the assistant to transcribe the rendered narration and run it before declaring
-  an episode finished.
-- Verified locally: 451 native tests including thirteen quality cases covering alignment, severity,
-  and the unchecked-is-not-passed rule; plus 150 React tests.
+- `measure_master_loudness` runs FFmpeg's `loudnorm` in analysis mode and reads the numbers it
+  prints, because those are the numbers a platform's own normalizer will read and approximating them
+  would report a different episode than the one that ships. Silence measures as negative infinity,
+  which is a real answer but not one this contract can carry, so it is reported as unmeasured rather
+  than clamped to a value. An unreadable analysis is unmeasured too, never a default.
+- `transcribe_and_check_episode` is the measuring half: it listens back to every narrated line with
+  an installed local model, measures the master, and checks both. A line whose take cannot be
+  transcribed is left out of what was heard, which the report then states as unchecked - a failed
+  recognition must never read as a clean line.
+- `check_episode_quality`, `transcribe_and_check_episode`, and their Tauri commands are exposed to
+  the assistant, and the producer prompt now directs it to the measuring one before declaring an
+  episode finished.
+- Verified locally with real FFmpeg: a loudness analysis is run against generated media and its
+  measurement read back, alongside sixteen quality cases covering alignment, severity, the
+  unchecked-is-not-passed rule, and the refusal to turn silence or an unreadable analysis into a
+  number.
+- Verified locally: 474 native tests and 152 React tests.
 
 ### Slice 12.9: Assistant Listening and Director's Pass
 
@@ -1383,6 +1423,43 @@ Phase 12 ships as a sequence of post-1.0 minor releases, one slice at a time. Ca
 and dialogue is the first, because performance timing, the score, sound design,
 formats, releases, quality control, and the assistant's listening pass all depend on
 turn-scoped narration existing first.
+
+## Known Boundary: Picture for an Audio-Only Episode
+
+An episode written entirely as dialogue has no imported video, so it has no picture. Narration
+builds it a scene and the audio path runs end to end - script, cast, beats, takes, listening,
+quality control, and release planning are all verified against real local speech - but the video
+renderer assembles scenes from canonical timeline clips and refuses one that has no visual source:
+`video.timeline_scene_track_mismatch`.
+
+Because `export_episode_release` derives all three deliverables from the finished master, an
+audio-only episode currently cannot export a release even though its audio exists.
+
+This is not a Phase 12 gap so much as an open product question: what should an audio-only episode
+look like? Video Studio already has the pieces - registered visual assets with pan-and-zoom motion,
+cards, waveform motion, and the audiogram renderer added in 12.7 - and the honest resolutions are
+either to give a dialogue episode a default visual treatment from those, or to let the release
+export derive the audio episode and audiogram from the assembled dialogue rather than from a video
+master. Both change what a release means, so neither is chosen here.
+
+Until it is resolved, an audio-only episode should be given a visual asset or card before rendering,
+which is existing Video Studio behavior.
+
+## Version Numbering
+
+soundAr advances one patch at a time: `0.8.0`, then `0.8.1`, `0.8.2`, `0.8.3`, and so on. Each
+shipped slice of work is its own patch release with its own changelog entry, so a user can see what
+changed between any two builds and can roll back to a specific one.
+
+- A patch bump is the default for every release, including new features. Phase 12 slices, UI
+  surfaces, and fixes all ship as patches.
+- A minor bump is reserved for a milestone that completes a roadmap phase's exit gate, and is
+  decided deliberately rather than reached by accumulation.
+- Never skip a number to signal size. A large release is still the next patch.
+
+Every release bumps `app/package.json`, `app/package-lock.json`, `app/src-tauri/tauri.conf.json`,
+and `app/src-tauri/Cargo.toml` together; `scripts/check-release-version.sh` enforces that they
+match and CI runs it on every pull request.
 
 ## Roadmap Maintenance
 

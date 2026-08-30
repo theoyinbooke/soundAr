@@ -444,6 +444,22 @@ export function VideoStudioView({
     }
   }
 
+  /**
+   * Perform the named lines with their characters' own voices.
+   *
+   * One durable job per line, so a long episode narrates through the same scheduler as every other
+   * generation and a line that already has a take is skipped rather than re-read.
+   */
+  async function narrateTurns(turnIds: string[], draft: boolean) {
+    if (!state.project) return;
+    try {
+      const project = await videoService.narrateTurns(state.project.id, turnIds, draft);
+      dispatch({ type: "preview-complete", project });
+    } catch (caught) {
+      dispatch({ type: "fail", error: caught instanceof Error ? caught.message : String(caught) });
+    }
+  }
+
   async function editTimeline(operations: VideoTimelineOperation[], label: string) {
     if (!state.project) return;
     const before = state.project;
@@ -536,7 +552,7 @@ export function VideoStudioView({
           <button className="video-button is-primary" type="button" onClick={() => void analyze(state.project!, "editor")}>Analyze source</button>
         </div>
       </section> : null}
-      {["editor", "rendering", "exporting"].includes(state.phase) && state.project && !needsAnalysis ? <VideoEditorWorkspace project={state.project} selectedSceneId={state.selectedSceneId} playheadMs={state.playheadMs} job={state.activeJob} working={state.phase === "rendering" ? "rendering" : state.phase === "exporting" ? "exporting" : undefined} onSelectScene={selectScene} onPlayheadChange={(playheadMs) => dispatch({ type: "set-playhead", playheadMs })} onRenderPreview={() => void renderPreview()} onExport={() => void exportVideo()} onSaveScene={saveScene} onAddVisual={addVisual} visualAdding={visualAdding} onEditTimeline={editTimeline} timelineEditing={timelineEditing} timelineFeedback={timelineFeedback} canUndoTimeline={Boolean(timelineUndo.length && timelineUndo.at(-1)?.expected_version_id === state.project.manifest.version_id)} canRedoTimeline={Boolean(timelineRedo.length && timelineRedo.at(-1)?.expected_version_id === state.project.manifest.version_id)} onUndoTimeline={() => void undoTimelineEdit()} onRedoTimeline={() => void redoTimelineEdit()} onCancelWorking={() => void cancelOperation()} bootstrap={bootstrap} voices={voices} presets={captionPresets} /> : null}
+      {["editor", "rendering", "exporting"].includes(state.phase) && state.project && !needsAnalysis ? <VideoEditorWorkspace project={state.project} selectedSceneId={state.selectedSceneId} playheadMs={state.playheadMs} job={state.activeJob} working={state.phase === "rendering" ? "rendering" : state.phase === "exporting" ? "exporting" : undefined} onSelectScene={selectScene} onPlayheadChange={(playheadMs) => dispatch({ type: "set-playhead", playheadMs })} onRenderPreview={() => void renderPreview()} onExport={() => void exportVideo()} onSaveScene={saveScene} onAddVisual={addVisual} visualAdding={visualAdding} onEditTimeline={editTimeline} timelineEditing={timelineEditing} timelineFeedback={timelineFeedback} canUndoTimeline={Boolean(timelineUndo.length && timelineUndo.at(-1)?.expected_version_id === state.project.manifest.version_id)} canRedoTimeline={Boolean(timelineRedo.length && timelineRedo.at(-1)?.expected_version_id === state.project.manifest.version_id)} onUndoTimeline={() => void undoTimelineEdit()} onRedoTimeline={() => void redoTimelineEdit()} onCancelWorking={() => void cancelOperation()} onNarrate={narrateTurns} bootstrap={bootstrap} voices={voices} presets={captionPresets} /> : null}
       {state.phase === "exported" && state.project ? <VideoExportComplete project={state.project} playheadMs={state.playheadMs} selectedSceneId={state.selectedSceneId} onPlayheadChange={(playheadMs) => dispatch({ type: "set-playhead", playheadMs })} onSelectScene={selectScene} onEdit={() => dispatch({ type: "preview-complete", project: state.project! })} onPublishPackage={publishPackage} /> : null}
       {state.phase === "error" ? <div className="video-error-state" role="alert"><h2>Video Studio needs attention</h2><p>{state.error}</p><button className="video-button is-primary" type="button" onClick={() => dispatch({ type: "dismiss-error" })}>Return to project</button></div> : null}
       {loadingProjects && !showHome ? <div className="video-corner-loading" role="status"><LoaderCircle className="video-spin" aria-hidden="true" size={14} />Refreshing projects</div> : null}

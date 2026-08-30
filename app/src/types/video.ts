@@ -242,6 +242,8 @@ export interface VideoNarrationBinding {
   turn_id?: string | null;
   /** Fingerprint of the pronunciation rules this take was produced under. */
   lexicon_fingerprint?: string | null;
+  /** The character who performed this line, distinct from the engine's `speaker` voice route. */
+  character_id?: string | null;
   /** A draft take is a fast stand-in and can never be exported as a master. */
   fidelity?: VideoTakeFidelity;
 }
@@ -749,6 +751,7 @@ export type VideoReleaseMemberKind =
   | "podcast_audio"
   | "video_master"
   | "trailer"
+  | "audiogram"
   | "transcript"
   | "show_notes";
 
@@ -772,6 +775,24 @@ export interface VideoReleasePlan {
   chapters: VideoReleaseChapter[];
   /** The moment the trailer would be cut from, chosen from the episode's own narration. */
   trailer_range?: { start_us: number; end_us: number } | null;
+}
+
+/** One deliverable soundAr produced and registered: checksummed and playable, never a bare path. */
+export interface VideoReleaseMemberArtifact {
+  kind: VideoReleaseMemberKind;
+  artifact_id: string;
+  managed_path: string;
+  sha256: string;
+  mime_type: string;
+  duration_us: number;
+}
+
+export interface VideoReleaseExportResult {
+  project: VideoProject;
+  produced: VideoReleaseMemberArtifact[];
+  /** Members that could not be produced, each naming its missing prerequisite. */
+  skipped: VideoReleaseMemberPlan[];
+  job_id: string;
 }
 
 /** A cue the format supplies for every episode, before there is a script to anchor it to. */
@@ -970,11 +991,19 @@ export interface VideoStudioService {
   deleteShowFormat(formatId: string): Promise<void>;
   createEpisode(formatId: string, episodeName: string, brief?: string): Promise<VideoProject>;
   planEpisodeRelease(projectId: string, hasShowNotes: boolean): Promise<VideoReleasePlan>;
+  exportEpisodeRelease(projectId: string, hasShowNotes: boolean): Promise<VideoReleaseExportResult>;
   listenToEpisode(
     projectId: string,
     integratedLufsMilli?: number,
     truePeakDbMilli?: number,
   ): Promise<VideoEpisodeListening>;
+  /**
+   * Listen back to every narrated line with an installed local model and check what was heard
+   * against the script. Prefer this over supplying `heard` yourself.
+   */
+  transcribeAndCheckEpisode(projectId: string, modelId: string): Promise<VideoQcReport>;
+  /** Perform the named lines with their characters' own voices, one durable job per line. */
+  narrateTurns(projectId: string, turnIds: string[], draft?: boolean): Promise<VideoProject>;
   checkEpisodeQuality(
     projectId: string,
     heard: Record<string, string>,
