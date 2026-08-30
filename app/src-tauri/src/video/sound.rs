@@ -237,7 +237,13 @@ pub(crate) fn normalize_tag(value: &str) -> String {
         .trim()
         .to_lowercase()
         .chars()
-        .map(|character| if character.is_alphanumeric() { character } else { '-' })
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()

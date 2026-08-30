@@ -65,8 +65,12 @@ impl CueRole {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CueAnchor {
-    Scene { scene_id: String },
-    Turn { turn_id: String },
+    Scene {
+        scene_id: String,
+    },
+    Turn {
+        turn_id: String,
+    },
     /// After the final line. The only anchor an `Outro` may use, and the only role that may use it.
     AfterFinalTurn,
 }
@@ -409,9 +413,14 @@ mod tests {
 
     #[test]
     fn only_an_outro_may_end_the_episode() {
-        cue("outro", CueRole::Outro, CueAnchor::AfterFinalTurn, 20_000_000)
-            .validate()
-            .unwrap();
+        cue(
+            "outro",
+            CueRole::Outro,
+            CueAnchor::AfterFinalTurn,
+            20_000_000,
+        )
+        .validate()
+        .unwrap();
 
         let misplaced = cue(
             "sting",
@@ -521,7 +530,12 @@ mod tests {
 
     #[test]
     fn an_outro_needs_a_script_to_play_after() {
-        let outro = cue("outro", CueRole::Outro, CueAnchor::AfterFinalTurn, 20_000_000);
+        let outro = cue(
+            "outro",
+            CueRole::Outro,
+            CueAnchor::AfterFinalTurn,
+            20_000_000,
+        );
         let error = validate_cue_sheet(
             std::slice::from_ref(&outro),
             &BTreeSet::new(),
@@ -544,8 +558,18 @@ mod tests {
 
     #[test]
     fn an_episode_may_end_on_only_one_outro() {
-        let first = cue("outro-a", CueRole::Outro, CueAnchor::AfterFinalTurn, 20_000_000);
-        let second = cue("outro-b", CueRole::Outro, CueAnchor::AfterFinalTurn, 18_000_000);
+        let first = cue(
+            "outro-a",
+            CueRole::Outro,
+            CueAnchor::AfterFinalTurn,
+            20_000_000,
+        );
+        let second = cue(
+            "outro-b",
+            CueRole::Outro,
+            CueAnchor::AfterFinalTurn,
+            18_000_000,
+        );
         let error = validate_cue_sheet(
             &[first, second],
             &BTreeSet::new(),

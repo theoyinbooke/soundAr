@@ -8,9 +8,9 @@ use std::fmt;
 use super::cast::{
     index_cast_by_name, CastMember, DialogueTurn, MAX_CAST_MEMBERS, MAX_DIALOGUE_TURNS,
 };
+use super::format::FormatOrigin;
 use super::lexicon::{fingerprint_for_character, validate_lexicon, LexiconEntry};
 use super::performance::{index_turns, validate_turn_beats, PerformanceClock, TurnBeat};
-use super::format::FormatOrigin;
 use super::score::{validate_cue_sheet, MusicCue};
 use super::sound::{validate_sound_design, SoundAsset, SoundLayer};
 use super::visuals::{VisualAsset, VisualLayer, MAX_VISUAL_ASSETS, MAX_VISUAL_LAYERS};
@@ -1707,7 +1707,10 @@ impl Validate for VideoProjectManifest {
             "render_artifacts",
         )?;
         validate_unique_ids(self.cast.iter().map(|member| member.id.as_str()), "cast")?;
-        validate_unique_ids(self.dialogue.iter().map(|turn| turn.id.as_str()), "dialogue")?;
+        validate_unique_ids(
+            self.dialogue.iter().map(|turn| turn.id.as_str()),
+            "dialogue",
+        )?;
         validate_unique_ids(
             self.narration_bindings
                 .iter()
@@ -3237,12 +3240,14 @@ mod tests {
                 source_line: index as u32 + 1,
                 revision: 1,
             });
-            manifest.turn_beats.push(super::super::performance::TurnBeat {
-                turn_id: id,
-                lead_in_us: Microseconds(220_000),
-                overlap_us: Microseconds::ZERO,
-                source: super::super::performance::BeatSource::Derived,
-            });
+            manifest
+                .turn_beats
+                .push(super::super::performance::TurnBeat {
+                    turn_id: id,
+                    lead_in_us: Microseconds(220_000),
+                    overlap_us: Microseconds::ZERO,
+                    source: super::super::performance::BeatSource::Derived,
+                });
         }
 
         manifest.validate_strict().unwrap();

@@ -54,13 +54,19 @@ impl Default for PerformanceClock {
 impl Validate for PerformanceClock {
     fn validate(&self) -> VideoResult<()> {
         for (value, field) in [
-            (self.intra_exchange_us, "performance_clock.intra_exchange_us"),
+            (
+                self.intra_exchange_us,
+                "performance_clock.intra_exchange_us",
+            ),
             (
                 self.turn_of_thought_us,
                 "performance_clock.turn_of_thought_us",
             ),
             (self.pre_reveal_us, "performance_clock.pre_reveal_us"),
-            (self.scene_boundary_us, "performance_clock.scene_boundary_us"),
+            (
+                self.scene_boundary_us,
+                "performance_clock.scene_boundary_us",
+            ),
         ] {
             if !(0..=MAX_BEAT_US).contains(&value.0) {
                 return Err(VideoError::new(
@@ -317,7 +323,13 @@ pub(crate) fn index_turns(dialogue: &[DialogueTurn]) -> (BTreeMap<&str, usize>, 
 mod tests {
     use super::*;
 
-    fn turn(id: &str, order: u32, character: &str, text: &str, direction: Option<&str>) -> DialogueTurn {
+    fn turn(
+        id: &str,
+        order: u32,
+        character: &str,
+        text: &str,
+        direction: Option<&str>,
+    ) -> DialogueTurn {
         DialogueTurn {
             id: id.into(),
             scene_id: None,

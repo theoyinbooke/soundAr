@@ -1034,7 +1034,9 @@ pub(crate) async fn delete_show_format(
 ) -> Result<(), String> {
     let service = Arc::clone(&state.video);
     tauri::async_runtime::spawn_blocking(move || {
-        service.delete_show_format(&format_id).map_err(service_error)
+        service
+            .delete_show_format(&format_id)
+            .map_err(service_error)
     })
     .await
     .map_err(|error| format!("video.worker_failed: Show format worker failed: {error}"))?
@@ -4774,7 +4776,10 @@ pub(crate) fn generate_cue_music(
     model_id: Option<String>,
     progress: Option<&video::ProgressCallback>,
 ) -> Result<Value, String> {
-    let record = runtime.video.get_project(project_id).map_err(service_error)?;
+    let record = runtime
+        .video
+        .get_project(project_id)
+        .map_err(service_error)?;
     let manifest: video::VideoProjectManifest = serde_json::from_value(
         record
             .get("manifest")
@@ -4805,8 +4810,8 @@ pub(crate) fn generate_cue_music(
         actor: "video-studio-composer".to_string(),
         priority: "normal".to_string(),
     };
-    let durable_value =
-        serde_json::to_value(&durable).map_err(|error| format!("video.invalid_request: {error}"))?;
+    let durable_value = serde_json::to_value(&durable)
+        .map_err(|error| format!("video.invalid_request: {error}"))?;
     let parent_job_id = runtime
         .store
         .create_job("video_generate_cue_music", &durable_value)?;
@@ -4845,8 +4850,13 @@ fn run_cue_music_job(
         None,
     );
     let generation_request = cue_music_request(request);
-    let (history, _generation_job_id) =
-        run_cue_music_child(runtime, parent_job_id, request, &generation_request, progress)?;
+    let (history, _generation_job_id) = run_cue_music_child(
+        runtime,
+        parent_job_id,
+        request,
+        &generation_request,
+        progress,
+    )?;
     let audio_path = history
         .get("audio_path")
         .and_then(Value::as_str)
@@ -5009,9 +5019,7 @@ fn run_cue_music_child(
             Some("failed" | "cancelled") => {
                 let (_, stored_request) = runtime.store.retry_synthesis_job(&child_job_id)?;
                 if stored_request != *generation_request {
-                    return Err(
-                        "video.resume_conflict: The stored cue music inputs changed".into(),
-                    );
+                    return Err("video.resume_conflict: The stored cue music inputs changed".into());
                 }
                 run_child(stored_request)?
             }
@@ -5048,10 +5056,7 @@ fn video_source_asset_ids(
         .collect())
 }
 
-fn new_video_source_asset_id(
-    project: &Value,
-    before: &BTreeSet<String>,
-) -> Result<String, String> {
+fn new_video_source_asset_id(project: &Value, before: &BTreeSet<String>) -> Result<String, String> {
     let manifest: video::VideoProjectManifest = serde_json::from_value(
         project
             .get("manifest")

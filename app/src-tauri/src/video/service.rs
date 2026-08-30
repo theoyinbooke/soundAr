@@ -5,28 +5,26 @@
 //! [`Store`] and deterministic media planning to the sibling video modules.
 
 use super::{
-    apply_dialogue_script, apply_timeline_edit, build_ass_document,
-    build_portrait_command_with_layout,
-    build_proxy_command, build_thumbnail_command, build_timeline_render_plan,
-    build_waveform_command, discover_media_runtime, local_media_input_args,
-    preflight_import_url_destination, probe_media, publish_atomic, sibling_staging_path,
-    terminate_process_group, validate_import_url, write_ass_document_atomic, AdmissionOutcome,
-    apply_lexicon, build_report, diff_spoken_words, effective_entries, episode_transcript,
-    findings_for_dead_air, findings_for_loudness, findings_for_turn, identify_clip_candidates,
-    listen_to_episode,
-    instantiate_format, plan_release, AssemblyOptions, CandidatePolicy, CacheKeyBuilder, CacheStage, CaptionTheme, CastMember,
-    DialogueScriptRequest, FfmpegProgressParser, LayoutRole,
-    MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance,
-    ProvenanceKind, PublicHttpsProxy, PublicationState, RationalFrameRate, RationalRate,
-    RenderArtifact, RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile,
-    TakeFidelity,
-    RenderWorkloadClass, ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord,
-    RevisionStage, RightsBasis, RightsConfirmation, RuntimeMediaProbe, SourceAsset,
-    SourceAssetKind, TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder,
-    VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    EpisodeListening, LoudnessMeasurement, QcReport, ReleasePlan, ShowFormat, VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
-    MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
-    TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
+    apply_dialogue_script, apply_lexicon, apply_timeline_edit, build_ass_document,
+    build_portrait_command_with_layout, build_proxy_command, build_report, build_thumbnail_command,
+    build_timeline_render_plan, build_waveform_command, diff_spoken_words, discover_media_runtime,
+    effective_entries, episode_transcript, findings_for_dead_air, findings_for_loudness,
+    findings_for_turn, identify_clip_candidates, instantiate_format, listen_to_episode,
+    local_media_input_args, plan_release, preflight_import_url_destination, probe_media,
+    publish_atomic, sibling_staging_path, terminate_process_group, validate_import_url,
+    write_ass_document_atomic, AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage,
+    CandidatePolicy, CaptionTheme, CastMember, DialogueScriptRequest, EpisodeListening,
+    FfmpegProgressParser, LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus,
+    Microseconds, NarrationBinding, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
+    PublicationState, QcReport, RationalFrameRate, RationalRate, ReleasePlan, RenderArtifact,
+    RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass,
+    ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis,
+    RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
+    TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder, VideoError,
+    VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest, VisualAsset,
+    VisualFit, VisualLayer, VisualMimeType, VisualMotion, MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES,
+    MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US,
+    TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -12682,7 +12680,10 @@ impl VideoStudioService {
     /// Every saved show format, validated on the way out so a corrupted document cannot reach a
     /// project as if it were a usable format.
     pub fn list_show_formats(&self) -> ServiceResult<Vec<ShowFormat>> {
-        let stored = self.store.show_formats().map_err(VideoServiceError::store)?;
+        let stored = self
+            .store
+            .show_formats()
+            .map_err(VideoServiceError::store)?;
         let formats: Vec<ShowFormat> = serde_json::from_value(stored).map_err(json_error)?;
         for format in &formats {
             format.validate()?;
@@ -15629,7 +15630,11 @@ impl VideoStudioService {
                             "The character who speaks this turn is no longer in the cast",
                         )
                     })?;
-                if !replacement.speaker.trim().eq_ignore_ascii_case(member.name.trim()) {
+                if !replacement
+                    .speaker
+                    .trim()
+                    .eq_ignore_ascii_case(member.name.trim())
+                {
                     return Err(VideoServiceError::new(
                         "video.narration_speaker_mismatch",
                         "The replacement speaker does not match the character who speaks this turn",

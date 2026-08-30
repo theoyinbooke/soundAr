@@ -152,11 +152,9 @@ pub fn listen_to_episode(
         cursor = cursor.max(line.start_us.checked_add(line.duration_us)?);
     }
 
-    let spoken_us = lines
-        .iter()
-        .try_fold(Microseconds::ZERO, |total, line| {
-            total.checked_add(line.duration_us)
-        })?;
+    let spoken_us = lines.iter().try_fold(Microseconds::ZERO, |total, line| {
+        total.checked_add(line.duration_us)
+    })?;
 
     let display_names = manifest
         .cast
@@ -422,7 +420,10 @@ mod tests {
         let mut manifest = manifest();
         perform(&mut manifest, &[("narrator", 0, 5_000_000, true)]);
 
-        assert!(listen_to_episode(&manifest, None).unwrap().loudness.is_none());
+        assert!(listen_to_episode(&manifest, None)
+            .unwrap()
+            .loudness
+            .is_none());
 
         let measured = LoudnessMeasurement {
             integrated_lufs_milli: -16_100,

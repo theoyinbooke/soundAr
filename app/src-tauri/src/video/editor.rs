@@ -7,13 +7,13 @@
 
 use super::contracts::{
     validate_identifier, AudioMixTrack, CaptionCue, Microseconds, ReviewedScene, RevisionStage,
-    SourceAssetKind, TakeFidelity, TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind,
-    Validate, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
+    SourceAssetKind, TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate,
+    VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
 };
 use super::lexicon::{fingerprint_for_character, LexiconEntry};
+use super::performance::{derive_turn_beats, BeatSource, TurnBeat};
 use super::score::{bed_ducking, fit_cue, MusicCue};
 use super::sound::{SoundAsset, SoundLayer};
-use super::performance::{derive_turn_beats, BeatSource, TurnBeat};
 use super::timeline::{
     map_source_endpoint_to_timeline, map_timeline_endpoint_to_source, QuantizeMode,
 };
@@ -66,17 +66,27 @@ pub enum VideoTimelineOperation {
         overlap_us: Microseconds,
     },
     /// Returns one turn to the beat derived from the script.
-    ClearTurnBeat { turn_id: String },
+    ClearTurnBeat {
+        turn_id: String,
+    },
     /// Adds or replaces one pronunciation rule. Takes produced under the rules this changes are
     /// dropped, so the affected lines are re-read and no other line is disturbed.
-    SetLexiconEntry { entry: LexiconEntry },
+    SetLexiconEntry {
+        entry: LexiconEntry,
+    },
     /// Removes one pronunciation rule, dropping the takes it governed.
-    RemoveLexiconEntry { entry_id: String },
+    RemoveLexiconEntry {
+        entry_id: String,
+    },
     /// Adds or replaces one music cue. A bed placed on a track is given its ducking envelope here
     /// rather than left for the author to remember.
-    SetMusicCue { cue: MusicCue },
+    SetMusicCue {
+        cue: MusicCue,
+    },
     /// Removes one music cue and the mix track it owned.
-    RemoveMusicCue { cue_id: String },
+    RemoveMusicCue {
+        cue_id: String,
+    },
     /// Places generated music on the timeline for a planned cue: fits it to the cue's target,
     /// positions it at the cue's anchor, and gives a bed its ducking envelope.
     PlaceMusicCue {
@@ -92,18 +102,26 @@ pub enum VideoTimelineOperation {
         tags: Vec<String>,
     },
     /// Removes one sound-design asset and every placement that used it.
-    RemoveSoundAsset { asset_id: String },
+    RemoveSoundAsset {
+        asset_id: String,
+    },
     /// Marks draft lines for re-reading at final fidelity by dropping their stand-in takes.
     ///
     /// Only the named turns lose their takes, so promoting one line never re-reads the rest of the
     /// episode. That is the whole point of drafting: the expensive voice is spent only on what
     /// survived the listen.
-    PromoteTurnsToFinal { turn_ids: Vec<String> },
+    PromoteTurnsToFinal {
+        turn_ids: Vec<String>,
+    },
     /// Adds or replaces one sound-design placement. The assistant may propose a placement from a
     /// stage direction, but it only ever takes effect through this revision-checked path.
-    SetSoundLayer { layer: SoundLayer },
+    SetSoundLayer {
+        layer: SoundLayer,
+    },
     /// Removes one sound-design placement.
-    RemoveSoundLayer { layer_id: String },
+    RemoveSoundLayer {
+        layer_id: String,
+    },
     /// Repositions or animates an existing managed visual without replacing its immutable bytes.
     UpdateVisualLayer {
         layer_id: String,
@@ -450,11 +468,7 @@ fn set_turn_beat(
 
 /// Return one turn to the beat the script implies.
 fn clear_turn_beat(manifest: &mut VideoProjectManifest, turn_id: &str) -> VideoResult<()> {
-    let Some(position) = manifest
-        .dialogue
-        .iter()
-        .position(|turn| turn.id == turn_id)
-    else {
+    let Some(position) = manifest.dialogue.iter().position(|turn| turn.id == turn_id) else {
         return Err(edit_error(
             VideoErrorCode::MissingReference,
             format!("dialogue turn {turn_id} does not exist"),
@@ -908,10 +922,7 @@ fn promote_turns_to_final(
     manifest: &mut VideoProjectManifest,
     turn_ids: &[String],
 ) -> VideoResult<()> {
-    let wanted = turn_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
+    let wanted = turn_ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let draft_turns = manifest
         .draft_turn_ids()
         .into_iter()
@@ -2545,6 +2556,7 @@ fn merge_error(message: impl Into<String>, field: impl Into<String>) -> VideoErr
 
 #[cfg(test)]
 mod tests {
+    use super::super::contracts::TakeFidelity;
     use super::super::contracts::{
         AudioMix, AudioMixTrack, CandidateStatus, CanvasMode, CanvasSpec, ClipCandidate, GapReason,
         LayoutElement, LayoutPlan, LayoutRole, MediaProbe, MediaReference, NarrationBinding,
@@ -3010,7 +3022,10 @@ mod tests {
             .invalidated_stages
             .contains(&RevisionStage::SceneRender));
         assert!(
-            !held.receipt.invalidated_stages.contains(&RevisionStage::Speech),
+            !held
+                .receipt
+                .invalidated_stages
+                .contains(&RevisionStage::Speech),
             "retiming a pause must not re-read any line"
         );
 
@@ -3082,7 +3097,11 @@ mod tests {
         manifest
     }
 
-    fn rule(id: &str, scope: super::super::lexicon::LexiconScope, character: Option<&str>) -> LexiconEntry {
+    fn rule(
+        id: &str,
+        scope: super::super::lexicon::LexiconScope,
+        character: Option<&str>,
+    ) -> LexiconEntry {
         use super::super::lexicon::LexiconMatch;
         LexiconEntry {
             id: id.into(),
@@ -3223,7 +3242,9 @@ mod tests {
 
     /// A registered soundAr music artifact for a cue to point at.
     fn music_asset() -> super::super::contracts::SourceAsset {
-        use super::super::contracts::{MediaProbe, Provenance, ProvenanceKind, SourceAsset, SourceAssetKind};
+        use super::super::contracts::{
+            MediaProbe, Provenance, ProvenanceKind, SourceAsset, SourceAssetKind,
+        };
         SourceAsset {
             id: "music-one".into(),
             kind: SourceAssetKind::SoundArMusic,

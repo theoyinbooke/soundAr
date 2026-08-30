@@ -385,7 +385,12 @@ mod tests {
 
     #[test]
     fn rewrites_a_name_wherever_it_appears() {
-        let lexicon = vec![entry("e1", LexiconScope::Project, "Adaeze", "Ah-DAH-eh-zeh")];
+        let lexicon = vec![entry(
+            "e1",
+            LexiconScope::Project,
+            "Adaeze",
+            "Ah-DAH-eh-zeh",
+        )];
         let applied = apply("Adaeze waited. Then adaeze left.", &lexicon, "narrator");
         assert_eq!(
             applied.spoken_text,
@@ -469,7 +474,12 @@ mod tests {
 
     #[test]
     fn handles_multibyte_text_without_splitting_a_character() {
-        let lexicon = vec![entry("e1", LexiconScope::Project, "Chiamaka", "chee-ah-MAH-kah")];
+        let lexicon = vec![entry(
+            "e1",
+            LexiconScope::Project,
+            "Chiamaka",
+            "chee-ah-MAH-kah",
+        )];
         let applied = apply("Ọ bụ Chiamaka — nwanne m.", &lexicon, "narrator");
         assert_eq!(applied.spoken_text, "Ọ bụ chee-ah-MAH-kah — nwanne m.");
     }

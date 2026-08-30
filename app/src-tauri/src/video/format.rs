@@ -161,7 +161,11 @@ impl Validate for ShowFormat {
             }
         }
         if let Some(style) = &self.show_notes_style {
-            validate_nonempty(style, "show_format.show_notes_style", MAX_SHOW_NOTES_STYLE_BYTES)?;
+            validate_nonempty(
+                style,
+                "show_format.show_notes_style",
+                MAX_SHOW_NOTES_STYLE_BYTES,
+            )?;
         }
         validate_timestamp_text(&self.created_at, "show_format.created_at")?;
         validate_timestamp_text(&self.updated_at, "show_format.updated_at")?;
@@ -373,7 +377,9 @@ mod tests {
     #[test]
     fn an_episode_records_which_format_revision_it_came_from() {
         let manifest = instantiate_format(&format(), "project-ep-1", "Episode 1", NOW).unwrap();
-        let origin = manifest.format_origin.expect("the episode records its origin");
+        let origin = manifest
+            .format_origin
+            .expect("the episode records its origin");
         assert_eq!(origin.format_id, "show-harmattan");
         assert_eq!(origin.format_revision, 3);
     }

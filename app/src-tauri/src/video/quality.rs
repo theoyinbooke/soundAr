@@ -137,8 +137,14 @@ impl QcReport {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WordDifference {
-    Skipped { expected: String, at_index: usize },
-    Inserted { heard: String, at_index: usize },
+    Skipped {
+        expected: String,
+        at_index: usize,
+    },
+    Inserted {
+        heard: String,
+        at_index: usize,
+    },
     Replaced {
         expected: String,
         heard: String,
@@ -170,8 +176,7 @@ pub fn diff_spoken_words(expected: &str, heard: &str) -> Vec<WordDifference> {
                 if expected_words[row].normalized == heard_words[column].normalized {
                     lengths[(row + 1) * columns + column + 1] + 1
                 } else {
-                    lengths[(row + 1) * columns + column]
-                        .max(lengths[row * columns + column + 1])
+                    lengths[(row + 1) * columns + column].max(lengths[row * columns + column + 1])
                 };
         }
     }
@@ -185,8 +190,8 @@ pub fn diff_spoken_words(expected: &str, heard: &str) -> Vec<WordDifference> {
         } else if lengths[(row + 1) * columns + column] >= lengths[row * columns + column + 1] {
             // A deletion immediately followed by an insertion is one word standing in for another,
             // which is what a mispronounced name looks like after recognition.
-            let substituted = lengths[(row + 1) * columns + column + 1]
-                == lengths[(row + 1) * columns + column];
+            let substituted =
+                lengths[(row + 1) * columns + column + 1] == lengths[(row + 1) * columns + column];
             if substituted {
                 differences.push(WordDifference::Replaced {
                     expected: expected_words[row].original.clone(),
@@ -266,7 +271,9 @@ pub fn findings_for_turn(turn_id: &str, differences: &[WordDifference]) -> Vec<Q
                     QcFindingKind::InsertedWord,
                     format!("The take says \"{heard}\", which the script does not contain"),
                 ),
-                WordDifference::Replaced { expected, heard, .. } => (
+                WordDifference::Replaced {
+                    expected, heard, ..
+                } => (
                     QcFindingKind::ReplacedWord,
                     format!("The take says \"{heard}\" where the script says \"{expected}\""),
                 ),
@@ -432,8 +439,7 @@ mod tests {
 
     #[test]
     fn a_skipped_word_is_reported_with_the_word_that_is_missing() {
-        let differences =
-            diff_spoken_words("She said nothing at all.", "She said nothing at all");
+        let differences = diff_spoken_words("She said nothing at all.", "She said nothing at all");
         assert!(differences.is_empty());
 
         let differences = diff_spoken_words("She said nothing at all.", "She said nothing all");
@@ -493,7 +499,11 @@ mod tests {
             .iter()
             .all(|finding| finding.turn_id.as_deref() == Some("turn-a")));
         // The detail is written in the user's own words, not as an opaque code.
-        assert!(findings[0].detail.contains("Adaze"), "{}", findings[0].detail);
+        assert!(
+            findings[0].detail.contains("Adaze"),
+            "{}",
+            findings[0].detail
+        );
     }
 
     #[test]
@@ -518,7 +528,11 @@ mod tests {
         assert!(findings
             .iter()
             .all(|finding| matches!(finding.severity, QcSeverity::Blocking)));
-        assert!(findings[0].detail.contains("-21.0"), "{}", findings[0].detail);
+        assert!(
+            findings[0].detail.contains("-21.0"),
+            "{}",
+            findings[0].detail
+        );
     }
 
     #[test]
@@ -538,7 +552,11 @@ mod tests {
         let findings = findings_for_caption_drift(&[late]);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, QcFindingKind::CaptionDrift);
-        assert!(findings[0].detail.contains("after"), "{}", findings[0].detail);
+        assert!(
+            findings[0].detail.contains("after"),
+            "{}",
+            findings[0].detail
+        );
         assert_eq!(findings[0].at_us, Some(Microseconds(2_000_000)));
     }
 

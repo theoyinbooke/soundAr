@@ -151,7 +151,8 @@ pub fn apply_dialogue_script(
 
     let mut applied = manifest.clone();
     applied.cast = request.cast.clone();
-    applied.turn_beats = derive_turn_beats(&turns, &manifest.performance_clock, &surviving_overrides)?;
+    applied.turn_beats =
+        derive_turn_beats(&turns, &manifest.performance_clock, &surviving_overrides)?;
     applied.dialogue = turns;
     applied.narration_bindings = narration_bindings;
     // A dropped take leaves its clip pointing at narration the script no longer contains.
@@ -394,10 +395,7 @@ mod tests {
         let repeated = "NARRATOR: She waited.\n\nNARRATOR: She waited.\n";
         let first = apply(&project(), repeated);
         assert_eq!(first.manifest.dialogue.len(), 2);
-        assert_ne!(
-            first.manifest.dialogue[0].id,
-            first.manifest.dialogue[1].id
-        );
+        assert_ne!(first.manifest.dialogue[0].id, first.manifest.dialogue[1].id);
         // Appending a third identical line must reuse both existing turns rather than renaming
         // them, so the two takes already rendered for this line survive.
         let extended = "NARRATOR: She waited.\n\nNARRATOR: She waited.\n\nNARRATOR: She waited.\n";
@@ -416,14 +414,20 @@ mod tests {
 
     #[test]
     fn changing_only_a_direction_keeps_the_turn_and_its_take() {
-        let first = apply(&project(), "ADAEZE: (quiet) You said you would come back.\n");
+        let first = apply(
+            &project(),
+            "ADAEZE: (quiet) You said you would come back.\n",
+        );
         let second = apply(
             &first.manifest,
             "ADAEZE: (furious) You said you would come back.\n",
         );
         assert_eq!(second.retained_turn_ids.len(), 1);
         assert!(second.new_turn_ids.is_empty());
-        assert_eq!(second.manifest.dialogue[0].direction.as_deref(), Some("furious"));
+        assert_eq!(
+            second.manifest.dialogue[0].direction.as_deref(),
+            Some("furious")
+        );
     }
 
     #[test]

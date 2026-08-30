@@ -238,11 +238,12 @@ impl VideoAgentOperation {
 
     fn validate(&self) -> Result<(), VideoAgentToolError> {
         match self {
-            Self::VideoRuntimeStatus(_)
-            | Self::ListVideoProjects(_)
-            | Self::ListShowFormats(_) => Ok(()),
-            Self::SaveShowFormat(format) => video::Validate::validate(format)
-                .map_err(VideoAgentToolError::from),
+            Self::VideoRuntimeStatus(_) | Self::ListVideoProjects(_) | Self::ListShowFormats(_) => {
+                Ok(())
+            }
+            Self::SaveShowFormat(format) => {
+                video::Validate::validate(format).map_err(VideoAgentToolError::from)
+            }
             Self::CreateEpisode(request) => {
                 require_text(&request.format_id, "format_id")?;
                 require_text(&request.episode_name, "episode_name")
@@ -1612,54 +1613,54 @@ fn visual_motion_schema() -> Value {
 /// exact voice, model, and language that perform every line it speaks.
 fn cast_schema() -> Value {
     json!({
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": video::MAX_CAST_MEMBERS,
-                    "items": {
-                        "type": "object",
-                        "required": ["id", "name", "display_name", "voice_id", "model_id", "language", "created_at"],
-                        "additionalProperties": false,
-                        "properties": {
-                            "id": {"type": "string", "description": "Stable character id, reused across revisions"},
-                            "name": {"type": "string", "description": "Script token, e.g. NARRATOR. Matched case-insensitively"},
-                            "display_name": {"type": "string"},
-                            "voice_id": {"type": "string", "description": "Installed soundAr voice id"},
-                            "model_id": {"type": "string", "description": "Installed speech model id"},
-                            "language": {"type": "string", "description": "BCP-47 tag, e.g. en-US"},
-                            "delivery": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "rate_milli": {"type": "integer", "minimum": 250, "maximum": 4000, "description": "1000 is natural speed"},
-                                    "pitch_milli": {"type": "integer", "minimum": -1000, "maximum": 1000},
-                                    "energy_milli": {"type": "integer", "minimum": 0, "maximum": 2000}
-                                }
-                            },
-                            "consent_reference_id": {"type": ["string", "null"], "description": "Required when a cloned managed voice performs this character"},
-                            "notes": {"type": ["string", "null"]},
-                            "created_at": {"type": "string", "description": "UTC RFC3339 timestamp"}
-                        }
+        "type": "array",
+        "minItems": 1,
+        "maxItems": video::MAX_CAST_MEMBERS,
+        "items": {
+            "type": "object",
+            "required": ["id", "name", "display_name", "voice_id", "model_id", "language", "created_at"],
+            "additionalProperties": false,
+            "properties": {
+                "id": {"type": "string", "description": "Stable character id, reused across revisions"},
+                "name": {"type": "string", "description": "Script token, e.g. NARRATOR. Matched case-insensitively"},
+                "display_name": {"type": "string"},
+                "voice_id": {"type": "string", "description": "Installed soundAr voice id"},
+                "model_id": {"type": "string", "description": "Installed speech model id"},
+                "language": {"type": "string", "description": "BCP-47 tag, e.g. en-US"},
+                "delivery": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "rate_milli": {"type": "integer", "minimum": 250, "maximum": 4000, "description": "1000 is natural speed"},
+                        "pitch_milli": {"type": "integer", "minimum": -1000, "maximum": 1000},
+                        "energy_milli": {"type": "integer", "minimum": 0, "maximum": 2000}
                     }
-                })
+                },
+                "consent_reference_id": {"type": ["string", "null"], "description": "Required when a cloned managed voice performs this character"},
+                "notes": {"type": ["string", "null"]},
+                "created_at": {"type": "string", "description": "UTC RFC3339 timestamp"}
+            }
+        }
+    })
 }
 
 /// One pronunciation rule, shared by the lexicon edit operation and `save_show_format`.
 fn lexicon_entry_schema() -> Value {
     json!({
-                                        "type":"object",
-                                        "additionalProperties":false,
-                                        "required":["id","scope","match_text","replacement","matching","created_at"],
-                                        "properties":{
-                                            "id":{"type":"string","minLength":1},
-                                            "scope":{"type":"string","enum":["character","project","global"],"description":"Precedence runs character, then project, then global. A global entry in a project is a snapshot taken when it was imported, so the episode stays reproducible."},
-                                            "character_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for character scope and rejected for every other scope"},
-                                            "match_text":{"type":"string","minLength":1,"maxLength":200},
-                                            "replacement":{"type":"string","minLength":1,"maxLength":400,"description":"Ordinary respelled text, not a phoneme alphabet: engines differ in what notation they accept"},
-                                            "matching":{"type":"string","enum":["word","exact"],"description":"word is case-insensitive; exact is case-sensitive, for acronyms"},
-                                            "notes":{"oneOf":[{"type":"string"},{"type":"null"}]},
-                                            "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
-                                        }
-                                    })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["id","scope","match_text","replacement","matching","created_at"],
+        "properties":{
+            "id":{"type":"string","minLength":1},
+            "scope":{"type":"string","enum":["character","project","global"],"description":"Precedence runs character, then project, then global. A global entry in a project is a snapshot taken when it was imported, so the episode stays reproducible."},
+            "character_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for character scope and rejected for every other scope"},
+            "match_text":{"type":"string","minLength":1,"maxLength":200},
+            "replacement":{"type":"string","minLength":1,"maxLength":400,"description":"Ordinary respelled text, not a phoneme alphabet: engines differ in what notation they accept"},
+            "matching":{"type":"string","enum":["word","exact"],"description":"word is case-insensitive; exact is case-sensitive, for acronyms"},
+            "notes":{"oneOf":[{"type":"string"},{"type":"null"}]},
+            "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
+        }
+    })
 }
 
 fn cue_template_schema(role_note: &str) -> Value {
@@ -1701,46 +1702,88 @@ fn show_format_schema() -> Value {
         properties([
             ("id", string("Stable show id, reused across episodes")),
             ("name", string("The show's name")),
-            ("revision", json!({"type":"integer","minimum":0,"description":"Ignored on save; soundAr owns the revision so two formats cannot claim the same provenance"})),
+            (
+                "revision",
+                json!({"type":"integer","minimum":0,"description":"Ignored on save; soundAr owns the revision so two formats cannot claim the same provenance"}),
+            ),
             ("cast", cast_schema()),
-            ("lexicon", json!({"type":"array","maxItems":500,"items":lexicon_entry_schema()})),
-            ("performance_clock", json!({
-                "type":"object",
-                "additionalProperties":false,
-                "required":["intra_exchange_us","turn_of_thought_us","pre_reveal_us","scene_boundary_us"],
-                "properties":{
-                    "intra_exchange_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Between two characters trading lines: the fastest beat"},
-                    "turn_of_thought_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"When the same character continues"},
-                    "pre_reveal_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Before a line the script marks as landing"},
-                    "scene_boundary_us":{"type":"integer","minimum":0,"maximum":10000000}
-                }
-            })),
-            ("caption_preset_id", string("One of soundAr's caption presets")),
-            ("canvas_mode", json!({"type":"string","enum":["portrait","landscape","square","custom"]})),
-            ("canvas", json!({
-                "type":"object",
-                "additionalProperties":false,
-                "required":["width","height","pixel_aspect_numerator","pixel_aspect_denominator"],
-                "properties":{
-                    "width":{"type":"integer","minimum":1},
-                    "height":{"type":"integer","minimum":1},
-                    "pixel_aspect_numerator":{"type":"integer","minimum":1},
-                    "pixel_aspect_denominator":{"type":"integer","minimum":1}
-                }
-            })),
-            ("frame_rate", json!({
-                "type":"object",
-                "additionalProperties":false,
-                "required":["numerator","denominator"],
-                "properties":{"numerator":{"type":"integer","minimum":1},"denominator":{"type":"integer","minimum":1}}
-            })),
-            ("target_lufs_milli", json!({"type":"integer","minimum":-36000,"maximum":-5000,"description":"Integrated loudness target for the master"})),
-            ("true_peak_db_milli", json!({"type":"integer","description":"True-peak ceiling for the master"})),
-            ("target_duration_us", json!({"type":"integer","minimum":1,"description":"How long an episode usually runs: a planning target, never a hard limit"})),
-            ("opening", json!({"oneOf":[cue_template_schema("An opening cannot be an outro"),{"type":"null"}]})),
-            ("closing", json!({"oneOf":[cue_template_schema("A closing must be an outro"),{"type":"null"}]})),
-            ("show_notes_style", nullable_string("How show notes for this series are written")),
-            ("created_at", string("UTC RFC3339 timestamp; preserved from the saved format when updating")),
+            (
+                "lexicon",
+                json!({"type":"array","maxItems":500,"items":lexicon_entry_schema()}),
+            ),
+            (
+                "performance_clock",
+                json!({
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["intra_exchange_us","turn_of_thought_us","pre_reveal_us","scene_boundary_us"],
+                    "properties":{
+                        "intra_exchange_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Between two characters trading lines: the fastest beat"},
+                        "turn_of_thought_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"When the same character continues"},
+                        "pre_reveal_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Before a line the script marks as landing"},
+                        "scene_boundary_us":{"type":"integer","minimum":0,"maximum":10000000}
+                    }
+                }),
+            ),
+            (
+                "caption_preset_id",
+                string("One of soundAr's caption presets"),
+            ),
+            (
+                "canvas_mode",
+                json!({"type":"string","enum":["portrait","landscape","square","custom"]}),
+            ),
+            (
+                "canvas",
+                json!({
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["width","height","pixel_aspect_numerator","pixel_aspect_denominator"],
+                    "properties":{
+                        "width":{"type":"integer","minimum":1},
+                        "height":{"type":"integer","minimum":1},
+                        "pixel_aspect_numerator":{"type":"integer","minimum":1},
+                        "pixel_aspect_denominator":{"type":"integer","minimum":1}
+                    }
+                }),
+            ),
+            (
+                "frame_rate",
+                json!({
+                    "type":"object",
+                    "additionalProperties":false,
+                    "required":["numerator","denominator"],
+                    "properties":{"numerator":{"type":"integer","minimum":1},"denominator":{"type":"integer","minimum":1}}
+                }),
+            ),
+            (
+                "target_lufs_milli",
+                json!({"type":"integer","minimum":-36000,"maximum":-5000,"description":"Integrated loudness target for the master"}),
+            ),
+            (
+                "true_peak_db_milli",
+                json!({"type":"integer","description":"True-peak ceiling for the master"}),
+            ),
+            (
+                "target_duration_us",
+                json!({"type":"integer","minimum":1,"description":"How long an episode usually runs: a planning target, never a hard limit"}),
+            ),
+            (
+                "opening",
+                json!({"oneOf":[cue_template_schema("An opening cannot be an outro"),{"type":"null"}]}),
+            ),
+            (
+                "closing",
+                json!({"oneOf":[cue_template_schema("A closing must be an outro"),{"type":"null"}]}),
+            ),
+            (
+                "show_notes_style",
+                nullable_string("How show notes for this series are written"),
+            ),
+            (
+                "created_at",
+                string("UTC RFC3339 timestamp; preserved from the saved format when updating"),
+            ),
             ("updated_at", string("UTC RFC3339 timestamp")),
         ]),
     )
@@ -1842,153 +1885,153 @@ fn timeline_operation_schemas() -> Vec<Value> {
 
 fn split_scene_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","scene_id","at_timeline_us"],
-                                "properties":{
-                                    "type":{"const":"split_scene"},
-                                    "scene_id":{"type":"string","minLength":1},
-                                    "at_timeline_us":{"type":"integer","minimum":0}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","scene_id","at_timeline_us"],
+        "properties":{
+            "type":{"const":"split_scene"},
+            "scene_id":{"type":"string","minLength":1},
+            "at_timeline_us":{"type":"integer","minimum":0}
+        }
+    })
 }
 
 fn trim_scene_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","scene_id","source_start_us","source_end_us"],
-                                "properties":{
-                                    "type":{"const":"trim_scene"},
-                                    "scene_id":{"type":"string","minLength":1},
-                                    "source_start_us":{"type":"integer","minimum":0},
-                                    "source_end_us":{"type":"integer","minimum":1}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","scene_id","source_start_us","source_end_us"],
+        "properties":{
+            "type":{"const":"trim_scene"},
+            "scene_id":{"type":"string","minLength":1},
+            "source_start_us":{"type":"integer","minimum":0},
+            "source_end_us":{"type":"integer","minimum":1}
+        }
+    })
 }
 
 fn reorder_scene_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","scene_id","to_index"],
-                                "properties":{
-                                    "type":{"const":"reorder_scene"},
-                                    "scene_id":{"type":"string","minLength":1},
-                                    "to_index":{"type":"integer","minimum":0}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","scene_id","to_index"],
+        "properties":{
+            "type":{"const":"reorder_scene"},
+            "scene_id":{"type":"string","minLength":1},
+            "to_index":{"type":"integer","minimum":0}
+        }
+    })
 }
 
 fn merge_scenes_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","first_scene_id","second_scene_id"],
-                                "properties":{
-                                    "type":{"const":"merge_scenes"},
-                                    "first_scene_id":{"type":"string","minLength":1},
-                                    "second_scene_id":{"type":"string","minLength":1}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","first_scene_id","second_scene_id"],
+        "properties":{
+            "type":{"const":"merge_scenes"},
+            "first_scene_id":{"type":"string","minLength":1},
+            "second_scene_id":{"type":"string","minLength":1}
+        }
+    })
 }
 
 fn set_turn_beat_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","turn_id","lead_in_us","overlap_us"],
-                                "properties":{
-                                    "type":{"const":"set_turn_beat"},
-                                    "turn_id":{"type":"string","minLength":1},
-                                    "lead_in_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Silence held before this turn. Zero when the turn overlaps instead."},
-                                    "overlap_us":{"type":"integer","minimum":0,"maximum":2000000,"description":"How far this turn starts before the previous one ends. Zero when the turn waits instead."}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","turn_id","lead_in_us","overlap_us"],
+        "properties":{
+            "type":{"const":"set_turn_beat"},
+            "turn_id":{"type":"string","minLength":1},
+            "lead_in_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Silence held before this turn. Zero when the turn overlaps instead."},
+            "overlap_us":{"type":"integer","minimum":0,"maximum":2000000,"description":"How far this turn starts before the previous one ends. Zero when the turn waits instead."}
+        }
+    })
 }
 
 fn clear_turn_beat_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","turn_id"],
-                                "properties":{
-                                    "type":{"const":"clear_turn_beat"},
-                                    "turn_id":{"type":"string","minLength":1}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","turn_id"],
+        "properties":{
+            "type":{"const":"clear_turn_beat"},
+            "turn_id":{"type":"string","minLength":1}
+        }
+    })
 }
 
 fn set_lexicon_entry_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","entry"],
-                                "properties":{
-                                    "type":{"const":"set_lexicon_entry"},
-                                    "entry":lexicon_entry_schema()
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","entry"],
+        "properties":{
+            "type":{"const":"set_lexicon_entry"},
+            "entry":lexicon_entry_schema()
+        }
+    })
 }
 
 fn remove_lexicon_entry_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","entry_id"],
-                                "properties":{
-                                    "type":{"const":"remove_lexicon_entry"},
-                                    "entry_id":{"type":"string","minLength":1}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","entry_id"],
+        "properties":{
+            "type":{"const":"remove_lexicon_entry"},
+            "entry_id":{"type":"string","minLength":1}
+        }
+    })
 }
 
 fn set_music_cue_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","cue"],
-                                "properties":{
-                                    "type":{"const":"set_music_cue"},
-                                    "cue":{
-                                        "type":"object",
-                                        "additionalProperties":false,
-                                        "required":["id","role","anchor","target_duration_us","direction","gain_db_milli","fade_in_us","fade_out_us","created_at"],
-                                        "properties":{
-                                            "id":{"type":"string","minLength":1},
-                                            "role":{"type":"string","enum":["sting","bed","transition","outro"],"description":"sting opens, bed sits under dialogue and always ducks, transition covers a cut, outro resolves after the final line"},
-                                            "anchor":{
-                                                "oneOf":[
-                                                    {"type":"object","additionalProperties":false,"required":["kind","scene_id"],"properties":{"kind":{"const":"scene"},"scene_id":{"type":"string","minLength":1}}},
-                                                    {"type":"object","additionalProperties":false,"required":["kind","turn_id"],"properties":{"kind":{"const":"turn"},"turn_id":{"type":"string","minLength":1}}},
-                                                    {"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"const":"after_final_turn"}}}
-                                                ],
-                                                "description":"Anchor to a scene or turn so the cue moves when the script is edited. Only an outro may use after_final_turn, and an outro must use it."
-                                            },
-                                            "target_duration_us":{"type":"integer","minimum":500000,"maximum":900000000,"description":"Ask the local music engine for this length; the rendered result is fitted to it"},
-                                            "direction":{"type":"string","minLength":1,"maxLength":2000},
-                                            "source_asset_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"The registered soundAr music artifact once generated; null while the cue is only planned"},
-                                            "track_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"The audio track carrying this cue. Requires source_asset_id. A bed placed on a track is given its ducking envelope automatically."},
-                                            "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000},
-                                            "fade_in_us":{"type":"integer","minimum":0},
-                                            "fade_out_us":{"type":"integer","minimum":0},
-                                            "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
-                                        }
-                                    }
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","cue"],
+        "properties":{
+            "type":{"const":"set_music_cue"},
+            "cue":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["id","role","anchor","target_duration_us","direction","gain_db_milli","fade_in_us","fade_out_us","created_at"],
+                "properties":{
+                    "id":{"type":"string","minLength":1},
+                    "role":{"type":"string","enum":["sting","bed","transition","outro"],"description":"sting opens, bed sits under dialogue and always ducks, transition covers a cut, outro resolves after the final line"},
+                    "anchor":{
+                        "oneOf":[
+                            {"type":"object","additionalProperties":false,"required":["kind","scene_id"],"properties":{"kind":{"const":"scene"},"scene_id":{"type":"string","minLength":1}}},
+                            {"type":"object","additionalProperties":false,"required":["kind","turn_id"],"properties":{"kind":{"const":"turn"},"turn_id":{"type":"string","minLength":1}}},
+                            {"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"const":"after_final_turn"}}}
+                        ],
+                        "description":"Anchor to a scene or turn so the cue moves when the script is edited. Only an outro may use after_final_turn, and an outro must use it."
+                    },
+                    "target_duration_us":{"type":"integer","minimum":500000,"maximum":900000000,"description":"Ask the local music engine for this length; the rendered result is fitted to it"},
+                    "direction":{"type":"string","minLength":1,"maxLength":2000},
+                    "source_asset_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"The registered soundAr music artifact once generated; null while the cue is only planned"},
+                    "track_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"The audio track carrying this cue. Requires source_asset_id. A bed placed on a track is given its ducking envelope automatically."},
+                    "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000},
+                    "fade_in_us":{"type":"integer","minimum":0},
+                    "fade_out_us":{"type":"integer","minimum":0},
+                    "created_at":{"type":"string","description":"UTC RFC3339 timestamp"}
+                }
+            }
+        }
+    })
 }
 
 fn remove_music_cue_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","cue_id"],
-                                "properties":{
-                                    "type":{"const":"remove_music_cue"},
-                                    "cue_id":{"type":"string","minLength":1}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","cue_id"],
+        "properties":{
+            "type":{"const":"remove_music_cue"},
+            "cue_id":{"type":"string","minLength":1}
+        }
+    })
 }
 
 fn register_sound_asset_operation_schema() -> Value {
@@ -2049,63 +2092,63 @@ fn promote_turns_to_final_operation_schema() -> Value {
 
 fn set_sound_layer_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","layer"],
-                                "properties":{
-                                    "type":{"const":"set_sound_layer"},
-                                    "layer":{
-                                        "type":"object",
-                                        "additionalProperties":false,
-                                        "required":["id","asset_id","kind","range","gain_db_milli","fade_in_us","fade_out_us"],
-                                        "properties":{
-                                            "id":{"type":"string","minLength":1},
-                                            "asset_id":{"type":"string","minLength":1,"description":"A sound asset already registered in this project. Placements never introduce new audio."},
-                                            "kind":{"type":"string","enum":["one_shot","ambience","room_tone"],"description":"one_shot happens once at a point; ambience runs across a scene span; room_tone runs under a whole scene and is what removes the digital silence between takes"},
-                                            "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for ambience and room tone"},
-                                            "turn_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Anchors a one-shot to the line it punctuates so it moves when that line does. Rejected for ambience and room tone."},
-                                            "range":visual_range_schema(),
-                                            "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000,"description":"Room tone must be at or below -18000 so it reads as a room rather than as noise"},
-                                            "fade_in_us":{"type":"integer","minimum":0},
-                                            "fade_out_us":{"type":"integer","minimum":0},
-                                            "loop_to_fill":{"type":"boolean","description":"Repeat the asset across the range. Rejected for a one-shot."},
-                                            "duck_under_speech":{"type":"boolean"}
-                                        }
-                                    }
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","layer"],
+        "properties":{
+            "type":{"const":"set_sound_layer"},
+            "layer":{
+                "type":"object",
+                "additionalProperties":false,
+                "required":["id","asset_id","kind","range","gain_db_milli","fade_in_us","fade_out_us"],
+                "properties":{
+                    "id":{"type":"string","minLength":1},
+                    "asset_id":{"type":"string","minLength":1,"description":"A sound asset already registered in this project. Placements never introduce new audio."},
+                    "kind":{"type":"string","enum":["one_shot","ambience","room_tone"],"description":"one_shot happens once at a point; ambience runs across a scene span; room_tone runs under a whole scene and is what removes the digital silence between takes"},
+                    "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for ambience and room tone"},
+                    "turn_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Anchors a one-shot to the line it punctuates so it moves when that line does. Rejected for ambience and room tone."},
+                    "range":visual_range_schema(),
+                    "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000,"description":"Room tone must be at or below -18000 so it reads as a room rather than as noise"},
+                    "fade_in_us":{"type":"integer","minimum":0},
+                    "fade_out_us":{"type":"integer","minimum":0},
+                    "loop_to_fill":{"type":"boolean","description":"Repeat the asset across the range. Rejected for a one-shot."},
+                    "duck_under_speech":{"type":"boolean"}
+                }
+            }
+        }
+    })
 }
 
 fn remove_sound_layer_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","layer_id"],
-                                "properties":{
-                                    "type":{"const":"remove_sound_layer"},
-                                    "layer_id":{"type":"string","minLength":1}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","layer_id"],
+        "properties":{
+            "type":{"const":"remove_sound_layer"},
+            "layer_id":{"type":"string","minLength":1}
+        }
+    })
 }
 
 fn update_visual_layer_operation_schema() -> Value {
     json!({
-                                "type":"object",
-                                "additionalProperties":false,
-                                "required":["type","layer_id","scene_id","range","fit","crop","z_index","motion","transition_in_us","transition_out_us"],
-                                "properties":{
-                                    "type":{"const":"update_visual_layer"},
-                                    "layer_id":{"type":"string","minLength":1},
-                                    "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}]},
-                                    "range":visual_range_schema(),
-                                    "fit":{"type":"string","enum":["cover","contain","stretch"]},
-                                    "crop":{"oneOf":[normalized_visual_bounds_schema(),{"type":"null"}]},
-                                    "z_index":{"type":"integer","minimum":-32768,"maximum":32767},
-                                    "motion":visual_motion_schema(),
-                                    "transition_in_us":{"type":"integer","minimum":0},
-                                    "transition_out_us":{"type":"integer","minimum":0}
-                                }
-                            })
+        "type":"object",
+        "additionalProperties":false,
+        "required":["type","layer_id","scene_id","range","fit","crop","z_index","motion","transition_in_us","transition_out_us"],
+        "properties":{
+            "type":{"const":"update_visual_layer"},
+            "layer_id":{"type":"string","minLength":1},
+            "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}]},
+            "range":visual_range_schema(),
+            "fit":{"type":"string","enum":["cover","contain","stretch"]},
+            "crop":{"oneOf":[normalized_visual_bounds_schema(),{"type":"null"}]},
+            "z_index":{"type":"integer","minimum":-32768,"maximum":32767},
+            "motion":visual_motion_schema(),
+            "transition_in_us":{"type":"integer","minimum":0},
+            "transition_out_us":{"type":"integer","minimum":0}
+        }
+    })
 }
 
 fn visual_asset_schema() -> Value {

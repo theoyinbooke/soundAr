@@ -129,7 +129,9 @@ impl ReleasePlan {
 ///
 /// Returns `None` when nothing has been narrated yet, because a transcript of an unperformed script
 /// would describe audio that does not exist.
-pub fn episode_transcript(manifest: &VideoProjectManifest) -> VideoResult<Option<TranscriptVersion>> {
+pub fn episode_transcript(
+    manifest: &VideoProjectManifest,
+) -> VideoResult<Option<TranscriptVersion>> {
     let artifact_duration = manifest
         .render_artifacts
         .iter()
@@ -612,7 +614,11 @@ mod tests {
 
         // A staged master is not a published one.
         let mut staged = manifest.clone();
-        staged.render_artifacts.last_mut().unwrap().publication_state = PublicationState::Staged;
+        staged
+            .render_artifacts
+            .last_mut()
+            .unwrap()
+            .publication_state = PublicationState::Staged;
         let plan = plan_release(&staged, Some(trailer), true).unwrap();
         assert!(!plan.is_ready());
         assert_eq!(plan.blocked()[0].kind, ReleaseMemberKind::VideoMaster);

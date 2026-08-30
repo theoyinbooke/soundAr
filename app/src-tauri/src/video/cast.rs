@@ -582,7 +582,11 @@ mod tests {
     fn rejects_a_direction_only_turn() {
         let error = parse_dialogue_script("ADAEZE: (quiet)\n", &cast()).unwrap_err();
         assert_eq!(error.code, VideoErrorCode::InvalidDialogue);
-        assert!(error.message.contains("nothing to say"), "{}", error.message);
+        assert!(
+            error.message.contains("nothing to say"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -617,10 +621,16 @@ mod tests {
     fn rejects_delivery_outside_the_supported_envelope() {
         let mut fast = CastDelivery::default();
         fast.rate_milli = 9_000;
-        assert_eq!(fast.validate().unwrap_err().code, VideoErrorCode::InvalidCast);
+        assert_eq!(
+            fast.validate().unwrap_err().code,
+            VideoErrorCode::InvalidCast
+        );
         let mut loud = CastDelivery::default();
         loud.energy_milli = -1;
-        assert_eq!(loud.validate().unwrap_err().code, VideoErrorCode::InvalidCast);
+        assert_eq!(
+            loud.validate().unwrap_err().code,
+            VideoErrorCode::InvalidCast
+        );
     }
 
     #[test]
