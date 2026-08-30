@@ -333,7 +333,7 @@ describe("videoStudioReducer", () => {
 
     const plan = await service.planEpisodeRelease(project.id, false);
     expect(plan.members.map((member) => member.kind)).toEqual([
-      "podcast_audio", "video_master", "trailer", "transcript", "show_notes",
+      "podcast_audio", "video_master", "trailer", "audiogram", "transcript", "show_notes",
     ]);
     // A blocked member always says why rather than being quietly omitted.
     for (const member of plan.members.filter((entry) => !entry.ready)) {
@@ -369,6 +369,18 @@ describe("videoStudioReducer", () => {
         operation_id: "promote-final", operations: [{ type: "promote_turns_to_final", turn_ids: ["turn-absent"] }],
       }),
     ).rejects.toThrow(/does not have a draft take/i);
+  });
+
+  it("will not export a release before there is a master to derive it from", async () => {
+    const service = createBrowserPreviewVideoService();
+    const created = await service.createVideoProject({ prompt: "A short story about a missing letter." });
+    // Every deliverable derives from the finished master.
+    await expect(service.exportEpisodeRelease(created.id, true)).rejects.toThrow(/final master/i);
+
+    const project = await service.getVideoProject("creator-update");
+    const plan = await service.planEpisodeRelease(project.id, true);
+    // The audiogram is a release member in its own right and is reported alongside the rest.
+    expect(plan.members.map((member) => member.kind)).toContain("audiogram");
   });
 
   it("moves a durable project through intake, analysis, review, render, and export", async () => {

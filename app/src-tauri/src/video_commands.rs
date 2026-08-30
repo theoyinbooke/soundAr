@@ -490,6 +490,35 @@ pub(crate) fn dispatch_video_operation(
                 })?,
             ))
         }
+        VideoAgentOperation::ExportEpisodeRelease(request) => {
+            let exported = runtime
+                .video
+                .export_episode_release(
+                    &request.project_id,
+                    "video-studio-producer",
+                    request.has_show_notes,
+                )
+                .map_err(VideoAgentToolError::from)?;
+            let project = video::present_video_project(
+                &exported.project,
+                &runtime.store.video_artifacts_root(),
+            )
+            .map_err(VideoAgentToolError::from)?;
+            // Saying what was skipped is the difference between a partial release and one that
+            // looks complete.
+            let summary = format!(
+                "Registered {} deliverable(s); {} member(s) could not be produced",
+                exported.produced.len(),
+                exported.skipped.len()
+            );
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Completed,
+                &summary,
+                project,
+                Some(exported.job_id),
+            )
+        }
         VideoAgentOperation::PlanEpisodeRelease(request) => {
             let plan = runtime
                 .video
@@ -981,6 +1010,31 @@ pub(crate) async fn check_episode_quality(
     })
     .await
     .map_err(|error| format!("video.worker_failed: Quality worker failed: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn export_episode_release(
+    state: tauri::State<'_, RuntimeState>,
+    project_id: String,
+    has_show_notes: bool,
+) -> Result<Value, String> {
+    let service = Arc::clone(&state.video);
+    let video_root = state.store.video_artifacts_root();
+    tauri::async_runtime::spawn_blocking(move || {
+        let exported = service
+            .export_episode_release(&project_id, "video-studio-producer", has_show_notes)
+            .map_err(service_error)?;
+        let project = video::present_video_project(&exported.project, &video_root)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "project": project,
+            "produced": exported.produced,
+            "skipped": exported.skipped,
+            "job_id": exported.job_id,
+        }))
+    })
+    .await
+    .map_err(|error| format!("video.worker_failed: Release export worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -3482,7 +3536,11 @@ fn discard_invalidated_render_artifacts(
             video::RenderArtifactRole::FinalMaster => {
                 stages.contains(&video::RevisionStage::FinalRender)
             }
-            video::RenderArtifactRole::PublishPackage => {
+            // Every deliverable is assembled from the master, so a re-render invalidates them all.
+            video::RenderArtifactRole::PublishPackage
+            | video::RenderArtifactRole::PodcastAudio
+            | video::RenderArtifactRole::Trailer
+            | video::RenderArtifactRole::Audiogram => {
                 stages.contains(&video::RevisionStage::PublishPackage)
             }
             _ => false,

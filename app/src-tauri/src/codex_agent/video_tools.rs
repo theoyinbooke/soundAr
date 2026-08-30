@@ -61,6 +61,7 @@ pub(crate) enum VideoAgentOperationKind {
     ListShowFormats,
     CreateEpisode,
     PlanEpisodeRelease,
+    ExportEpisodeRelease,
     CheckEpisodeQuality,
     ListenToEpisode,
     RegisterGeneratedVisual,
@@ -92,6 +93,7 @@ impl VideoAgentOperationKind {
             Self::ListShowFormats => "list_show_formats",
             Self::CreateEpisode => "create_episode",
             Self::PlanEpisodeRelease => "plan_episode_release",
+            Self::ExportEpisodeRelease => "export_episode_release",
             Self::CheckEpisodeQuality => "check_episode_quality",
             Self::ListenToEpisode => "listen_to_episode",
             Self::RegisterGeneratedVisual => "register_generated_visual",
@@ -124,6 +126,7 @@ impl VideoAgentOperationKind {
             Self::ExportVideo
             | Self::ExportPublishPackage
             | Self::PlanEpisodeRelease
+            | Self::ExportEpisodeRelease
             | Self::CheckEpisodeQuality => VideoProductionPhase::Export,
             Self::ListVideoProjects
             | Self::GetVideoProject
@@ -154,6 +157,7 @@ pub(crate) enum VideoAgentOperation {
     ListShowFormats(EmptyRequest),
     CreateEpisode(CreateEpisodeRequest),
     PlanEpisodeRelease(PlanEpisodeReleaseRequest),
+    ExportEpisodeRelease(PlanEpisodeReleaseRequest),
     CheckEpisodeQuality(CheckEpisodeQualityRequest),
     ListenToEpisode(ListenToEpisodeRequest),
     RegisterGeneratedVisual(RegisterGeneratedVisualRequest),
@@ -184,6 +188,7 @@ impl VideoAgentOperation {
             Self::ListShowFormats(_) => VideoAgentOperationKind::ListShowFormats,
             Self::CreateEpisode(_) => VideoAgentOperationKind::CreateEpisode,
             Self::PlanEpisodeRelease(_) => VideoAgentOperationKind::PlanEpisodeRelease,
+            Self::ExportEpisodeRelease(_) => VideoAgentOperationKind::ExportEpisodeRelease,
             Self::CheckEpisodeQuality(_) => VideoAgentOperationKind::CheckEpisodeQuality,
             Self::ListenToEpisode(_) => VideoAgentOperationKind::ListenToEpisode,
             Self::RegisterGeneratedVisual(_) => VideoAgentOperationKind::RegisterGeneratedVisual,
@@ -215,6 +220,7 @@ impl VideoAgentOperation {
             "list_show_formats" => Self::ListShowFormats(decode(arguments)?),
             "create_episode" => Self::CreateEpisode(decode(arguments)?),
             "plan_episode_release" => Self::PlanEpisodeRelease(decode(arguments)?),
+            "export_episode_release" => Self::ExportEpisodeRelease(decode(arguments)?),
             "check_episode_quality" => Self::CheckEpisodeQuality(decode(arguments)?),
             "listen_to_episode" => Self::ListenToEpisode(decode(arguments)?),
             "register_generated_visual" => Self::RegisterGeneratedVisual(decode(arguments)?),
@@ -248,7 +254,9 @@ impl VideoAgentOperation {
                 require_text(&request.format_id, "format_id")?;
                 require_text(&request.episode_name, "episode_name")
             }
-            Self::PlanEpisodeRelease(request) => require_text(&request.project_id, "project_id"),
+            Self::PlanEpisodeRelease(request) | Self::ExportEpisodeRelease(request) => {
+                require_text(&request.project_id, "project_id")
+            }
             Self::CheckEpisodeQuality(request) => require_text(&request.project_id, "project_id"),
             Self::ListenToEpisode(request) => require_text(&request.project_id, "project_id"),
             Self::PreviewLink(request) => {
@@ -1200,6 +1208,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "list_show_formats" => VideoAgentOperationKind::ListShowFormats,
         "create_episode" => VideoAgentOperationKind::CreateEpisode,
         "plan_episode_release" => VideoAgentOperationKind::PlanEpisodeRelease,
+        "export_episode_release" => VideoAgentOperationKind::ExportEpisodeRelease,
         "check_episode_quality" => VideoAgentOperationKind::CheckEpisodeQuality,
         "listen_to_episode" => VideoAgentOperationKind::ListenToEpisode,
         "register_generated_visual" => VideoAgentOperationKind::RegisterGeneratedVisual,
@@ -1233,6 +1242,7 @@ pub(crate) fn requires_studio_access(tool: &str) -> bool {
                 | VideoAgentOperationKind::ReviseVideo
                 | VideoAgentOperationKind::ExportVideo
                 | VideoAgentOperationKind::ExportPublishPackage
+                | VideoAgentOperationKind::ExportEpisodeRelease
                 | VideoAgentOperationKind::CancelVideoJob
                 | VideoAgentOperationKind::ResumeVideoJob
         )
@@ -1417,6 +1427,17 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                     ("heard", json!({"type":"object","additionalProperties":{"type":"string"},"description":"Turn id to the text a local recognizer heard in that turn's take"})),
                     ("integrated_lufs_milli", json!({"type":["integer","null"],"description":"Measured integrated loudness of the master, in milli-LUFS. Never estimate this."})),
                     ("true_peak_db_milli", json!({"type":["integer","null"],"description":"Measured true peak of the master, in milli-dBTP"})),
+                ]),
+            ),
+        ),
+        tool(
+            "export_episode_release",
+            "Produce and register every release deliverable this episode can supply: the audio episode carrying its chapter marks, a short vertical trailer cut from the moment the analyst chose in the episode's own narration, and a square audiogram. All three derive from the finished master, so a master is required, and a line still standing in with a draft take blocks the export outright. A member that cannot be produced is reported with its reason rather than omitted. Requires Studio or Full access.",
+            object_schema(
+                &["project_id"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode"})),
                 ]),
             ),
         ),
@@ -2452,8 +2473,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 25);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 25);
+        assert_eq!(names.len(), 26);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 26);
         for required in [
             "preview_link",
             "import_link",
@@ -2469,6 +2490,7 @@ mod tests {
             "list_show_formats",
             "create_episode",
             "plan_episode_release",
+            "export_episode_release",
             "check_episode_quality",
             "listen_to_episode",
             "register_generated_visual",

@@ -107,6 +107,9 @@ pub enum VideoEncoder {
     H264Nvenc,
     Libx264,
     Image,
+    /// No video stream at all. Named so an audio deliverable is never mistaken for a render that
+    /// failed to select an encoder.
+    AudioOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -437,6 +440,199 @@ fn validate_plan_paths(
     })
 }
 
+/// Encode the episode as a podcast audio file, carrying its chapter marks.
+///
+/// M4A rather than MP3: chapter marks are a first-class part of the container, so a player reads
+/// them without depending on an ID3 extension a given client may or may not honour.
+///
+/// The chapter document is a separate input mapped in explicitly. Chapters cannot be expressed as
+/// command-line arguments, and building the document as text keeps a title containing FFmetadata
+/// syntax from reaching the command line at all.
+pub fn build_podcast_audio_command(
+    ffmpeg: &Path,
+    input: &Path,
+    chapters_metadata: Option<&Path>,
+    output: &Path,
+) -> Result<RenderCommandPlan, MediaError> {
+    let paths = validate_plan_paths(ffmpeg, input, output)?;
+    let metadata = chapters_metadata
+        .map(|path| {
+            fs::canonicalize(path).map_err(|error| {
+                MediaError::new(
+                    "render_input_not_found",
+                    "The chapter metadata document could not be opened",
+                )
+                .detail(error.to_string())
+            })
+        })
+        .transpose()?;
+
+    let mut args = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-nostdin"),
+        OsString::from("-n"),
+        OsString::from("-progress"),
+        OsString::from("pipe:2"),
+        OsString::from("-stats_period"),
+        OsString::from("0.25"),
+    ];
+    args.extend(local_media_input_args(&paths.input)?);
+    if let Some(metadata) = &metadata {
+        args.extend([
+            OsString::from("-f"),
+            OsString::from("ffmetadata"),
+            OsString::from("-i"),
+            metadata.as_os_str().to_os_string(),
+        ]);
+    }
+    args.extend([
+        OsString::from("-map"),
+        OsString::from("0:a:0"),
+        // Metadata comes from the chapter document when there is one, and from nowhere otherwise.
+        // Carrying the master's own metadata through would publish whatever the render left on it.
+        OsString::from("-map_metadata"),
+        OsString::from(if metadata.is_some() { "1" } else { "-1" }),
+        OsString::from("-map_chapters"),
+        OsString::from(if metadata.is_some() { "1" } else { "-1" }),
+        OsString::from("-c:a"),
+        OsString::from("aac"),
+        OsString::from("-b:a"),
+        OsString::from("160k"),
+        OsString::from("-ar"),
+        OsString::from("48000"),
+        OsString::from("-movflags"),
+        OsString::from("+faststart"),
+        OsString::from("-f"),
+        OsString::from("mp4"),
+    ]);
+    args.push(paths.output.as_os_str().to_os_string());
+
+    Ok(RenderCommandPlan {
+        profile: RenderProfile::Final,
+        // Audio-only transcoding never touches the GPU and should not queue behind rendering.
+        workload_class: RenderWorkloadClass::Light,
+        primary: RenderCommand {
+            program: paths.ffmpeg,
+            args,
+            output: paths.output,
+            encoder: VideoEncoder::AudioOnly,
+            emits_progress: true,
+        },
+        software_fallback: None,
+    })
+}
+
+/// Cut a short vertical trailer out of the finished master.
+///
+/// The range is placed before the input so FFmpeg seeks rather than decoding to the cut point,
+/// which matters because a trailer is usually taken from the middle of a long episode. The frame is
+/// scaled to cover and then centre-cropped, so a landscape master yields a portrait trailer without
+/// letterboxing.
+pub fn build_trailer_command(
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    start_us: i64,
+    end_us: i64,
+    profile: RenderProfile,
+    h264_nvenc_runtime: bool,
+) -> Result<RenderCommandPlan, MediaError> {
+    if start_us < 0 || end_us <= start_us {
+        return Err(MediaError::new(
+            "invalid_trailer_range",
+            "A trailer must have a positive range inside the master",
+        ));
+    }
+    let paths = validate_plan_paths(ffmpeg, input, output)?;
+    let (width, height) = profile.portrait_dimensions();
+    let filter = format!(
+        "scale=w={width}:h={height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,fps={}",
+        profile.frame_rate()
+    );
+
+    let mut common = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-nostdin"),
+        OsString::from("-n"),
+        OsString::from("-progress"),
+        OsString::from("pipe:2"),
+        OsString::from("-stats_period"),
+        OsString::from("0.25"),
+        OsString::from("-ss"),
+        OsString::from(format_timestamp_us(start_us)),
+        OsString::from("-to"),
+        OsString::from(format_timestamp_us(end_us)),
+    ];
+    common.extend(local_media_input_args(&paths.input)?);
+    common.extend([
+        OsString::from("-map_metadata"),
+        OsString::from("-1"),
+        OsString::from("-map_chapters"),
+        OsString::from("-1"),
+        OsString::from("-map"),
+        OsString::from("0:v:0"),
+        OsString::from("-map"),
+        OsString::from("0:a:0?"),
+        OsString::from("-vf"),
+        OsString::from(filter),
+    ]);
+    Ok(build_h264_plan(paths, common, profile, h264_nvenc_runtime))
+}
+
+/// Render a square audiogram from the episode's audio.
+///
+/// An audiogram is audio that can be posted where only video plays. The waveform is drawn from the
+/// audio itself rather than from a stored waveform image, so what a viewer sees is what they are
+/// hearing at that moment.
+pub fn build_audiogram_command(
+    ffmpeg: &Path,
+    input: &Path,
+    output: &Path,
+    profile: RenderProfile,
+    h264_nvenc_runtime: bool,
+) -> Result<RenderCommandPlan, MediaError> {
+    let paths = validate_plan_paths(ffmpeg, input, output)?;
+    // Square, because that is the shape that survives every feed without being cropped.
+    let size = profile.portrait_dimensions().0;
+    let rate = profile.frame_rate();
+    let filter = format!(
+        "color=c=0x18181B:s={size}x{size}:r={rate}[bg];\
+[0:a]showwaves=s={size}x{half}:mode=cline:rate={rate}:colors=0xF5F5F4[wave];\
+[bg][wave]overlay=x=0:y=(H-h)/2:shortest=1,format=yuv420p[v]",
+        half = size / 2
+    );
+
+    let mut common = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-nostdin"),
+        OsString::from("-n"),
+        OsString::from("-progress"),
+        OsString::from("pipe:2"),
+        OsString::from("-stats_period"),
+        OsString::from("0.25"),
+    ];
+    common.extend(local_media_input_args(&paths.input)?);
+    common.extend([
+        OsString::from("-map_metadata"),
+        OsString::from("-1"),
+        OsString::from("-map_chapters"),
+        OsString::from("-1"),
+        OsString::from("-filter_complex"),
+        OsString::from(filter),
+        OsString::from("-map"),
+        OsString::from("[v]"),
+        OsString::from("-map"),
+        OsString::from("0:a:0"),
+    ]);
+    Ok(build_h264_plan(paths, common, profile, h264_nvenc_runtime))
+}
+
 fn base_video_arguments(input: &Path) -> Result<Vec<OsString>, MediaError> {
     let mut args = vec![
         OsString::from("-hide_banner"),
@@ -539,7 +735,8 @@ fn encoder_arguments(encoder: VideoEncoder, profile: RenderProfile) -> Vec<OsStr
             OsString::from("-pix_fmt"),
             OsString::from("yuv420p"),
         ],
-        VideoEncoder::Image => Vec::new(),
+        // Neither shape carries video encoder settings: one writes a still, the other no picture.
+        VideoEncoder::Image | VideoEncoder::AudioOnly => Vec::new(),
     }
 }
 
@@ -954,6 +1151,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video::contracts::Microseconds;
     use crate::video::media::{is_executable_file, probe_media};
     use std::{
         env,
@@ -1008,6 +1206,193 @@ mod tests {
             .args
             .contains(&OsString::from("libx264")));
         assert!(!root.0.join("should-not-run").exists());
+    }
+
+    /// Render a short A/V fixture so the deliverable commands are proved against real media
+    /// rather than only against their own argument lists.
+    fn fixture_media(ffmpeg: &Path, output: &Path, seconds: &str) -> bool {
+        Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=size=640x360:rate=30:duration={seconds}"),
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=440:duration={seconds}"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(output)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_plan(plan: &RenderCommandPlan) -> bool {
+        plan.primary
+            .command()
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn a_podcast_deliverable_is_audio_only_and_carries_its_chapters() {
+        let (Some(ffmpeg), Some(ffprobe)) = (find_in_path("ffmpeg"), find_in_path("ffprobe"))
+        else {
+            return;
+        };
+        let root = TestDirectory::new("podcast-audio");
+        let master = root.0.join("master.mp4");
+        assert!(
+            fixture_media(&ffmpeg, &master, "4"),
+            "the fixture master could not be rendered"
+        );
+        let chapters = root.0.join("chapters.txt");
+        fs::write(
+            &chapters,
+            crate::video::release::ffmetadata_chapters(&[
+                crate::video::release::ReleaseChapter {
+                    id: "chapter-one".into(),
+                    title: "The letter".into(),
+                    start_us: Microseconds::ZERO,
+                    end_us: Microseconds(2_000_000),
+                },
+                crate::video::release::ReleaseChapter {
+                    id: "chapter-two".into(),
+                    // Characters that are FFmetadata syntax must survive the round trip.
+                    title: "Act 2; the reveal".into(),
+                    start_us: Microseconds(2_000_000),
+                    end_us: Microseconds(4_000_000),
+                },
+            ]),
+        )
+        .expect("write chapter metadata");
+
+        let output = root.0.join("episode.m4a");
+        let plan = build_podcast_audio_command(&ffmpeg, &master, Some(&chapters), &output)
+            .expect("build podcast plan");
+        assert_eq!(plan.primary.encoder, VideoEncoder::AudioOnly);
+        assert!(run_plan(&plan), "podcast audio render failed");
+
+        let probe = probe_media(&output, &ffprobe).expect("probe the podcast deliverable");
+        assert!(
+            probe.primary_video_stream.is_none(),
+            "a podcast deliverable must carry no picture"
+        );
+        assert!(probe.primary_audio_stream.is_some());
+        assert_eq!(probe.chapters.len(), 2);
+        assert_eq!(probe.chapters[0].title.as_deref(), Some("The letter"));
+        assert_eq!(
+            probe.chapters[1].title.as_deref(),
+            Some("Act 2; the reveal")
+        );
+        assert_eq!(probe.chapters[1].start_us, 2_000_000);
+    }
+
+    #[test]
+    fn a_trailer_is_cut_to_its_range_and_is_vertical() {
+        let (Some(ffmpeg), Some(ffprobe)) = (find_in_path("ffmpeg"), find_in_path("ffprobe"))
+        else {
+            return;
+        };
+        let root = TestDirectory::new("trailer");
+        let master = root.0.join("master.mp4");
+        assert!(
+            fixture_media(&ffmpeg, &master, "6"),
+            "the fixture master could not be rendered"
+        );
+        let output = root.0.join("trailer.mp4");
+        let plan = build_trailer_command(
+            &ffmpeg,
+            &master,
+            &output,
+            2_000_000,
+            5_000_000,
+            RenderProfile::Proxy,
+            false,
+        )
+        .expect("build trailer plan");
+        assert!(run_plan(&plan), "trailer render failed");
+
+        let probe = probe_media(&output, &ffprobe).expect("probe the trailer");
+        let video = probe
+            .streams
+            .iter()
+            .find(|stream| stream.codec_type == "video")
+            .expect("the trailer has picture");
+        // A landscape master yields a portrait trailer without letterboxing.
+        assert_eq!((video.width, video.height), (Some(540), Some(960)));
+        assert!(
+            (probe.duration_us - 3_000_000).abs() < 400_000,
+            "trailer ran {}us, expected about 3s",
+            probe.duration_us
+        );
+    }
+
+    #[test]
+    fn a_trailer_range_must_be_positive_and_ordered() {
+        let Some(ffmpeg) = find_in_path("ffmpeg") else {
+            return;
+        };
+        let root = TestDirectory::new("trailer-range");
+        let input = root.0.join("input.mp4");
+        fs::write(&input, b"fixture").unwrap();
+        for (start, end) in [(-1_000_000, 1_000_000), (2_000_000, 2_000_000)] {
+            let error = build_trailer_command(
+                &ffmpeg,
+                &input,
+                &root.0.join("out.mp4"),
+                start,
+                end,
+                RenderProfile::Proxy,
+                false,
+            )
+            .expect_err("an unusable range is refused");
+            assert_eq!(error.code, "invalid_trailer_range");
+        }
+    }
+
+    #[test]
+    fn an_audiogram_is_square_and_carries_both_picture_and_sound() {
+        let (Some(ffmpeg), Some(ffprobe)) = (find_in_path("ffmpeg"), find_in_path("ffprobe"))
+        else {
+            return;
+        };
+        let root = TestDirectory::new("audiogram");
+        let master = root.0.join("master.mp4");
+        assert!(
+            fixture_media(&ffmpeg, &master, "3"),
+            "the fixture master could not be rendered"
+        );
+        let output = root.0.join("audiogram.mp4");
+        let plan = build_audiogram_command(&ffmpeg, &master, &output, RenderProfile::Proxy, false)
+            .expect("build audiogram plan");
+        assert!(run_plan(&plan), "audiogram render failed");
+
+        let probe = probe_media(&output, &ffprobe).expect("probe the audiogram");
+        let video = probe
+            .streams
+            .iter()
+            .find(|stream| stream.codec_type == "video")
+            .expect("the audiogram has picture");
+        // Square, because that is the shape that survives every feed without being cropped.
+        assert_eq!(video.width, video.height);
+        assert_eq!(video.width, Some(540));
+        assert!(probe.primary_audio_stream.is_some());
     }
 
     #[test]

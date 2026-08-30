@@ -1052,8 +1052,7 @@ Depends on: 12.6, the existing publish package and candidate analyst.
 
 ### Current Evidence
 
-Slice 12.7's planning layer is implemented and locally verified. The remaining work is the FFmpeg
-rendering of the audio episode with embedded chapters, the vertical trailer cut, and the audiogram.
+Slice 12.7 is implemented and locally verified, end to end.
 
 - `video/release.rs` holds the release contract. A blocked member always names its missing
   prerequisite, because a release that quietly omits its trailer looks identical to one that never
@@ -1070,10 +1069,32 @@ rendering of the audio episode with embedded chapters, the vertical trailer cut,
   built for imported video, pointed at soundAr's own output.
 - Scenes are the episode's chapters, because they are the author's own divisions. An episode with
   no scenes has no chapters rather than one invented per line.
-- `plan_episode_release` is exposed as an assistant tool and a Tauri command, and the producer
-  prompt now directs the assistant to call it before declaring an episode finished.
-- Verified locally: 438 native tests including six release cases - one proving the existing analyst
-  picks a bounded, on-clock moment from generated narration - plus 149 React tests.
+- `export_episode_release` produces and registers the deliverables. The audio episode is M4A rather
+  than MP3 so chapter marks are a first-class part of the container, and the chapter document is
+  written through the same atomic path as any other managed file so a crash cannot leave a truncated
+  document FFmpeg would still parse. A chapter title containing FFmetadata syntax is escaped, since
+  unescaped it would truncate the document or silently move a chapter boundary.
+- The trailer seeks before decoding rather than after, because a trailer is usually taken from the
+  middle of a long episode, and scales to cover then centre-crops so a landscape master yields a
+  portrait cut without letterboxing. The audiogram draws its waveform from the audio itself, so what
+  a viewer sees is what they are hearing.
+- Each deliverable is validated against the published file rather than the staged one, so it becomes
+  addressable only after being proved to be the media it claims to be, and all of them commit as one
+  revision so a release is registered whole or not at all. A previous export's members are replaced
+  rather than appended, so two different episodes can never be downloaded from one project.
+- A release cannot be exported while any line is a draft take, and the missing master is named
+  outright rather than failing later on a checksum.
+- `plan_episode_release` and `export_episode_release` are exposed as assistant tools and Tauri
+  commands, and the producer prompt now directs the assistant through both before declaring an
+  episode finished.
+- Verified locally with real FFmpeg: the three deliverable commands are each executed against
+  generated media and the results probed - the podcast carries no picture and reads back both of its
+  chapter titles including one containing FFmetadata syntax, the trailer is cut to its range and is
+  portrait, and the audiogram is square with both picture and sound. One service case exports a
+  release end to end and proves every produced member is checksum-matched, playable, and addressable
+  on the committed project, while the trailer is reported as skipped with its reason because the
+  fixture has no narration to cut from.
+- Verified locally: 470 native tests and 152 React tests.
 
 ### Slice 12.8: Production Quality Control
 

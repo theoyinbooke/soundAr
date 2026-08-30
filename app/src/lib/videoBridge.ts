@@ -36,6 +36,7 @@ import type {
   VideoQcFinding,
   VideoQcFindingKind,
   VideoQcReport,
+  VideoReleaseExportResult,
   VideoReleaseMemberKind,
   VideoReleaseMemberPlan,
   VideoReleasePlan,
@@ -1003,6 +1004,22 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
       const loudnessChecked = integratedLufsMilli !== undefined && truePeakDbMilli !== undefined;
       return { findings, checked_turns: checked.map((turn) => turn.id), unchecked_turns: unchecked, loudness_checked: loudnessChecked };
     },
+    async exportEpisodeRelease(projectId, hasShowNotes) {
+      const project = projects.get(projectId);
+      if (!project) throw new Error("Video project was not found.");
+      // Every deliverable derives from the master, so without one there is nothing to export.
+      if (!project.master) throw new Error("video.final_master_required: Render a final master before exporting a release.");
+      const plan = await this.planEpisodeRelease(projectId, hasShowNotes);
+      const produced = plan.members
+        .filter((member) => member.ready && member.kind !== "video_master" && member.kind !== "transcript" && member.kind !== "show_notes")
+        .map((member) => ({
+          kind: member.kind, artifact_id: `${projectId}-${member.kind}`,
+          managed_path: `release/${member.kind}`, sha256: "0".repeat(64),
+          mime_type: member.kind === "podcast_audio" ? "audio/mp4" : "video/mp4",
+          duration_us: project.duration_ms * 1000,
+        }));
+      return { project: clone(project), produced, skipped: plan.members.filter((member) => !member.ready), job_id: `export-release-${projectId}` };
+    },
     async planEpisodeRelease(projectId, hasShowNotes) {
       const project = projects.get(projectId);
       if (!project) throw new Error("Video project was not found.");
@@ -1018,6 +1035,7 @@ export function createBrowserPreviewVideoService(): VideoStudioService {
           member("podcast_audio", narrated, "No line has been narrated yet, so there is no audio episode to publish"),
           member("video_master", hasMaster, "Render a final master for the current timeline first"),
           member("trailer", Boolean(trailer), "No narrated moment is long enough to cut a trailer from"),
+          member("audiogram", hasMaster, "Render a final master for the current timeline first"),
           member("transcript", narrated, "No line has been narrated yet, so there is nothing to transcribe"),
           member("show_notes", hasShowNotes, "Write the episode's show notes first"),
         ],
@@ -1397,6 +1415,8 @@ function createNativeVideoService(): VideoStudioService {
     deleteShowFormat: (formatId) => invoke<void>("delete_show_format", { formatId }),
     createEpisode: (formatId, episodeName, brief) => invoke<VideoProject>("create_episode", { formatId, episodeName, brief }).then(withNativeProjectUrls),
     planEpisodeRelease: (projectId, hasShowNotes) => invoke<VideoReleasePlan>("plan_episode_release", { projectId, hasShowNotes }),
+    exportEpisodeRelease: (projectId, hasShowNotes) =>
+      invoke<VideoReleaseExportResult>("export_episode_release", { projectId, hasShowNotes }).then((result) => ({ ...result, project: withNativeProjectUrls(result.project) })),
     listenToEpisode: (projectId, integratedLufsMilli, truePeakDbMilli) =>
       invoke<VideoEpisodeListening>("listen_to_episode", { projectId, integratedLufsMilli, truePeakDbMilli }),
     checkEpisodeQuality: (projectId, heard, integratedLufsMilli, truePeakDbMilli) =>

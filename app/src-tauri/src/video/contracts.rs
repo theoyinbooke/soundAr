@@ -1301,7 +1301,7 @@ impl Validate for AudioMix {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RenderArtifactRole {
     Proxy,
@@ -1312,7 +1312,24 @@ pub enum RenderArtifactRole {
     FinalMaster,
     Captions,
     Transcript,
+    /// The episode as audio, with its chapter marks.
+    PodcastAudio,
+    /// A short vertical cut of the episode's strongest moment.
+    Trailer,
+    /// A square waveform video, for feeds where only video plays.
+    Audiogram,
     PublishPackage,
+}
+
+impl RenderArtifactRole {
+    /// Whether this artifact is something the audience receives, rather than working media the
+    /// production needed along the way. A release is assembled from exactly these.
+    pub const fn is_release_member(self) -> bool {
+        matches!(
+            self,
+            Self::FinalMaster | Self::PodcastAudio | Self::Trailer | Self::Audiogram
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1371,9 +1388,6 @@ impl Validate for RenderArtifact {
     }
 }
 
-/// Binds the active generated narration for a scene to both its soundAr History
-/// provenance and the immutable managed artifact used by the canonical timeline.
-///
 /// Whether a take is the finished performance or a fast stand-in.
 ///
 /// Draft mode exists so a whole episode can be heard in about a minute with the fastest installed
@@ -1390,6 +1404,9 @@ pub enum TakeFidelity {
     Final,
 }
 
+/// Binds the active generated narration for a scene or turn to both its soundAr History
+/// provenance and the immutable managed artifact used by the canonical timeline.
+///
 /// The generation route is stored explicitly so a later voice revision can be
 /// reproduced without guessing which model, speaker, or consent-backed voice was
 /// used. `script_sha256` prevents a narration take from silently surviving a

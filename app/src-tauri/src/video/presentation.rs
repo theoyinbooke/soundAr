@@ -684,6 +684,9 @@ fn present_manifest_artifact(
         RenderArtifactRole::Preview => "preview",
         RenderArtifactRole::FinalMaster => "master",
         RenderArtifactRole::PublishPackage => "publish-package",
+        RenderArtifactRole::PodcastAudio => "podcast-audio",
+        RenderArtifactRole::Trailer => "trailer",
+        RenderArtifactRole::Audiogram => "audiogram",
         RenderArtifactRole::Thumbnail
         | RenderArtifactRole::Waveform
         | RenderArtifactRole::SceneSegment
@@ -1074,6 +1077,9 @@ fn artifact_title(artifact: &RenderArtifact) -> &'static str {
         RenderArtifactRole::FinalMaster => "Final video master",
         RenderArtifactRole::Captions => "Captions",
         RenderArtifactRole::Transcript => "Transcript",
+        RenderArtifactRole::PodcastAudio => "Podcast audio",
+        RenderArtifactRole::Trailer => "Trailer",
+        RenderArtifactRole::Audiogram => "Audiogram",
         RenderArtifactRole::PublishPackage => "Publish package",
     }
 }

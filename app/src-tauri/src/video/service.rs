@@ -6,19 +6,21 @@
 
 use super::{
     apply_dialogue_script, apply_lexicon, apply_timeline_edit, build_ass_document,
-    build_portrait_command_with_layout, build_proxy_command, build_report, build_thumbnail_command,
-    build_timeline_render_plan, build_waveform_command, diff_spoken_words, discover_media_runtime,
-    effective_entries, episode_transcript, findings_for_dead_air, findings_for_loudness,
-    findings_for_turn, identify_clip_candidates, instantiate_format, listen_to_episode,
-    local_media_input_args, plan_release, preflight_import_url_destination, probe_media,
-    publish_atomic, sibling_staging_path, terminate_process_group, validate_import_url,
-    write_ass_document_atomic, AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage,
-    CandidatePolicy, CaptionTheme, CastMember, DialogueScriptRequest, EpisodeListening,
-    FfmpegProgressParser, LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus,
-    Microseconds, NarrationBinding, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
-    PublicationState, QcReport, RationalFrameRate, RationalRate, ReleasePlan, RenderArtifact,
-    RenderArtifactRole, RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass,
-    ResourceClass, ResourceRequest, ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis,
+    build_audiogram_command, build_podcast_audio_command, build_portrait_command_with_layout,
+    build_proxy_command, build_report, build_thumbnail_command, build_timeline_render_plan,
+    build_trailer_command, build_waveform_command, diff_spoken_words, discover_media_runtime,
+    effective_entries, episode_transcript, ffmetadata_chapters, findings_for_dead_air,
+    findings_for_loudness, findings_for_turn, identify_clip_candidates, instantiate_format,
+    listen_to_episode, local_media_input_args, plan_release, preflight_import_url_destination,
+    probe_media, publish_atomic, sibling_staging_path, terminate_process_group,
+    validate_import_url, write_ass_document_atomic, AdmissionOutcome, AssemblyOptions,
+    CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme, CastMember, DialogueScriptRequest,
+    EpisodeListening, FfmpegProgressParser, LayoutRole, LoudnessMeasurement, MediaError,
+    MediaRuntimeStatus, Microseconds, NarrationBinding, PortraitLayout, Provenance, ProvenanceKind,
+    PublicHttpsProxy, PublicationState, QcReport, RationalFrameRate, RationalRate,
+    ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole,
+    RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass,
+    ResourceRequest, ResourceScheduler, RevisionRecord, RevisionStage, RightsBasis,
     RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
     TimeRange, TimelineClip, TimelineTrack, TrackKind, Validate, VideoEncoder, VideoError,
     VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest, VisualAsset,
@@ -607,6 +609,38 @@ pub struct VideoScriptReceipt {
     pub retained_turn_ids: Vec<String>,
     pub new_turn_ids: Vec<String>,
     pub dropped_binding_ids: Vec<String>,
+}
+
+/// One deliverable soundAr produced and registered.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseMemberArtifact {
+    pub kind: ReleaseMemberKind,
+    pub artifact_id: String,
+    pub managed_path: String,
+    pub sha256: String,
+    pub mime_type: String,
+    pub duration_us: i64,
+}
+
+/// What a deliverable actually turned out to be, measured after publication.
+#[derive(Clone, Debug, PartialEq)]
+struct RenderedRelease {
+    sha256: String,
+    duration_us: i64,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseExportResult {
+    pub project: Value,
+    pub produced: Vec<ReleaseMemberArtifact>,
+    /// Members that could not be produced, each naming its missing prerequisite. Reported rather
+    /// than omitted, so a partial release is never mistaken for a complete one.
+    pub skipped: Vec<ReleaseMemberPlan>,
+    pub job_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -3250,7 +3284,7 @@ fn service_encoder_arguments(encoder: VideoEncoder, profile: RenderProfile) -> V
             OsString::from("-pix_fmt"),
             OsString::from("yuv420p"),
         ],
-        VideoEncoder::Image => Vec::new(),
+        VideoEncoder::Image | VideoEncoder::AudioOnly => Vec::new(),
     }
 }
 
@@ -8608,6 +8642,228 @@ mod tests {
     }
 
     #[test]
+    fn real_ffmpeg_release_export_produces_registered_playable_deliverables() {
+        let workspace = TestWorkspace::new();
+        let runtime = workspace.service.runtime_status(true);
+        if !runtime.ready_for_local_media {
+            eprintln!("Skipping release export test because FFmpeg/FFprobe are unavailable");
+            return;
+        }
+        let ffmpeg = runtime
+            .ffmpeg
+            .path
+            .as_deref()
+            .expect("ffmpeg path")
+            .to_path_buf();
+        let ffprobe = runtime
+            .ffprobe
+            .path
+            .as_deref()
+            .expect("ffprobe path")
+            .to_path_buf();
+
+        let project_id = format!("project-{}", new_id());
+        let created = workspace.create_project(&project_id, "Release export");
+        let mut manifest: VideoProjectManifest =
+            serde_json::from_value(created.get("manifest").cloned().expect("manifest")).unwrap();
+
+        // A finished master is the one hard prerequisite; every deliverable derives from it.
+        let master_dir = workspace
+            .service
+            .project_dir(&project_id)
+            .expect("project dir")
+            .join("renders");
+        fs::create_dir_all(&master_dir).expect("create render dir");
+        let master_path = master_dir.join("master.mp4");
+        let status = Command::new(&ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30:duration=4",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=4",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&master_path)
+            .status()
+            .expect("render fixture master");
+        assert!(status.success(), "the fixture master could not be rendered");
+
+        manifest.timeline_duration_us = Microseconds(4_000_000);
+        manifest.reviewed_scenes.push(ReviewedScene {
+            id: "scene-one".into(),
+            candidate_id: None,
+            source_asset_id: None,
+            source_range: None,
+            timeline_start_us: Microseconds::ZERO,
+            timeline_duration_us: Microseconds(4_000_000),
+            title: "Act 1; the letter".into(),
+            script: "The harmattan came early.".into(),
+            review_state: ReviewState::Approved,
+            revision: 1,
+        });
+        manifest.render_artifacts.push(RenderArtifact {
+            id: "master".into(),
+            role: RenderArtifactRole::FinalMaster,
+            scene_id: None,
+            managed_path: workspace
+                .service
+                .relative_managed_path(&master_path)
+                .expect("relative master path"),
+            sha256: sha256_file(&master_path).expect("hash master"),
+            cache_key: "c".repeat(64),
+            mime_type: "video/mp4".into(),
+            duration_us: Some(Microseconds(4_000_000)),
+            width: Some(320),
+            height: Some(180),
+            publication_state: PublicationState::Published,
+            created_at: utc_now(),
+        });
+        manifest.revision += 1;
+        manifest.updated_at = utc_now();
+        manifest.revision_history.push(RevisionRecord {
+            id: new_id(),
+            revision: manifest.revision,
+            parent_id: manifest
+                .revision_history
+                .last()
+                .map(|record| record.id.clone()),
+            actor: "service-test".into(),
+            reason: "Attach a finished master".into(),
+            changed_paths: vec![
+                "/render_artifacts".into(),
+                "/reviewed_scenes".into(),
+                "/timeline_duration_us".into(),
+            ],
+            invalidated_stages: BTreeSet::from([
+                RevisionStage::Plan,
+                RevisionStage::Captions,
+                RevisionStage::Tracking,
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ]),
+            created_at: manifest.updated_at.clone(),
+        });
+        manifest.validate_strict().expect("valid master manifest");
+        workspace
+            .service
+            .revise_manifest(ReviseVideoManifestRequest {
+                project_id: project_id.clone(),
+                expected_revision: created.get("revision").and_then(Value::as_i64).unwrap(),
+                manifest,
+                actor: "service-test".into(),
+                reason: "Attach a finished master".into(),
+                changed_paths: vec![
+                    "/render_artifacts".into(),
+                    "/reviewed_scenes".into(),
+                    "/timeline_duration_us".into(),
+                ],
+                invalidated_stages: BTreeSet::from([
+                    RevisionStage::Plan,
+                    RevisionStage::Captions,
+                    RevisionStage::Tracking,
+                    RevisionStage::SceneRender,
+                    RevisionStage::Preview,
+                    RevisionStage::FinalRender,
+                    RevisionStage::PublishPackage,
+                ]),
+                status: Some("ready".into()),
+            })
+            .expect("commit the master");
+
+        let exported = workspace
+            .service
+            .export_episode_release(&project_id, "service-test", true)
+            .expect("export the release");
+
+        // The audio episode and the audiogram always derive from the master; the trailer needs a
+        // narrated moment, which this fixture has none of, so it is reported rather than omitted.
+        let produced = exported
+            .produced
+            .iter()
+            .map(|member| member.kind)
+            .collect::<Vec<_>>();
+        assert!(produced.contains(&ReleaseMemberKind::PodcastAudio));
+        assert!(produced.contains(&ReleaseMemberKind::Audiogram));
+        assert!(exported
+            .skipped
+            .iter()
+            .any(|member| member.kind == ReleaseMemberKind::Trailer
+                && member.blocked_reason.is_some()));
+
+        for member in &exported.produced {
+            let path = workspace
+                .service
+                .resolve_absolute_managed_path(
+                    &workspace.service.video_root.join(&member.managed_path),
+                )
+                .expect("resolve deliverable");
+            // Registered means checksummed and playable, not merely written.
+            assert_eq!(sha256_file(&path).expect("hash deliverable"), member.sha256);
+            let probe = probe_media(&path, &ffprobe).expect("probe deliverable");
+            assert!(probe.duration_us > 0);
+            match member.kind {
+                ReleaseMemberKind::PodcastAudio => {
+                    assert!(probe.primary_video_stream.is_none());
+                    assert_eq!(probe.chapters.len(), 1);
+                    // A chapter title containing FFmetadata syntax survives the round trip.
+                    assert_eq!(
+                        probe.chapters[0].title.as_deref(),
+                        Some("Act 1; the letter")
+                    );
+                }
+                ReleaseMemberKind::Audiogram => {
+                    assert!(probe.primary_video_stream.is_some());
+                    assert!(probe.primary_audio_stream.is_some());
+                }
+                other => panic!("unexpected deliverable {other:?}"),
+            }
+        }
+
+        // Every deliverable is addressable on the committed project, not just on disk.
+        let reloaded: VideoProjectManifest =
+            serde_json::from_value(exported.project.get("manifest").cloned().expect("manifest"))
+                .unwrap();
+        for member in &exported.produced {
+            assert!(reloaded
+                .render_artifacts
+                .iter()
+                .any(|artifact| artifact.id == member.artifact_id
+                    && matches!(artifact.publication_state, PublicationState::Published)));
+        }
+    }
+
+    #[test]
+    fn a_release_cannot_be_exported_from_stand_in_takes() {
+        let workspace = TestWorkspace::new();
+        let project_id = format!("project-{}", new_id());
+        workspace.create_project(&project_id, "Draft release");
+        // No master at all: the one hard prerequisite is named rather than failing later.
+        let error = workspace
+            .service
+            .export_episode_release(&project_id, "service-test", true)
+            .expect_err("a release without a master is refused");
+        assert_eq!(error.code, "video.final_master_required");
+    }
+
+    #[test]
     fn real_ffmpeg_ingest_audio_video_render_and_package_smoke() {
         let workspace = TestWorkspace::new();
         let runtime = workspace.service.runtime_status(true);
@@ -11828,7 +12084,7 @@ impl VideoStudioService {
     ) -> ServiceResult<RenderArtifact> {
         let artifact = RenderArtifact {
             id: product.id.clone(),
-            role: product.role.clone(),
+            role: product.role,
             scene_id: None,
             managed_path: self.relative_managed_path(&product.path)?,
             sha256: product.sha256.clone(),
@@ -12636,6 +12892,430 @@ impl VideoStudioService {
             unchecked_turns,
             loudness.is_some(),
         )?)
+    }
+
+    /// Render one deliverable, publish it atomically, and measure what was actually produced.
+    ///
+    /// The validator runs against the published file rather than the staged one, so a deliverable
+    /// only becomes addressable after it has been proved to be the media it claims to be.
+    #[allow(clippy::too_many_arguments)]
+    fn render_release_member(
+        &self,
+        job_id: &str,
+        project_id: &str,
+        plan: RenderCommandPlan,
+        output: &Path,
+        expected_duration_us: Option<i64>,
+        ffprobe: &Path,
+        cancel: &AtomicBool,
+        playable: impl Fn(&RuntimeMediaProbe) -> bool,
+        rejection: &'static str,
+    ) -> ServiceResult<RenderedRelease> {
+        let staging = plan.primary.output.clone();
+        if output.is_file() {
+            fs::remove_file(output).map_err(|error| {
+                VideoServiceError::io(
+                    "video.release_failed",
+                    "A previous deliverable could not be cleared",
+                    error,
+                )
+            })?;
+        }
+        self.execute_render_plan(
+            job_id,
+            project_id,
+            &plan,
+            expected_duration_us,
+            0.1,
+            0.9,
+            cancel,
+            None,
+        )?;
+        publish_atomic(&staging, output, |path| {
+            let probe = probe_media(path, ffprobe)?;
+            if probe.duration_us <= 0 || !playable(&probe) {
+                return Err(MediaError::new("invalid_release_member", rejection));
+            }
+            Ok(())
+        })?;
+        let probe = probe_media(output, ffprobe)?;
+        let stream = probe
+            .primary_video_stream
+            .and_then(|index| probe.streams.iter().find(|stream| stream.index == index));
+        Ok(RenderedRelease {
+            sha256: sha256_file(output)?,
+            duration_us: probe.duration_us,
+            width: stream.and_then(|stream| stream.width),
+            height: stream.and_then(|stream| stream.height),
+        })
+    }
+
+    fn release_artifact(
+        &self,
+        role: RenderArtifactRole,
+        path: &Path,
+        rendered: &RenderedRelease,
+        mime_type: &str,
+    ) -> ServiceResult<RenderArtifact> {
+        let artifact = RenderArtifact {
+            id: new_id(),
+            role,
+            scene_id: None,
+            managed_path: self.relative_managed_path(path)?,
+            sha256: rendered.sha256.clone(),
+            // A deliverable is addressed by its own bytes: it is derived from one exact master and
+            // is replaced wholesale whenever that master is re-rendered.
+            cache_key: rendered.sha256.clone(),
+            mime_type: mime_type.to_string(),
+            duration_us: Some(Microseconds(rendered.duration_us)),
+            width: rendered.width,
+            height: rendered.height,
+            publication_state: PublicationState::Published,
+            created_at: utc_now(),
+        };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    fn commit_release_artifacts(
+        &self,
+        project_id: &str,
+        actor: &str,
+        manifest: VideoProjectManifest,
+        job_id: &str,
+    ) -> ServiceResult<Value> {
+        let lock = ProjectLock::acquire(self, project_id, actor)?;
+        let current = self.get_project(project_id)?;
+        let revision = current
+            .get("revision")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| invalid_store_shape("revision"))?;
+        let mut manifest = manifest;
+        let next_revision = manifest.revision.checked_add(1).ok_or_else(|| {
+            VideoServiceError::new(
+                "video.revision_overflow",
+                "The release revision could not be advanced",
+            )
+        })?;
+        manifest.revision = next_revision;
+        manifest.updated_at = utc_now();
+        let reason = "Publish release deliverables".to_string();
+        manifest.revision_history.push(RevisionRecord {
+            id: new_id(),
+            revision: next_revision,
+            parent_id: manifest
+                .revision_history
+                .last()
+                .map(|record| record.id.clone()),
+            actor: actor.to_string(),
+            reason: reason.clone(),
+            changed_paths: vec!["/render_artifacts".to_string()],
+            invalidated_stages: BTreeSet::from([RevisionStage::PublishPackage]),
+            created_at: manifest.updated_at.clone(),
+        });
+        manifest.validate_strict()?;
+        let manifest_value = serde_json::to_value(&manifest).map_err(json_error)?;
+        let status = current.get("status").and_then(Value::as_str);
+        let project = self
+            .store
+            .commit_video_manifest_and_complete_job(
+                project_id,
+                revision,
+                &manifest_value,
+                actor,
+                &reason,
+                &lock.token,
+                status,
+                job_id,
+            )
+            .map_err(VideoServiceError::store)?;
+        drop(lock);
+        Ok(project)
+    }
+
+    /// Produce and register every release deliverable this episode can supply.
+    ///
+    /// All three are derived from the finished master, so the master is the one hard prerequisite.
+    /// A member that cannot be produced is reported with its reason rather than omitted, because a
+    /// partial release that looks complete is worse than one that says what is missing.
+    pub fn export_episode_release(
+        &self,
+        project_id: &str,
+        actor: &str,
+        has_show_notes: bool,
+    ) -> ServiceResult<ReleaseExportResult> {
+        let plan = self.plan_episode_release(project_id, has_show_notes)?;
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+        manifest.validate_strict()?;
+
+        // A stand-in must never be published. The manifest already refuses a master built on one,
+        // but saying so here names the actual problem instead of failing later on a checksum.
+        let drafts = manifest.draft_turn_ids();
+        if !drafts.is_empty() {
+            return Err(VideoServiceError::new(
+                "video.draft_not_promoted",
+                format!(
+                    "{} line(s) are still draft takes; promote them before publishing a release",
+                    drafts.len()
+                ),
+            ));
+        }
+
+        let master = manifest
+            .render_artifacts
+            .iter()
+            .find(|artifact| {
+                matches!(artifact.role, RenderArtifactRole::FinalMaster)
+                    && matches!(artifact.publication_state, PublicationState::Published)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                VideoServiceError::new(
+                    "video.final_master_required",
+                    "Render a final master before exporting a release",
+                )
+            })?;
+        // `managed_path` is relative to managed video storage; the resolver takes an absolute path
+        // and re-checks that it is still inside that storage.
+        let master_path =
+            self.resolve_absolute_managed_path(&self.video_root.join(&master.managed_path))?;
+
+        let runtime = self.runtime_status(false);
+        let ffmpeg = required_tool_path(
+            &runtime.ffmpeg,
+            "video.ffmpeg_unavailable",
+            "FFmpeg is required to produce release deliverables",
+        )?;
+        let ffprobe = required_tool_path(
+            &runtime.ffprobe,
+            "video.ffprobe_unavailable",
+            "FFprobe is required to validate release deliverables",
+        )?;
+
+        let request_value = json!({ "project_id": project_id, "has_show_notes": has_show_notes });
+        let job_id = self
+            .store
+            .create_job("video_export_release", &request_value)
+            .map_err(VideoServiceError::store)?;
+        let result = self.export_release_deliverables(
+            &job_id,
+            project_id,
+            actor,
+            manifest.clone(),
+            plan,
+            &master,
+            &master_path,
+            ffmpeg,
+            ffprobe,
+        );
+        if let Err(error) = &result {
+            let _ = self.store.fail_job(&job_id, &error.stable_message());
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn export_release_deliverables(
+        &self,
+        job_id: &str,
+        project_id: &str,
+        actor: &str,
+        manifest: VideoProjectManifest,
+        plan: ReleasePlan,
+        master: &RenderArtifact,
+        master_path: &Path,
+        ffmpeg: &Path,
+        ffprobe: &Path,
+    ) -> ServiceResult<ReleaseExportResult> {
+        self.store
+            .start_job(job_id)
+            .map_err(VideoServiceError::store)?;
+        let cancel = AtomicBool::new(false);
+        let _lease = self.acquire_resources(
+            job_id,
+            project_id,
+            ResourceRequest {
+                class: ResourceClass::Medium,
+                vram_mb: 0,
+                cpu_threads: 4,
+                io_slots: 2,
+                nvenc_sessions: 0,
+            },
+            &cancel,
+            None,
+        )?;
+
+        let deliverables_dir = self.project_dir(project_id)?.join("release");
+        self.secure_managed_directory(&deliverables_dir)?;
+        let mut produced = Vec::new();
+        let mut artifacts = Vec::new();
+
+        // The audio episode, carrying the chapters the author's own scenes define.
+        let chapters_path = deliverables_dir.join("chapters.ffmetadata");
+        // The chapter document is written through the same atomic path as any other managed file,
+        // so a crash mid-write cannot leave a truncated document that FFmpeg would still parse.
+        let chapters_staging = sibling_staging_path(&chapters_path)?;
+        fs::write(&chapters_staging, ffmetadata_chapters(&plan.chapters)).map_err(|error| {
+            VideoServiceError::io(
+                "video.release_failed",
+                "The chapter metadata could not be staged",
+                error,
+            )
+        })?;
+        publish_atomic(&chapters_staging, &chapters_path, |path| {
+            fs::read_to_string(path)
+                .map_err(|error| {
+                    MediaError::new(
+                        "invalid_chapter_metadata",
+                        "The chapter metadata could not be read back",
+                    )
+                    .detail(error.to_string())
+                })
+                .and_then(|document| {
+                    document
+                        .starts_with(";FFMETADATA1")
+                        .then_some(())
+                        .ok_or_else(|| {
+                            MediaError::new(
+                                "invalid_chapter_metadata",
+                                "The chapter metadata is not an FFmetadata document",
+                            )
+                        })
+                })
+        })?;
+        let podcast_path = deliverables_dir.join("episode.m4a");
+        let podcast = self.render_release_member(
+            job_id,
+            project_id,
+            build_podcast_audio_command(
+                ffmpeg,
+                master_path,
+                (!plan.chapters.is_empty()).then_some(chapters_path.as_path()),
+                &sibling_staging_path(&podcast_path)?,
+            )?,
+            &podcast_path,
+            master.duration_us.map(|duration| duration.0),
+            ffprobe,
+            &cancel,
+            |probe| probe.primary_audio_stream.is_some() && probe.primary_video_stream.is_none(),
+            "The podcast deliverable is not audio-only playable media",
+        )?;
+        artifacts.push(self.release_artifact(
+            RenderArtifactRole::PodcastAudio,
+            &podcast_path,
+            &podcast,
+            "audio/mp4",
+        )?);
+        produced.push(ReleaseMemberArtifact {
+            kind: ReleaseMemberKind::PodcastAudio,
+            artifact_id: artifacts.last().expect("just pushed").id.clone(),
+            managed_path: artifacts.last().expect("just pushed").managed_path.clone(),
+            sha256: artifacts.last().expect("just pushed").sha256.clone(),
+            mime_type: "audio/mp4".to_string(),
+            duration_us: podcast.duration_us,
+        });
+
+        // The trailer, cut from the moment the analyst chose in the episode's own narration.
+        if let Some(range) = plan.trailer_range {
+            let trailer_path = deliverables_dir.join("trailer.mp4");
+            let trailer = self.render_release_member(
+                job_id,
+                project_id,
+                build_trailer_command(
+                    ffmpeg,
+                    master_path,
+                    &sibling_staging_path(&trailer_path)?,
+                    range.start_us.0,
+                    range.end_us.0,
+                    RenderProfile::Final,
+                    self.runtime_status(false).h264_nvenc_runtime,
+                )?,
+                &trailer_path,
+                Some(range.end_us.0 - range.start_us.0),
+                ffprobe,
+                &cancel,
+                |probe| probe.primary_video_stream.is_some(),
+                "The trailer is not playable video",
+            )?;
+            artifacts.push(self.release_artifact(
+                RenderArtifactRole::Trailer,
+                &trailer_path,
+                &trailer,
+                "video/mp4",
+            )?);
+            produced.push(ReleaseMemberArtifact {
+                kind: ReleaseMemberKind::Trailer,
+                artifact_id: artifacts.last().expect("just pushed").id.clone(),
+                managed_path: artifacts.last().expect("just pushed").managed_path.clone(),
+                sha256: artifacts.last().expect("just pushed").sha256.clone(),
+                mime_type: "video/mp4".to_string(),
+                duration_us: trailer.duration_us,
+            });
+        }
+
+        // The audiogram, for feeds where only video plays.
+        let audiogram_path = deliverables_dir.join("audiogram.mp4");
+        let audiogram = self.render_release_member(
+            job_id,
+            project_id,
+            build_audiogram_command(
+                ffmpeg,
+                master_path,
+                &sibling_staging_path(&audiogram_path)?,
+                RenderProfile::Preview,
+                self.runtime_status(false).h264_nvenc_runtime,
+            )?,
+            &audiogram_path,
+            master.duration_us.map(|duration| duration.0),
+            ffprobe,
+            &cancel,
+            |probe| probe.primary_video_stream.is_some() && probe.primary_audio_stream.is_some(),
+            "The audiogram is not playable audio/video",
+        )?;
+        artifacts.push(self.release_artifact(
+            RenderArtifactRole::Audiogram,
+            &audiogram_path,
+            &audiogram,
+            "video/mp4",
+        )?);
+        produced.push(ReleaseMemberArtifact {
+            kind: ReleaseMemberKind::Audiogram,
+            artifact_id: artifacts.last().expect("just pushed").id.clone(),
+            managed_path: artifacts.last().expect("just pushed").managed_path.clone(),
+            sha256: artifacts.last().expect("just pushed").sha256.clone(),
+            mime_type: "video/mp4".to_string(),
+            duration_us: audiogram.duration_us,
+        });
+
+        // Commit every deliverable as one revision, so a release is either registered whole or not
+        // at all rather than leaving half its members addressable.
+        // Replacing rather than appending: a release is derived wholly from one master, so leaving
+        // a previous export's members addressable would let two different episodes be downloaded
+        // from the same project.
+        let mut revised = manifest;
+        revised
+            .render_artifacts
+            .retain(|artifact| !artifact.role.is_release_member() || artifact.id == master.id);
+        revised.render_artifacts.extend(artifacts);
+        let project = self.commit_release_artifacts(project_id, actor, revised, job_id)?;
+
+        Ok(ReleaseExportResult {
+            project,
+            produced,
+            skipped: plan
+                .members
+                .into_iter()
+                .filter(|member| !member.ready)
+                .collect(),
+            job_id: job_id.to_string(),
+        })
     }
 
     /// What this episode's release would contain, and what is still missing.

@@ -34,6 +34,8 @@ pub enum ReleaseMemberKind {
     VideoMaster,
     /// A short vertical cut of the strongest moment.
     Trailer,
+    /// A square waveform video, for feeds where only video plays.
+    Audiogram,
     /// The episode's own transcript.
     Transcript,
     /// Written notes for the episode.
@@ -41,10 +43,11 @@ pub enum ReleaseMemberKind {
 }
 
 impl ReleaseMemberKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::PodcastAudio,
         Self::VideoMaster,
         Self::Trailer,
+        Self::Audiogram,
         Self::Transcript,
         Self::ShowNotes,
     ];
@@ -54,6 +57,7 @@ impl ReleaseMemberKind {
             Self::PodcastAudio => "podcast_audio",
             Self::VideoMaster => "video_master",
             Self::Trailer => "trailer",
+            Self::Audiogram => "audiogram",
             Self::Transcript => "transcript",
             Self::ShowNotes => "show_notes",
         }
@@ -227,6 +231,41 @@ pub fn episode_chapters(manifest: &VideoProjectManifest) -> VideoResult<Vec<Rele
     Ok(chapters)
 }
 
+/// Render the episode's chapters as an FFmetadata document.
+///
+/// This is what a podcast player reads to offer chapter navigation. The microsecond timebase is
+/// declared explicitly rather than converting to milliseconds, so a chapter mark lands on the same
+/// clock the episode was assembled on.
+///
+/// FFmetadata treats `=`, `;`, `#`, `\`, and a newline as syntax, so a chapter title containing any
+/// of them is escaped. An unescaped title would either truncate the document or silently move a
+/// chapter's boundary.
+pub fn ffmetadata_chapters(chapters: &[ReleaseChapter]) -> String {
+    let mut document = String::from(";FFMETADATA1\n");
+    for chapter in chapters {
+        document.push_str("[CHAPTER]\nTIMEBASE=1/1000000\n");
+        document.push_str(&format!("START={}\n", chapter.start_us.0));
+        document.push_str(&format!("END={}\n", chapter.end_us.0));
+        document.push_str(&format!("title={}\n", escape_ffmetadata(&chapter.title)));
+    }
+    document
+}
+
+fn escape_ffmetadata(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '=' | ';' | '#' | '\\' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            '\n' => escaped.push_str("\\\n"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 /// Decide what this episode's release would contain.
 ///
 /// `has_show_notes` is supplied by the caller because notes are written, not derived: the contract
@@ -286,6 +325,15 @@ pub fn plan_release(
             ReleaseMemberKind::Trailer,
             trailer_range.is_some(),
             "No narrated moment is long enough to cut a trailer from",
+        ),
+        member(
+            ReleaseMemberKind::Audiogram,
+            has_master && no_drafts,
+            if has_master {
+                &draft_reason
+            } else {
+                "Render a final master for the current timeline first"
+            },
         ),
         member(
             ReleaseMemberKind::Transcript,
@@ -571,6 +619,59 @@ mod tests {
             .blocked_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("1 line(s)")));
+    }
+
+    #[test]
+    fn chapters_are_written_on_the_microsecond_clock_they_were_assembled_on() {
+        let chapters = vec![
+            ReleaseChapter {
+                id: "chapter-one".into(),
+                title: "The letter".into(),
+                start_us: Microseconds::ZERO,
+                end_us: Microseconds(20_000_000),
+            },
+            ReleaseChapter {
+                id: "chapter-two".into(),
+                title: "The answer".into(),
+                start_us: Microseconds(20_000_000),
+                end_us: Microseconds(45_500_000),
+            },
+        ];
+        let document = ffmetadata_chapters(&chapters);
+        assert!(document.starts_with(";FFMETADATA1\n"));
+        assert_eq!(document.matches("[CHAPTER]").count(), 2);
+        assert!(document.contains("TIMEBASE=1/1000000"));
+        assert!(document.contains("START=20000000\nEND=45500000\ntitle=The answer"));
+    }
+
+    #[test]
+    fn a_chapter_title_cannot_break_the_metadata_document() {
+        // These characters are FFmetadata syntax; unescaped they would truncate the document or
+        // silently move a chapter boundary.
+        let chapters = vec![ReleaseChapter {
+            id: "chapter-one".into(),
+            title: "Act 1; scene #2 = the reveal".into(),
+            start_us: Microseconds::ZERO,
+            end_us: Microseconds(1_000_000),
+        }];
+        let document = ffmetadata_chapters(&chapters);
+        assert!(
+            document.contains(r"title=Act 1\; scene \#2 \= the reveal"),
+            "{document}"
+        );
+        // Exactly one key per line: nothing leaked into a new directive.
+        assert_eq!(
+            document
+                .lines()
+                .filter(|line| line.starts_with("title="))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_episode_with_no_chapters_still_produces_a_valid_document() {
+        assert_eq!(ffmetadata_chapters(&[]), ";FFMETADATA1\n");
     }
 
     #[test]
