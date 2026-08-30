@@ -11,6 +11,7 @@ use super::cast::{
 use super::lexicon::{fingerprint_for_character, validate_lexicon, LexiconEntry};
 use super::performance::{index_turns, validate_turn_beats, PerformanceClock, TurnBeat};
 use super::score::{validate_cue_sheet, MusicCue};
+use super::sound::{validate_sound_design, SoundAsset, SoundLayer};
 use super::visuals::{VisualAsset, VisualLayer, MAX_VISUAL_ASSETS, MAX_VISUAL_LAYERS};
 
 pub const VIDEO_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -48,6 +49,7 @@ pub enum VideoErrorCode {
     InvalidDialogue,
     InvalidLexicon,
     InvalidPerformance,
+    InvalidSoundPlacement,
     UnknownSpeaker,
     InvalidArtifact,
     InvalidRevision,
@@ -87,6 +89,7 @@ impl VideoErrorCode {
             Self::CueFitFailed => "video.cue_fit_failed",
             Self::InvalidDialogue => "video.invalid_dialogue",
             Self::InvalidLexicon => "video.invalid_lexicon",
+            Self::InvalidSoundPlacement => "video.invalid_sound_placement",
             Self::InvalidPerformance => "video.invalid_performance",
             Self::UnknownSpeaker => "video.unknown_speaker",
             Self::InvalidArtifact => "video.invalid_artifact",
@@ -1509,6 +1512,10 @@ pub struct VideoProjectManifest {
     #[serde(default)]
     pub music_cues: Vec<MusicCue>,
     #[serde(default)]
+    pub sound_assets: Vec<SoundAsset>,
+    #[serde(default)]
+    pub sound_layers: Vec<SoundLayer>,
+    #[serde(default)]
     pub performance_clock: PerformanceClock,
     #[serde(default)]
     pub turn_beats: Vec<TurnBeat>,
@@ -1555,6 +1562,8 @@ impl VideoProjectManifest {
             dialogue: Vec::new(),
             lexicon: Vec::new(),
             music_cues: Vec::new(),
+            sound_assets: Vec::new(),
+            sound_layers: Vec::new(),
             performance_clock: PerformanceClock::default(),
             turn_beats: Vec::new(),
             narration_bindings: Vec::new(),
@@ -1956,6 +1965,30 @@ impl Validate for VideoProjectManifest {
             &music_asset_ids,
             !self.dialogue.is_empty(),
         )?;
+        let scene_ranges = self
+            .reviewed_scenes
+            .iter()
+            .map(|scene| {
+                let end = scene
+                    .timeline_start_us
+                    .checked_add(scene.timeline_duration_us)?;
+                Ok((
+                    scene.id.as_str(),
+                    TimeRange::new(scene.timeline_start_us.0, end.0)?,
+                ))
+            })
+            .collect::<VideoResult<BTreeMap<_, _>>>()?;
+        validate_sound_design(
+            &self.sound_assets,
+            &self.sound_layers,
+            &scene_ranges,
+            &self
+                .dialogue
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<BTreeSet<_>>(),
+        )?;
+
         // A bed that does not duck buries the dialogue it is supposed to support. The mix contract
         // can already express the envelope, so the only thing missing was refusing to render a bed
         // without one.
@@ -2787,6 +2820,8 @@ mod tests {
             dialogue: vec![],
             lexicon: vec![],
             music_cues: vec![],
+            sound_assets: vec![],
+            sound_layers: vec![],
             performance_clock: PerformanceClock::default(),
             turn_beats: vec![],
             narration_bindings: vec![],

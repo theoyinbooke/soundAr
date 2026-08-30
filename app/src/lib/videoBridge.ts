@@ -32,6 +32,7 @@ import type {
   VideoPerformanceClock,
   VideoScene,
   VideoScriptResponse,
+  VideoSoundLayer,
   VideoStudioService,
   VideoTimelineManifest,
   VideoTurnBeat,
@@ -616,6 +617,37 @@ function applyBrowserTimelineOperations(project: VideoProject, request: VideoTim
       } else {
         if (!cues.some((existing) => existing.id === operation.cue_id)) throw new Error("video.missing_reference: The music cue no longer exists.");
         edited.manifest.music_cues = cues.filter((existing) => existing.id !== operation.cue_id);
+      }
+    } else if (operation.type === "set_sound_layer" || operation.type === "remove_sound_layer") {
+      const layers = edited.manifest.sound_layers ?? [];
+      if (operation.type === "set_sound_layer") {
+        const { layer } = operation;
+        if (!(edited.manifest.sound_assets ?? []).some((asset) => asset.id === layer.asset_id)) {
+          throw new Error("video.missing_reference: That sound asset is not registered in this project.");
+        }
+        const span = layer.range.end_us - layer.range.start_us;
+        if (layer.fade_in_us + layer.fade_out_us > span) throw new Error("video.invalid_sound_placement: Sound layer fades cannot together exceed the placement.");
+        if (layer.loop_to_fill && layer.kind === "one_shot") throw new Error("video.invalid_sound_placement: A one-shot happens once and cannot loop.");
+        if (layer.kind === "one_shot" && !layer.scene_id && !layer.turn_id) throw new Error("video.invalid_sound_placement: A one-shot must be anchored to the scene or turn it punctuates.");
+        if (layer.kind !== "one_shot" && !layer.scene_id) throw new Error("video.invalid_sound_placement: Ambience and room tone belong to a scene.");
+        if (layer.kind !== "one_shot" && layer.turn_id) throw new Error("video.invalid_sound_placement: Ambience and room tone run under a whole scene, not one turn.");
+        if (layer.kind === "room_tone" && layer.gain_db_milli > -18_000) throw new Error("video.invalid_sound_placement: Room tone must sit far under the dialogue.");
+        const presented: VideoSoundLayer = {
+          id: layer.id, asset_id: layer.asset_id, kind: layer.kind,
+          scene_id: layer.scene_id ?? null, turn_id: layer.turn_id ?? null,
+          start_ms: microsecondsToMilliseconds(layer.range.start_us, "range start_us"),
+          end_ms: microsecondsToMilliseconds(layer.range.end_us, "range end_us"),
+          gain_db: layer.gain_db_milli / 1000,
+          fade_in_ms: microsecondsToMilliseconds(layer.fade_in_us, "fade_in_us"),
+          fade_out_ms: microsecondsToMilliseconds(layer.fade_out_us, "fade_out_us"),
+          loop_to_fill: layer.loop_to_fill ?? false, duck_under_speech: layer.duck_under_speech ?? false,
+        };
+        edited.manifest.sound_layers = layers.some((existing) => existing.id === layer.id)
+          ? layers.map((existing) => (existing.id === layer.id ? presented : existing))
+          : [...layers, presented];
+      } else {
+        if (!layers.some((existing) => existing.id === operation.layer_id)) throw new Error("video.missing_reference: The sound placement no longer exists.");
+        edited.manifest.sound_layers = layers.filter((existing) => existing.id !== operation.layer_id);
       }
     } else {
       const layerIndex = (edited.manifest.visual_layers ?? []).findIndex((layer) => layer.id === operation.layer_id);

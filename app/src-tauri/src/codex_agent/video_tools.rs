@@ -1244,7 +1244,7 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "edit_video_timeline",
-            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, set or remove a pronunciation rule, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line; changing a pronunciation rule re-reads only the lines that rule governs; a music bed placed on a track always ducks against the speech beneath it. Use one stable operation_id for retries. Requires Studio or Full access.",
+            "Apply source-clock-safe split, trim, reorder, or exact merge operations, retime the beat before a dialogue turn, set or remove a pronunciation rule, or reposition a visual layer on one immutable project version. Retiming a conversation reassembles it without re-reading any line; changing a pronunciation rule re-reads only the lines that rule governs; a music bed placed on a track always ducks against the speech beneath it; sound-design placements reference audio the user already registered and never introduce new files. Use one stable operation_id for retries. Requires Studio or Full access.",
             timeline_edit_schema(),
         ),
         tool(
@@ -1511,9 +1511,37 @@ fn timeline_edit_schema() -> Value {
                     "type":"array",
                     "minItems":1,
                     "maxItems":100,
-                    "items": {
-                        "oneOf": [
-                            {
+                    "items": { "oneOf": timeline_operation_schemas() }
+                }),
+            ),
+        ]),
+    )
+}
+
+/// Every operation `edit_video_timeline` accepts, one schema per function.
+///
+/// These are separate functions rather than one literal because `json!` expands recursively and a
+/// union this large exceeds the macro's recursion limit when written inline.
+fn timeline_operation_schemas() -> Vec<Value> {
+    vec![
+        split_scene_operation_schema(),
+        trim_scene_operation_schema(),
+        reorder_scene_operation_schema(),
+        merge_scenes_operation_schema(),
+        set_turn_beat_operation_schema(),
+        clear_turn_beat_operation_schema(),
+        set_lexicon_entry_operation_schema(),
+        remove_lexicon_entry_operation_schema(),
+        set_music_cue_operation_schema(),
+        remove_music_cue_operation_schema(),
+        set_sound_layer_operation_schema(),
+        remove_sound_layer_operation_schema(),
+        update_visual_layer_operation_schema(),
+    ]
+}
+
+fn split_scene_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","scene_id","at_timeline_us"],
@@ -1522,8 +1550,11 @@ fn timeline_edit_schema() -> Value {
                                     "scene_id":{"type":"string","minLength":1},
                                     "at_timeline_us":{"type":"integer","minimum":0}
                                 }
-                            },
-                            {
+                            })
+}
+
+fn trim_scene_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","scene_id","source_start_us","source_end_us"],
@@ -1533,8 +1564,11 @@ fn timeline_edit_schema() -> Value {
                                     "source_start_us":{"type":"integer","minimum":0},
                                     "source_end_us":{"type":"integer","minimum":1}
                                 }
-                            },
-                            {
+                            })
+}
+
+fn reorder_scene_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","scene_id","to_index"],
@@ -1543,8 +1577,11 @@ fn timeline_edit_schema() -> Value {
                                     "scene_id":{"type":"string","minLength":1},
                                     "to_index":{"type":"integer","minimum":0}
                                 }
-                            },
-                            {
+                            })
+}
+
+fn merge_scenes_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","first_scene_id","second_scene_id"],
@@ -1553,8 +1590,11 @@ fn timeline_edit_schema() -> Value {
                                     "first_scene_id":{"type":"string","minLength":1},
                                     "second_scene_id":{"type":"string","minLength":1}
                                 }
-                            },
-                            {
+                            })
+}
+
+fn set_turn_beat_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","turn_id","lead_in_us","overlap_us"],
@@ -1564,8 +1604,11 @@ fn timeline_edit_schema() -> Value {
                                     "lead_in_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Silence held before this turn. Zero when the turn overlaps instead."},
                                     "overlap_us":{"type":"integer","minimum":0,"maximum":2000000,"description":"How far this turn starts before the previous one ends. Zero when the turn waits instead."}
                                 }
-                            },
-                            {
+                            })
+}
+
+fn clear_turn_beat_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","turn_id"],
@@ -1573,8 +1616,11 @@ fn timeline_edit_schema() -> Value {
                                     "type":{"const":"clear_turn_beat"},
                                     "turn_id":{"type":"string","minLength":1}
                                 }
-                            },
-                            {
+                            })
+}
+
+fn set_lexicon_entry_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","entry"],
@@ -1596,8 +1642,11 @@ fn timeline_edit_schema() -> Value {
                                         }
                                     }
                                 }
-                            },
-                            {
+                            })
+}
+
+fn remove_lexicon_entry_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","entry_id"],
@@ -1605,8 +1654,11 @@ fn timeline_edit_schema() -> Value {
                                     "type":{"const":"remove_lexicon_entry"},
                                     "entry_id":{"type":"string","minLength":1}
                                 }
-                            },
-                            {
+                            })
+}
+
+fn set_music_cue_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","cue"],
@@ -1638,8 +1690,11 @@ fn timeline_edit_schema() -> Value {
                                         }
                                     }
                                 }
-                            },
-                            {
+                            })
+}
+
+fn remove_music_cue_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","cue_id"],
@@ -1647,8 +1702,52 @@ fn timeline_edit_schema() -> Value {
                                     "type":{"const":"remove_music_cue"},
                                     "cue_id":{"type":"string","minLength":1}
                                 }
-                            },
-                            {
+                            })
+}
+
+fn set_sound_layer_operation_schema() -> Value {
+    json!({
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","layer"],
+                                "properties":{
+                                    "type":{"const":"set_sound_layer"},
+                                    "layer":{
+                                        "type":"object",
+                                        "additionalProperties":false,
+                                        "required":["id","asset_id","kind","range","gain_db_milli","fade_in_us","fade_out_us"],
+                                        "properties":{
+                                            "id":{"type":"string","minLength":1},
+                                            "asset_id":{"type":"string","minLength":1,"description":"A sound asset already registered in this project. Placements never introduce new audio."},
+                                            "kind":{"type":"string","enum":["one_shot","ambience","room_tone"],"description":"one_shot happens once at a point; ambience runs across a scene span; room_tone runs under a whole scene and is what removes the digital silence between takes"},
+                                            "scene_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Required for ambience and room tone"},
+                                            "turn_id":{"oneOf":[{"type":"string","minLength":1},{"type":"null"}],"description":"Anchors a one-shot to the line it punctuates so it moves when that line does. Rejected for ambience and room tone."},
+                                            "range":visual_range_schema(),
+                                            "gain_db_milli":{"type":"integer","minimum":-60000,"maximum":12000,"description":"Room tone must be at or below -18000 so it reads as a room rather than as noise"},
+                                            "fade_in_us":{"type":"integer","minimum":0},
+                                            "fade_out_us":{"type":"integer","minimum":0},
+                                            "loop_to_fill":{"type":"boolean","description":"Repeat the asset across the range. Rejected for a one-shot."},
+                                            "duck_under_speech":{"type":"boolean"}
+                                        }
+                                    }
+                                }
+                            })
+}
+
+fn remove_sound_layer_operation_schema() -> Value {
+    json!({
+                                "type":"object",
+                                "additionalProperties":false,
+                                "required":["type","layer_id"],
+                                "properties":{
+                                    "type":{"const":"remove_sound_layer"},
+                                    "layer_id":{"type":"string","minLength":1}
+                                }
+                            })
+}
+
+fn update_visual_layer_operation_schema() -> Value {
+    json!({
                                 "type":"object",
                                 "additionalProperties":false,
                                 "required":["type","layer_id","scene_id","range","fit","crop","z_index","motion","transition_in_us","transition_out_us"],
@@ -1664,13 +1763,7 @@ fn timeline_edit_schema() -> Value {
                                     "transition_in_us":{"type":"integer","minimum":0},
                                     "transition_out_us":{"type":"integer","minimum":0}
                                 }
-                            }
-                        ]
-                    }
-                }),
-            ),
-        ]),
-    )
+                            })
 }
 
 fn visual_asset_schema() -> Value {
@@ -2055,7 +2148,7 @@ mod tests {
             schema["inputSchema"]["properties"]["operations"]["items"]["oneOf"]
                 .as_array()
                 .map(Vec::len),
-            Some(11)
+            Some(13)
         );
 
         // Retiming a conversation goes through the same version-bound batch as every other edit.

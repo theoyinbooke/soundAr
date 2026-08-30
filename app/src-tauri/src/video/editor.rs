@@ -12,6 +12,7 @@ use super::contracts::{
 };
 use super::lexicon::{fingerprint_for_character, LexiconEntry};
 use super::score::{bed_ducking, MusicCue};
+use super::sound::SoundLayer;
 use super::performance::{derive_turn_beats, BeatSource, TurnBeat};
 use super::timeline::{
     map_source_endpoint_to_timeline, map_timeline_endpoint_to_source, QuantizeMode,
@@ -76,6 +77,11 @@ pub enum VideoTimelineOperation {
     SetMusicCue { cue: MusicCue },
     /// Removes one music cue and the mix track it owned.
     RemoveMusicCue { cue_id: String },
+    /// Adds or replaces one sound-design placement. The assistant may propose a placement from a
+    /// stage direction, but it only ever takes effect through this revision-checked path.
+    SetSoundLayer { layer: SoundLayer },
+    /// Removes one sound-design placement.
+    RemoveSoundLayer { layer_id: String },
     /// Repositions or animates an existing managed visual without replacing its immutable bytes.
     UpdateVisualLayer {
         layer_id: String,
@@ -159,6 +165,10 @@ pub fn apply_timeline_edit(
             VideoTimelineOperation::SetMusicCue { cue } => set_music_cue(&mut edited, cue)?,
             VideoTimelineOperation::RemoveMusicCue { cue_id } => {
                 remove_music_cue(&mut edited, cue_id)?
+            }
+            VideoTimelineOperation::SetSoundLayer { layer } => set_sound_layer(&mut edited, layer)?,
+            VideoTimelineOperation::RemoveSoundLayer { layer_id } => {
+                remove_sound_layer(&mut edited, layer_id)?
             }
             VideoTimelineOperation::UpdateVisualLayer {
                 layer_id,
@@ -282,6 +292,10 @@ fn validate_request(
             VideoTimelineOperation::SetMusicCue { cue } => cue.validate()?,
             VideoTimelineOperation::RemoveMusicCue { cue_id } => {
                 validate_identifier(cue_id, "operations.cue_id")?
+            }
+            VideoTimelineOperation::SetSoundLayer { layer } => layer.validate()?,
+            VideoTimelineOperation::RemoveSoundLayer { layer_id } => {
+                validate_identifier(layer_id, "operations.layer_id")?
             }
             VideoTimelineOperation::UpdateVisualLayer {
                 layer_id, scene_id, ..
@@ -579,6 +593,45 @@ fn speech_track_id(manifest: &VideoProjectManifest, exclude_track_id: &str) -> O
                 })
         })
         .map(|track| track.id.clone())
+}
+
+fn set_sound_layer(manifest: &mut VideoProjectManifest, layer: &SoundLayer) -> VideoResult<()> {
+    layer.validate()?;
+    // Placements reference registered assets only. Accepting an unknown id here would let a
+    // proposal from a stage direction invent a sound the project does not have.
+    if !manifest
+        .sound_assets
+        .iter()
+        .any(|asset| asset.id == layer.asset_id)
+    {
+        return Err(edit_error(
+            VideoErrorCode::MissingReference,
+            format!("sound asset {} is not registered", layer.asset_id),
+            "operations.layer.asset_id",
+        ));
+    }
+    match manifest
+        .sound_layers
+        .iter_mut()
+        .find(|existing| existing.id == layer.id)
+    {
+        Some(existing) => *existing = layer.clone(),
+        None => manifest.sound_layers.push(layer.clone()),
+    }
+    Ok(())
+}
+
+fn remove_sound_layer(manifest: &mut VideoProjectManifest, layer_id: &str) -> VideoResult<()> {
+    let before = manifest.sound_layers.len();
+    manifest.sound_layers.retain(|layer| layer.id != layer_id);
+    if manifest.sound_layers.len() == before {
+        return Err(edit_error(
+            VideoErrorCode::MissingReference,
+            format!("sound placement {layer_id} does not exist"),
+            "operations.layer_id",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_editable_scene_references(manifest: &VideoProjectManifest) -> VideoResult<()> {
@@ -2970,6 +3023,120 @@ mod tests {
             &manifest,
             &request(vec![VideoTimelineOperation::RemoveMusicCue {
                 cue_id: "cue-absent".into(),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+    }
+
+    fn sound_asset() -> super::super::sound::SoundAsset {
+        use super::super::contracts::{Provenance, ProvenanceKind};
+        use super::super::sound::{SoundAsset, SoundMimeType};
+        SoundAsset {
+            id: "sound-tone".into(),
+            name: "Quiet room".into(),
+            managed_path: "sounds/sound-tone.wav".into(),
+            sha256: "d".repeat(64),
+            mime_type: SoundMimeType::Wav,
+            duration_us: Microseconds(8_000_000),
+            sample_rate: 48_000,
+            channels: 2,
+            size_bytes: 1_536_000,
+            tags: vec!["room tone".into()],
+            provenance: Provenance {
+                kind: ProvenanceKind::UserUpload,
+                original_uri: None,
+                imported_at: NOW.into(),
+                producer: "editor-test".into(),
+                producer_version: None,
+                metadata: BTreeMap::new(),
+            },
+            created_at: NOW.into(),
+        }
+    }
+
+    fn room_tone_layer(scene_id: &str, start: i64, end: i64) -> SoundLayer {
+        use super::super::sound::SoundPlacementKind;
+        SoundLayer {
+            id: "tone-one".into(),
+            asset_id: "sound-tone".into(),
+            kind: SoundPlacementKind::RoomTone,
+            scene_id: Some(scene_id.into()),
+            turn_id: None,
+            range: range(start, end),
+            gain_db_milli: -26_000,
+            fade_in_us: Microseconds(250_000),
+            fade_out_us: Microseconds(250_000),
+            loop_to_fill: true,
+            duck_under_speech: false,
+        }
+    }
+
+    #[test]
+    fn room_tone_runs_under_a_whole_scene_and_can_be_removed() {
+        let mut manifest = manifest();
+        manifest.sound_assets.push(sound_asset());
+        manifest.validate_strict().unwrap();
+        let scene = manifest.reviewed_scenes[0].clone();
+        let scene_end = scene.timeline_start_us.0 + scene.timeline_duration_us.0;
+
+        let placed = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetSoundLayer {
+                layer: room_tone_layer(&scene.id, scene.timeline_start_us.0, scene_end),
+            }]),
+        )
+        .unwrap();
+        assert_eq!(placed.manifest.sound_layers.len(), 1);
+
+        let removed = apply_timeline_edit(
+            &placed.manifest,
+            &request(vec![VideoTimelineOperation::RemoveSoundLayer {
+                layer_id: "tone-one".into(),
+            }]),
+        )
+        .unwrap();
+        assert!(removed.manifest.sound_layers.is_empty());
+    }
+
+    #[test]
+    fn a_placement_cannot_invent_a_sound_the_project_does_not_have() {
+        let manifest = manifest();
+        let scene = manifest.reviewed_scenes[0].clone();
+        let scene_end = scene.timeline_start_us.0 + scene.timeline_duration_us.0;
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetSoundLayer {
+                layer: room_tone_layer(&scene.id, scene.timeline_start_us.0, scene_end),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::MissingReference);
+    }
+
+    #[test]
+    fn room_tone_that_stops_early_is_rejected_by_the_manifest() {
+        let mut manifest = manifest();
+        manifest.sound_assets.push(sound_asset());
+        let scene = manifest.reviewed_scenes[0].clone();
+        let short_end = scene.timeline_start_us.0 + scene.timeline_duration_us.0 / 2;
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::SetSoundLayer {
+                layer: room_tone_layer(&scene.id, scene.timeline_start_us.0, short_end),
+            }]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, VideoErrorCode::InvalidSoundPlacement);
+    }
+
+    #[test]
+    fn removing_a_placement_that_does_not_exist_is_rejected() {
+        let manifest = manifest();
+        let error = apply_timeline_edit(
+            &manifest,
+            &request(vec![VideoTimelineOperation::RemoveSoundLayer {
+                layer_id: "tone-absent".into(),
             }]),
         )
         .unwrap_err();

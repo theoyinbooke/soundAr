@@ -308,6 +308,44 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             })
         })
         .collect::<Vec<_>>();
+    let sound_assets = manifest
+        .sound_assets
+        .iter()
+        .map(|asset| {
+            json!({
+                "id": asset.id,
+                "name": asset.name,
+                "mime_type": asset.mime_type.as_mime(),
+                "local_path": managed_path(video_root, &asset.managed_path),
+                "duration_ms": micros_to_millis(asset.duration_us),
+                "sample_rate": asset.sample_rate,
+                "channels": asset.channels,
+                "size_bytes": asset.size_bytes,
+                "tags": asset.tags,
+                "created_at": asset.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let sound_layers = manifest
+        .sound_layers
+        .iter()
+        .map(|layer| {
+            json!({
+                "id": layer.id,
+                "asset_id": layer.asset_id,
+                "kind": layer.kind,
+                "scene_id": layer.scene_id,
+                "turn_id": layer.turn_id,
+                "start_ms": micros_to_millis(layer.range.start_us),
+                "end_ms": micros_to_millis(layer.range.end_us),
+                "gain_db": f64::from(layer.gain_db_milli) / 1000.0,
+                "fade_in_ms": micros_to_millis(layer.fade_in_us),
+                "fade_out_ms": micros_to_millis(layer.fade_out_us),
+                "loop_to_fill": layer.loop_to_fill,
+                "duck_under_speech": layer.duck_under_speech,
+            })
+        })
+        .collect::<Vec<_>>();
     // A cue reports the length it was asked for. The fitted length is only real once local
     // generation has produced audio, so a planned cue reports no duration of its own.
     let music_cues = manifest
@@ -445,6 +483,8 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "dialogue": dialogue,
             "lexicon": lexicon,
             "music_cues": music_cues,
+            "sound_assets": sound_assets,
+            "sound_layers": sound_layers,
             "turn_beats": turn_beats,
             "performance_clock": {
                 "intra_exchange_ms": micros_to_millis(manifest.performance_clock.intra_exchange_us),

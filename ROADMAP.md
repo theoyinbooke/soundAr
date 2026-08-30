@@ -949,6 +949,32 @@ Depends on: 12.2 for placement, existing visual-asset registration for the patte
 - The assistant may propose placements from parenthetical stage directions, but a
   placement is only applied through the same revision-checked service the UI uses.
 
+### Current Evidence
+
+Slice 12.5 is implemented and locally verified. The remaining work is the durable registration job
+that copies, hashes, and probes a user-selected file into the managed sound library.
+
+- `video/sound.rs` holds the `SoundAsset` and `SoundLayer` contracts. Nothing here generates audio:
+  assets are files the user already has, carrying the same rights and provenance record as any
+  other imported media, which keeps the feature outside the licensing and hardware-qualification
+  questions a generative sound-effect model would raise.
+- Room tone is delivered here, where registered media exists to supply it. It must run under the
+  whole scene rather than stopping partway, because stopping leaves exactly the digital silence it
+  exists to remove, and a scene has only one room and so only one room tone. Its level is capped
+  far under the dialogue; nearer than that it reads as noise rather than as a room.
+- A one-shot must be anchored to the scene or turn it punctuates, so a later edit cannot silently
+  move it away from the moment it was placed for, and it cannot loop. Ambience and room tone belong
+  to a scene rather than to one line. No placement may spill past its scene into the next cut.
+- Assets are found by normalized tag rather than filename, because the assistant proposes
+  placements from written stage directions rather than from a controlled vocabulary.
+- `set_sound_layer` and `remove_sound_layer` join the existing revision-checked
+  `edit_video_timeline` batch. A placement can only reference an already registered asset, so a
+  proposal from a stage direction can never invent audio the project does not have.
+- The `edit_video_timeline` operation union outgrew a single `json!` literal and now builds from one
+  schema function per operation.
+- Verified locally: 415 native tests including thirteen sound cases and four editor cases, plus 146
+  React tests including preview-bridge parity.
+
 ### Slice 12.6: Show Formats
 
 Depends on: 12.1 through 12.5.

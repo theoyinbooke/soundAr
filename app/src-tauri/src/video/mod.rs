@@ -20,6 +20,7 @@ pub mod renderer;
 pub mod scheduler;
 pub mod score;
 pub mod service;
+pub mod sound;
 pub mod timeline;
 pub mod visuals;
 
@@ -38,6 +39,10 @@ pub use cast::{
     MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
+pub use sound::{
+    assets_matching_tag, SoundAsset, SoundLayer, SoundMimeType, SoundPlacementKind,
+    MAX_SOUND_ASSETS, MAX_SOUND_LAYERS,
+};
 pub use score::{
     bed_ducking, fit_cue, CueAnchor, CueFit, CueFitAction, CueRole, MusicCue,
     CUE_FIT_TOLERANCE_US, MAX_MUSIC_CUES,

@@ -325,6 +325,10 @@ export interface VideoProjectManifest {
   /** Present on current manifests; optional only for migration-era project compatibility. */
   music_cues?: VideoMusicCue[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
+  sound_assets?: VideoSoundAsset[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
+  sound_layers?: VideoSoundLayer[];
+  /** Present on current manifests; optional only for migration-era project compatibility. */
   turn_beats?: VideoTurnBeat[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
   performance_clock?: VideoPerformanceClock;
@@ -502,6 +506,8 @@ export type VideoTimelineOperation =
   | { type: "remove_lexicon_entry"; entry_id: string }
   | { type: "set_music_cue"; cue: VideoMusicCueInput }
   | { type: "remove_music_cue"; cue_id: string }
+  | { type: "set_sound_layer"; layer: VideoSoundLayerInput }
+  | { type: "remove_sound_layer"; layer_id: string }
   | {
     type: "update_visual_layer";
     layer_id: string;
@@ -550,6 +556,57 @@ export interface VideoDialogueTurn {
   /** 1-indexed line in the script this turn was parsed from. */
   source_line: number;
   revision: number;
+}
+
+/**
+ * `one_shot` happens once at a point; `ambience` runs across a scene span; `room_tone` runs under
+ * a whole scene and is what removes the digital silence between takes.
+ */
+export type VideoSoundPlacementKind = "one_shot" | "ambience" | "room_tone";
+
+/** One registered sound-design file. soundAr never generates these; the user supplies them. */
+export interface VideoSoundAsset {
+  id: string;
+  name: string;
+  mime_type: string;
+  local_path: string;
+  duration_ms: number;
+  sample_rate: number;
+  channels: number;
+  size_bytes: number;
+  tags: string[];
+  created_at: string;
+}
+
+/** One placed sound. */
+export interface VideoSoundLayer {
+  id: string;
+  asset_id: string;
+  kind: VideoSoundPlacementKind;
+  scene_id?: string | null;
+  turn_id?: string | null;
+  start_ms: number;
+  end_ms: number;
+  gain_db: number;
+  fade_in_ms: number;
+  fade_out_ms: number;
+  loop_to_fill: boolean;
+  duck_under_speech: boolean;
+}
+
+/** The wire shape `set_sound_layer` sends, in microseconds. */
+export interface VideoSoundLayerInput {
+  id: string;
+  asset_id: string;
+  kind: VideoSoundPlacementKind;
+  scene_id?: string | null;
+  turn_id?: string | null;
+  range: { start_us: number; end_us: number };
+  gain_db_milli: number;
+  fade_in_us: number;
+  fade_out_us: number;
+  loop_to_fill?: boolean;
+  duck_under_speech?: boolean;
 }
 
 /** `sting` opens, `bed` sits under dialogue and always ducks, `outro` resolves after the last line. */
