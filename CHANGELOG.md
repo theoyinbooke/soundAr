@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.3 - 2026-08-31
+
+- Gave a performed episode moving pictures. Where a local video-generation model is installed,
+  soundAr now generates short shots and cuts them across an episode's narration instead of drawing
+  a static card. Shots are described by whoever is writing the show - an episode's own words
+  describe a conversation, and a shot has to say what is on screen - and a handful are repeated
+  across the clock, because a clip costs about a minute of local compute for under two seconds of
+  footage. The drawn card remains the automatic fallback, so an episode is still packageable on a
+  machine with no generator.
+- Found the local video generator the way FFmpeg is found. `sd-cli` is discovered with the same
+  discipline as every other media tool, reported in runtime status whether present or absent, and
+  overridable with `SOUNDAR_SD_CLI_PATH`.
+- Refused an undistilled denoiser rather than running one. soundAr generates at eight steps with
+  guidance fixed at 1.0; an undistilled checkpoint given those settings emits black frames and
+  exits successfully, so a model directory holding both now resolves to the distilled one and says
+  why when it holds neither.
+- Recorded the video model in the catalog without bundling it. The weights are open but licensed
+  for a limited territory, so `data/curated_models.json` carries the licence, the installation
+  note, and the measured performance rather than soundAr shipping or downloading them.
+
 ## 0.1.2 - 2026-08-30
 
 - Drew a picture for episodes that have none. A script performed by voices produces sound and

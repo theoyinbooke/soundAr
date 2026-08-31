@@ -68,6 +68,8 @@ export function ShowsView() {
   const visuals = episode?.manifest.visual_assets ?? [];
   const cover = visuals.find((asset) => asset.provenance?.kind === "generated_locally");
   const ownPicture = visuals.find((asset) => asset.provenance?.kind !== "generated_locally");
+  // Generated shots replace a drawn card, so the panel shows whichever this episode actually has.
+  const clips = (episode?.manifest.artifacts ?? []).filter((artifact) => artifact.role === "generated-clip");
 
   const drawCover = useCallback(async (redraw: boolean) => {
     if (!service || !selectedId) return;
@@ -141,25 +143,42 @@ export function ShowsView() {
         <h3 className="shows-section-heading"><ImageIcon aria-hidden="true" size={13} />Picture</h3>
         {/* Voices produce sound and nothing to look at, and every video deliverable needs a
             picture. This says which one this episode is packaging with. */}
-        {episode?.poster_url
-          ? <img className="episode-cover" src={episode.poster_url} alt={`Cover for ${episode.name}`} />
-          : null}
-        <p className="shows-panel-empty">
-          {ownPicture
-            ? "This episode has its own artwork, so no cover is drawn for it."
-            : cover
-              ? "Drawn by soundAr from this episode's name and cast, so it can be packaged as video."
-              : "No picture yet. Without one this episode cannot be rendered or packaged as video."}
-        </p>
-        <button
-          className="button button-secondary"
-          type="button"
-          disabled={drawing}
-          onClick={() => void drawCover(Boolean(cover || ownPicture))}
-        >
-          {drawing ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <ImageIcon aria-hidden="true" size={13} />}
-          {cover || ownPicture ? "Redraw cover" : "Draw cover"}
-        </button>
+        {clips.length ? <>
+          <ul className="episode-shots">
+            {clips.map((clip, index) => <li key={clip.id}>
+              {clip.poster_url
+                ? <img src={clip.poster_url} alt={`Shot ${index + 1}`} />
+                : <span className="episode-shot-blank" aria-hidden="true" />}
+              <small>Shot {index + 1}{clip.duration_ms ? ` · ${(clip.duration_ms / 1000).toFixed(1)}s` : ""}</small>
+            </li>)}
+          </ul>
+          <p className="shows-panel-empty">
+            {/* A few shots are cut and repeated: a clip costs about a minute of local compute for
+                under two seconds of footage, so an episode is never covered one-to-one. */}
+            {clips.length} generated shot{clips.length === 1 ? "" : "s"}, cut across the episode.
+            Ask the assistant to describe different shots to change them.
+          </p>
+        </> : <>
+          {episode?.poster_url
+            ? <img className="episode-cover" src={episode.poster_url} alt={`Cover for ${episode.name}`} />
+            : null}
+          <p className="shows-panel-empty">
+            {ownPicture
+              ? "This episode has its own artwork, so no cover is drawn for it."
+              : cover
+                ? "Drawn by soundAr from this episode's name and cast. Ask the assistant for generated shots to replace it with moving footage."
+                : "No picture yet. Without one this episode cannot be rendered or packaged as video."}
+          </p>
+          <button
+            className="button button-secondary"
+            type="button"
+            disabled={drawing}
+            onClick={() => void drawCover(Boolean(cover || ownPicture))}
+          >
+            {drawing ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <ImageIcon aria-hidden="true" size={13} />}
+            {cover || ownPicture ? "Redraw cover" : "Draw cover"}
+          </button>
+        </>}
       </Panel>
 
       <Panel ariaLabel="Release">

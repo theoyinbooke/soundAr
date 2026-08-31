@@ -557,6 +557,8 @@ pub fn present_runtime_tools(
             transcriber.0,
             bundled_whisper_ready,
         ),
+        // Reported whether or not it is installed, so an episode without moving shots shows why.
+        present_tool("clip-generator", "Video generator", &status.sd_cli, false),
     ]
 }
 
@@ -689,6 +691,7 @@ fn present_manifest_artifact(
         RenderArtifactRole::PodcastAudio => "podcast-audio",
         RenderArtifactRole::Trailer => "trailer",
         RenderArtifactRole::Audiogram => "audiogram",
+        RenderArtifactRole::GeneratedClip => "generated-clip",
         RenderArtifactRole::Thumbnail
         | RenderArtifactRole::Waveform
         | RenderArtifactRole::SceneSegment
@@ -1082,6 +1085,7 @@ fn artifact_title(artifact: &RenderArtifact) -> &'static str {
         RenderArtifactRole::PodcastAudio => "Podcast audio",
         RenderArtifactRole::Trailer => "Trailer",
         RenderArtifactRole::Audiogram => "Audiogram",
+        RenderArtifactRole::GeneratedClip => "Generated clip",
         RenderArtifactRole::PublishPackage => "Publish package",
     }
 }

@@ -25,6 +25,7 @@ pub mod renderer;
 pub mod scheduler;
 pub mod score;
 pub mod service;
+pub mod shots;
 pub mod sound;
 pub mod timeline;
 pub mod visuals;
@@ -68,11 +69,11 @@ pub use lexicon::{
 pub use listening::{listen_to_episode, EpisodeListening, GapSummary, ListenedLine, SpeakerShare};
 pub use media::{
     discover_media_runtime, local_media_input_args, preflight_import_url_destination,
-    probe_h264_nvenc_runtime, probe_media, validate_caption_cues, validate_import_url,
-    validate_local_media_source, CaptionCueInput, CaptionValidation, ImportProvider,
-    MediaChapterProbe, MediaError, MediaProbe as RuntimeMediaProbe, MediaRuntimeStatus,
-    MediaStreamProbe, MediaToolKind, MediaToolStatus, PublicHttpsProxy, ValidatedImportUrl,
-    LOCAL_MEDIA_FORMAT_WHITELIST, LOCAL_MEDIA_PROTOCOL_WHITELIST,
+    probe_h264_nvenc_runtime, probe_media, resolve_clip_models, validate_caption_cues,
+    validate_import_url, validate_local_media_source, CaptionCueInput, CaptionValidation,
+    ImportProvider, MediaChapterProbe, MediaError, MediaProbe as RuntimeMediaProbe,
+    MediaRuntimeStatus, MediaStreamProbe, MediaToolKind, MediaToolStatus, PublicHttpsProxy,
+    ValidatedImportUrl, LOCAL_MEDIA_FORMAT_WHITELIST, LOCAL_MEDIA_PROTOCOL_WHITELIST,
 };
 pub use media_server::LocalMediaServer;
 pub use performance::{
@@ -94,13 +95,14 @@ pub use release::{
     TRAILER_TARGET_US,
 };
 pub use renderer::{
-    build_audiogram_command, build_cover_image_command, build_loudness_analysis_command,
-    build_podcast_audio_command, build_portrait_command, build_portrait_command_with_layout,
-    build_proxy_command, build_thumbnail_command, build_trailer_command, build_waveform_command,
-    parse_ffmpeg_progress, publish_atomic, should_fallback_from_nvenc, sibling_staging_path,
-    terminate_process_group, FfmpegProgress, FfmpegProgressParser, FfmpegProgressPhase,
-    PortraitLayout, PublishedArtifact, RenderCommand, RenderCommandPlan, RenderProfile,
-    RenderWorkloadClass, VideoEncoder,
+    build_audiogram_command, build_clip_command, build_cover_image_command,
+    build_loudness_analysis_command, build_podcast_audio_command, build_portrait_command,
+    build_portrait_command_with_layout, build_proxy_command, build_thumbnail_command,
+    build_trailer_command, build_waveform_command, parse_ffmpeg_progress, publish_atomic,
+    should_fallback_from_nvenc, sibling_staging_path, terminate_process_group, ClipModelPaths,
+    FfmpegProgress, FfmpegProgressParser, FfmpegProgressPhase, PortraitLayout, PublishedArtifact,
+    RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, VideoEncoder,
+    CLIP_CFG_SCALE, CLIP_FPS, CLIP_FRAMES, CLIP_STEPS,
 };
 pub use scheduler::{
     AdmissionBlock, AdmissionOutcome, ResourceCapacity, ResourceClass, ResourceLease,
@@ -125,6 +127,9 @@ pub use service::{
     TimelineRenderProfile, TimelineRenderRequest, VideoJobResult, VideoScriptReceipt,
     VideoScriptRequest, VideoServiceError, VideoServiceProgress, VideoStudioService,
     VisualAssetOrigin, VisualSourceReceipt,
+};
+pub use shots::{
+    plan_shots, shot_count_for, tile_shots, ShotPlan, CLIP_DURATION_US, MAX_SHOTS, MIN_SHOTS,
 };
 pub use sound::{
     assets_matching_tag, SoundAsset, SoundLayer, SoundPlacementKind, MAX_SOUND_ASSETS,

@@ -60,6 +60,19 @@ describe("ShowsView", () => {
     expect(within(picture).getByRole("button", { name: /Draw cover/ })).toBeEnabled();
   });
 
+  it("shows generated shots in place of a drawn card once an episode has them", async () => {
+    const user = userEvent.setup();
+    renderShows();
+
+    await user.click(await screen.findByRole("button", { name: /^Inspect Creator update · Reel master$/ }));
+    const picture = await screen.findByRole("region", { name: "Picture" });
+
+    // With no generated shots the panel offers the drawn card, which is the fallback.
+    expect(within(picture).getByRole("button", { name: /Draw cover|Redraw cover/ })).toBeVisible();
+    // And it says where moving footage comes from, rather than leaving the user to guess.
+    expect(within(picture).getByText(/cannot be rendered or packaged as video|assistant/i)).toBeVisible();
+  });
+
   it("hands a selected episode to the editor rather than opening a second one", async () => {
     const user = userEvent.setup();
     const onOpenProject = vi.fn();

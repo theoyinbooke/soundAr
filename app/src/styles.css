@@ -2717,3 +2717,10 @@ input[type="checkbox"]:checked::before { transform: translateX(12px); }
 /* A drawn cover is shown at the shape it will be packaged at, so what the user sees here is what
    the episode ships with. */
 .episode-cover { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 10px; background: var(--surface-2); }
+
+/* Generated shots are shown as the strip they are: a few clips cut and repeated, not one clip per
+   second, because a clip costs about a minute of local compute. */
+.episode-shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; list-style: none; margin: 0 0 10px; padding: 0; }
+.episode-shots li { display: flex; flex-direction: column; gap: 4px; }
+.episode-shots img, .episode-shot-blank { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); display: block; }
+.episode-shots small { color: var(--text-muted); font-size: 11px; }
