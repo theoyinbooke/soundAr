@@ -62,6 +62,7 @@ pub(crate) enum VideoAgentOperationKind {
     ListShowFormats,
     CreateEpisode,
     EnsureEpisodeCover,
+    GenerateEpisodeClips,
     PlanEpisodeRelease,
     ExportEpisodeRelease,
     CheckEpisodeQuality,
@@ -97,6 +98,7 @@ impl VideoAgentOperationKind {
             Self::ListShowFormats => "list_show_formats",
             Self::CreateEpisode => "create_episode",
             Self::EnsureEpisodeCover => "ensure_episode_cover",
+            Self::GenerateEpisodeClips => "generate_episode_clips",
             Self::PlanEpisodeRelease => "plan_episode_release",
             Self::ExportEpisodeRelease => "export_episode_release",
             Self::CheckEpisodeQuality => "check_episode_quality",
@@ -128,6 +130,7 @@ impl VideoAgentOperationKind {
             | Self::WriteVideoScript
             | Self::GenerateCueMusic
             | Self::EnsureEpisodeCover
+            | Self::GenerateEpisodeClips
             | Self::NarrateTurns
             | Self::AddVisualAsset => VideoProductionPhase::Review,
             Self::RenderVideoPreview => VideoProductionPhase::Preview,
@@ -167,6 +170,7 @@ pub(crate) enum VideoAgentOperation {
     ListShowFormats(EmptyRequest),
     CreateEpisode(CreateEpisodeRequest),
     EnsureEpisodeCover(EnsureEpisodeCoverRequest),
+    GenerateEpisodeClips(GenerateEpisodeClipsRequest),
     PlanEpisodeRelease(PlanEpisodeReleaseRequest),
     ExportEpisodeRelease(PlanEpisodeReleaseRequest),
     CheckEpisodeQuality(CheckEpisodeQualityRequest),
@@ -201,6 +205,7 @@ impl VideoAgentOperation {
             Self::ListShowFormats(_) => VideoAgentOperationKind::ListShowFormats,
             Self::CreateEpisode(_) => VideoAgentOperationKind::CreateEpisode,
             Self::EnsureEpisodeCover(_) => VideoAgentOperationKind::EnsureEpisodeCover,
+            Self::GenerateEpisodeClips(_) => VideoAgentOperationKind::GenerateEpisodeClips,
             Self::PlanEpisodeRelease(_) => VideoAgentOperationKind::PlanEpisodeRelease,
             Self::ExportEpisodeRelease(_) => VideoAgentOperationKind::ExportEpisodeRelease,
             Self::CheckEpisodeQuality(_) => VideoAgentOperationKind::CheckEpisodeQuality,
@@ -238,6 +243,7 @@ impl VideoAgentOperation {
             "list_show_formats" => Self::ListShowFormats(decode(arguments)?),
             "create_episode" => Self::CreateEpisode(decode(arguments)?),
             "ensure_episode_cover" => Self::EnsureEpisodeCover(decode(arguments)?),
+            "generate_episode_clips" => Self::GenerateEpisodeClips(decode(arguments)?),
             "plan_episode_release" => Self::PlanEpisodeRelease(decode(arguments)?),
             "export_episode_release" => Self::ExportEpisodeRelease(decode(arguments)?),
             "check_episode_quality" => Self::CheckEpisodeQuality(decode(arguments)?),
@@ -275,6 +281,16 @@ impl VideoAgentOperation {
                 require_text(&request.episode_name, "episode_name")
             }
             Self::EnsureEpisodeCover(request) => require_text(&request.project_id, "project_id"),
+            Self::GenerateEpisodeClips(request) => {
+                require_text(&request.project_id, "project_id")?;
+                if request.shots.iter().all(|shot| shot.trim().is_empty()) {
+                    return Err(VideoAgentToolError::new(
+                        "video.shots_not_described",
+                        "Describe what each shot shows",
+                    ));
+                }
+                Ok(())
+            }
             Self::PlanEpisodeRelease(request) | Self::ExportEpisodeRelease(request) => {
                 require_text(&request.project_id, "project_id")
             }
@@ -645,6 +661,15 @@ pub(crate) struct PlanEpisodeReleaseRequest {
     /// Notes are written, not derived, so the caller says whether they exist.
     #[serde(default)]
     pub(crate) has_show_notes: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GenerateEpisodeClipsRequest {
+    pub(crate) project_id: String,
+    /// What each shot shows. Written, never derived: an episode's own words describe a
+    /// conversation, and a shot has to say what is on screen.
+    pub(crate) shots: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1271,6 +1296,7 @@ pub(crate) fn operation_kind(tool: &str) -> Option<VideoAgentOperationKind> {
         "list_show_formats" => VideoAgentOperationKind::ListShowFormats,
         "create_episode" => VideoAgentOperationKind::CreateEpisode,
         "ensure_episode_cover" => VideoAgentOperationKind::EnsureEpisodeCover,
+        "generate_episode_clips" => VideoAgentOperationKind::GenerateEpisodeClips,
         "plan_episode_release" => VideoAgentOperationKind::PlanEpisodeRelease,
         "export_episode_release" => VideoAgentOperationKind::ExportEpisodeRelease,
         "check_episode_quality" => VideoAgentOperationKind::CheckEpisodeQuality,
@@ -1469,6 +1495,17 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                     ("format_id", string("A saved show format id")),
                     ("episode_name", string("This episode's name")),
                     ("brief", nullable_string("What this episode is about, recorded as its initial intent")),
+                ]),
+            ),
+        ),
+        tool(
+            "generate_episode_clips",
+            "Generate this episode's moving shots and cut them across its narration, so a show performed by voices has something to look at. You write what each shot shows: describe the picture, not the conversation - \"a lighthouse beam sweeping across black water at night\" is a shot, \"two friends discussing a lighthouse keeper\" is not, and the second renders as nothing recognisable. A clip costs about a minute of local compute for under two seconds of footage, so supply a handful of shots and soundAr repeats them across the episode rather than generating one per second. Shots are content-addressed, so re-running with the same descriptions regenerates nothing. Requires the local video-generation model to be installed; where it is not, use ensure_episode_cover for a drawn card instead. Requires Studio or Full access.",
+            object_schema(
+                &["project_id", "shots"],
+                properties([
+                    ("project_id", string("Video Studio project id")),
+                    ("shots", json!({"type":"array","minItems":1,"maxItems":12,"items":{"type":"string","minLength":8,"maxLength":400},"description":"What each shot shows, as a visual description of the picture"})),
                 ]),
             ),
         ),
@@ -2574,8 +2611,8 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 29);
-        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 29);
+        assert_eq!(names.len(), 30);
+        assert_eq!(names.iter().copied().collect::<HashSet<_>>().len(), 30);
         for required in [
             "preview_link",
             "import_link",
@@ -2592,6 +2629,7 @@ mod tests {
             "list_show_formats",
             "create_episode",
             "ensure_episode_cover",
+            "generate_episode_clips",
             "plan_episode_release",
             "export_episode_release",
             "check_episode_quality",

@@ -427,6 +427,35 @@ pub(crate) fn dispatch_video_operation(
                 None,
             )
         }
+        VideoAgentOperation::GenerateEpisodeClips(request) => {
+            let directory = clip_model_directory(runtime).ok_or_else(|| {
+                VideoAgentToolError::new(
+                    "video.clip_model_missing",
+                    "No local video-generation model is installed; use ensure_episode_cover instead",
+                )
+            })?;
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let record = runtime
+                .video
+                .generate_episode_clips(
+                    &request.project_id,
+                    "video-studio-producer",
+                    &directory,
+                    &request.shots,
+                    &cancel,
+                )
+                .map_err(VideoAgentToolError::from)?;
+            let project =
+                video::present_video_project(&record, &runtime.store.video_artifacts_root())
+                    .map_err(VideoAgentToolError::from)?;
+            VideoAgentResult::project(
+                kind,
+                VideoAgentResultStatus::Ready,
+                "The episode has generated shots cut across its narration",
+                project,
+                None,
+            )
+        }
         VideoAgentOperation::EnsureEpisodeCover(request) => {
             let record = runtime
                 .video
@@ -1739,8 +1768,12 @@ pub(crate) fn narrate_turns(
         .map_err(service_error)?;
 
     // Voices produce sound and nothing to look at, and every video deliverable needs a picture.
-    // Drawing one here means a performed episode is packageable without the user having to know
-    // that a picture was the missing piece. An episode that already has one keeps it.
+    // Where this machine can generate moving shots, the episode gets those; where it cannot, it
+    // gets a drawn card. Either way a performed episode is packageable without the user having to
+    // know that a picture was the missing piece.
+    // Shots have to be described by whoever is writing the show: an episode's own words describe a
+    // conversation, not what is on screen. Narration therefore falls back to a drawn card, and the
+    // assistant calls generate_episode_clips with real shot descriptions when it wants footage.
     let record = runtime
         .video
         .ensure_episode_cover(project_id, "video-studio-performer", false)
@@ -3235,6 +3268,43 @@ fn selected_revision_scene<'a>(
             "video.scene_required: Plan at least one scene before changing narration".into()
         }),
     }
+}
+
+/// Where this machine keeps the local video-generation weights, if it has them.
+///
+/// These weights are large and licensed separately from soundAr, so they are never bundled and
+/// never fetched by the model downloader: the user installs them deliberately. soundAr therefore
+/// looks where such an installation actually lands - an explicit setting first, then the managed
+/// model directory, then the registry for anyone who recorded it there.
+pub(crate) fn clip_model_directory(runtime: &RuntimeState) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(configured) = std::env::var_os("SOUNDAR_H3_MODEL_DIR") {
+        candidates.push(PathBuf::from(configured));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".soundAr/models/minimax-h3"));
+        candidates.push(home.join(".soundAr/models/MiniMaxAI__MiniMax-H3"));
+    }
+    let registry = read_json(runtime.model_registry_path.clone(), json!({ "models": [] }));
+    if let Some(models) = registry.get("models").and_then(Value::as_array) {
+        candidates.extend(
+            models
+                .iter()
+                .filter(|model| {
+                    model
+                        .get("engine")
+                        .and_then(Value::as_str)
+                        .is_some_and(|engine| engine.eq_ignore_ascii_case("minimax-h3"))
+                })
+                .filter_map(|model| model.get("local_path").and_then(Value::as_str))
+                .map(PathBuf::from),
+        );
+    }
+    // A directory only counts when the weights it needs are actually inside it, so a stale or
+    // half-finished install is reported as absent rather than failing later mid-generation.
+    candidates
+        .into_iter()
+        .find(|path| path.is_dir() && video::resolve_clip_models(path).is_ok())
 }
 
 fn sha256_text(value: &str) -> String {

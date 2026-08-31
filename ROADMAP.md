@@ -1478,6 +1478,37 @@ without the user having to know that a picture was the missing piece. It is also
 explicitly from the Shows episode screen, from the `ensure_episode_cover` agent tool, and therefore
 from the headless CLI.
 
+## Generated Shots for a Performed Episode
+
+A drawn cover card gives a performed episode a picture. Where a local video-generation model is
+installed, soundAr instead cuts short generated shots across the narration, which is what a show
+with nothing to film has always done: b-roll.
+
+- **Shots are written, never derived.** An episode's name, cast, and dialogue describe a
+  conversation; a shot has to say what is on screen. Concatenating the former produces a sentence
+  about a podcast, which a video model renders as nothing recognisable. `generate_episode_clips`
+  therefore takes shot descriptions from whoever is writing the show, and the assistant is
+  instructed to supply them.
+- **A handful of shots, repeated.** A clip costs about a minute of local compute for under two
+  seconds of footage, so an episode is covered by at most twelve distinct shots tiled across its
+  clock rather than one clip per second. Each is content-addressed by its prompt, so re-running on
+  an unchanged episode regenerates nothing.
+- **Clips replace the card.** A drawn card is a full-canvas layer; leaving it in place would paint
+  it over the shots it was standing in for. Where no generator is installed the card remains the
+  automatic fallback, so every episode is still packageable.
+- **Generated clips are muted.** The episode's own narration is the sound; a clip's incidental
+  audio must never talk over the cast.
+- **The weights are never bundled.** MiniMax H3 is open-weight but licensed for a limited
+  territory, so soundAr discovers a user-installed model directory and refuses cleanly when it is
+  absent. `data/curated_models.json` records the licence and the measured performance.
+- **The denoiser must be a distilled checkpoint.** soundAr generates at eight steps with guidance
+  fixed at 1.0. An undistilled model given those settings emits black frames and exits
+  successfully, so the resolver requires a turbo checkpoint and names why rather than spending a
+  minute per shot producing nothing.
+
+Measured on an RTX 4080 Laptop 12 GB: 864x480, 39 frames, 8 steps, text encoder on CPU, peak
+11.5 GB VRAM, 74 s per clip. 768p and longer clips exceed the compute buffer on that card.
+
 ## Version Numbering
 
 The version line was reset to `0.1.1` on 2026-08-30. Work had reached `0.8.8` in a few weeks, which

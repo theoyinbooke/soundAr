@@ -1,3 +1,4 @@
+use super::renderer::ClipModelPaths;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -112,6 +113,8 @@ pub enum MediaToolKind {
     Deno,
     FasterWhisper,
     WhisperCpp,
+    /// stable-diffusion.cpp's CLI, which is how soundAr runs a local video-generation model.
+    SdCli,
 }
 
 impl MediaToolKind {
@@ -124,6 +127,7 @@ impl MediaToolKind {
             Self::Deno => "deno",
             Self::FasterWhisper => "faster_whisper",
             Self::WhisperCpp => "whisper_cpp",
+            Self::SdCli => "sd_cli",
         }
     }
 
@@ -136,6 +140,7 @@ impl MediaToolKind {
             Self::Deno => &["deno"],
             Self::FasterWhisper => &["faster-whisper", "faster_whisper"],
             Self::WhisperCpp => &["whisper-cli", "whisper-cpp"],
+            Self::SdCli => &["sd-cli", "sd"],
         }
     }
 
@@ -157,6 +162,7 @@ impl MediaToolKind {
                 "WHISPER_CPP_BIN",
                 "WHISPER_CLI_BIN",
             ],
+            Self::SdCli => &["SOUNDAR_SD_CLI_PATH", "SOUNDAR_SD_CLI_BIN", "SD_CLI_BIN"],
         }
     }
 
@@ -170,6 +176,9 @@ impl MediaToolKind {
             }
             Self::Node | Self::Deno => {
                 "Install a yt-dlp-supported JavaScript runtime (Deno or Node) for YouTube extraction."
+            }
+            Self::SdCli => {
+                "Install stable-diffusion.cpp's sd-cli, built with CUDA, to generate video clips locally."
             }
             Self::FasterWhisper => {
                 "Install faster-whisper in an isolated CUDA-capable runtime and configure its executable path."
@@ -222,6 +231,7 @@ pub struct MediaRuntimeStatus {
     pub deno: MediaToolStatus,
     pub faster_whisper: MediaToolStatus,
     pub whisper_cpp: MediaToolStatus,
+    pub sd_cli: MediaToolStatus,
     pub ready_for_local_media: bool,
     pub ready_for_link_import: bool,
     pub ready_for_transcription: bool,
@@ -241,6 +251,7 @@ impl MediaRuntimeStatus {
             MediaToolKind::Deno => &self.deno,
             MediaToolKind::FasterWhisper => &self.faster_whisper,
             MediaToolKind::WhisperCpp => &self.whisper_cpp,
+            MediaToolKind::SdCli => &self.sd_cli,
         }
     }
 }
@@ -274,7 +285,7 @@ impl DiscoveryContext {
     }
 }
 
-fn all_tool_kinds() -> [MediaToolKind; 7] {
+fn all_tool_kinds() -> [MediaToolKind; 8] {
     [
         MediaToolKind::Ffmpeg,
         MediaToolKind::Ffprobe,
@@ -283,6 +294,7 @@ fn all_tool_kinds() -> [MediaToolKind; 7] {
         MediaToolKind::Deno,
         MediaToolKind::FasterWhisper,
         MediaToolKind::WhisperCpp,
+        MediaToolKind::SdCli,
     ]
 }
 
@@ -347,6 +359,8 @@ fn discover_media_runtime_with(context: &DiscoveryContext) -> MediaRuntimeStatus
     setup_actions.sort();
     setup_actions.dedup();
 
+    let sd_cli = discover_tool(MediaToolKind::SdCli, context);
+
     MediaRuntimeStatus {
         ffmpeg,
         ffprobe,
@@ -355,6 +369,7 @@ fn discover_media_runtime_with(context: &DiscoveryContext) -> MediaRuntimeStatus
         deno,
         faster_whisper,
         whisper_cpp,
+        sd_cli,
         ready_for_local_media,
         ready_for_link_import,
         ready_for_transcription,
@@ -513,6 +528,7 @@ fn inspect_tool(kind: MediaToolKind, path: &Path) -> Result<(String, Vec<String>
     let version_args: &[&str] = match kind {
         MediaToolKind::Ffmpeg | MediaToolKind::Ffprobe => &["-version"],
         MediaToolKind::WhisperCpp => &["--version"],
+        MediaToolKind::SdCli => &["--help"],
         _ => &["--version"],
     };
     let mut output = run_tool_inspection(path, version_args)?;
@@ -581,6 +597,15 @@ fn version_identity_matches(kind: MediaToolKind, first_line: &str, path: &Path) 
                 && value.chars().any(|character| character.is_ascii_digit())
         }
         MediaToolKind::Deno => value.contains("deno"),
+        // sd-cli identifies itself through its usage banner rather than a version string.
+        MediaToolKind::SdCli => {
+            value.contains("usage")
+                || value.contains("sd")
+                || path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with("sd"))
+        }
         MediaToolKind::FasterWhisper => {
             value.contains("faster")
                 || path
@@ -804,6 +829,90 @@ pub fn validate_local_media_source(path: &Path) -> Result<PathBuf, MediaError> {
 /// Produces the complete security-sensitive FFmpeg input argument group, including `-i`.
 /// Append these arguments together at the intended input position; do not append a second
 /// bare `-i <path>` for an untrusted source.
+/// Find the video generator's weights inside one installed model directory.
+///
+/// Filenames are matched by role rather than listed exactly, because the community publishes these
+/// weights under many names and quantizations and soundAr should accept whichever the user
+/// installed.
+///
+/// The denoiser must be a distilled ("turbo") checkpoint. soundAr generates at eight steps with
+/// guidance fixed at 1.0, which is what a distilled model wants and what an undistilled one cannot
+/// work with: given those settings it emits black frames rather than failing, so picking the wrong
+/// checkpoint would spend a minute of compute per shot producing nothing and report success.
+/// Everything else prefers the smallest candidate, because on a consumer card the binding
+/// constraint is VRAM and a set that loads is worth more than a set that does not.
+pub fn resolve_clip_models(directory: &Path) -> Result<ClipModelPaths, MediaError> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| {
+            MediaError::new(
+                "clip_model_missing",
+                "The video model directory could not be read",
+            )
+            .detail(error.to_string())
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+
+    let pick = |matches: &dyn Fn(&str) -> bool| -> Option<PathBuf> {
+        entries
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .map(str::to_ascii_lowercase)
+                    .is_some_and(|name| matches(&name))
+            })
+            .min_by_key(|path| {
+                fs::metadata(path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(u64::MAX)
+            })
+            .cloned()
+    };
+
+    // The denoiser decides what the clip can be conditioned on; the first-and-last-frame variant
+    // is the one soundAr drives, so a reference-only checkpoint is not accepted in its place.
+    let denoiser = pick(&|name| {
+        name.ends_with(".gguf")
+            && name.contains("fl2va")
+            && !name.contains("qwen")
+            && name.contains("turbo")
+    })
+    .ok_or_else(|| {
+        MediaError::new(
+            "clip_model_missing",
+            "No distilled first-and-last-frame denoiser was found in the video model directory; \
+             soundAr generates at eight steps with guidance 1.0, which needs a turbo checkpoint",
+        )
+    })?;
+    let text_encoder =
+        pick(&|name| name.ends_with(".gguf") && name.contains("qwen")).ok_or_else(|| {
+            MediaError::new(
+                "clip_model_missing",
+                "No text encoder was found in the video model directory",
+            )
+        })?;
+    let video_vae = pick(&|name| name.contains("video_vae") && name.ends_with(".safetensors"))
+        .ok_or_else(|| {
+            MediaError::new(
+                "clip_model_missing",
+                "No video VAE was found in the video model directory",
+            )
+        })?;
+    // Audio is optional: soundAr scores its own episodes, so a clip's own audio track is not
+    // needed and skipping its decode is time not spent.
+    let audio_vae = pick(&|name| name.contains("audio_vae") && name.ends_with(".safetensors"));
+
+    Ok(ClipModelPaths {
+        denoiser,
+        text_encoder,
+        video_vae,
+        audio_vae,
+    })
+}
+
 pub fn local_media_input_args(path: &Path) -> Result<Vec<OsString>, MediaError> {
     let source = validate_local_media_source(path)?;
     Ok(vec![
@@ -2674,6 +2783,87 @@ mod tests {
             .diagnostic
             .as_deref()
             .is_some_and(|value| value.contains("not a regular executable")));
+    }
+
+    #[test]
+    fn video_model_weights_are_found_by_role_not_by_exact_filename() {
+        let root = TestDirectory::new("clip-models");
+        // The community publishes these weights under many names and quantizations.
+        for name in [
+            "minimax_h3_fl2va_turbo_Q3_K_M.gguf",
+            "minimax_h3_fl2va_pruned-Q2_K.gguf",
+            "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
+            "minimax_h3_video_vae_fp16.safetensors",
+            "minimax_h3_audio_vae_fp32.safetensors",
+            "notes.txt",
+        ] {
+            fs::write(root.0.join(name), vec![0_u8; name.len() * 16]).expect("write weight");
+        }
+        let models = resolve_clip_models(&root.0).expect("resolve weights");
+        // The distilled checkpoint wins even though the undistilled one is smaller: soundAr's
+        // fixed settings produce black frames on an undistilled model rather than failing.
+        assert!(models.denoiser.to_string_lossy().contains("turbo"));
+        // The text encoder must never be mistaken for the denoiser: both are .gguf.
+        assert!(models.text_encoder.to_string_lossy().contains("qwen"));
+        assert!(models.video_vae.to_string_lossy().contains("video_vae"));
+        assert!(models.audio_vae.is_some());
+    }
+
+    #[test]
+    fn a_reference_only_checkpoint_is_not_accepted_as_the_denoiser() {
+        let root = TestDirectory::new("clip-models-ref");
+        // Ref2VA cannot be driven from a first frame, so it must not silently stand in.
+        for name in [
+            "minimax_h3_ref2va_pruned-Q3_K.gguf",
+            "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
+            "minimax_h3_video_vae_fp16.safetensors",
+        ] {
+            fs::write(root.0.join(name), vec![0_u8; 32]).expect("write weight");
+        }
+        let error = resolve_clip_models(&root.0).expect_err("no usable denoiser");
+        assert_eq!(error.code, "clip_model_missing");
+
+        // An undistilled first-and-last-frame checkpoint is refused for the same reason.
+        let undistilled = TestDirectory::new("clip-models-undistilled");
+        for name in [
+            "minimax_h3_fl2va_pruned-Q2_K.gguf",
+            "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
+            "minimax_h3_video_vae_fp16.safetensors",
+        ] {
+            fs::write(undistilled.0.join(name), vec![0_u8; 32]).expect("write weight");
+        }
+        let error = resolve_clip_models(&undistilled.0).expect_err("undistilled refused");
+        assert!(
+            error.message.to_lowercase().contains("distilled"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_video_vae_is_named_rather_than_guessed_at() {
+        let root = TestDirectory::new("clip-models-partial");
+        for name in [
+            "minimax_h3_fl2va_turbo_Q3_K_M.gguf",
+            "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
+        ] {
+            fs::write(root.0.join(name), vec![0_u8; 32]).expect("write weight");
+        }
+        let error = resolve_clip_models(&root.0).expect_err("no video vae");
+        assert!(
+            error.message.to_lowercase().contains("video vae"),
+            "{error:?}"
+        );
+        // Audio is optional, so its absence alone is not an error.
+        let full = TestDirectory::new("clip-models-noaudio");
+        for name in [
+            "minimax_h3_fl2va_turbo_Q3_K_M.gguf",
+            "qwen3vl_32b_minimax_h3-Q2_K_M.gguf",
+            "minimax_h3_video_vae_fp16.safetensors",
+        ] {
+            fs::write(full.0.join(name), vec![0_u8; 32]).expect("write weight");
+        }
+        let models = resolve_clip_models(&full.0).expect("resolve without audio");
+        assert!(models.audio_vae.is_none());
     }
 
     #[test]

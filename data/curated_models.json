@@ -32,7 +32,9 @@
       "license": "Apache-2.0",
       "tier": "recommended",
       "recommended_for_12gb": true,
-      "languages": ["en"],
+      "languages": [
+        "en"
+      ],
       "summary": "English CTC checkpoint for forced alignment of corrected transcript text to local audio.",
       "known_limitations": [
         "English-only character vocabulary; numerals must be written as words.",
@@ -47,7 +49,9 @@
         "Stores results separately from original Whisper or NeMo timing evidence.",
         "Model weights are downloaded only after explicit user approval."
       ],
-      "source_urls": ["https://huggingface.co/facebook/wav2vec2-base-960h"]
+      "source_urls": [
+        "https://huggingface.co/facebook/wav2vec2-base-960h"
+      ]
     },
     {
       "model_id": "microsoft/wavlm-base-plus-sv",
@@ -58,7 +62,9 @@
       "license": "CC-BY-SA-3.0",
       "tier": "recommended",
       "recommended_for_12gb": true,
-      "languages": ["en"],
+      "languages": [
+        "en"
+      ],
       "summary": "WavLM x-vector checkpoint for local speaker similarity and provisional word-anchored diarization.",
       "known_limitations": [
         "Cosine similarity is comparative evidence, not proof of speaker identity.",
@@ -73,7 +79,9 @@
         "Inputs are resampled to 16 kHz and embeddings are L2-normalized before cosine similarity.",
         "Model weights are downloaded only after explicit user approval."
       ],
-      "source_urls": ["https://huggingface.co/microsoft/wavlm-base-plus-sv"]
+      "source_urls": [
+        "https://huggingface.co/microsoft/wavlm-base-plus-sv"
+      ]
     },
     {
       "model_id": "openai/whisper-tiny",
@@ -205,8 +213,20 @@
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
-        "en", "fr", "de", "it", "es", "pt", "el", "nl", "pl",
-        "zh", "ja", "ko", "vi", "ar"
+        "en",
+        "fr",
+        "de",
+        "it",
+        "es",
+        "pt",
+        "el",
+        "nl",
+        "pl",
+        "zh",
+        "ja",
+        "ko",
+        "vi",
+        "ar"
       ],
       "summary": "State-of-the-art 2B Conformer ASR — #1 on HuggingFace Open ASR Leaderboard (5.42% avg WER).",
       "known_limitations": [
@@ -236,7 +256,14 @@
       "tier": "advanced",
       "recommended_for_12gb": true,
       "languages": [
-        "en", "es", "fr", "pt", "hi", "de", "nl", "it"
+        "en",
+        "es",
+        "fr",
+        "pt",
+        "hi",
+        "de",
+        "nl",
+        "it"
       ],
       "summary": "Lightweight Voxtral 3B for speech-to-text, audio understanding, and Q&A — fits in ~9.5GB VRAM.",
       "known_limitations": [
@@ -304,8 +331,23 @@
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
-        "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru",
-        "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi"
+        "en",
+        "es",
+        "fr",
+        "de",
+        "it",
+        "pt",
+        "pl",
+        "tr",
+        "ru",
+        "nl",
+        "cs",
+        "ar",
+        "zh-cn",
+        "ja",
+        "hu",
+        "ko",
+        "hi"
       ],
       "summary": "Multilingual Coqui XTTS model for voice cloning and 17-language synthesis at 24kHz.",
       "known_limitations": [
@@ -343,7 +385,16 @@
       "tier": "recommended",
       "recommended_for_12gb": true,
       "languages": [
-        "en", "en-gb", "ja", "zh", "ko", "fr", "es", "hi", "it", "pt"
+        "en",
+        "en-gb",
+        "ja",
+        "zh",
+        "ko",
+        "fr",
+        "es",
+        "hi",
+        "it",
+        "pt"
       ],
       "summary": "Lightweight 82M TTS with 54 voices across 8 languages — low-latency 24kHz output.",
       "known_limitations": [
@@ -412,7 +463,9 @@
       "revision": "749d1c1a46eb10492095d68fbcf55691ccf137cd",
       "tier": "recommended",
       "recommended_for_12gb": true,
-      "languages": ["en"],
+      "languages": [
+        "en"
+      ],
       "summary": "Lower-latency 350M English synthesis with voice cloning, paralinguistic tags, and 24kHz output.",
       "known_limitations": [
         "English only.",
@@ -441,7 +494,10 @@
       "license": "BreezeBlue Research and Non-Commercial License 1.0",
       "tier": "advanced",
       "recommended_for_12gb": true,
-      "languages": ["en", "zh"],
+      "languages": [
+        "en",
+        "zh"
+      ],
       "summary": "Bilingual 3.47B speech model with natural-language voice design, expressive events, and 24 kHz output.",
       "known_limitations": [
         "The model weights and self-hosted outputs are restricted to research and non-commercial use; commercial use requires written authorization from BreezeBlue.",
@@ -483,7 +539,21 @@
       "license": "CC-BY-NC-SA-4.0",
       "tier": "recommended",
       "recommended_for_12gb": true,
-      "languages": ["en", "zh", "ja", "de", "fr", "es", "ko", "ar", "ru", "nl", "it", "pl", "pt"],
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "de",
+        "fr",
+        "es",
+        "ko",
+        "ar",
+        "ru",
+        "nl",
+        "it",
+        "pl",
+        "pt"
+      ],
       "summary": "Fish Audio's stable multilingual Fish Speech 1.5 checkpoint with reference-free generation and 44.1 kHz output.",
       "known_limitations": [
         "The model weights are restricted to non-commercial use and derivatives must remain under CC-BY-NC-SA-4.0.",
@@ -556,7 +626,20 @@
       "license": "MIT (ACE-Step); Apache-2.0 (Qwen3 text encoder)",
       "tier": "recommended",
       "recommended_for_12gb": true,
-      "languages": ["en", "zh", "ja", "ko", "es", "fr", "de", "it", "pt", "ru", "ar", "hi"],
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko",
+        "es",
+        "fr",
+        "de",
+        "it",
+        "pt",
+        "ru",
+        "ar",
+        "hi"
+      ],
       "summary": "ACE-Step 1.5 Studio: the 2B Turbo song model, 1.7B local planner, 48 kHz stereo VAE, and text encoder in one pinned local pack.",
       "known_limitations": [
         "The complete studio pack is a large download. On a 12 GB GPU soundAr uses CPU offload so planning and decoding remain reliable.",
@@ -587,7 +670,20 @@
       "license": "MIT",
       "tier": "advanced",
       "recommended_for_12gb": false,
-      "languages": ["en", "zh", "ja", "ko", "es", "fr", "de", "it", "pt", "ru", "ar", "hi"],
+      "languages": [
+        "en",
+        "zh",
+        "ja",
+        "ko",
+        "es",
+        "fr",
+        "de",
+        "it",
+        "pt",
+        "ru",
+        "ar",
+        "hi"
+      ],
       "summary": "ACE-Step Base Tools for vocal/instrument extraction, layer generation, accompaniment completion, and deeper edits.",
       "known_limitations": [
         "This checkpoint is an editing companion, not the default song generator.",
@@ -615,7 +711,18 @@
       "license": "MIT (ACE-Step); Apache-2.0 (Qwen3 text encoder)",
       "tier": "advanced",
       "recommended_for_12gb": false,
-      "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "ru"],
+      "languages": [
+        "en",
+        "es",
+        "fr",
+        "de",
+        "it",
+        "pt",
+        "ja",
+        "ko",
+        "zh",
+        "ru"
+      ],
       "summary": "ACE-Step 1.5 XL Turbo quality tier for slower 48 kHz stereo renders with CPU offload.",
       "known_limitations": [
         "The local checkpoint is approximately 11.1 GB; soundAr uses model CPU offload on 12 GB NVIDIA GPUs, which increases render time.",
@@ -635,6 +742,36 @@
       "source_urls": [
         "https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers",
         "https://huggingface.co/docs/diffusers/api/pipelines/ace_step"
+      ]
+    },
+    {
+      "model_id": "MiniMaxAI/MiniMax-H3",
+      "task": "video",
+      "engine": "minimax-h3",
+      "install_status": "available",
+      "revision": null,
+      "tier": "optional",
+      "recommended_for_12gb": true,
+      "languages": [
+        "en"
+      ],
+      "summary": "Local video generation with synchronized audio. soundAr uses it to cut short moving shots across an episode that has no footage of its own.",
+      "known_limitations": [
+        "Open weights are licensed only for the EU, UK, South Korea, and the United States; organisations elsewhere must apply to MiniMax for a licence.",
+        "Weights are large and are never bundled with soundAr: the denoiser, text encoder, and VAEs are installed by the user.",
+        "On a 12 GB card a clip is about 1.6 seconds at 864x480 and costs roughly a minute of compute, so an episode is covered by a few repeated shots rather than one clip per second.",
+        "Requires stable-diffusion.cpp's sd-cli built with CUDA; soundAr discovers it like FFmpeg."
+      ],
+      "test_status": "required",
+      "default_chunk_seconds": null,
+      "default_sample_rate": null,
+      "runtime_notes": [
+        "Measured on an RTX 4080 Laptop 12 GB: 8 steps, cfg 1.0, 864x480, 39 frames, text encoder on CPU, peak 11.5 GB VRAM, 74 s per clip.",
+        "The weights are distilled for 8 steps; 12 and 16 steps were measured and add nothing.",
+        "768p and clips longer than 39 frames exceed the compute buffer on a 12 GB card."
+      ],
+      "source_urls": [
+        "https://huggingface.co/hexgrad/Kokoro-82M"
       ]
     }
   ]

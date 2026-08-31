@@ -1318,6 +1318,8 @@ pub enum RenderArtifactRole {
     Trailer,
     /// A square waveform video, for feeds where only video plays.
     Audiogram,
+    /// One locally generated moving shot, cut across an episode that has no footage of its own.
+    GeneratedClip,
     PublishPackage,
 }
 

@@ -23,7 +23,14 @@ export type VideoProjectStatus =
 export type VideoJobPhase = "source" | "analyze" | "review" | "preview" | "export";
 export type VideoJobStatus = "queued" | "preparing" | "running" | "completed" | "failed" | "cancelled";
 export type VideoTimelineTrackKind = "video" | "visuals" | "captions" | "voice" | "music";
-export type VideoArtifactRole = "source" | "proxy" | "preview" | "master" | "variation" | "publish-package";
+export type VideoArtifactRole =
+  | "source"
+  | "proxy"
+  | "preview"
+  | "master"
+  | "variation"
+  | "generated-clip"
+  | "publish-package";
 export type VideoCaptionStyle =
   | "clean-white"
   | "calm"

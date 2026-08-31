@@ -331,6 +331,135 @@ pub fn build_cover_image_command(
     })
 }
 
+/// Everything the local video generator needs to produce one clip.
+///
+/// The settings are the ones soundAr measured on a 12 GB card: eight steps, because the weights
+/// are distilled for eight and more buys nothing; guidance fixed at 1.0, because a distilled
+/// model refuses anything higher; and the text encoder on CPU, because it is larger than the
+/// remaining VRAM and only runs once per prompt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipModelPaths {
+    pub denoiser: PathBuf,
+    pub text_encoder: PathBuf,
+    pub video_vae: PathBuf,
+    pub audio_vae: Option<PathBuf>,
+}
+
+/// Steps the generator runs. The weights are distilled for this count.
+pub const CLIP_STEPS: u16 = 8;
+/// Guidance. A distilled model is classifier-free-guidance-free and aborts above this.
+pub const CLIP_CFG_SCALE: &str = "1.0";
+/// Frames per clip, aligned to the generator's own grid.
+pub const CLIP_FRAMES: u16 = 39;
+pub const CLIP_FPS: u16 = 24;
+
+/// Build the command that generates one clip as a lossless frame sequence.
+///
+/// Frames are written as PNG rather than as an encoded video because soundAr assembles them onto
+/// its own timeline: handing the assembler a compressed intermediate would spend quality on a file
+/// that is about to be re-encoded anyway.
+pub fn build_clip_command(
+    sd_cli: &Path,
+    models: &ClipModelPaths,
+    prompt: &str,
+    width: u32,
+    height: u32,
+    seed: i64,
+    frame_pattern: &Path,
+) -> Result<RenderCommand, MediaError> {
+    let sd_cli = fs::canonicalize(sd_cli).map_err(|error| {
+        MediaError::new(
+            "sd_cli_unavailable",
+            "The video generator could not be resolved",
+        )
+        .detail(error.to_string())
+    })?;
+    if !is_executable_file(&sd_cli) {
+        return Err(MediaError::new(
+            "sd_cli_unavailable",
+            "The configured video generator path is not executable",
+        ));
+    }
+    for (label, path) in [
+        ("denoiser", &models.denoiser),
+        ("text encoder", &models.text_encoder),
+        ("video vae", &models.video_vae),
+    ] {
+        if !path.is_file() {
+            return Err(MediaError::new(
+                "clip_model_missing",
+                format!("The video generator's {label} weights are missing"),
+            ));
+        }
+    }
+    let parent = frame_pattern.parent().ok_or_else(|| {
+        MediaError::new(
+            "invalid_render_output",
+            "The clip output has no parent directory",
+        )
+    })?;
+    if !parent.is_dir() {
+        return Err(MediaError::new(
+            "invalid_render_output",
+            "The clip output directory does not exist",
+        ));
+    }
+
+    let mut args = vec![
+        OsString::from("-M"),
+        OsString::from("vid_gen"),
+        OsString::from("--diffusion-model"),
+        models.denoiser.as_os_str().to_os_string(),
+        OsString::from("--llm"),
+        models.text_encoder.as_os_str().to_os_string(),
+        OsString::from("--vae"),
+        models.video_vae.as_os_str().to_os_string(),
+    ];
+    if let Some(audio_vae) = &models.audio_vae {
+        args.extend([
+            OsString::from("--audio-vae"),
+            audio_vae.as_os_str().to_os_string(),
+        ]);
+    }
+    args.extend([
+        OsString::from("-p"),
+        OsString::from(prompt),
+        OsString::from("--cfg-scale"),
+        OsString::from(CLIP_CFG_SCALE),
+        OsString::from("--steps"),
+        OsString::from(CLIP_STEPS.to_string()),
+        OsString::from("-W"),
+        OsString::from(width.to_string()),
+        OsString::from("-H"),
+        OsString::from(height.to_string()),
+        OsString::from("--fps"),
+        OsString::from(CLIP_FPS.to_string()),
+        OsString::from("--video-frames"),
+        OsString::from(CLIP_FRAMES.to_string()),
+        // The text encoder is larger than the VRAM left after the denoiser, and it runs once per
+        // prompt rather than once per step, so CPU is where it belongs.
+        OsString::from("--backend"),
+        OsString::from("te=cpu"),
+        OsString::from("--diffusion-fa"),
+        OsString::from("--offload-to-cpu"),
+        OsString::from("--rng"),
+        OsString::from("cpu"),
+        // A fixed seed makes a clip reproducible from its prompt alone.
+        OsString::from("--seed"),
+        OsString::from(seed.to_string()),
+        OsString::from("-o"),
+        frame_pattern.as_os_str().to_os_string(),
+    ]);
+
+    Ok(RenderCommand {
+        program: sd_cli,
+        args,
+        output: frame_pattern.to_path_buf(),
+        encoder: VideoEncoder::Image,
+        emits_progress: false,
+    })
+}
+
 /// Escape a path for use inside a filter argument, where `:` separates options and `\'` quotes.
 fn escape_filter_text_path(path: &Path) -> String {
     path.to_string_lossy()

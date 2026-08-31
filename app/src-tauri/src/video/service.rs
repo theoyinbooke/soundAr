@@ -16,8 +16,8 @@ use super::{
     preflight_import_url_destination, probe_media, profile_dimensions, publish_atomic,
     sibling_staging_path, terminate_process_group, validate_import_url, write_ass_document_atomic,
     AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme,
-    CastMember, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser, GapReason,
-    LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds,
+    CastMember, ClipModelPaths, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser,
+    GapReason, LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds,
     NarrationBinding, NormalizedRect, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
     PublicationState, QcReport, RationalFrameRate, RationalRate, ReleaseMemberKind,
     ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole, RenderCommand,
@@ -26,7 +26,7 @@ use super::{
     RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
     TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate, VideoEncoder,
     VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
+    VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion, CLIP_FPS,
     MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
     TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
@@ -87,6 +87,14 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 /// A cover is one frame with no encode. Anything slower than this is a stuck process, not a
 /// slow render.
 const COVER_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
+/// One clip takes about a minute on a consumer card. Anything past this is a stuck process.
+const CLIP_GENERATION_TIMEOUT: Duration = Duration::from_secs(900);
+const CLIP_ENCODE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The canvas soundAr generates clips at: the largest that fits a 12 GB card with room for the
+/// compute buffer, measured rather than assumed.
+const CLIP_CANVAS: (u32, u32) = (864, 480);
+/// Appended to every generated shot, so an episode's clips look like one piece of work.
+const CLIP_STYLE: &str = "cinematic, shallow depth of field, natural light, film grain";
 const SHAREABLE_FILE_MODE: u32 = 0o644;
 const MAX_RENDER_DURATION: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_MEDIA_DURATION_US: i64 = 6 * 60 * 60 * 1_000_000;
@@ -13181,6 +13189,319 @@ impl VideoStudioService {
     ///
     /// Does nothing when the project already has scenes, so an author's own divisions are never
     /// replaced by a generated one.
+    /// The track generated clips are laid on. Named so it can be recognised and replaced whole.
+    const CLIP_TRACK_ID: &'static str = "generated-clips";
+
+    /// Whether this machine can generate moving clips at all.
+    pub fn clip_generation_available(&self, models: Option<&Path>) -> bool {
+        let runtime = self.runtime_status(false);
+        runtime.sd_cli.available
+            && models.is_some_and(|dir| super::media::resolve_clip_models(dir).is_ok())
+    }
+
+    /// Generate this episode's shots and cut them across its narration.
+    ///
+    /// A clip costs about a minute of compute for under two seconds of footage, so an episode is
+    /// never covered one-to-one. It is covered by a handful of distinct shots, repeated across the
+    /// clock, which is how b-roll has always worked. Each shot is content-addressed by its prompt,
+    /// so re-running this on an unchanged episode regenerates nothing.
+    ///
+    /// The shots are described by the caller. An episode's own words describe a conversation, and
+    /// a shot has to say what is on screen - deriving one from the other produces a sentence about
+    /// a podcast, which a video model renders as nothing recognisable.
+    pub fn generate_episode_clips(
+        &self,
+        project_id: &str,
+        actor: &str,
+        model_directory: &Path,
+        descriptions: &[String],
+        cancel: &AtomicBool,
+    ) -> ServiceResult<Value> {
+        let record = self.get_project(project_id)?;
+        let manifest: VideoProjectManifest = serde_json::from_value(
+            record
+                .get("manifest")
+                .cloned()
+                .ok_or_else(|| invalid_store_shape("manifest"))?,
+        )
+        .map_err(json_error)?;
+
+        let span_us = self.episode_span_us(&manifest);
+        if span_us <= 0 {
+            return Err(VideoServiceError::new(
+                "video.clip_span_unknown",
+                "This episode has no duration yet, so there is nothing for clips to cover",
+            ));
+        }
+
+        let runtime = self.runtime_status(false);
+        let sd_cli = required_tool_path(
+            &runtime.sd_cli,
+            "video.sd_cli_unavailable",
+            "The local video generator is required to generate clips",
+        )?;
+        let ffmpeg = required_tool_path(
+            &runtime.ffmpeg,
+            "video.ffmpeg_unavailable",
+            "FFmpeg is required to assemble generated clips",
+        )?;
+        let ffprobe = required_tool_path(
+            &runtime.ffprobe,
+            "video.ffprobe_unavailable",
+            "FFprobe is required to measure generated clips",
+        )?;
+        let models = super::media::resolve_clip_models(model_directory)
+            .map_err(|error| VideoServiceError::new("video.clip_model_missing", error.message))?;
+
+        let (width, height) = CLIP_CANVAS;
+        let shots = super::shots::plan_shots(descriptions, span_us, CLIP_STYLE);
+        if shots.is_empty() {
+            return Err(VideoServiceError::new(
+                "video.shots_not_described",
+                "Describe what each shot shows before generating clips",
+            ));
+        }
+
+        let mut artifacts = Vec::new();
+        for shot in &shots {
+            self.ensure_not_cancelled(cancel)?;
+            let cache_key = shot.cache_key();
+            let output = self.cache_path("clip", &cache_key, "mp4")?;
+            if !output.is_file() {
+                self.render_one_clip(
+                    sd_cli, ffmpeg, &models, shot, width, height, &cache_key, &output,
+                )?;
+            }
+            let probe = probe_media(&output, ffprobe)?;
+            let artifact = RenderArtifact {
+                id: format!("clip-{}", &cache_key[..24]),
+                role: RenderArtifactRole::GeneratedClip,
+                scene_id: None,
+                managed_path: self.relative_managed_path(&output)?,
+                sha256: sha256_file(&output)?,
+                cache_key,
+                mime_type: "video/mp4".to_string(),
+                duration_us: Some(Microseconds(probe.duration_us)),
+                width: Some(width),
+                height: Some(height),
+                publication_state: PublicationState::Published,
+                created_at: utc_now(),
+            };
+            artifact.validate()?;
+            artifacts.push(artifact);
+        }
+
+        // A small number of clips is cut across the whole episode rather than one clip per second.
+        let placements = super::shots::tile_shots(artifacts.len(), span_us);
+        let clips = placements
+            .iter()
+            .enumerate()
+            .map(|(position, (shot_index, start, duration))| {
+                let artifact = &artifacts[*shot_index];
+                Ok(TimelineClip {
+                    id: format!("clip-cut-{position:04}"),
+                    scene_id: None,
+                    turn_id: None,
+                    media: super::MediaReference {
+                        source_asset_id: None,
+                        render_artifact_id: Some(artifact.id.clone()),
+                    },
+                    source_range: TimeRange::new(0, duration.0)?,
+                    timeline_start_us: *start,
+                    timeline_duration_us: *duration,
+                    playback_rate: RationalRate::ONE,
+                    gain_db_milli: 0,
+                    // A generated clip supplies picture only; the episode's own narration is the
+                    // sound, and a clip's incidental audio must never talk over it.
+                    muted: true,
+                    crop: None,
+                })
+            })
+            .collect::<Result<Vec<_>, VideoError>>()?;
+
+        let expectation = project_expectation(&record)?;
+        let shot_count = artifacts.len();
+        self.commit_manifest_mutation_at_if_parent_active(
+            project_id,
+            &expectation,
+            actor,
+            &format!("Generate {shot_count} shot(s) and cut them across the episode"),
+            None,
+            vec![
+                "/render_artifacts".to_string(),
+                "/tracks".to_string(),
+                "/visual_assets".to_string(),
+                "/visual_layers".to_string(),
+            ],
+            BTreeSet::from([
+                RevisionStage::SceneRender,
+                RevisionStage::Preview,
+                RevisionStage::FinalRender,
+                RevisionStage::PublishPackage,
+            ]),
+            None,
+            move |manifest: &mut VideoProjectManifest| {
+                // Replace the previous set outright: a regenerated episode gets one clip track,
+                // never last run's cuts with this run's stacked on top.
+                manifest
+                    .render_artifacts
+                    .retain(|existing| !matches!(existing.role, RenderArtifactRole::GeneratedClip));
+                manifest
+                    .tracks
+                    .retain(|track| track.id != Self::CLIP_TRACK_ID);
+                // Moving shots replace a drawn card. The card is a full-canvas layer, so leaving
+                // it in place would paint it straight over the clips it was standing in for.
+                let cards = manifest
+                    .visual_assets
+                    .iter()
+                    .filter(|asset| asset.id.starts_with("cover-"))
+                    .map(|asset| asset.id.clone())
+                    .collect::<Vec<_>>();
+                manifest
+                    .visual_layers
+                    .retain(|layer| !cards.contains(&layer.asset_id));
+                manifest
+                    .visual_assets
+                    .retain(|asset| !asset.id.starts_with("cover-"));
+                manifest.render_artifacts.extend(artifacts.clone());
+                manifest.tracks.push(TimelineTrack {
+                    id: Self::CLIP_TRACK_ID.to_string(),
+                    kind: TrackKind::Video,
+                    preserve_gaps: false,
+                    clips: clips.clone(),
+                });
+                Ok(())
+            },
+        )
+    }
+
+    /// Generate one shot and encode it into a managed clip.
+    #[allow(clippy::too_many_arguments)]
+    fn render_one_clip(
+        &self,
+        sd_cli: &Path,
+        ffmpeg: &Path,
+        models: &ClipModelPaths,
+        shot: &super::shots::ShotPlan,
+        width: u32,
+        height: u32,
+        cache_key: &str,
+        output: &Path,
+    ) -> ServiceResult<()> {
+        let frames_dir = self.video_root.join("cache").join("clip").join(cache_key);
+        self.secure_managed_directory(&frames_dir)?;
+        let pattern = frames_dir.join("f_%03d.png");
+        // The seed is derived from the prompt, so the same shot is the same footage every time.
+        let seed = i64::from(u32::from_str_radix(&cache_key[..8], 16).unwrap_or(1));
+
+        let command =
+            super::build_clip_command(sd_cli, models, &shot.prompt, width, height, seed, &pattern)
+                .map_err(|error| VideoServiceError::new("video.clip_failed", error.message))?;
+        self.run_generator(&command, CLIP_GENERATION_TIMEOUT)?;
+
+        // Frames are assembled here rather than by the generator, so nothing is encoded twice.
+        let staging = sibling_staging_path(output)?;
+        let encode = RenderCommand {
+            program: fs::canonicalize(ffmpeg).map_err(|error| {
+                VideoServiceError::io(
+                    "video.ffmpeg_unavailable",
+                    "FFmpeg could not be resolved",
+                    error,
+                )
+            })?,
+            args: vec![
+                OsString::from("-hide_banner"),
+                OsString::from("-loglevel"),
+                OsString::from("error"),
+                OsString::from("-nostdin"),
+                OsString::from("-y"),
+                OsString::from("-framerate"),
+                OsString::from(CLIP_FPS.to_string()),
+                OsString::from("-i"),
+                pattern.as_os_str().to_os_string(),
+                OsString::from("-c:v"),
+                OsString::from("libx264"),
+                OsString::from("-preset"),
+                OsString::from("medium"),
+                OsString::from("-crf"),
+                OsString::from("18"),
+                OsString::from("-pix_fmt"),
+                OsString::from("yuv420p"),
+                OsString::from("-movflags"),
+                OsString::from("+faststart"),
+                // Name the container as well as the codec. The clip is written to a staging path
+                // with no extension, and an inferred format is how a generated still ended up a
+                // JPEG wearing a .png name once already.
+                OsString::from("-f"),
+                OsString::from("mp4"),
+                staging.as_os_str().to_os_string(),
+            ],
+            output: staging.clone(),
+            encoder: VideoEncoder::Libx264,
+            emits_progress: false,
+        };
+        self.run_generator(&encode, CLIP_ENCODE_TIMEOUT)?;
+        publish_atomic(&staging, output, |candidate| {
+            if fs::metadata(candidate).is_ok_and(|metadata| metadata.len() > 1024) {
+                Ok(())
+            } else {
+                Err(MediaError::new(
+                    "clip_empty",
+                    "The generated clip was empty",
+                ))
+            }
+        })?;
+        // The frames were an intermediate; keeping them would double the cache for no benefit.
+        // Retained on request, so a clip that came out wrong can be traced to generation or encode.
+        if std::env::var_os("SOUNDAR_KEEP_CLIP_FRAMES").is_none() {
+            let _ = fs::remove_dir_all(&frames_dir);
+        }
+        Ok(())
+    }
+
+    /// Run one generator or encoder command under a hard deadline.
+    fn run_generator(&self, command: &RenderCommand, timeout: Duration) -> ServiceResult<()> {
+        let mut child = command.command().spawn().map_err(|error| {
+            VideoServiceError::io(
+                "video.clip_failed",
+                "The video generator could not start",
+                error,
+            )
+        })?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(_)) => {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    return Err(VideoServiceError::new(
+                        "video.clip_failed",
+                        "The clip could not be generated",
+                    )
+                    .details(json!({ "stderr": truncate_chars(stderr.trim(), 600) })));
+                }
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = terminate_process_group(&mut child, Duration::from_secs(5));
+                    return Err(VideoServiceError::new(
+                        "video.clip_failed",
+                        "The clip generator exceeded its time budget",
+                    ));
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(200)),
+                Err(error) => {
+                    return Err(VideoServiceError::io(
+                        "video.clip_failed",
+                        "The clip generator could not be supervised",
+                        error,
+                    ))
+                }
+            }
+        }
+    }
+
     /// The id a generated cover claims for one exact card, so regenerating an unchanged episode
     /// finds its existing asset instead of stacking a second identical one.
     fn cover_asset_id(cache_key: &str) -> String {
