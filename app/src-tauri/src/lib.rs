@@ -7642,7 +7642,10 @@ for line in sys.stdin:
         let id = run["id"].as_str().expect("comparison ID");
         let started = Instant::now();
         let completed = runtime.execute_comparison(id).expect("execute comparison");
-        assert!(started.elapsed() < Duration::from_millis(950));
+        // Four takes of half a second each run serially would take two seconds. The bound only
+        // has to sit well under that to prove they ran together; a tighter one measured process
+        // spawn time on a loaded CI runner instead of the coordinator.
+        assert!(started.elapsed() < Duration::from_millis(1_600));
         assert_eq!(completed["status"], "partial");
         assert_eq!(
             completed["takes"]

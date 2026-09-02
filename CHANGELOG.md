@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 - 2026-09-02
 
 - Opened a video from Recent in Video Studio. Selecting a video, draft or finished, used to land on
   History with a grid of masters above an unrelated audio record; it now opens that video where
