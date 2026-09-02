@@ -218,6 +218,8 @@ mod tests {
             language: "en-US".to_string(),
             delivery: CastDelivery::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: "2026-08-30T00:00:00Z".to_string(),
         }

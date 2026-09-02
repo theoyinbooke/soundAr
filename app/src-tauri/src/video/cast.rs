@@ -14,6 +14,10 @@ use super::contracts::{
     validate_identifier, validate_language_tag, validate_nonempty, validate_timestamp_text,
     Validate, VideoError, VideoErrorCode, VideoResult,
 };
+use super::vocal_events::{
+    events_of, normalize_cues, render_for_vocabulary, words_of, RenderedLine, VocalEvent,
+    VocalVocabulary,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -23,6 +27,11 @@ pub const MAX_TURN_TEXT_BYTES: usize = 8_000;
 pub const MAX_DIRECTION_BYTES: usize = 500;
 pub const MAX_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SPEAKER_NAME_BYTES: usize = 64;
+/// A persona is a voice design, not a biography; a paragraph is enough to cast from.
+pub const MAX_PERSONA_BYTES: usize = 600;
+/// How many distinct takes a reaction may be layered from. A crowd is several people; a voice
+/// model is one, so a laugh from the room is a few laughs at once.
+pub const MAX_ENSEMBLE: u8 = 4;
 
 /// Delivery is stored in milli-units so a saved performance is reproducible without
 /// float drift across a save, reload, and re-render.
@@ -104,7 +113,19 @@ pub struct CastMember {
     pub consent_reference_id: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Who this voice is, in the words a voice-design engine is steered with: "an upbeat man in
+    /// his thirties, crisp setups, confident punchlines". Sent to an engine that follows an
+    /// instruction; ignored, and reported as ignored, by one that does not.
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// Distinct takes layered for a reaction turn, so a crowd reads as a crowd. `1` is one voice.
+    #[serde(default = "default_ensemble")]
+    pub ensemble: u8,
     pub created_at: String,
+}
+
+fn default_ensemble() -> u8 {
+    1
 }
 
 impl CastMember {
@@ -135,6 +156,22 @@ impl Validate for CastMember {
                 .at("cast.notes"));
             }
         }
+        if let Some(persona) = &self.persona {
+            if persona.trim().is_empty() || persona.len() > MAX_PERSONA_BYTES {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidCast,
+                    format!("a persona must be non-empty and at most {MAX_PERSONA_BYTES} bytes"),
+                )
+                .at("cast.persona"));
+            }
+        }
+        if !(1..=MAX_ENSEMBLE).contains(&self.ensemble) {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidCast,
+                format!("an ensemble layers between 1 and {MAX_ENSEMBLE} takes"),
+            )
+            .at("cast.ensemble"));
+        }
         validate_timestamp_text(&self.created_at, "cast.created_at")?;
         Ok(())
     }
@@ -142,9 +179,10 @@ impl Validate for CastMember {
 
 /// One character's uninterrupted contribution to the script.
 ///
-/// `text` is exactly what the voice is asked to speak. A parenthetical `direction` steers
-/// performance and beat selection but is never spoken, so it is stored separately rather than
-/// stripped and forgotten.
+/// `text` is what the voice is asked to perform, in canonical form: the words as written, and
+/// every vocal event as a `(laugh)` token wherever the writer put it. A parenthetical `direction`
+/// steers performance and beat selection but is never spoken, so it is stored separately rather
+/// than stripped and forgotten.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DialogueTurn {
@@ -164,9 +202,31 @@ pub struct DialogueTurn {
 }
 
 impl DialogueTurn {
-    /// The exact bytes a narration take for this turn must have been asked to speak.
+    /// The exact bytes a narration take for this turn must have been asked to perform, in
+    /// canonical form. Provenance hashes are taken over this, never over an engine's rendering.
     pub fn spoken_text(&self) -> &str {
         self.text.as_str()
+    }
+
+    /// The line as one engine reads it: events in that engine's vocabulary, or removed with the
+    /// removal reported when it has none.
+    pub fn rendered_for(&self, vocabulary: VocalVocabulary) -> RenderedLine {
+        render_for_vocabulary(&self.text, vocabulary)
+    }
+
+    /// The words alone.
+    pub fn words(&self) -> String {
+        words_of(&self.text)
+    }
+
+    /// Everything this line asks the voice to do that is not a word.
+    pub fn vocal_events(&self) -> Vec<VocalEvent> {
+        events_of(&self.text)
+    }
+
+    /// A reaction performs and says nothing: an audience laughing, a room applauding.
+    pub fn is_reaction(&self) -> bool {
+        self.words().is_empty() && !self.vocal_events().is_empty()
     }
 }
 
@@ -378,11 +438,35 @@ pub fn parse_dialogue_script(script: &str, cast: &[CastMember]) -> VideoResult<V
     Ok(turns)
 }
 
-/// Extract a leading parenthetical direction and reject a turn that says nothing.
+/// Extract a leading parenthetical direction, canonicalise the vocal cues, and reject a turn that
+/// neither says nor performs anything.
 fn finish_turn(mut turn: ParsedTurn) -> VideoResult<ParsedTurn> {
     let (direction, spoken) = split_leading_direction(&turn.text, turn.source_line)?;
-    turn.direction = direction;
-    turn.text = spoken;
+    // A writer's `(laughs)`, `[Laughter]`, or `*giggles*` becomes soundAr's one spelling, so the
+    // voice that performs it is handed what it was trained on and never the word itself. A
+    // bracketed note that is not a cue - `[SFX: door]` - is never spoken; it joins the direction.
+    let parsed = normalize_cues(&spoken);
+    turn.text = parsed.canonical;
+    let mut direction_parts = direction.into_iter().collect::<Vec<_>>();
+    direction_parts.extend(parsed.notes);
+    let direction = direction_parts.join("; ");
+    turn.direction = if direction.is_empty() {
+        None
+    } else {
+        Some(direction)
+    };
+    if let Some(direction) = &turn.direction {
+        if direction.len() > MAX_DIRECTION_BYTES {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidDialogue,
+                format!(
+                    "the stage directions at line {} exceed {MAX_DIRECTION_BYTES} bytes",
+                    turn.source_line
+                ),
+            )
+            .at("script"));
+        }
+    }
     if turn.text.trim().is_empty() {
         return Err(VideoError::new(
             VideoErrorCode::InvalidDialogue,
@@ -437,7 +521,8 @@ fn is_speaker_char(value: char) -> bool {
 }
 
 /// Take a leading `(...)` direction off a turn, rejecting an unbalanced parenthetical rather than
-/// speaking a stray bracket.
+/// speaking a stray bracket. A leading vocal cue - `(laughs)` - is not a direction: it is
+/// something the voice performs, and it stays in the line for `normalize_cues` to canonicalise.
 fn split_leading_direction(text: &str, line: u32) -> VideoResult<(Option<String>, String)> {
     let trimmed = text.trim_start();
     if !trimmed.starts_with('(') {
@@ -450,6 +535,9 @@ fn split_leading_direction(text: &str, line: u32) -> VideoResult<(Option<String>
         )
         .at("script"));
     };
+    if VocalEvent::from_cue(&trimmed[1..close]).is_some() {
+        return Ok((None, text.trim().to_string()));
+    }
     let direction = trimmed[1..close].trim().to_string();
     if direction.is_empty() {
         return Err(VideoError::new(
@@ -508,6 +596,8 @@ mod tests {
             language: "en-US".into(),
             delivery: CastDelivery::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: "2026-01-01T00:00:00Z".into(),
         }
@@ -586,6 +676,73 @@ mod tests {
             error.message.contains("nothing to say"),
             "{}",
             error.message
+        );
+    }
+
+    #[test]
+    fn a_laugh_is_a_cue_not_a_direction_wherever_it_stands() {
+        let script = "ADAEZE: (laughs) You cannot be serious. [chuckles] Not at all.\n";
+        let turns = parse_dialogue_script(script, &cast()).unwrap();
+        assert_eq!(turns[0].direction, None);
+        assert_eq!(
+            turns[0].text,
+            "(laugh) You cannot be serious. (chuckle) Not at all."
+        );
+    }
+
+    #[test]
+    fn a_reaction_line_is_a_turn_that_performs_and_says_nothing() {
+        let turns = parse_dialogue_script("NARRATOR: [Laughter] [Applause]\n", &cast()).unwrap();
+        assert_eq!(turns[0].text, "(laugh) (applause)");
+        let turn = DialogueTurn {
+            id: "turn-0000-abc".into(),
+            scene_id: None,
+            order: 0,
+            character_id: "narrator".into(),
+            text: turns[0].text.clone(),
+            direction: None,
+            source_line: 1,
+            revision: 1,
+        };
+        assert!(turn.is_reaction());
+        assert_eq!(turn.words(), "");
+        assert_eq!(
+            turn.vocal_events(),
+            vec![VocalEvent::Laugh, VocalEvent::Applause]
+        );
+        assert_eq!(
+            turn.rendered_for(VocalVocabulary::Bracket).text,
+            "[laugh] [applause]"
+        );
+    }
+
+    #[test]
+    fn a_direction_and_a_bracketed_note_both_steer_and_neither_is_spoken() {
+        let script = "ADAEZE: (quiet) [SFX: rain on the roof] You said you would come back.\n";
+        let turns = parse_dialogue_script(script, &cast()).unwrap();
+        assert_eq!(
+            turns[0].direction.as_deref(),
+            Some("quiet; SFX: rain on the roof")
+        );
+        assert_eq!(turns[0].text, "You said you would come back.");
+    }
+
+    #[test]
+    fn a_persona_and_an_ensemble_are_bounded() {
+        let mut character = member("crowd", "AUDIENCE");
+        character.persona = Some("A warm comedy-club crowd".into());
+        character.ensemble = 3;
+        character.validate().unwrap();
+        character.ensemble = 9;
+        assert_eq!(
+            character.validate().unwrap_err().code,
+            VideoErrorCode::InvalidCast
+        );
+        character.ensemble = 1;
+        character.persona = Some(" ".into());
+        assert_eq!(
+            character.validate().unwrap_err().code,
+            VideoErrorCode::InvalidCast
         );
     }
 

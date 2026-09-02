@@ -407,6 +407,8 @@ mod tests {
                 language: "en-US".into(),
                 delivery: CastDelivery::default(),
                 consent_reference_id: None,
+                persona: None,
+                ensemble: 1,
                 notes: None,
                 created_at: NOW.into(),
             });
@@ -604,6 +606,7 @@ mod tests {
                             format!("This is line number {index} of the episode.").as_bytes()
                         )
                     ),
+                    performance: None,
                     created_at: NOW.into(),
                 });
         }

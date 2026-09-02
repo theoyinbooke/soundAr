@@ -18,17 +18,17 @@ use super::{
     AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme,
     CastMember, ClipModelPaths, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser,
     GapReason, LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds,
-    NarrationBinding, NormalizedRect, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
-    PublicationState, QcReport, RationalFrameRate, RationalRate, ReleaseMemberKind,
-    ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole, RenderCommand,
-    RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass, ResourceRequest,
-    ResourceScheduler, ReviewState, ReviewedScene, RevisionRecord, RevisionStage, RightsBasis,
-    RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
-    TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate, VideoEncoder,
-    VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion, CLIP_FPS,
-    MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
-    TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
+    NarrationBinding, NormalizedRect, PerformanceRecord, PortraitLayout, Provenance,
+    ProvenanceKind, PublicHttpsProxy, PublicationState, QcReport, RationalFrameRate, RationalRate,
+    ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole,
+    RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass,
+    ResourceRequest, ResourceScheduler, ReviewState, ReviewedScene, RevisionRecord, RevisionStage,
+    RightsBasis, RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind,
+    TakeFidelity, TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate,
+    VideoEncoder, VideoError, VideoProjectManifest, VideoTimelineChangeReceipt,
+    VideoTimelineEditRequest, VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType,
+    VisualMotion, CLIP_FPS, MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION,
+    MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -613,6 +613,11 @@ pub struct VideoScriptRequest {
     pub operation_id: String,
     pub cast: Vec<CastMember>,
     pub script: String,
+    /// Proceed although some characters are cast on voices that cannot perform the cues written
+    /// for them. The cues are removed rather than spoken; the writer has chosen to hear the lines
+    /// without them.
+    #[serde(default)]
+    pub accept_dropped_cues: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -965,6 +970,10 @@ pub struct NarrationReplacement {
     pub model_id: String,
     pub speaker: String,
     pub language: String,
+    /// How the take was performed, recorded on its binding so a later change of persona,
+    /// direction, or engine vocabulary re-reads exactly the lines it affects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance: Option<PerformanceRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -6283,6 +6292,8 @@ mod tests {
                 language: "en-US".to_string(),
                 delivery: super::super::CastDelivery::default(),
                 consent_reference_id: None,
+                persona: None,
+                ensemble: 1,
                 notes: None,
                 created_at: utc_now(),
             },
@@ -6295,6 +6306,8 @@ mod tests {
                 language: "en-US".to_string(),
                 delivery: super::super::CastDelivery::default(),
                 consent_reference_id: None,
+                persona: None,
+                ensemble: 1,
                 notes: None,
                 created_at: utc_now(),
             },
@@ -6345,6 +6358,8 @@ mod tests {
             language: "en-US".to_string(),
             delivery: Default::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: utc_now(),
         });
@@ -6597,6 +6612,7 @@ mod tests {
             base_version_id: version_id,
             operation_id: "script-draft-1".to_string(),
             cast: script_cast(),
+            accept_dropped_cues: false,
             script: script.to_string(),
         };
 
@@ -6663,6 +6679,7 @@ mod tests {
                 operation_id: "script-draft-2".to_string(),
                 cast: script_cast(),
                 script: script.replace("She did not answer.", "She said nothing at all."),
+                accept_dropped_cues: false,
             })
             .expect("commit the revised script");
         assert_eq!(revised.receipt.new_turn_ids.len(), 1);
@@ -8277,6 +8294,7 @@ mod tests {
                 model_id: "test/voice-model".to_string(),
                 speaker: "speaker-new".to_string(),
                 language: "en".to_string(),
+                performance: None,
             }],
         };
         let replacement = workspace
@@ -8402,6 +8420,7 @@ mod tests {
                 model_id: "test/voice-model".to_string(),
                 speaker: "speaker-new".to_string(),
                 language: "en".to_string(),
+                performance: None,
             }],
         };
         let cancellation_observed = Arc::new(AtomicBool::new(false));
@@ -17815,6 +17834,7 @@ impl VideoStudioService {
                 speaker: replacement.speaker.clone(),
                 language: replacement.language.clone(),
                 script_sha256: script_sha,
+                performance: replacement.performance.clone(),
                 created_at: utc_now(),
             };
             binding.validate()?;

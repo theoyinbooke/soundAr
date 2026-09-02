@@ -73,6 +73,30 @@ class EngineContractRegistry:
         instruction = str(request.get("instruction") or "").strip()
         if len(instruction) > 1_000:
             raise ValueError("Voice instructions are limited to 1,000 characters.")
+        expressive = self.expressiveness(engine)
+        if instruction and not expressive["instruction"]:
+            raise ValueError(
+                f"{manifest['display_name']} does not follow a voice instruction. "
+                "Choose an instruction-following model such as Breeze TTS 2."
+            )
+
+        raw_ensemble = request.get("ensemble", 1)
+        if raw_ensemble is None:
+            raw_ensemble = 1
+        if isinstance(raw_ensemble, bool) or (
+            isinstance(raw_ensemble, float) and not raw_ensemble.is_integer()
+        ):
+            raise ValueError("ensemble must be a whole number between 1 and 4.")
+        try:
+            ensemble = int(raw_ensemble)
+        except (TypeError, ValueError) as error:
+            raise ValueError("ensemble must be a whole number between 1 and 4.") from error
+        if not 1 <= ensemble <= 4:
+            raise ValueError("ensemble must be a whole number between 1 and 4.")
+        if ensemble > 1 and not expressive["ensemble"]:
+            raise ValueError(
+                f"{manifest['display_name']} does not layer ensemble takes."
+            )
 
         reference = request.get("reference_audio_path")
         voice_modes = manifest.get("voice_modes", [])
@@ -220,6 +244,28 @@ class EngineContractRegistry:
             raise ValueError("seed must be an integer.")
         if not 0 <= seed <= 4_294_967_295:
             raise ValueError("seed must be between 0 and 4294967295.")
+
+    def expressiveness(self, engine: str) -> dict[str, Any]:
+        """What an engine can do beyond reading words, as its manifest declares it.
+
+        Every field has a value so a caller never has to guess: an engine that declares nothing
+        performs nothing, follows no instruction, and layers no takes.
+        """
+        declared = dict(self.get(engine).get("expressive") or {})
+        vocabulary = str(declared.get("vocal_events") or "none").strip().lower()
+        if vocabulary not in {"none", "parenthesis", "bracket"}:
+            raise RuntimeError(
+                f"Engine {engine} declares an unknown vocal vocabulary: {vocabulary}"
+            )
+        cfg_scale = declared.get("instruction_cfg_scale")
+        return {
+            "instruction": bool(declared.get("instruction", False)),
+            "instruction_cfg_scale": float(cfg_scale) if cfg_scale is not None else None,
+            "vocal_events": vocabulary,
+            "supported_events": [str(event) for event in declared.get("supported_events", [])],
+            "ensemble": bool(declared.get("ensemble", False)),
+            "energy_control": declared.get("energy_control"),
+        }
 
     def normalize_language(self, engine: str, language: str) -> str:
         manifest = self.get(engine)

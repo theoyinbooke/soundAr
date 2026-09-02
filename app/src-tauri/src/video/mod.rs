@@ -29,6 +29,7 @@ pub mod shots;
 pub mod sound;
 pub mod timeline;
 pub mod visuals;
+pub mod vocal_events;
 
 pub use assembly::{
     build_ass_document, build_timeline_render_plan, plan_caption_preview_pages,
@@ -41,8 +42,8 @@ pub use cache::{
 };
 pub use cast::{
     index_cast_by_name, parse_dialogue_script, CastDelivery, CastMember, DialogueTurn, ParsedTurn,
-    MAX_CAST_MEMBERS, MAX_DIALOGUE_TURNS, MAX_DIRECTION_BYTES, MAX_SCRIPT_BYTES,
-    MAX_TURN_TEXT_BYTES,
+    MAX_CAST_MEMBERS, MAX_DIALOGUE_TURNS, MAX_DIRECTION_BYTES, MAX_ENSEMBLE, MAX_PERSONA_BYTES,
+    MAX_SCRIPT_BYTES, MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
 pub use cover::{
@@ -145,4 +146,8 @@ pub use visuals::{
     VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
     MAX_VISUAL_ASSETS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_LAYERS,
     MAX_VISUAL_PIXELS,
+};
+pub use vocal_events::{
+    events_of, normalize_cues, render_for_vocabulary, segments_of, words_of, CueParse,
+    RenderedLine, ScriptSegment, VocalEvent, VocalVocabulary,
 };

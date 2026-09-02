@@ -13,6 +13,7 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from core.audio_utils import (
 from core.benchmark import BenchmarkCollector
 from core.gpu_manager import GPUManager
 from core.engine_contract import EngineContractRegistry
+from core.vocal_events import normalize_cues, render_for_vocabulary
 from core.hub_browser import HubBrowser
 from core.model_manager import ModelManager
 from core.music_engine import MusicEngine
@@ -45,6 +47,30 @@ from core.speaker_diarizer import (
     turns_from_windows,
 )
 from core.forced_aligner import ForcedAligner
+
+
+def mix_ensemble_takes(takes: list[np.ndarray], sample_rate: int) -> np.ndarray:
+    """Layer several takes of one reaction into a crowd.
+
+    Each take starts a little after the last, because people in a room do not laugh on the same
+    sample; the offsets are small enough that the reaction still lands on its cue. The sum is
+    scaled by the square root of the count, which is how uncorrelated sources add, and then held
+    under full scale so a loud room never clips.
+    """
+    if not takes:
+        raise ValueError("An ensemble needs at least one take.")
+    offset_samples = int(sample_rate * 0.09)
+    mono = [np.asarray(take, dtype=np.float32).reshape(-1) for take in takes]
+    length = max(offset_samples * index + take.size for index, take in enumerate(mono))
+    mixed = np.zeros(length, dtype=np.float32)
+    for index, take in enumerate(mono):
+        start = offset_samples * index
+        mixed[start:start + take.size] += take
+    mixed /= math.sqrt(len(mono))
+    peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+    if peak > 0.97:
+        mixed *= 0.97 / peak
+    return mixed
 
 
 class Runtime:
@@ -701,6 +727,28 @@ class Runtime:
         engine_name = str(installed.get("engine", self.manager.detect_engine(model_id)))
         self._validate_scope(engine_name)
         language = self.contracts.validate_synthesis(engine_name, request)
+        # A cue is performed in the engine's own vocabulary or removed - never read as a word.
+        # This runs for every caller, so a line typed into Generate or sent to the local API is
+        # treated the same as one performed in an episode.
+        expressive = self.contracts.expressiveness(engine_name)
+        rendered = render_for_vocabulary(
+            normalize_cues(text).canonical,
+            expressive["vocal_events"],
+        )
+        dropped_events = list(rendered.dropped)
+        text = rendered.text
+        if not text:
+            raise ValueError(
+                "This line is only vocal cues, and the selected model performs none of them. "
+                "Choose a model that performs cues, such as Breeze TTS 2, or write words."
+            )
+        instruction = str(request.get("instruction") or "").strip()
+        cfg_scale = request.get("cfg_scale")
+        if instruction and cfg_scale is None and expressive["instruction_cfg_scale"]:
+            # An engine that follows an instruction needs guidance to follow it; the manifest
+            # says how much. A caller that names its own scale keeps it.
+            cfg_scale = float(expressive["instruction_cfg_scale"])
+        ensemble = int(request.get("ensemble") or 1)
         model_path = str(installed.get("local_path", ""))
         self.stt_engine.unload_model()
         self.speaker_verifier.unload_model()
@@ -743,28 +791,49 @@ class Runtime:
                 "sequence": sequence,
             })
 
-        result = self.engine.synthesize(
-            text=text,
-            speaker=str(request.get("speaker") or "default"),
-            language=language,
-            reference_audio=reference_audio,
-            reference_sr=reference_sr,
-            controls={
-                "speed": float(request.get("speed", 1.0)),
-                "exaggeration": float(request.get("exaggeration", 0.5)),
-                "cfg_weight": float(request.get("cfg_weight", 0.5)),
-                "temperature": float(request.get("temperature", 0.8)),
-                "top_p": float(request.get("top_p", 0.95)),
-                "repetition_penalty": float(request.get("repetition_penalty", 1.2)),
-                "cfg_scale": float(request.get("cfg_scale", 1.0)),
-                "instruction": str(request.get("instruction") or "Speak clearly and naturally."),
-                "seed": int(request.get("seed", 0)),
-            },
-            progress_callback=publish_preview if preview_path is not None else None,
-        )
+        base_seed = int(request.get("seed", 0))
+        controls = {
+            "speed": float(request.get("speed", 1.0)),
+            "exaggeration": float(request.get("exaggeration", 0.5)),
+            "cfg_weight": float(request.get("cfg_weight", 0.5)),
+            "temperature": float(request.get("temperature", 0.8)),
+            "top_p": float(request.get("top_p", 0.95)),
+            "repetition_penalty": float(request.get("repetition_penalty", 1.2)),
+            "cfg_scale": float(cfg_scale if cfg_scale is not None else 1.0),
+            "instruction": instruction or "Speak clearly and naturally.",
+            "seed": base_seed,
+        }
+        takes = []
+        for index in range(max(1, ensemble)):
+            # Each layered take is a different performance of the same line, so it gets its own
+            # seed; the first keeps the caller's so a single take is reproducible as before.
+            controls_for_take = dict(controls)
+            controls_for_take["seed"] = (base_seed + index * 7_919) % 4_294_967_296
+            takes.append(
+                self.engine.synthesize(
+                    text=text,
+                    speaker=str(request.get("speaker") or "default"),
+                    language=language,
+                    reference_audio=reference_audio,
+                    reference_sr=reference_sr,
+                    controls=controls_for_take,
+                    progress_callback=(
+                        publish_preview if preview_path is not None and index == 0 else None
+                    ),
+                )
+            )
+        result = takes[0]
+        if len(takes) > 1:
+            mixed = mix_ensemble_takes([take.audio for take in takes], result.sample_rate)
+            result = replace(
+                result,
+                audio=mixed,
+                duration_seconds=len(mixed) / result.sample_rate,
+                inference_seconds=sum(take.inference_seconds for take in takes),
+            )
         metrics = collector.stop(model_id, engine_name, "tts", result.duration_seconds)
 
-        return self._write_generated_audio(
+        written = self._write_generated_audio(
             request=request,
             model_id=model_id,
             engine_name=engine_name,
@@ -774,6 +843,18 @@ class Runtime:
             metrics=metrics,
             generation_kind="speech",
         )
+        # What the engine was actually handed travels back with the take, so a caller can see a
+        # cue that was dropped rather than assume it was performed.
+        written["performance"] = {
+            "engine": engine_name,
+            "rendered_text": text,
+            "vocabulary": expressive["vocal_events"],
+            "dropped_events": dropped_events,
+            "instruction": instruction or None,
+            "cfg_scale": controls["cfg_scale"] if instruction else None,
+            "ensemble": max(1, ensemble),
+        }
+        return written
 
     def generate_music(self, request: dict[str, object]) -> dict[str, object]:
         """Generate a short local music draft from a text prompt."""

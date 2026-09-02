@@ -259,6 +259,8 @@ mod tests {
             language: "en-US".into(),
             delivery: CastDelivery::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: timestamp(),
         }

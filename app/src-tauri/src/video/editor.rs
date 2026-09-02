@@ -2967,6 +2967,8 @@ mod tests {
                 language: "en-US".into(),
                 delivery: CastDelivery::default(),
                 consent_reference_id: None,
+                persona: None,
+                ensemble: 1,
                 notes: None,
                 created_at: NOW.into(),
             });
@@ -3091,6 +3093,7 @@ mod tests {
                 speaker: member.name.clone(),
                 language: member.language.clone(),
                 script_sha256: format!("{:x}", Sha256::digest(turn.text.as_bytes())),
+                performance: None,
                 created_at: NOW.into(),
             });
         }
@@ -3901,6 +3904,7 @@ mod tests {
             speaker: "speaker".into(),
             language: "en".into(),
             script_sha256: format!("{:x}", Sha256::digest(script.as_bytes())),
+            performance: None,
             created_at: NOW.into(),
         });
         manifest.validate_strict().unwrap();

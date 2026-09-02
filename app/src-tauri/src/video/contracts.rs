@@ -1446,7 +1446,128 @@ pub struct NarrationBinding {
     pub character_id: Option<String>,
     pub language: String,
     pub script_sha256: String,
+    /// How the take was performed: the instruction the voice was steered with, the vocabulary its
+    /// cues were written in, and the cues it could not perform. Takes recorded before delivery
+    /// reached the engine carry none, which is also how they were made.
+    #[serde(default)]
+    pub performance: Option<PerformanceRecord>,
     pub created_at: String,
+}
+
+/// What a voice was asked to do beyond the words: the delivery a take was produced under.
+///
+/// A take whose performance no longer matches its character's persona, its line's direction, or
+/// the vocabulary its engine reads is stale in exactly the way a take of changed words is stale.
+/// The fingerprint is what makes that comparison one string.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceRecord {
+    /// The instruction sent to the engine: persona, then direction. `None` when the engine does
+    /// not follow one.
+    #[serde(default)]
+    pub instruction: Option<String>,
+    /// The vocabulary the line's cues were rendered in.
+    #[serde(default)]
+    pub vocabulary: super::vocal_events::VocalVocabulary,
+    /// Distinct takes layered into this one.
+    #[serde(default = "one_take")]
+    pub ensemble: u8,
+    /// Cues the line asked for that this voice cannot perform, and therefore did not.
+    #[serde(default)]
+    pub dropped_events: Vec<super::vocal_events::VocalEvent>,
+    /// The text the engine was handed, after cue rendering.
+    pub rendered_text: String,
+    /// Guidance strength for the instruction, in thousandths, where the engine declares one.
+    #[serde(default)]
+    pub cfg_scale_milli: Option<i32>,
+    /// Emotion strength for an engine that takes one, in thousandths of its 0..1 range.
+    #[serde(default)]
+    pub exaggeration_milli: Option<i32>,
+    /// SHA-256 over rendered text, instruction, vocabulary, ensemble, and engine controls.
+    pub fingerprint: String,
+}
+
+fn one_take() -> u8 {
+    1
+}
+
+impl PerformanceRecord {
+    /// Describe a performance before it happens, so the same inputs always name the same take.
+    pub fn new(
+        rendered_text: impl Into<String>,
+        instruction: Option<String>,
+        vocabulary: super::vocal_events::VocalVocabulary,
+        ensemble: u8,
+        dropped_events: Vec<super::vocal_events::VocalEvent>,
+        cfg_scale_milli: Option<i32>,
+        exaggeration_milli: Option<i32>,
+    ) -> Self {
+        let rendered_text = rendered_text.into();
+        let instruction = instruction.filter(|value| !value.trim().is_empty());
+        let mut hasher = Sha256::new();
+        hasher.update(b"performance-v1");
+        for field in [
+            rendered_text.as_str(),
+            instruction.as_deref().unwrap_or_default(),
+            vocabulary.as_str(),
+            &ensemble.to_string(),
+            &cfg_scale_milli
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            &exaggeration_milli
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ] {
+            hasher.update([0x1f]);
+            hasher.update(field.as_bytes());
+        }
+        Self {
+            instruction,
+            vocabulary,
+            ensemble,
+            dropped_events,
+            rendered_text,
+            cfg_scale_milli,
+            exaggeration_milli,
+            fingerprint: format!("{:x}", hasher.finalize()),
+        }
+    }
+
+    pub fn cfg_scale(&self) -> Option<f64> {
+        self.cfg_scale_milli.map(|value| f64::from(value) / 1000.0)
+    }
+
+    pub fn exaggeration(&self) -> Option<f64> {
+        self.exaggeration_milli
+            .map(|value| f64::from(value) / 1000.0)
+    }
+}
+
+impl Validate for PerformanceRecord {
+    fn validate(&self) -> VideoResult<()> {
+        if let Some(instruction) = &self.instruction {
+            if instruction.trim().is_empty() || instruction.len() > 1_200 {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidNarration,
+                    "a performance instruction must be non-empty and at most 1200 bytes",
+                )
+                .at("narration_bindings.performance.instruction"));
+            }
+        }
+        if !(1..=super::cast::MAX_ENSEMBLE).contains(&self.ensemble) {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidNarration,
+                "a performance layers between 1 and 4 takes",
+            )
+            .at("narration_bindings.performance.ensemble"));
+        }
+        validate_sha256(
+            &self.fingerprint,
+            "narration_bindings.performance.fingerprint",
+            VideoErrorCode::InvalidNarration,
+        )?;
+        Ok(())
+    }
 }
 
 impl Validate for NarrationBinding {
@@ -1479,6 +1600,9 @@ impl Validate for NarrationBinding {
             "narration_bindings.script_sha256",
             VideoErrorCode::InvalidNarration,
         )?;
+        if let Some(performance) = &self.performance {
+            performance.validate()?;
+        }
         validate_timestamp_text(&self.created_at, "narration_bindings.created_at")?;
         Ok(())
     }
@@ -3173,6 +3297,8 @@ mod tests {
             language: "en-US".into(),
             delivery: super::super::cast::CastDelivery::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: timestamp(),
         });
@@ -3185,6 +3311,8 @@ mod tests {
             language: "en-US".into(),
             delivery: super::super::cast::CastDelivery::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: timestamp(),
         });
@@ -3240,6 +3368,7 @@ mod tests {
                 "{:x}",
                 Sha256::digest("The harmattan came early.".as_bytes())
             ),
+            performance: None,
             created_at: timestamp(),
         });
         manifest
@@ -3518,6 +3647,7 @@ mod tests {
             speaker: "af_heart".into(),
             language: "en-US".into(),
             script_sha256: format!("{:x}", Sha256::digest(script.as_bytes())),
+            performance: None,
             created_at: timestamp(),
         });
         manifest.validate_strict().unwrap();

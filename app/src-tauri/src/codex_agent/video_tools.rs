@@ -1797,6 +1797,8 @@ fn cast_schema() -> Value {
                 },
                 "consent_reference_id": {"type": ["string", "null"], "description": "Required when a cloned managed voice performs this character"},
                 "notes": {"type": ["string", "null"]},
+                "persona": {"type": ["string", "null"], "maxLength": 600, "description": "Who this voice is, as a voice-design instruction: age, character, energy, delivery. Sent to an engine that follows instructions (Breeze TTS 2). Give every character one."},
+                "ensemble": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Distinct takes layered for this character's reaction lines, so a crowd sounds like a crowd. 1 for a single voice."},
                 "created_at": {"type": "string", "description": "UTC RFC3339 timestamp"}
             }
         }
@@ -1973,8 +1975,12 @@ fn video_script_schema() -> Value {
             (
                 "script",
                 string(
-                    "Speaker-attributed script. Each turn opens with `NAME:` naming a declared cast member; following lines continue it and a blank line closes it. A leading `(direction)` steers performance and is never spoken.",
+                    "Speaker-attributed script. Each turn opens with `NAME:` naming a declared cast member; following lines continue it and a blank line closes it. A leading `(direction)` steers performance and is never spoken. A vocal cue - (laughs), (sighs), (chuckles), (clears throat), (gasps), (applause) - may stand anywhere in a line and is performed, not read; a line that is only cues, such as an audience's `(laughs)`, is a reaction. Characters with cues must be cast on a voice that performs them; the tool refuses otherwise and names the voice that can.",
                 ),
+            ),
+            (
+                "accept_dropped_cues",
+                json!({"type":"boolean","description":"Proceed although some characters' voices cannot perform the cues written for them; those cues are removed, never spoken. Not accepted for a reaction line."}),
             ),
         ]),
     )
