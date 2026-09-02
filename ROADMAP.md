@@ -1509,6 +1509,32 @@ with nothing to film has always done: b-roll.
 Measured on an RTX 4080 Laptop 12 GB: 864x480, 39 frames, 8 steps, text encoder on CPU, peak
 11.5 GB VRAM, 74 s per clip. 768p and longer clips exceed the compute buffer on that card.
 
+## Resolved: An Audience That Said the Word "Laughter"
+
+A comedy episode wrote its audience as `[Laughter]`, cast it on a voice that performs no vocal
+events, and shipped on a flat colour card sixty-three seconds long against a thirty-second brief.
+Every gate that existed passed it. `docs/show-production-harness.md` records the evaluation and the
+design; the short version:
+
+- **Cues are performed, never read.** Every spelling of a cue becomes one canonical token, rendered
+  into each engine's own vocabulary at take time and removed, with the removal recorded, where the
+  voice has none. `write_video_script` refuses a cast that cannot perform its script.
+- **A persona steers the voice.** A character's persona and a line's direction reach an
+  instruction-following engine at the guidance its manifest asks for, and each take records the
+  performance it was made under.
+- **Length is a contract.** A format's target carries a tolerance, the listening report measures
+  against it, and an episode outside it is a blocking finding.
+- **The quality check gates the release.** A check is recorded against what it listened to; a
+  missing, stale, or blocking check blocks the audio, the master, and the audiogram. Findings can
+  be accepted; the absence of a check cannot.
+- **The picture is footage in the show's world, or a motion backdrop.** A format carries a look;
+  shots are generated in the episode's aspect and set in that world; the flat card is retired for a
+  drawn backdrop; a backdrop is not shipped where footage could be made unless the writer chooses.
+- **The recipe is a file.** `app/src-tauri/prompts/producer.md`, held to the tool catalog by a test.
+
+Recorded and not fixed in this pass: a music bed still cannot render (sidechain ducking has no
+render plan), and sound layers do not reach the master.
+
 ## Version Numbering
 
 The version line was reset to `0.1.1` on 2026-08-30. Work had reached `0.8.8` in a few weeks, which

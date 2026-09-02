@@ -48,6 +48,8 @@ Supported path overrides are:
 | local CTranslate2 model | `SOUNDAR_WHISPER_MODEL_PATH` |
 | whisper.cpp CLI | `SOUNDAR_WHISPER_CPP_PATH` |
 | NVIDIA status tool | `SOUNDAR_NVIDIA_SMI_PATH` |
+| stable-diffusion.cpp `sd-cli` (video generator) | `SOUNDAR_SD_CLI_PATH` |
+| MiniMax H3 weights directory | `SOUNDAR_H3_MODEL_DIR` |
 
 An override is accepted only when it resolves to an executable regular file. A discovered encoder is not considered usable until its runtime smoke test succeeds.
 
@@ -201,3 +203,14 @@ scripts/video/qualify_gpu_overlap.py \
 ```
 
 The harness synthesizes all media locally with FFmpeg lavfi, includes a two-second speech gap, validates every output through FFprobe and a first-frame decode, measures GPU/VRAM, verifies content-addressed cache reuse, and atomically publishes an immutable JSON report. See [video-studio-performance.md](video-studio-performance.md) for the exact-machine baseline and regression thresholds.
+
+## Footage for a performed episode
+
+A show performed by voices has nothing to film. Where `sd-cli` and a MiniMax H3 distilled
+checkpoint are installed, soundAr generates short shots in the episode's own aspect, set in the
+world the show's look describes, and cuts them across the narration. Where they are not, it draws a
+motion backdrop with FFmpeg alone: a drifting field in the show's palette under grain and a
+vignette, with the title and a speaker card burned in. `sd-cli` is discovered like FFmpeg and
+reported in runtime status whether present or absent; the weights are never bundled, and the
+directory is found through `SOUNDAR_H3_MODEL_DIR`, `~/.soundAr/models/minimax-h3`, or a registry
+entry with engine `minimax-h3`.

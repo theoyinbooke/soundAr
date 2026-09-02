@@ -282,11 +282,15 @@ impl VideoAgentOperation {
             }
             Self::EnsureEpisodeCover(request) => require_text(&request.project_id, "project_id"),
             Self::GenerateEpisodeClips(request) => {
+                // Blank shots are dropped by the planner and an empty list falls back to the
+                // show's look; a list of only blanks is a caller that meant to write something.
                 require_text(&request.project_id, "project_id")?;
-                if request.shots.iter().all(|shot| shot.trim().is_empty()) {
+                if !request.shots.is_empty()
+                    && request.shots.iter().all(|shot| shot.trim().is_empty())
+                {
                     return Err(VideoAgentToolError::new(
                         "video.shots_not_described",
-                        "Describe what each shot shows",
+                        "Describe what each shot shows, or send no shots to use the show's look",
                     ));
                 }
                 Ok(())

@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.1.4 - 2026-09-01
+
+- Performed vocal cues instead of reading them. A comedy episode wrote its audience as
+  `[Laughter]` and cast it on a voice that performs no vocal events, so the audience said the word.
+  Every spelling of a cue - `(laughs)`, `[chuckles]`, `*giggles*`, `[Laughter]` - now becomes one
+  canonical `(laugh)` token wherever it stands in a line, and is rendered into the engine's own
+  vocabulary when a take is requested: Breeze TTS 2 reads `(laugh)`, Chatterbox Turbo reads
+  `[laugh]`, and a voice with no vocabulary has the cue removed and the removal recorded rather
+  than spoken. A line that is only cues is a reaction, and a character may declare an ensemble so
+  a room laughs as several people. `write_video_script` refuses a cast that cannot perform its own
+  script and names the voice that can. The Generate screen and the local API get the same
+  treatment, because the bridge renders cues for every caller.
+- Steered a voice with its character. A cast member now carries a persona - who the voice is, as
+  a voice-design instruction - and it reaches an instruction-following engine together with the
+  line's direction, at the guidance scale the engine's manifest asks for. Each take records the
+  performance it was produced under, so a changed persona or direction re-reads exactly the lines
+  it affects and nothing else. Engine manifests declare what each voice can do beyond words.
+- Made an episode's length a contract. A show format carries a tolerance around its target, an
+  episode inherits both, the listening report says how far the performed length sits from the
+  target, and a performed episode outside tolerance is a blocking quality finding. Previously a
+  thirty-second show that ran sixty-three seconds passed every gate.
+- Taught quality control what a performed cue sounds like. A laugh a recogniser writes down as
+  "ha ha ha" is the cue performed and never an inserted word; a take that says "laughter" is
+  reported as a spoken cue; a cue the cast voice could not perform is reported as dropped.
+- Made the quality check a release gate. Each check is recorded against a fingerprint of
+  everything it listened to, and the release plan blocks the audio episode, the master, and the
+  audiogram while that record is missing, stale, or blocking. Findings can be accepted explicitly;
+  the absence of a check cannot.
+- Retired the flat card. An audio-only episode with no generator now gets a motion backdrop drawn
+  by FFmpeg alone: a slow-drifting radial field in the show's palette under grain and a vignette,
+  the title resolving over the first seconds, and a speaker card naming each character as they
+  begin to speak.
+- Gave a show a look. A format names the world the audience sees, a mood, and optionally a
+  palette. Every generated shot is set in that world, shots are generated in the episode's own
+  aspect so a portrait show gets portrait footage, a writer who supplies no shots gets three views
+  of the world, and the backdrop is coloured after the mood. The release plan refuses to ship a
+  backdrop while a video generator could have made footage, unless the writer chooses it.
+- Let a voice-design engine be cast as itself. A character whose voice_id is `__engine_default__`
+  on an engine that declares a default voice mode, such as Breeze TTS 2, is performed by the
+  engine's own designed voice steered by the character's persona; previously the Video Studio
+  narration path required a library voice, so Breeze could not be cast in a show at all.
+- Moved the producer's standing instructions out of a string literal into
+  `app/src-tauri/prompts/producer.md`, rewritten as the recipe a show is made by, with a test that
+  holds every tool it names to the catalog.
+
 ## 0.1.3 - 2026-08-31
 
 - Gave a performed episode moving pictures. Where a local video-generation model is installed,

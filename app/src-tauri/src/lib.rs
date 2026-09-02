@@ -1,3 +1,6 @@
+// The presented project is one large `json!` literal; the macro nests once per key.
+#![recursion_limit = "512"]
+
 mod agent_cli;
 mod codex_agent;
 mod store;

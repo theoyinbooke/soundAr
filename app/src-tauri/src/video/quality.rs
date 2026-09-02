@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 /// normalize the episode and change how it sounds.
 pub const LOUDNESS_TOLERANCE_MILLI: i32 = 1_000;
 
+/// How far a measured true peak may sit above the ceiling before it is worth reporting. A
+/// lossy encoder and a meter disagree by a tenth of a decibel or two on the same master; that
+/// is the measurement, not the mix.
+pub const TRUE_PEAK_TOLERANCE_MILLI: i32 = 300;
+
 /// How far a caption may sit from the word it belongs to before a viewer notices.
 pub const CAPTION_DRIFT_TOLERANCE_US: i64 = 250_000;
 
@@ -169,6 +174,11 @@ pub fn diff_spoken_words(expected: &str, heard: &str) -> Vec<WordDifference> {
     if expected_words.is_empty() && heard_words.is_empty() {
         return Vec::new();
     }
+    // A recogniser writes "good night" as "goodnight" and "smartphone" as "smart phone"; either
+    // way the same words were said. Two neighbours on one side that spell one word on the other
+    // are compared as that word.
+    let heard_words = join_compounds(heard_words, &expected_words);
+    let expected_words = join_compounds(expected_words, &heard_words);
 
     // Longest common subsequence over the normalized words. The alignment is what turns a raw
     // mismatch into "this word was replaced by that one" rather than a wall of insertions and
@@ -243,6 +253,35 @@ struct SpokenWord {
     normalized: String,
 }
 
+/// Merge adjacent words in `words` wherever their concatenation is a word in `against`.
+fn join_compounds(words: Vec<SpokenWord>, against: &[SpokenWord]) -> Vec<SpokenWord> {
+    let vocabulary = against
+        .iter()
+        .map(|word| word.normalized.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut joined = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while index < words.len() {
+        if index + 1 < words.len() {
+            let compound = format!("{}{}", words[index].normalized, words[index + 1].normalized);
+            if vocabulary.contains(compound.as_str()) {
+                joined.push(SpokenWord {
+                    original: format!("{} {}", words[index].original, words[index + 1].original),
+                    normalized: compound,
+                });
+                index += 2;
+                continue;
+            }
+        }
+        joined.push(SpokenWord {
+            original: words[index].original.clone(),
+            normalized: words[index].normalized.clone(),
+        });
+        index += 1;
+    }
+    joined
+}
+
 fn normalize_words(text: &str) -> Vec<SpokenWord> {
     text.split_whitespace()
         .filter_map(|word| {
@@ -256,10 +295,53 @@ fn normalize_words(text: &str) -> Vec<SpokenWord> {
             }
             Some(SpokenWord {
                 original: word.to_string(),
-                normalized,
+                normalized: spell_number(&normalized),
             })
         })
         .collect()
+}
+
+/// A recogniser writes "twenty" as "20"; the script wrote a word. Both are the same thing said,
+/// so digits up to ninety-nine are compared as the words a voice would say.
+fn spell_number(token: &str) -> String {
+    let Ok(value) = token.parse::<u32>() else {
+        return token.to_string();
+    };
+    const ONES: [&str; 20] = [
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+    ];
+    const TENS: [&str; 10] = [
+        "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
+    ];
+    match value {
+        0..=19 => ONES[value as usize].to_string(),
+        20..=99 if value % 10 == 0 => TENS[(value / 10) as usize].to_string(),
+        20..=99 => format!(
+            "{}{}",
+            TENS[(value / 10) as usize],
+            ONES[(value % 10) as usize]
+        ),
+        _ => token.to_string(),
+    }
 }
 
 /// Compare what a performed line was asked to do with what a recogniser heard.
@@ -554,7 +636,7 @@ pub fn findings_for_loudness(
             at_us: None,
         });
     }
-    if measured.true_peak_db_milli > true_peak_ceiling_milli {
+    if measured.true_peak_db_milli > true_peak_ceiling_milli + TRUE_PEAK_TOLERANCE_MILLI {
         findings.push(QcFinding {
             id: "qc-true-peak".to_string(),
             kind: QcFindingKind::TruePeakExceeded,
@@ -694,6 +776,41 @@ pub fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compound_is_the_same_words_said() {
+        assert!(diff_spoken_words(
+            "I'm the one paying. Good night!",
+            "I'm the one paying, goodnight."
+        )
+        .is_empty());
+        assert!(diff_spoken_words("my smartphone rang", "my smart phone rang").is_empty());
+        assert_eq!(diff_spoken_words("Good night", "good fight").len(), 1);
+    }
+
+    #[test]
+    fn digits_and_number_words_are_the_same_thing_said() {
+        assert!(diff_spoken_words("for twenty minutes", "for 20 minutes").is_empty());
+        assert!(diff_spoken_words("twenty-five past", "25 past").is_empty());
+        assert_eq!(
+            diff_spoken_words("for twenty minutes", "for 21 minutes").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_true_peak_a_hair_over_the_ceiling_is_the_meter_not_the_mix() {
+        let measured = LoudnessMeasurement {
+            integrated_lufs_milli: -16_000,
+            true_peak_db_milli: -1_400,
+        };
+        assert!(findings_for_loudness(measured, -16_000, -1_500).is_empty());
+        let hot = LoudnessMeasurement {
+            integrated_lufs_milli: -16_000,
+            true_peak_db_milli: -900,
+        };
+        assert_eq!(findings_for_loudness(hot, -16_000, -1_500).len(), 1);
+    }
 
     #[test]
     fn a_performed_laugh_is_not_an_inserted_word_but_a_read_one_is() {

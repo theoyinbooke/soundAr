@@ -25,6 +25,8 @@ soundAr is an open-source desktop application for high-quality, private media pr
 - Import one explicitly authorized link or local video, transcribe it on the source clock, review candidate moments, and export a portrait reel.
 - Start a video from a prompt, existing soundAr audio, or a project and build an animated podcast with captions, cards, waveform motion, speech, and music.
 - Compose still images and locally generated illustrations as timed visual layers with crop, fit, fades, and keyframed pan-and-zoom motion—without a conventional video-generation model.
+- Perform a written show with a cast of local voices: each character carries a persona, vocal cues such as `(laughs)` and `(sighs)` are performed rather than read, an audience laughs as several voices, and the episode is measured against its show's target length before it is released.
+- Give a show performed by voices something to look at: short generated shots cut across the narration in the show's own world where a local video generator is installed, and a drawn motion backdrop in the show's palette where it is not.
 - Split, trim, reorder, and merge scenes on the durable source-clock timeline; drag and resize captions directly on the portrait canvas and choose from eight rendered caption treatments.
 - Revise a scene, voice, caption style, crop, mix, or opening conversationally and rerender only invalidated work.
 - Build longer work in chapter-based Projects and render chapters independently.
@@ -96,6 +98,8 @@ Independent generations, project chapters, and batch rows use one durable schedu
 ## Creative Producer
 
 The optional Assistant pane connects to an existing Codex CLI installation and uses the ChatGPT account already managed by Codex. soundAr never installs Codex, reads its credential files, or asks for an API key. It searches the ordinary Linux executable locations and common Node, Rust, Flatpak, Snap, mise, nvm, fnm, pnpm, and user-local locations, then selects the newest valid installation so a stale launcher PATH cannot hide the current model catalog. `SOUNDAR_CODEX_BIN` or `CODEX_BIN` can intentionally pin an exact executable. When no valid installation is found, the pane explains what is missing without changing the machine.
+
+The assistant follows a written recipe for a performed show (`app/src-tauri/prompts/producer.md`): format, cast, cues, narrate, listen, picture, score, check, release. Each step's tool refuses to be skipped - a cast that cannot perform its own script, an episode outside its length tolerance, a release without a current quality check, or a backdrop where footage could be made - so a forgotten step is refused rather than trusted.
 
 The assistant is designed for goals, not just exact generation commands. It can:
 

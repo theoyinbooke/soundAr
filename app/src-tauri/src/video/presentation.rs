@@ -496,6 +496,8 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "cast": cast,
             "dialogue": dialogue,
             "format_origin": manifest.format_origin,
+            "length_target": manifest.length_target,
+            "look": manifest.look,
             "lexicon": lexicon,
             "music_cues": music_cues,
             "sound_assets": sound_assets,

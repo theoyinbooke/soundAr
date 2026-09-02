@@ -3676,6 +3676,10 @@ fn sha256_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+/// The voice id a character declares to be performed by an engine's own designed voice rather
+/// than a library entry. The assistant's speech tool uses the same token.
+pub(crate) const ENGINE_DEFAULT_VOICE_ID: &str = "__engine_default__";
+
 fn resolve_voice_revision_route(
     runtime: &RuntimeState,
     selection: VoiceRevisionSelection,
@@ -3712,6 +3716,52 @@ fn resolve_voice_revision_route(
             "video.language_unsupported: {} does not support {}",
             selection.model_id, selection.language
         ));
+    }
+    // An engine that designs its voice from an instruction has no library voice to pick: Breeze
+    // is cast as itself, and the character's persona is what makes it someone. The route names
+    // the engine's own default speaker, and no library entry is consulted or required.
+    if selection.voice_id == ENGINE_DEFAULT_VOICE_ID || selection.voice_id == "default" {
+        let engine = model
+            .get("engine")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let manifests = read_json(
+            runtime.runtime_root.join("data/engine_manifests.json"),
+            json!({ "engines": [] }),
+        );
+        let designs_its_voice = manifests
+            .get("engines")
+            .and_then(Value::as_array)
+            .and_then(|engines| {
+                engines.iter().find(|manifest| {
+                    manifest.get("id").and_then(Value::as_str) == Some(engine.as_str())
+                })
+            })
+            .and_then(|manifest| manifest.get("voice_modes"))
+            .and_then(Value::as_array)
+            .is_some_and(|modes| modes.iter().any(|mode| mode.as_str() == Some("default")));
+        if !designs_its_voice {
+            return Err(format!(
+                "video.voice_unavailable: {} has no engine-default voice; choose a preset or consent-backed library voice for it",
+                selection.model_id
+            ));
+        }
+        let voice_name = format!(
+            "{} default voice",
+            model
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or(selection.model_id.as_str())
+        );
+        return Ok(ResolvedVoiceRoute {
+            selection: VoiceRevisionSelection {
+                speaker: "default".to_string(),
+                ..selection
+            },
+            voice_name,
+            reference_audio_path: None,
+        });
     }
     let voice = runtime
         .store
