@@ -82,7 +82,6 @@ jobs:
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           retryAttempts: 3
-          args: --bundles deb,appimage
       - name: Verify Linux bundles
         run: ./scripts/verify-linux-bundles.sh "${GITHUB_REF_NAME#v}"
       - name: Verify clean install and previous-release upgrade journey
@@ -107,8 +106,6 @@ jobs:
           files=(
             "app/src-tauri/target/release/bundle/deb/soundAr_${version}_amd64.deb"
             "app/src-tauri/target/release/bundle/deb/soundAr_${version}_amd64.deb.sig"
-            "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage"
-            "app/src-tauri/target/release/bundle/appimage/soundAr_${version}_amd64.AppImage.sig"
             install-linux.sh
             setup-runtime.sh
             setup-engine-runtime.sh
@@ -134,9 +131,7 @@ jobs:
       - name: Attest release packages
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: |
-            app/src-tauri/target/release/bundle/deb/soundAr_*.deb
-            app/src-tauri/target/release/bundle/appimage/soundAr_*.AppImage
+          subject-path: app/src-tauri/target/release/bundle/deb/soundAr_*.deb
       - name: Attach installer, runtime manifest, and checksums
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -162,8 +157,6 @@ jobs:
           for asset in \
             "soundAr_${version}_amd64.deb" \
             "soundAr_${version}_amd64.deb.sig" \
-            "soundAr_${version}_amd64.AppImage" \
-            "soundAr_${version}_amd64.AppImage.sig" \
             latest.json install-linux.sh setup-runtime.sh setup-engine-runtime.sh requirements-runtime.txt \
             common.txt kokoro.txt transformers.txt speaker-verification.txt alignment.txt \
             speecht5.txt chatterbox.txt coqui.txt nemo.txt musicgen.txt acestep.txt breeze.txt \
