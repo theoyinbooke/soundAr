@@ -90,7 +90,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           previous_tag="$(gh release list --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')"
-          [[ -n "$previous_tag" ]] || { echo "No previous stable release is available for upgrade verification." >&2; exit 1; }
+          # The version line was reset on 2026-08-30 and the pre-reset releases were retired, so
+          # the first release of the new line has nothing to upgrade from. That is a clean install
+          # verified below by the bundle checks, not a missing prerequisite.
+          if [[ -z "$previous_tag" ]]; then
+            echo "No previous stable release exists; this is the first release of the line, so the upgrade journey is skipped." >&2
+            exit 0
+          fi
           previous_dir="$(mktemp -d)"
           gh release download "$previous_tag" --pattern '*_amd64.deb' --dir "$previous_dir"
           previous_deb="$(find "$previous_dir" -maxdepth 1 -type f -name '*_amd64.deb' -print -quit)"
