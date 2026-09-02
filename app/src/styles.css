@@ -1705,6 +1705,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .assistant-canvas.is-idle { padding-bottom: clamp(36vh, calc(36vh + (100vh - 800px) * 0.3), 50vh); }
 /* On a tall full-screen window the same 36vh leaves the greeting sitting at mid-height, which reads
    as low; the extra height is spent above the composer so it rises with the window. */
+/* A full-screen canvas is a bigger room: the greeting and composer grow with it and sit higher,
+   so the page reads as an opening rather than a small form floating mid-screen. */
+@media (min-width: 1400px) and (min-height: 900px) {
+  .assistant-canvas.is-idle { padding-bottom: 54vh; }
+  .assistant-canvas.is-idle .assistant-column { width: min(100%, 960px); }
+  .assistant-canvas.is-idle .assistant-hero { padding-bottom: 34px; }
+  .assistant-canvas.is-idle .assistant-hero h1 { font-size: 44px; }
+  .assistant-canvas.is-idle .assistant-hero p { font-size: 19px; margin-top: 10px; }
+  .assistant-canvas.is-idle .assistant-composer { border-radius: 18px; }
+  .assistant-canvas.is-idle .assistant-composer textarea { min-height: 104px; padding: 18px 18px 8px; font-size: 16px; }
+  .assistant-canvas.is-idle .assistant-composer-bar { min-height: 46px; padding: 4px 10px 10px; }
+}
 .assistant-canvas .assistant-composer { background: var(--surface); }
 .assistant-canvas .assistant-message.is-user { max-width: 74%; }
 .assistant-canvas .assistant-message p { font-size: 13px; }

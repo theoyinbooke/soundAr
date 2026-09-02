@@ -74,11 +74,11 @@ export default function App() {
     showView("video");
   }, [showView]);
 
-  // Selecting finished work should play it, not drop the user into the editor. History already
-  // holds the playable master, so preview focuses it there and leaves editing an explicit step.
+  // Selecting a video, finished or draft, opens that video in Video Studio, where it can be
+  // played, revised, and exported. History is for audio generations.
   const previewVideoProject = useCallback((projectId: string) => {
     setSelectedVideoProjectId(projectId);
-    showView("history");
+    showView("video");
   }, [showView]);
 
   const markVideoChanged = useCallback(() => {

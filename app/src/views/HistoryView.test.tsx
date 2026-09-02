@@ -41,49 +41,16 @@ const damaged: HistoryItem = {
 };
 
 describe("History artifact integrity", () => {
-  it("keeps final video masters playable, downloadable, and linked to Video Studio", async () => {
-    const user = userEvent.setup();
-    const onOpenProject = vi.fn();
-    render(<VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={onOpenProject}>
+  it("keeps videos out of History: they open in Video Studio, not here", async () => {
+    // A video, draft or finished, is Video Studio's; History holds audio generations. A master
+    // grid here used to sit above every record and pulled a click on a video into this page.
+    render(<VideoIntegrationProvider service={createBrowserPreviewVideoService()} onOpenProject={vi.fn()}>
       <HistoryView history={[]} onChange={vi.fn()} />
     </VideoIntegrationProvider>);
 
-    const player = await screen.findByLabelText("Play Creator update · Portrait master");
-    const card = player.closest("article");
-    expect(card).not.toBeNull();
-    // Exports are saved through the shell, never through an anchor: a cross-origin `<a download>`
-    // navigates the window to the file rather than saving it.
-    expect(within(card!).queryByRole("link")).not.toBeInTheDocument();
-    // Browser preview has no filesystem, so there is nothing to save — and never an `<a download>`,
-    // which the desktop webview would follow as a navigation instead of a save.
-    expect(within(card!).queryByRole("button", { name: /^Save / })).not.toBeInTheDocument();
-    await user.click(within(card!).getByRole("button", { name: "Open in Video Studio" }));
-    expect(onOpenProject).toHaveBeenCalledWith("creator-update-master");
-  });
-
-  it("plays the selected master in place instead of sending the user to the editor", async () => {
-    // Choosing finished work from the sidebar lands here, on the master's own player. Opening the
-    // Video Studio editor stays an explicit, separate action on the card.
-    const onOpenProject = vi.fn();
-    Element.prototype.scrollIntoView = vi.fn();
-    const service = createBrowserPreviewVideoService();
-    const projects = await service.listVideoProjects();
-    const target = projects.find((project) => project.master);
-    expect(target).toBeDefined();
-
-    render(<VideoIntegrationProvider service={service} onOpenProject={onOpenProject} activeProjectId={target!.id}>
-      <HistoryView history={[]} onChange={vi.fn()} />
-    </VideoIntegrationProvider>);
-
-    const player = await screen.findByLabelText(`Play ${target!.master!.title}`);
-    expect(player).toBeInstanceOf(HTMLVideoElement);
-    expect(player).toHaveAttribute("controls");
-    const card = player.closest("article");
-    expect(card).toHaveClass("is-selected");
-    expect(card).toHaveAttribute("aria-current", "true");
-    expect(card!.scrollIntoView).toHaveBeenCalled();
-    // Reaching the player must not have opened the editor.
-    expect(onOpenProject).not.toHaveBeenCalled();
+    expect(screen.queryByRole("heading", { name: "Video masters" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/^Play Creator update/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Videos live in Video Studio and Projects/)).toBeInTheDocument();
   });
 
   it("explains a modified artifact and disables playback and reveal", () => {

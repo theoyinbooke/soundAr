@@ -3831,7 +3831,20 @@ fn foundation_runtime_ready_for_install(python: &Path, allow_unmanaged: bool) ->
     };
     let manifest = read_json(runtime_dir.join("runtime.json"), json!({}));
     manifest.get("schema_version").and_then(Value::as_u64) == Some(2)
-        && manifest.get("transformers").and_then(Value::as_str) == Some("5.5.0")
+        && manifest.get("transformers").and_then(Value::as_str)
+            == Some(qualified_transformers_version())
+}
+
+/// The Transformers pin the shipped runtime is qualified against, read from the same
+/// requirements file the installer uses. Hard-coding it here once let a dependency bump leave a
+/// freshly installed runtime reported as "setup required".
+fn qualified_transformers_version() -> &'static str {
+    const RUNTIME_REQUIREMENTS: &str = include_str!("../../../requirements-runtime.txt");
+    RUNTIME_REQUIREMENTS
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("transformers=="))
+        .map(str::trim)
+        .unwrap_or("5.10.1")
 }
 
 fn engine_runtime_states(capabilities: &Value, worker_pool: &[PythonProcess]) -> Vec<Value> {
@@ -6690,7 +6703,7 @@ mod tests {
         fs::write(&python, b"python fixture").expect("write python fixture");
         fs::write(
             root.join("runtime.json"),
-            r#"{"schema_version":2,"transformers":"5.5.0"}"#,
+            r#"{"schema_version":2,"transformers":"5.10.1"}"#,
         )
         .expect("write runtime manifest");
 

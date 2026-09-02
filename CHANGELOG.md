@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Opened a video from Recent in Video Studio. Selecting a video, draft or finished, used to land on
+  History with a grid of masters above an unrelated audio record; it now opens that video where
+  it can be played, revised, and exported. History is audio generations only.
+- Stopped reporting a freshly installed runtime as "setup required". The readiness check compared
+  the runtime against a hard-coded Transformers pin; it now reads the pin from the same
+  requirements file the installer uses.
+- Let the idle chat grow and rise on a full-screen canvas: a wider column, larger type, a taller
+  composer, sitting higher. Ordinary window sizes are unchanged.
+
 ## 0.1.5 - 2026-09-02
 
 - Made a room laugh like a room. Two identical `(laughs)` lines used to produce the same seed, the
