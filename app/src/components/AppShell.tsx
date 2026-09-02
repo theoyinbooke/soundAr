@@ -1,6 +1,7 @@
 import {
   Activity,
   ArrowLeft,
+  History,
   ArrowRight,
   AudioLines,
   Drama,
@@ -64,7 +65,12 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
   },
 ];
 
-const primaryNav = navGroups.flatMap((group) => group.items);
+// The phone dock keeps History as a destination: a phone has no Recent list beside it to make
+// the entry redundant, which is why the desktop rail dropped it.
+const primaryNav = [
+  ...navGroups.flatMap((group) => group.items),
+  { key: "history" as NavKey, label: "History", icon: History },
+];
 const mobilePrimaryKeys = new Set<NavKey>(["generate", "video", "projects", "history"]);
 
 function WindowControls() {

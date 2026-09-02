@@ -28,6 +28,10 @@ async function openRoute(page: import("@playwright/test").Page, route: string) {
   } else if (route === "Settings") {
     await page.getByRole("banner").getByRole("button", { name: "File", exact: true }).click();
     await page.getByRole("menuitem", { name: "Settings" }).click();
+  } else if (route === "History") {
+    // The desktop rail no longer lists History, because Recent sits beneath it; the View menu does.
+    await page.getByRole("banner").getByRole("button", { name: "View", exact: true }).click();
+    await page.getByRole("menuitem", { name: "History" }).click();
   } else if (route === "About") {
     await page.getByRole("banner").getByRole("button", { name: "Help", exact: true }).click();
     await page.getByRole("menuitem", { name: "About soundAr" }).click();
@@ -209,11 +213,16 @@ test("desktop navigation stays open and keeps unambiguous route names", async ({
   await openWorkspace(page);
 
   await expect(page.locator(".app-shell")).not.toHaveClass(/is-sidebar-collapsed/);
-  for (const route of routes) {
+  for (const route of routes.filter((route) => route !== "History")) {
     const button = page.locator(".sidebar").getByRole("button", { name: route, exact: true });
     await expect(button).toHaveCount(1);
     await expect(button).toHaveAccessibleName(route);
   }
+  // History left the rail because Recent sits beneath it; it stays a destination from the View menu.
+  await expect(page.locator(".sidebar").getByRole("button", { name: "History", exact: true })).toHaveCount(0);
+  await page.getByRole("banner").getByRole("button", { name: "View", exact: true }).click();
+  await expect(page.getByRole("menuitem", { name: "History" })).toHaveCount(1);
+  await page.keyboard.press("Escape");
 });
 
 test("phone workspace never expands beyond the viewport", async ({ page }) => {
