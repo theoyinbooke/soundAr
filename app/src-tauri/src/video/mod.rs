@@ -56,7 +56,7 @@ pub use editor::{
 };
 pub use format::{
     instantiate_format, materialize_format_cues, CueTemplate, FormatOrigin, ShowFormat,
-    MAX_SHOW_FORMATS,
+    DEFAULT_DURATION_TOLERANCE_BP, MAX_SHOW_FORMATS,
 };
 pub use intelligence::{
     apply_scene_plan, identify_clip_candidates, plan_reviewed_timeline, source_range_fingerprint,
@@ -67,7 +67,9 @@ pub use lexicon::{
     apply_lexicon, effective_entries, fingerprint_for_character, lexicon_fingerprint,
     LexiconApplication, LexiconEntry, LexiconMatch, LexiconScope, MAX_LEXICON_ENTRIES,
 };
-pub use listening::{listen_to_episode, EpisodeListening, GapSummary, ListenedLine, SpeakerShare};
+pub use listening::{
+    listen_to_episode, EpisodeListening, GapSummary, LengthReport, ListenedLine, SpeakerShare,
+};
 pub use media::{
     discover_media_runtime, local_media_input_args, preflight_import_url_destination,
     probe_h264_nvenc_runtime, probe_media, resolve_clip_models, validate_caption_cues,
@@ -87,8 +89,10 @@ pub use presentation::{
 };
 pub use quality::{
     build_report, diff_spoken_words, findings_for_caption_drift, findings_for_dead_air,
-    findings_for_loudness, findings_for_turn, parse_loudness_analysis, CaptionAlignment,
-    LoudnessMeasurement, QcFinding, QcFindingKind, QcReport, QcSeverity, WordDifference,
+    findings_for_dropped_cues, findings_for_length, findings_for_loudness,
+    findings_for_performed_line, findings_for_turn, parse_loudness_analysis, quality_fingerprint,
+    CaptionAlignment, LoudnessMeasurement, QcFinding, QcFindingKind, QcReport, QcSeverity,
+    QualityRecord, QualityStatus, WordDifference,
 };
 pub use release::{
     episode_chapters, episode_transcript, ffmetadata_chapters, plan_release, ReleaseChapter,

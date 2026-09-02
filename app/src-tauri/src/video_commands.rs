@@ -544,10 +544,28 @@ pub(crate) fn dispatch_video_operation(
                 .and_then(Value::as_array)
                 .map(Vec::len)
                 .unwrap_or_default();
+            let kinds = report
+                .get("findings")
+                .and_then(Value::as_array)
+                .map(|findings| {
+                    findings
+                        .iter()
+                        .filter(|finding| {
+                            finding.get("severity").and_then(Value::as_str) == Some("blocking")
+                        })
+                        .filter_map(|finding| finding.get("kind").and_then(Value::as_str))
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
             let summary = if blocking == 0 && unchecked == 0 {
-                "Every narrated line matches its script".to_string()
-            } else {
+                "Every narrated line matches its script and the episode is within its length; the check is recorded for release".to_string()
+            } else if kinds.is_empty() {
                 format!("{blocking} blocking finding(s), {unchecked} unchecked line(s)")
+            } else {
+                format!("{blocking} blocking finding(s) ({kinds}), {unchecked} unchecked line(s)")
             };
             Ok(VideoAgentResult::ready(kind, &summary, report))
         }
@@ -594,6 +612,7 @@ pub(crate) fn dispatch_video_operation(
                     &request.project_id,
                     "video-studio-producer",
                     request.has_show_notes,
+                    request.accept_findings,
                 )
                 .map_err(VideoAgentToolError::from)?;
             let project = video::present_video_project(
@@ -619,7 +638,11 @@ pub(crate) fn dispatch_video_operation(
         VideoAgentOperation::PlanEpisodeRelease(request) => {
             let plan = runtime
                 .video
-                .plan_episode_release(&request.project_id, request.has_show_notes)
+                .plan_episode_release(
+                    &request.project_id,
+                    request.has_show_notes,
+                    request.accept_findings,
+                )
                 .map_err(VideoAgentToolError::from)?;
             let summary = if plan.is_ready() {
                 "Every release member can be produced".to_string()
@@ -1228,7 +1251,7 @@ pub(crate) async fn export_episode_release(
     let video_root = state.store.video_artifacts_root();
     tauri::async_runtime::spawn_blocking(move || {
         let exported = service
-            .export_episode_release(&project_id, "video-studio-producer", has_show_notes)
+            .export_episode_release(&project_id, "video-studio-producer", has_show_notes, false)
             .map_err(service_error)?;
         let project = video::present_video_project(&exported.project, &video_root)
             .map_err(|error| error.to_string())?;
@@ -1275,7 +1298,7 @@ pub(crate) async fn plan_episode_release(
     let service = Arc::clone(&state.video);
     tauri::async_runtime::spawn_blocking(move || {
         let plan = service
-            .plan_episode_release(&project_id, has_show_notes)
+            .plan_episode_release(&project_id, has_show_notes, false)
             .map_err(service_error)?;
         serde_json::to_value(plan).map_err(|error| format!("video.invalid_request: {error}"))
     })

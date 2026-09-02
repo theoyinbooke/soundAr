@@ -47,6 +47,12 @@ pub enum QcFindingKind {
     CaptionDrift,
     /// Silence long enough to read as a fault.
     DeadAir,
+    /// The performed episode sits outside the length its show asked for.
+    DurationOffTarget,
+    /// A vocal cue was read as its word - the voice said "laughter" instead of laughing.
+    SpokenCue,
+    /// A vocal cue the cast voice cannot perform was removed rather than spoken.
+    DroppedCue,
 }
 
 /// How much a finding matters.
@@ -256,6 +262,238 @@ fn normalize_words(text: &str) -> Vec<SpokenWord> {
         .collect()
 }
 
+/// Compare what a performed line was asked to do with what a recogniser heard.
+///
+/// A recogniser writes a laugh down as "ha ha ha" and a sigh as "ah", so those are not inserted
+/// words when the line asked for the event. The one thing it must never hear is the cue's own
+/// name: "laughter" in a take that was meant to laugh means the voice read the cue as text, and
+/// that is reported as its own finding rather than buried among ordinary insertions.
+pub fn findings_for_performed_line(turn_id: &str, asked: &str, heard: &str) -> Vec<QcFinding> {
+    let events = super::vocal_events::events_of(asked);
+    let words = super::vocal_events::words_of(asked);
+    if events.is_empty() {
+        return findings_for_turn(turn_id, &diff_spoken_words(&words, heard));
+    }
+    let expected = normalize_words(&words)
+        .into_iter()
+        .map(|word| word.normalized)
+        .collect::<std::collections::BTreeSet<_>>();
+    let performed = events
+        .iter()
+        .flat_map(|event| event.heard_as().iter().copied())
+        .collect::<std::collections::BTreeSet<_>>();
+    let misread = events
+        .iter()
+        .flat_map(|event| event.misread_as().iter().map(move |word| (*word, *event)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let mut findings = Vec::new();
+    let mut remaining = Vec::new();
+    for word in normalize_words(heard) {
+        if let Some(event) = misread.get(word.normalized.as_str()) {
+            if !expected.contains(&word.normalized) {
+                findings.push(QcFinding {
+                    id: format!("qc-{turn_id}-cue-{}", findings.len()),
+                    kind: QcFindingKind::SpokenCue,
+                    // The audience said "laughter". Nothing about that is publishable.
+                    severity: QcSeverity::Blocking,
+                    turn_id: Some(turn_id.to_string()),
+                    detail: format!(
+                        "The take says \"{}\" where the script asked the voice to {}",
+                        word.original,
+                        event.canonical()
+                    ),
+                    at_us: None,
+                });
+                continue;
+            }
+        }
+        if performed.contains(word.normalized.as_str()) && !expected.contains(&word.normalized) {
+            continue;
+        }
+        remaining.push(word.original);
+    }
+    if words.is_empty() {
+        // A reaction has no words to diff. Whatever else a recogniser made of a laugh is noise,
+        // not a misstatement.
+        return findings;
+    }
+    findings.extend(findings_for_turn(
+        turn_id,
+        &diff_spoken_words(&words, &remaining.join(" ")),
+    ));
+    findings
+}
+
+/// Report cues a take was asked for and could not perform.
+pub fn findings_for_dropped_cues(
+    turn_id: &str,
+    dropped: &[super::vocal_events::VocalEvent],
+) -> Vec<QcFinding> {
+    dropped
+        .iter()
+        .enumerate()
+        .map(|(index, event)| QcFinding {
+            id: format!("qc-{turn_id}-dropped-{index}"),
+            kind: QcFindingKind::DroppedCue,
+            // The line still says what it should; it just does not laugh.
+            severity: QcSeverity::Notice,
+            turn_id: Some(turn_id.to_string()),
+            detail: format!(
+                "The cast voice cannot {}; the cue was removed rather than spoken",
+                event.canonical()
+            ),
+            at_us: None,
+        })
+        .collect()
+}
+
+/// Report a performed episode that missed the length its show asked for.
+pub fn findings_for_length(
+    target: &super::contracts::LengthTarget,
+    actual_us: Microseconds,
+) -> Vec<QcFinding> {
+    if target.accepts(actual_us) {
+        return Vec::new();
+    }
+    let delta = target.delta_us(actual_us);
+    vec![QcFinding {
+        id: "qc-length".to_string(),
+        kind: QcFindingKind::DurationOffTarget,
+        // A thirty-second spot that runs a minute is a different deliverable, not a long one.
+        severity: QcSeverity::Blocking,
+        turn_id: None,
+        detail: format!(
+            "The episode runs {:.1}s against a target of {:.1}s (allowed within {:.1}s); it is {:.1}s {}",
+            (actual_us.0 as f64) / 1_000_000.0,
+            (target.target_us.0 as f64) / 1_000_000.0,
+            (target.tolerance_us().0 as f64) / 1_000_000.0,
+            (delta.0.abs() as f64) / 1_000_000.0,
+            if delta.0 > 0 { "too long" } else { "too short" }
+        ),
+        at_us: None,
+    }]
+}
+
+/// A quality check as it was recorded, bound to the episode it checked.
+///
+/// The fingerprint covers everything the check listened to: the takes, the master, the mix
+/// targets, and the performed length. A later change to any of them makes the record stale, and a
+/// stale record is reported as no record, because a check of a different episode proves nothing
+/// about this one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityRecord {
+    pub project_id: String,
+    pub version_id: String,
+    pub revision: u64,
+    pub fingerprint: String,
+    pub checked_at: String,
+    pub report: QcReport,
+}
+
+/// What a release planner needs to know about the last quality check.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum QualityStatus {
+    /// No check has been recorded for this episode.
+    Unchecked,
+    /// A check exists, but the episode changed after it.
+    Stale,
+    /// The last check stands and found blocking problems.
+    Blocking {
+        findings: usize,
+        unchecked_turns: usize,
+    },
+    /// The last check stands, found nothing blocking, but did not measure the master's loudness.
+    Unmeasured,
+    /// The last check stands and found nothing blocking.
+    Clear,
+}
+
+impl QualityRecord {
+    /// How this record relates to the episode as it now stands.
+    pub fn status_for(&self, manifest: &super::contracts::VideoProjectManifest) -> QualityStatus {
+        if self.fingerprint != quality_fingerprint(manifest) {
+            return QualityStatus::Stale;
+        }
+        if self.report.is_clear() {
+            QualityStatus::Clear
+        } else if self.report.blocking().is_empty()
+            && self.report.unchecked_turns.is_empty()
+            && !self.report.loudness_checked
+        {
+            QualityStatus::Unmeasured
+        } else {
+            QualityStatus::Blocking {
+                findings: self.report.blocking().len(),
+                unchecked_turns: self.report.unchecked_turns.len(),
+            }
+        }
+    }
+}
+
+/// Everything a quality check listened to, as one hash.
+pub fn quality_fingerprint(manifest: &super::contracts::VideoProjectManifest) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"quality-v1");
+    let mut bindings = manifest
+        .narration_bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{:?}",
+                binding.turn_id.as_deref().unwrap_or_default(),
+                binding.render_artifact_id,
+                binding.script_sha256,
+                binding
+                    .performance
+                    .as_ref()
+                    .map(|performance| performance.fingerprint.as_str())
+                    .unwrap_or_default(),
+                binding.fidelity
+            )
+        })
+        .collect::<Vec<_>>();
+    bindings.sort();
+    for binding in bindings {
+        hasher.update([0x1f]);
+        hasher.update(binding.as_bytes());
+    }
+    let mut masters = manifest
+        .render_artifacts
+        .iter()
+        .filter(|artifact| {
+            matches!(
+                artifact.role,
+                super::contracts::RenderArtifactRole::FinalMaster
+            ) && matches!(
+                artifact.publication_state,
+                super::contracts::PublicationState::Published
+            )
+        })
+        .map(|artifact| artifact.sha256.clone())
+        .collect::<Vec<_>>();
+    masters.sort();
+    for master in masters {
+        hasher.update([0x1e]);
+        hasher.update(master.as_bytes());
+    }
+    hasher.update([0x1d]);
+    hasher.update(manifest.timeline_duration_us.0.to_string().as_bytes());
+    hasher.update([0x1d]);
+    hasher.update(manifest.audio_mix.target_lufs_milli.to_string().as_bytes());
+    hasher.update([0x1d]);
+    hasher.update(manifest.audio_mix.true_peak_db_milli.to_string().as_bytes());
+    if let Some(target) = &manifest.length_target {
+        hasher.update([0x1d]);
+        hasher.update(target.target_us.0.to_string().as_bytes());
+        hasher.update(target.tolerance_bp.to_string().as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Turn one take's word differences into reviewable findings.
 pub fn findings_for_turn(turn_id: &str, differences: &[WordDifference]) -> Vec<QcFinding> {
     differences
@@ -456,6 +694,71 @@ pub fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_performed_laugh_is_not_an_inserted_word_but_a_read_one_is() {
+        let asked = "(laugh) Good evening! I bought a smart refrigerator.";
+        let performed = findings_for_performed_line(
+            "turn-1",
+            asked,
+            "Ha ha ha! Good evening! I bought a smart refrigerator.",
+        );
+        assert!(performed.is_empty(), "{performed:?}");
+
+        let read = findings_for_performed_line(
+            "turn-1",
+            asked,
+            "Laughs. Good evening! I bought a smart refrigerator.",
+        );
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0].kind, QcFindingKind::SpokenCue);
+        assert_eq!(read[0].severity, QcSeverity::Blocking);
+        assert!(read[0].detail.contains("laugh"), "{}", read[0].detail);
+    }
+
+    #[test]
+    fn a_reaction_is_judged_only_on_whether_its_cue_was_read() {
+        assert!(
+            findings_for_performed_line("turn-2", "(laugh) (applause)", "Ha ha ha! Yeah!")
+                .is_empty()
+        );
+        let read =
+            findings_for_performed_line("turn-2", "(laugh) (applause)", "Laughter. Applause.");
+        assert_eq!(read.len(), 2);
+        assert!(read
+            .iter()
+            .all(|finding| finding.kind == QcFindingKind::SpokenCue));
+    }
+
+    #[test]
+    fn a_line_without_cues_is_diffed_word_for_word_as_before() {
+        let findings = findings_for_performed_line("turn-3", "Same, fridge.", "Same fridge.");
+        assert!(findings.is_empty());
+        let findings = findings_for_performed_line("turn-3", "Same, fridge.", "Same bridge.");
+        assert_eq!(findings[0].kind, QcFindingKind::ReplacedWord);
+    }
+
+    #[test]
+    fn a_dropped_cue_is_a_notice_and_a_missed_length_is_blocking() {
+        let dropped =
+            findings_for_dropped_cues("turn-4", &[super::super::vocal_events::VocalEvent::Sigh]);
+        assert_eq!(dropped[0].kind, QcFindingKind::DroppedCue);
+        assert_eq!(dropped[0].severity, QcSeverity::Notice);
+
+        let target = super::super::contracts::LengthTarget {
+            target_us: Microseconds(30_000_000),
+            tolerance_bp: 2_000,
+        };
+        assert!(findings_for_length(&target, Microseconds(35_000_000)).is_empty());
+        let long = findings_for_length(&target, Microseconds(63_000_000));
+        assert_eq!(long[0].kind, QcFindingKind::DurationOffTarget);
+        assert_eq!(long[0].severity, QcSeverity::Blocking);
+        assert!(
+            long[0].detail.contains("33.0s too long"),
+            "{}",
+            long[0].detail
+        );
+    }
 
     #[test]
     fn punctuation_and_capitalisation_are_not_errors() {

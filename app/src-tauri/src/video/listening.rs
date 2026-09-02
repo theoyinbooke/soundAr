@@ -13,7 +13,7 @@
 //! than approximated, because an approximation the assistant cannot distinguish from a measurement
 //! is worse than no value at all.
 
-use super::contracts::{Microseconds, TrackKind, VideoProjectManifest, VideoResult};
+use super::contracts::{LengthTarget, Microseconds, TrackKind, VideoProjectManifest, VideoResult};
 use super::quality::LoudnessMeasurement;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -69,6 +69,34 @@ pub struct EpisodeListening {
     /// Present only when the runtime measured it. Absent means unmeasured, never "fine".
     #[serde(default)]
     pub loudness: Option<LoudnessMeasurement>,
+    /// How the performed length compares with what the show asked for. Absent when the episode
+    /// was not started from a format and so has no target to be measured against.
+    #[serde(default)]
+    pub length: Option<LengthReport>,
+}
+
+/// The performed length against its target, in the terms a writer edits in.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LengthReport {
+    pub target_us: Microseconds,
+    pub tolerance_us: Microseconds,
+    pub actual_us: Microseconds,
+    /// Positive when the episode runs long.
+    pub delta_us: Microseconds,
+    pub within_tolerance: bool,
+}
+
+impl LengthReport {
+    pub fn measure(target: &LengthTarget, actual_us: Microseconds) -> Self {
+        Self {
+            target_us: target.target_us,
+            tolerance_us: target.tolerance_us(),
+            actual_us,
+            delta_us: target.delta_us(actual_us),
+            within_tolerance: target.accepts(actual_us),
+        }
+    }
 }
 
 /// One performed line, as it actually sits in the episode.
@@ -210,6 +238,14 @@ pub fn listen_to_episode(
         .map(|turn| turn.id.clone())
         .collect::<Vec<_>>();
 
+    // Measured against the performed span, which is what the episode's clock became once its
+    // lines were read, rather than against the planning length it was created with.
+    let length = manifest
+        .length_target
+        .as_ref()
+        .filter(|_| !lines.is_empty())
+        .map(|target| LengthReport::measure(target, cursor));
+
     Ok(EpisodeListening {
         project_id: manifest.project_id.clone(),
         timeline_duration_us: manifest.timeline_duration_us,
@@ -236,6 +272,7 @@ pub fn listen_to_episode(
             .map(str::to_string)
             .collect(),
         loudness,
+        length,
     })
 }
 

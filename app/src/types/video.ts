@@ -558,6 +558,10 @@ export interface VideoCastMember {
   delivery: VideoCastDelivery;
   consent_reference_id?: string | null;
   notes?: string | null;
+  /** Who this voice is, as a voice-design instruction for an engine that follows one. */
+  persona?: string | null;
+  /** Distinct takes layered for this character's reaction lines. 1 is a single voice. */
+  ensemble?: number;
   created_at: string;
 }
 
@@ -719,6 +723,14 @@ export interface VideoEpisodeListening {
   /** Lines still standing in with a draft take. An episode with any of these is unfinished. */
   draft_turns: string[];
   loudness?: { integrated_lufs_milli: number; true_peak_db_milli: number } | null;
+  /** The performed length against the show's target; absent when the episode has no target. */
+  length?: {
+    target_us: number;
+    tolerance_us: number;
+    actual_us: number;
+    delta_us: number;
+    within_tolerance: boolean;
+  } | null;
 }
 
 export type VideoQcFindingKind =
@@ -728,7 +740,10 @@ export type VideoQcFindingKind =
   | "loudness_off_target"
   | "true_peak_exceeded"
   | "caption_drift"
-  | "dead_air";
+  | "dead_air"
+  | "duration_off_target"
+  | "spoken_cue"
+  | "dropped_cue";
 
 export type VideoQcSeverity = "notice" | "warning" | "blocking";
 
@@ -837,6 +852,8 @@ export interface VideoShowFormat {
   target_lufs_milli: number;
   true_peak_db_milli: number;
   target_duration_us: number;
+  /** Allowed slack either side of the target, in basis points of it. Default 2000. */
+  duration_tolerance_bp?: number;
   opening?: VideoCueTemplate | null;
   closing?: VideoCueTemplate | null;
   show_notes_style?: string | null;

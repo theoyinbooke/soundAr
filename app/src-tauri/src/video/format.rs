@@ -14,8 +14,8 @@
 use super::cast::CastMember;
 use super::contracts::{
     validate_identifier, validate_nonempty, validate_timestamp_text, AudioMix, CanvasMode,
-    CanvasSpec, CaptionPresetId, LayoutPlan, Microseconds, NormalizedRect, RationalFrameRate,
-    Validate, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
+    CanvasSpec, CaptionPresetId, LayoutPlan, LengthTarget, Microseconds, NormalizedRect,
+    RationalFrameRate, Validate, VideoError, VideoErrorCode, VideoProjectManifest, VideoResult,
     MAX_TIMELINE_DURATION_US,
 };
 use super::lexicon::LexiconEntry;
@@ -97,8 +97,13 @@ pub struct ShowFormat {
     pub frame_rate: RationalFrameRate,
     pub target_lufs_milli: i32,
     pub true_peak_db_milli: i32,
-    /// How long an episode of this show usually runs. A planning target, never a hard limit.
+    /// How long an episode of this show is meant to run. An episode is measured against it once
+    /// performed, and one outside the tolerance is a quality finding until the writer accepts
+    /// the length.
     pub target_duration_us: Microseconds,
+    /// Slack either side of the target, in basis points of it. Two thousand is a fifth.
+    #[serde(default = "default_duration_tolerance_bp")]
+    pub duration_tolerance_bp: u32,
     #[serde(default)]
     pub opening: Option<CueTemplate>,
     #[serde(default)]
@@ -109,9 +114,21 @@ pub struct ShowFormat {
     pub updated_at: String,
 }
 
+/// A fifth either side: a thirty-second show may run twenty-four to thirty-six.
+pub const DEFAULT_DURATION_TOLERANCE_BP: u32 = 2_000;
+
+fn default_duration_tolerance_bp() -> u32 {
+    DEFAULT_DURATION_TOLERANCE_BP
+}
+
 impl Validate for ShowFormat {
     fn validate(&self) -> VideoResult<()> {
         validate_identifier(&self.id, "show_format.id")?;
+        LengthTarget {
+            target_us: self.target_duration_us,
+            tolerance_bp: self.duration_tolerance_bp,
+        }
+        .validate()?;
         validate_nonempty(&self.name, "show_format.name", 256)?;
         CaptionPresetId::parse(&self.caption_preset_id)?;
         self.canvas.validate()?;
@@ -233,6 +250,10 @@ pub fn instantiate_format(
     manifest.cast = format.cast.clone();
     manifest.lexicon = format.lexicon.clone();
     manifest.performance_clock = format.performance_clock;
+    manifest.length_target = Some(LengthTarget {
+        target_us: format.target_duration_us,
+        tolerance_bp: format.duration_tolerance_bp,
+    });
     manifest.format_origin = Some(FormatOrigin {
         format_id: format.id.clone(),
         format_name: format.name.clone(),
@@ -341,6 +362,7 @@ mod tests {
             target_lufs_milli: -16_000,
             true_peak_db_milli: -1_000,
             target_duration_us: Microseconds(600_000_000),
+            duration_tolerance_bp: 2_000,
             opening: Some(template("cue-opening", CueRole::Sting)),
             closing: Some(template("cue-closing", CueRole::Outro)),
             show_notes_style: Some("Three short paragraphs, no bullet lists.".into()),

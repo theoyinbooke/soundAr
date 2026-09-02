@@ -661,6 +661,10 @@ pub(crate) struct PlanEpisodeReleaseRequest {
     /// Notes are written, not derived, so the caller says whether they exist.
     #[serde(default)]
     pub(crate) has_show_notes: bool,
+    /// Release although the last quality check found blocking problems. A missing or stale
+    /// check cannot be accepted, only run.
+    #[serde(default)]
+    pub(crate) accept_findings: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1558,23 +1562,25 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "export_episode_release",
-            "Produce and register every release deliverable this episode can supply: the audio episode carrying its chapter marks, a short vertical trailer cut from the moment the analyst chose in the episode's own narration, and a square audiogram. All three derive from the finished master, so a master is required, and a line still standing in with a draft take blocks the export outright. A member that cannot be produced is reported with its reason rather than omitted. Requires Studio or Full access.",
+            "Produce and register every release deliverable this episode can supply: the audio episode carrying its chapter marks, a short vertical trailer cut from the moment the analyst chose in the episode's own narration, and a square audiogram. All three derive from the finished master, so a master is required, and a line still standing in with a draft take blocks the export outright. The audio episode, the master, and the audiogram also wait for a current quality check: run transcribe_and_check_episode after the final render, fix what it finds or pass accept_findings, and only then export. A member that cannot be produced is reported with its reason rather than omitted. Requires Studio or Full access.",
             object_schema(
                 &["project_id"],
                 properties([
                     ("project_id", string("Video Studio project id")),
                     ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode"})),
+                    ("accept_findings", json!({"type":"boolean","description":"Release although the last quality check found blocking problems. A missing or stale check cannot be accepted; run transcribe_and_check_episode instead."})),
                 ]),
             ),
         ),
         tool(
             "plan_episode_release",
-            "Report what this episode's release would contain and what is still missing: the audio episode with its chapters, the video master, a short vertical trailer, the transcript, and show notes. The trailer moment is chosen by running soundAr's existing candidate analyst over the episode's own narration, so generated work is reviewed by the same deterministic rules as imported source. A blocked member always names its missing prerequisite instead of being quietly omitted. Read-only.",
+            "Report what this episode's release would contain and what is still missing: the audio episode with its chapters, the video master, a short vertical trailer, the transcript, and show notes. The trailer moment is chosen by running soundAr's existing candidate analyst over the episode's own narration, so generated work is reviewed by the same deterministic rules as imported source. A blocked member always names its missing prerequisite instead of being quietly omitted, including a quality check that is missing, stale, or blocking. Read-only.",
             object_schema(
                 &["project_id"],
                 properties([
                     ("project_id", string("Video Studio project id")),
                     ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode. Notes are written, not derived."})),
+                    ("accept_findings", json!({"type":"boolean","description":"Release although the last quality check found blocking problems. A missing or stale check cannot be accepted; run transcribe_and_check_episode instead."})),
                 ]),
             ),
         ),
@@ -1927,7 +1933,11 @@ fn show_format_schema() -> Value {
             ),
             (
                 "target_duration_us",
-                json!({"type":"integer","minimum":1,"description":"How long an episode usually runs: a planning target, never a hard limit"}),
+                json!({"type":"integer","minimum":1,"description":"How long an episode of this show is meant to run. A performed episode outside the tolerance is a blocking quality finding until the writer accepts the length."}),
+            ),
+            (
+                "duration_tolerance_bp",
+                json!({"type":"integer","minimum":0,"maximum":10000,"description":"Allowed slack either side of the target, in basis points of it. Default 2000, a fifth."}),
             ),
             (
                 "opening",

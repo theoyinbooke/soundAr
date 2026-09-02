@@ -9,17 +9,17 @@ use super::{
     build_audiogram_command, build_cover_image_command, build_loudness_analysis_command,
     build_podcast_audio_command, build_portrait_command_with_layout, build_proxy_command,
     build_report, build_thumbnail_command, build_timeline_render_plan, build_trailer_command,
-    build_waveform_command, cover_spec, diff_spoken_words, discover_media_runtime,
-    effective_entries, episode_transcript, ffmetadata_chapters, findings_for_dead_air,
-    findings_for_loudness, findings_for_turn, identify_clip_candidates, instantiate_format,
-    listen_to_episode, local_media_input_args, parse_loudness_analysis, plan_release,
-    preflight_import_url_destination, probe_media, profile_dimensions, publish_atomic,
-    sibling_staging_path, terminate_process_group, validate_import_url, write_ass_document_atomic,
-    AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme,
-    CastMember, ClipModelPaths, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser,
-    GapReason, LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds,
-    NarrationBinding, NormalizedRect, PerformanceRecord, PortraitLayout, Provenance,
-    ProvenanceKind, PublicHttpsProxy, PublicationState, QcReport, RationalFrameRate, RationalRate,
+    build_waveform_command, cover_spec, discover_media_runtime, effective_entries,
+    episode_transcript, ffmetadata_chapters, findings_for_dead_air, findings_for_loudness,
+    identify_clip_candidates, instantiate_format, listen_to_episode, local_media_input_args,
+    parse_loudness_analysis, plan_release, preflight_import_url_destination, probe_media,
+    profile_dimensions, publish_atomic, sibling_staging_path, terminate_process_group,
+    validate_import_url, write_ass_document_atomic, AdmissionOutcome, AssemblyOptions,
+    CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme, CastMember, ClipModelPaths,
+    DialogueScriptRequest, EpisodeListening, FfmpegProgressParser, GapReason, LayoutRole,
+    LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds, NarrationBinding,
+    NormalizedRect, PerformanceRecord, PortraitLayout, Provenance, ProvenanceKind,
+    PublicHttpsProxy, PublicationState, QcReport, RationalFrameRate, RationalRate,
     ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole,
     RenderCommand, RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass,
     ResourceRequest, ResourceScheduler, ReviewState, ReviewedScene, RevisionRecord, RevisionStage,
@@ -6335,6 +6335,7 @@ mod tests {
             target_lufs_milli: -16_000,
             true_peak_db_milli: -1_000,
             target_duration_us: Microseconds(600_000_000),
+            duration_tolerance_bp: 2_000,
             opening: None,
             closing: None,
             show_notes_style: None,
@@ -9189,9 +9190,22 @@ mod tests {
             })
             .expect("commit the master");
 
+        // A release waits for the check that listened to it; this one records a check and then
+        // accepts what it found, because the fixture is about deliverables, not findings.
+        workspace
+            .service
+            .check_episode_quality(
+                &project_id,
+                &std::collections::BTreeMap::new(),
+                Some(LoudnessMeasurement {
+                    integrated_lufs_milli: -16_000,
+                    true_peak_db_milli: -1_500,
+                }),
+            )
+            .expect("record a quality check");
         let exported = workspace
             .service
-            .export_episode_release(&project_id, "service-test", true)
+            .export_episode_release(&project_id, "service-test", true, true)
             .expect("export the release");
 
         // The audio episode and the audiogram always derive from the master; the trailer needs a
@@ -9259,7 +9273,7 @@ mod tests {
         // No master at all: the one hard prerequisite is named rather than failing later.
         let error = workspace
             .service
-            .export_episode_release(&project_id, "service-test", true)
+            .export_episode_release(&project_id, "service-test", true, true)
             .expect_err("a release without a master is refused");
         assert_eq!(error.code, "video.final_master_required");
     }
@@ -14035,20 +14049,42 @@ impl VideoStudioService {
             }
             match heard.get(&turn.id) {
                 Some(spoken) => {
-                    // The comparison is against what the voice was asked to say, which is the
-                    // scripted line after its pronunciation rules were applied.
+                    // The comparison is against what the voice was asked to perform, which is
+                    // the scripted line after its pronunciation rules were applied, cues and all:
+                    // a laugh heard as "ha ha" is the cue performed, and "laughter" is it read.
                     let asked = apply_lexicon(
                         turn.spoken_text(),
                         &effective_entries(&manifest.lexicon, &turn.character_id),
                     )
                     .spoken_text;
-                    findings.extend(findings_for_turn(
-                        &turn.id,
-                        &diff_spoken_words(&asked, spoken),
+                    findings.extend(super::quality::findings_for_performed_line(
+                        &turn.id, &asked, spoken,
                     ));
                     checked_turns.push(turn.id.clone());
                 }
                 None => unchecked_turns.push(turn.id.clone()),
+            }
+            // A cue the cast voice could not perform was removed before the take was made. That
+            // is recorded on the take, and reported here so nobody assumes the room laughed.
+            if let Some(dropped) = manifest
+                .narration_bindings
+                .iter()
+                .find(|binding| binding.turn_id.as_deref() == Some(turn.id.as_str()))
+                .and_then(|binding| binding.performance.as_ref())
+                .map(|performance| performance.dropped_events.as_slice())
+                .filter(|dropped| !dropped.is_empty())
+            {
+                findings.extend(super::quality::findings_for_dropped_cues(&turn.id, dropped));
+            }
+        }
+
+        // The length the show asked for, against the length that was performed.
+        if let Some(target) = &manifest.length_target {
+            if !manifest.narration_bindings.is_empty() {
+                findings.extend(super::quality::findings_for_length(
+                    target,
+                    manifest.timeline_duration_us,
+                ));
             }
         }
 
@@ -14082,12 +14118,41 @@ impl VideoStudioService {
             ));
         }
 
-        Ok(build_report(
-            findings,
-            checked_turns,
-            unchecked_turns,
-            loudness.is_some(),
-        )?)
+        let report = build_report(findings, checked_turns, unchecked_turns, loudness.is_some())?;
+        // The check is recorded against exactly what it listened to, so a release can ask whether
+        // this episode - not an earlier cut of it - was checked.
+        let quality = super::quality::QualityRecord {
+            project_id: project_id.to_string(),
+            version_id: project_expectation(&record)?.version_id,
+            revision: manifest.revision,
+            fingerprint: super::quality::quality_fingerprint(&manifest),
+            checked_at: utc_now(),
+            report: report.clone(),
+        };
+        self.store
+            .save_video_quality_record(
+                project_id,
+                &serde_json::to_value(&quality).map_err(json_error)?,
+            )
+            .map_err(VideoServiceError::store)?;
+        Ok(report)
+    }
+
+    /// The last quality check as it relates to the episode now.
+    pub fn quality_status(
+        &self,
+        manifest: &VideoProjectManifest,
+    ) -> ServiceResult<super::quality::QualityStatus> {
+        let Some(stored) = self
+            .store
+            .video_quality_record(&manifest.project_id)
+            .map_err(VideoServiceError::store)?
+        else {
+            return Ok(super::quality::QualityStatus::Unchecked);
+        };
+        let record: super::quality::QualityRecord =
+            serde_json::from_value(stored).map_err(json_error)?;
+        Ok(record.status_for(manifest))
     }
 
     /// Render one deliverable, publish it atomically, and measure what was actually produced.
@@ -14239,8 +14304,9 @@ impl VideoStudioService {
         project_id: &str,
         actor: &str,
         has_show_notes: bool,
+        accept_findings: bool,
     ) -> ServiceResult<ReleaseExportResult> {
-        let plan = self.plan_episode_release(project_id, has_show_notes)?;
+        let plan = self.plan_episode_release(project_id, has_show_notes, accept_findings)?;
         let record = self.get_project(project_id)?;
         let manifest: VideoProjectManifest = serde_json::from_value(
             record
@@ -14523,6 +14589,7 @@ impl VideoStudioService {
         &self,
         project_id: &str,
         has_show_notes: bool,
+        accept_findings: bool,
     ) -> ServiceResult<ReleasePlan> {
         let record = self.get_project(project_id)?;
         let manifest: VideoProjectManifest = serde_json::from_value(
@@ -14550,7 +14617,14 @@ impl VideoStudioService {
             .map(|candidate| candidate.source_range),
             None => None,
         };
-        Ok(plan_release(&manifest, trailer_range, has_show_notes)?)
+        let quality = self.quality_status(&manifest)?;
+        Ok(plan_release(
+            &manifest,
+            trailer_range,
+            has_show_notes,
+            quality,
+            accept_findings,
+        )?)
     }
 
     /// Every saved show format, validated on the way out so a corrupted document cannot reach a

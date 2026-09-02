@@ -265,6 +265,8 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "delivery": member.delivery,
                 "consent_reference_id": member.consent_reference_id,
                 "notes": member.notes,
+                "persona": member.persona,
+                "ensemble": member.ensemble,
                 "created_at": member.created_at,
             })
         })

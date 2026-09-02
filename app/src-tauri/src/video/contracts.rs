@@ -1707,10 +1707,67 @@ pub struct VideoProjectManifest {
     pub turn_beats: Vec<TurnBeat>,
     #[serde(default)]
     pub narration_bindings: Vec<NarrationBinding>,
+    /// How long this episode is meant to run, inherited from its show. The performed length is
+    /// measured against it; nothing here stretches or cuts the performance to fit.
+    #[serde(default)]
+    pub length_target: Option<LengthTarget>,
     pub render_artifacts: Vec<RenderArtifact>,
     pub revision_history: Vec<RevisionRecord>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The length an episode was asked to be, with the slack a writer is allowed around it.
+///
+/// A target is a contract, not an estimate: a thirty-second show that runs sixty-three seconds
+/// has not met it, and the report says so in seconds rather than letting the overrun pass
+/// because every gate that existed was about something else.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LengthTarget {
+    pub target_us: Microseconds,
+    /// Allowed distance either side of the target, in basis points of the target.
+    pub tolerance_bp: u32,
+}
+
+impl LengthTarget {
+    pub fn tolerance_us(&self) -> Microseconds {
+        Microseconds(
+            self.target_us
+                .0
+                .saturating_mul(i64::from(self.tolerance_bp))
+                / 10_000,
+        )
+    }
+
+    /// Signed distance from target: positive when the episode runs long.
+    pub fn delta_us(&self, actual_us: Microseconds) -> Microseconds {
+        Microseconds(actual_us.0 - self.target_us.0)
+    }
+
+    pub fn accepts(&self, actual_us: Microseconds) -> bool {
+        self.delta_us(actual_us).0.abs() <= self.tolerance_us().0
+    }
+}
+
+impl Validate for LengthTarget {
+    fn validate(&self) -> VideoResult<()> {
+        if !(1..=MAX_TIMELINE_DURATION_US).contains(&self.target_us.0) {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidShowFormat,
+                "a length target must be between one microsecond and six hours",
+            )
+            .at("length_target.target_us"));
+        }
+        if self.tolerance_bp > 10_000 {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidShowFormat,
+                "a length tolerance cannot exceed the target itself",
+            )
+            .at("length_target.tolerance_bp"));
+        }
+        Ok(())
+    }
 }
 
 impl VideoProjectManifest {
@@ -1766,6 +1823,7 @@ impl VideoProjectManifest {
             performance_clock: PerformanceClock::default(),
             turn_beats: Vec::new(),
             narration_bindings: Vec::new(),
+            length_target: None,
             render_artifacts: Vec::new(),
             revision_history: Vec::new(),
             created_at: created_at.clone(),
@@ -3052,6 +3110,7 @@ mod tests {
             performance_clock: PerformanceClock::default(),
             turn_beats: vec![],
             narration_bindings: vec![],
+            length_target: None,
             render_artifacts: vec![],
             revision_history: vec![],
             created_at: timestamp(),

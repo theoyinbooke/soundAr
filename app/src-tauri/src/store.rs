@@ -346,6 +346,52 @@ impl Store {
         Ok(())
     }
 
+    /// The last recorded quality check for an episode, if any.
+    pub fn video_quality_record(&self, project_id: &str) -> Result<Option<Value>, String> {
+        let records = self.video_quality_records()?;
+        Ok(records.get(project_id).cloned())
+    }
+
+    /// Record an episode's quality check, replacing the previous one. A check is a statement
+    /// about one version of one episode; keeping the older one would only let it be mistaken for
+    /// current.
+    pub fn save_video_quality_record(
+        &self,
+        project_id: &str,
+        record: &Value,
+    ) -> Result<(), String> {
+        let mut records = self.video_quality_records()?;
+        records.insert(project_id.to_string(), record.clone());
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('video_quality_records', ?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+                params![Value::Object(records).to_string(), now()],
+            )
+            .map_err(|error| format!("Could not save the quality record: {error}"))?;
+        Ok(())
+    }
+
+    fn video_quality_records(&self) -> Result<serde_json::Map<String, Value>, String> {
+        let connection = self.lock()?;
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = 'video_quality_records'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Could not read quality records: {error}"))?;
+        drop(connection);
+        let Some(stored) = stored else {
+            return Ok(serde_json::Map::new());
+        };
+        let parsed: Value = serde_json::from_str(&stored)
+            .map_err(|error| format!("Stored quality records are unreadable: {error}"))?;
+        Ok(parsed.as_object().cloned().unwrap_or_default())
+    }
+
     pub fn capture_path(&self) -> Result<PathBuf, String> {
         fs::create_dir_all(&self.transcription_sources_root)
             .map_err(|error| format!("Could not create capture storage: {error}"))?;
