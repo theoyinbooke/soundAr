@@ -41,6 +41,17 @@
   on an engine that declares a default voice mode, such as Breeze TTS 2, is performed by the
   engine's own designed voice steered by the character's persona; previously the Video Studio
   narration path required a library voice, so Breeze could not be cast in a show at all.
+- Let a music bed render. A bed must duck under the speech it plays under, and until now the
+  render refused any timeline that carried a ducking envelope because no filter implemented it.
+  The graph now splits the speech track and compresses the bed by it, so a bed dips while a voice
+  speaks and returns between lines; a real render proves the drop.
+- Let sound design reach the master. Placed room tone, ambience, and one-shots were registered,
+  validated, shown, and silently absent from every render. Each placed sound now enters the mix at
+  its range with its fades and gain, loops to fill where asked, and ducks under speech where asked.
+- Chose the recogniser for quality control. `transcribe_and_check_episode` no longer needs a
+  model id: soundAr picks the most accurate installed recogniser (Parakeet first), because a small
+  Whisper mishears takes it should pass and fails an episode on its own spelling.
+- Corrected the MiniMax H3 catalog entry's source link, which pointed at Kokoro.
 - Moved the producer's standing instructions out of a string literal into
   `app/src-tauri/prompts/producer.md`, rewritten as the recipe a show is made by, with a test that
   holds every tool it names to the catalog.

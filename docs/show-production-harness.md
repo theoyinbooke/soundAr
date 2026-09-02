@@ -227,6 +227,6 @@ because the narration path required a library voice; a recogniser's spelling is 
 words, so the checker now treats digits, compounds, and a tenth of a decibel as measurement rather
 than fault; and Whisper-tiny is not a quality-control recogniser on this machine, Parakeet is.
 
-Still open after this pass: a music bed cannot render (sidechain ducking has no render plan),
-sound layers do not reach the master, and the MiniMax entry in `data/curated_models.json` points
-its source URL at Kokoro.
+Closed in a second pass the same day: a music bed now renders and ducks under speech, placed sound
+design reaches the master, the quality check picks the most accurate installed recogniser itself,
+and the MiniMax catalog link is correct.

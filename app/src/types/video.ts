@@ -1035,7 +1035,8 @@ export interface VideoStudioService {
    * Listen back to every narrated line with an installed local model and check what was heard
    * against the script. Prefer this over supplying `heard` yourself.
    */
-  transcribeAndCheckEpisode(projectId: string, modelId: string): Promise<VideoQcReport>;
+  /** Leave modelId out and soundAr chooses its most accurate installed recogniser. */
+  transcribeAndCheckEpisode(projectId: string, modelId?: string): Promise<VideoQcReport>;
   /** Perform the named lines with their characters' own voices, one durable job per line. */
   narrateTurns(projectId: string, turnIds: string[], draft?: boolean): Promise<VideoProject>;
   checkEpisodeQuality(

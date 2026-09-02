@@ -3271,17 +3271,6 @@ fn validate_timeline_render_contract(
             .details(json!({ "scene_id": scene.id })));
         }
     }
-    if manifest
-        .audio_mix
-        .tracks
-        .iter()
-        .any(|track| track.ducking.is_some())
-    {
-        return Err(VideoServiceError::new(
-            "video.timeline_feature_unsupported",
-            "Sidechain ducking needs a compatible render plan",
-        ));
-    }
     Ok(())
 }
 
@@ -19105,6 +19094,44 @@ impl VideoStudioService {
                     "A managed visual asset no longer matches its manifest checksum",
                 )
                 .details(json!({ "visual_asset_id": visual.id })));
+            }
+            render_key_builder = render_key_builder.artifact(resolved_key.clone(), actual_sha256);
+            resolved_sources.insert(resolved_key, path);
+        }
+
+        // Sound design reaches the master: every placed sound's managed source is resolved and
+        // checksummed like any other media the render reads.
+        let placed_sound_ids = manifest
+            .sound_layers
+            .iter()
+            .map(|layer| layer.asset_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for sound in manifest
+            .sound_assets
+            .iter()
+            .filter(|sound| placed_sound_ids.contains(sound.id.as_str()))
+        {
+            self.ensure_not_cancelled(cancel)?;
+            let source = manifest
+                .source_assets
+                .iter()
+                .find(|source| source.id == sound.source_asset_id)
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.source_not_found",
+                        "A placed sound references a source that is no longer in the project",
+                    )
+                    .details(json!({ "sound_asset_id": sound.id }))
+                })?;
+            let resolved_key = format!("sound:{}", sound.id);
+            let path = self.resolve_managed_path(&source.managed_path)?;
+            let actual_sha256 = sha256_file(&path)?;
+            if actual_sha256 != source.sha256 {
+                return Err(VideoServiceError::new(
+                    "video.integrity_failed",
+                    "A placed sound's source no longer matches its manifest checksum",
+                )
+                .details(json!({ "sound_asset_id": sound.id })));
             }
             render_key_builder = render_key_builder.artifact(resolved_key.clone(), actual_sha256);
             resolved_sources.insert(resolved_key, path);

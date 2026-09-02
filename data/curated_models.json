@@ -771,7 +771,7 @@
         "768p and clips longer than 39 frames exceed the compute buffer on a 12 GB card."
       ],
       "source_urls": [
-        "https://huggingface.co/hexgrad/Kokoro-82M"
+        "https://huggingface.co/MiniMaxAI/MiniMax-H3"
       ]
     }
   ]

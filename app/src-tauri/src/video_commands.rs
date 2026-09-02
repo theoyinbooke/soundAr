@@ -524,9 +524,17 @@ pub(crate) fn dispatch_video_operation(
             ))
         }
         VideoAgentOperation::TranscribeAndCheckEpisode(request) => {
-            let report =
-                transcribe_and_check_episode(runtime, &request.project_id, &request.model_id)
-                    .map_err(VideoAgentToolError::from)?;
+            let model_id = match request.model_id.clone() {
+                Some(model_id) => model_id,
+                None => default_quality_recognizer(runtime).ok_or_else(|| {
+                    VideoAgentToolError::new(
+                        "video.transcriber_unavailable",
+                        "No local transcription model is installed; install one in Models before checking an episode",
+                    )
+                })?,
+            };
+            let report = transcribe_and_check_episode(runtime, &request.project_id, &model_id)
+                .map_err(VideoAgentToolError::from)?;
             let blocking = report
                 .get("findings")
                 .and_then(Value::as_array)
@@ -1141,6 +1149,41 @@ pub(crate) async fn listen_to_episode(
 /// This is the measuring half of quality control. A line whose take cannot be transcribed is left
 /// out of `heard`, which the check then reports as unchecked rather than as passed - a failed
 /// recognition must never read as a clean line.
+/// The most accurate installed recogniser, for listening back to takes.
+///
+/// A quality check is only as good as its ears. The order is by measured accuracy on this
+/// machine's kind of material - a small Whisper mishears enough that it would fail takes it
+/// should pass - and a model is offered only when its weights are actually present.
+pub(crate) fn default_quality_recognizer(runtime: &RuntimeState) -> Option<String> {
+    const PREFERENCE: [&str; 6] = [
+        "nvidia/parakeet-tdt-1.1b",
+        "openai/whisper-large-v3-turbo",
+        "CohereLabs/cohere-transcribe-03-2026",
+        "mistralai/Voxtral-Mini-3B-2507",
+        "openai/whisper-small",
+        "openai/whisper-tiny",
+    ];
+    let registry = read_json(runtime.model_registry_path.clone(), json!({ "models": [] }));
+    let models = registry.get("models").and_then(Value::as_array)?;
+    let ready = |wanted: &str| {
+        models.iter().any(|model| {
+            model.get("model_id").and_then(Value::as_str) == Some(wanted)
+                && registry_model_ready_for_task(model, "stt")
+        })
+    };
+    PREFERENCE
+        .iter()
+        .find(|candidate| ready(candidate))
+        .map(|candidate| candidate.to_string())
+        .or_else(|| {
+            models
+                .iter()
+                .filter(|model| registry_model_ready_for_task(model, "stt"))
+                .find_map(|model| model.get("model_id").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+}
+
 pub(crate) fn transcribe_and_check_episode(
     runtime: &RuntimeState,
     project_id: &str,
@@ -1203,10 +1246,16 @@ pub(crate) fn transcribe_and_check_episode(
 pub(crate) async fn transcribe_and_check_episode_quality(
     state: tauri::State<'_, RuntimeState>,
     project_id: String,
-    model_id: String,
+    model_id: Option<String>,
 ) -> Result<Value, String> {
     let runtime = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let model_id = match model_id {
+            Some(model_id) => model_id,
+            None => default_quality_recognizer(&runtime).ok_or(
+                "video.transcriber_unavailable: No local transcription model is installed",
+            )?,
+        };
         transcribe_and_check_episode(&runtime, &project_id, &model_id)
     })
     .await

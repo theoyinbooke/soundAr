@@ -301,7 +301,10 @@ impl VideoAgentOperation {
             Self::CheckEpisodeQuality(request) => require_text(&request.project_id, "project_id"),
             Self::TranscribeAndCheckEpisode(request) => {
                 require_text(&request.project_id, "project_id")?;
-                require_text(&request.model_id, "model_id")
+                match request.model_id.as_deref() {
+                    Some(model_id) => require_text(model_id, "model_id"),
+                    None => Ok(()),
+                }
             }
             Self::ListenToEpisode(request) => require_text(&request.project_id, "project_id"),
             Self::PreviewLink(request) => {
@@ -641,7 +644,9 @@ pub(crate) struct ListenToEpisodeRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TranscribeAndCheckEpisodeRequest {
     pub(crate) project_id: String,
-    pub(crate) model_id: String,
+    /// Absent means the best installed recogniser, which soundAr chooses.
+    #[serde(default)]
+    pub(crate) model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1547,12 +1552,12 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "transcribe_and_check_episode",
-            "Listen back to every narrated line with an installed local transcription model, measure the master's loudness, and check both against what the episode was asked to be. This is the measuring half of quality control: prefer it over check_episode_quality, which requires you to supply what was heard yourself. A line whose take cannot be transcribed is reported as unchecked rather than as passed. Requires Studio or Full access.",
+            "Listen back to every narrated line with an installed local transcription model, measure the master's loudness, and check both against what the episode was asked to be. This is the measuring half of quality control: prefer it over check_episode_quality, which requires you to supply what was heard yourself. Do not name a model unless the user did; soundAr picks the most accurate installed recogniser. A line whose take cannot be transcribed is reported as unchecked rather than as passed. Requires Studio or Full access.",
             object_schema(
-                &["project_id", "model_id"],
+                &["project_id"],
                 properties([
                     ("project_id", string("Video Studio project id")),
-                    ("model_id", string("An installed local transcription model id")),
+                    ("model_id", json!({"type":["string","null"],"description":"An installed local transcription model id. Leave it out: soundAr chooses the most accurate installed recogniser, and a small model mishears takes it should pass."})),
                 ]),
             ),
         ),

@@ -1532,8 +1532,8 @@ design; the short version:
   drawn backdrop; a backdrop is not shipped where footage could be made unless the writer chooses.
 - **The recipe is a file.** `app/src-tauri/prompts/producer.md`, held to the tool catalog by a test.
 
-Recorded and not fixed in this pass: a music bed still cannot render (sidechain ducking has no
-render plan), and sound layers do not reach the master.
+A second pass the same day closed the two render gaps: a music bed now ducks under speech through
+a sidechain compressor in the render graph, and placed sound design enters the mix at its range.
 
 ## Version Numbering
 
