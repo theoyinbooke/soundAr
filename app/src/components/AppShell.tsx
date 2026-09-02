@@ -12,7 +12,6 @@ import {
   Columns3,
   Cpu,
   FlaskConical,
-  History,
   Info,
   Minus,
   Moon,
@@ -54,7 +53,6 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { key: "voices", label: "Voices", icon: UsersRound },
       { key: "models", label: "Models", icon: Boxes },
-      { key: "history", label: "History", icon: History },
     ],
   },
   {
