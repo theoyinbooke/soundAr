@@ -451,15 +451,10 @@ export function HistoryView({ history, onChange, selectedId }: { history: Histor
   const selectedArtifactMessage = selected?.artifact_state === "modified"
     ? "Audio file changed on disk"
     : selectedUnavailable ? "Audio file is missing" : undefined;
-  const videoMasters = sortVideoProjectsForLibrary(videoProjects).filter((project) => project.master);
 
   return (
     <div className="page history-page">
-      <PageHeader title="History" subtitle="Reopen, audition, and export audio generations and final video masters." />
-      {videoService ? <section className="video-history-library" aria-labelledby="video-history-library-title">
-        <div className="video-library-heading"><div><h2 id="video-history-library-title">Video masters</h2><p>Completed MP4 exports remain playable and downloadable from their project record.</p></div>{videoMasters.length ? <span>{videoMasters.length} master{videoMasters.length === 1 ? "" : "s"}</span> : null}</div>
-        {videoProjectsLoading && !videoMasters.length ? <div className="video-library-loading" role="status"><LoaderCircle className="spin" aria-hidden="true" size={14} />Loading video masters</div> : videoMasters.length ? <div className="video-history-card-grid">{videoMasters.map((project) => <VideoMasterCard key={project.id} project={project} variant="history" selected={project.id === activeVideoProjectId} onOpen={onOpenVideoProject} />)}</div> : <div className="video-library-empty"><span>{videoProjectsError ?? "Final Video Studio exports will appear here."}</span></div>}
-      </section> : null}
+      <PageHeader title="History" subtitle="Reopen, audition, and export audio generations. Videos live in Video Studio and Projects." />
       <Panel className={`history-workspace history-detail-only${selected ? "" : " is-empty"}`} ariaLabel="Generation history">
         <section className="history-detail" aria-label="Generation details">
           {selected ? <>
