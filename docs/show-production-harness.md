@@ -201,3 +201,32 @@ pass `accept_dropped_cues: true` to proceed with the cues stripped and recorded.
 > footage from the installed generator, and a release plan that is ready with no blocking
 > findings. Update `CHANGELOG.md` under a new `0.1.4` entry and bump the four version files
 > together. Report what was measured, not what was intended.
+
+## 6. Result of the first run (2026-09-01, branch `show-harness`, 0.1.4)
+
+The comedy episode was made again through the headless CLI, from a saved format through a
+released package, with every step measured rather than assumed.
+
+| Step | What happened |
+| --- | --- |
+| Format and cast | Both characters on Breeze TTS 2 with personas; the audience with an ensemble of 3; target 30 s, tolerance 20 %; look "a small brick-wall comedy club, one microphone under a warm amber spotlight, an audience in shadow", mood warm |
+| Script | Cues written as `(laughs)`, `(chuckles)`, `(applause)`; the audience turns are reactions; the casting gate accepted the cast |
+| Narration | 8 lines in about 2 minutes including model load; the audience's laughs rendered as three layered takes |
+| Listening | 34.8 s performed against 30 s, within tolerance; longest gap 0.22 s |
+| Footage | 3 portrait shots (480x864) in the club world in 227 s, cut across the episode; the flat card never appeared |
+| Final master | 1080x1920 H.264, 34.8 s, in 17 s |
+| Quality, Whisper-tiny | 13 blocking findings, all recogniser mishearings plus a true peak 0.1 dB over the ceiling; no spoken cue, no length finding |
+| Quality, Parakeet | after digit and compound equivalence and a 0.3 dB true-peak tolerance: 1 blocking finding, a possibly dropped "it" |
+| Release plan | audio, master, and audiogram blocked on that finding; trailer, transcript, notes ready |
+| Fix | the line's direction was changed; the script tool reported 1 stale take; narration re-read only that line in 19 s |
+| Re-check | "Every narrated line matches its script and the episode is within its length" |
+| Release | trailer 33 s portrait, audiogram 34.9 s square, episode audio 34.8 s with chapters; nothing skipped |
+
+What the run taught, beyond the design: Breeze could not be cast in a show at all before this pass,
+because the narration path required a library voice; a recogniser's spelling is not the take's
+words, so the checker now treats digits, compounds, and a tenth of a decibel as measurement rather
+than fault; and Whisper-tiny is not a quality-control recogniser on this machine, Parakeet is.
+
+Still open after this pass: a music bed cannot render (sidechain ducking has no render plan),
+sound layers do not reach the master, and the MiniMax entry in `data/curated_models.json` points
+its source URL at Kokoro.
