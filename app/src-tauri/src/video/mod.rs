@@ -29,6 +29,7 @@ pub mod shots;
 pub mod sound;
 pub mod timeline;
 pub mod visuals;
+pub mod vocal_events;
 
 pub use assembly::{
     build_ass_document, build_timeline_render_plan, plan_caption_preview_pages,
@@ -41,12 +42,13 @@ pub use cache::{
 };
 pub use cast::{
     index_cast_by_name, parse_dialogue_script, CastDelivery, CastMember, DialogueTurn, ParsedTurn,
-    MAX_CAST_MEMBERS, MAX_DIALOGUE_TURNS, MAX_DIRECTION_BYTES, MAX_SCRIPT_BYTES,
-    MAX_TURN_TEXT_BYTES,
+    MAX_CAST_MEMBERS, MAX_DIALOGUE_TURNS, MAX_DIRECTION_BYTES, MAX_ENSEMBLE, MAX_PERSONA_BYTES,
+    MAX_SCRIPT_BYTES, MAX_TURN_TEXT_BYTES,
 };
 pub use contracts::*;
 pub use cover::{
-    cover_palette, cover_spec, cover_subtitle, CoverPalette, CoverSpec, COVER_PALETTES,
+    backdrop_spec, cover_palette, cover_spec, cover_subtitle, look_palette, mix_colours,
+    mood_palettes, BackdropSpec, CoverPalette, CoverSpec, OwnedPalette, COVER_PALETTES,
 };
 pub use dialogue::{apply_dialogue_script, AppliedDialogueScript, DialogueScriptRequest};
 pub use editor::{
@@ -54,8 +56,8 @@ pub use editor::{
     VideoTimelineEditRequest, VideoTimelineOperation,
 };
 pub use format::{
-    instantiate_format, materialize_format_cues, CueTemplate, FormatOrigin, ShowFormat,
-    MAX_SHOW_FORMATS,
+    instantiate_format, materialize_format_cues, normalize_hex_colour, CueTemplate, FormatOrigin,
+    Look, Mood, ShowFormat, DEFAULT_DURATION_TOLERANCE_BP, MAX_LOOK_WORLD_BYTES, MAX_SHOW_FORMATS,
 };
 pub use intelligence::{
     apply_scene_plan, identify_clip_candidates, plan_reviewed_timeline, source_range_fingerprint,
@@ -66,7 +68,9 @@ pub use lexicon::{
     apply_lexicon, effective_entries, fingerprint_for_character, lexicon_fingerprint,
     LexiconApplication, LexiconEntry, LexiconMatch, LexiconScope, MAX_LEXICON_ENTRIES,
 };
-pub use listening::{listen_to_episode, EpisodeListening, GapSummary, ListenedLine, SpeakerShare};
+pub use listening::{
+    listen_to_episode, EpisodeListening, GapSummary, LengthReport, ListenedLine, SpeakerShare,
+};
 pub use media::{
     discover_media_runtime, local_media_input_args, preflight_import_url_destination,
     probe_h264_nvenc_runtime, probe_media, resolve_clip_models, validate_caption_cues,
@@ -86,16 +90,18 @@ pub use presentation::{
 };
 pub use quality::{
     build_report, diff_spoken_words, findings_for_caption_drift, findings_for_dead_air,
-    findings_for_loudness, findings_for_turn, parse_loudness_analysis, CaptionAlignment,
-    LoudnessMeasurement, QcFinding, QcFindingKind, QcReport, QcSeverity, WordDifference,
+    findings_for_dropped_cues, findings_for_length, findings_for_loudness,
+    findings_for_performed_line, findings_for_turn, parse_loudness_analysis, quality_fingerprint,
+    CaptionAlignment, LoudnessMeasurement, QcFinding, QcFindingKind, QcReport, QcSeverity,
+    QualityRecord, QualityStatus, WordDifference,
 };
 pub use release::{
-    episode_chapters, episode_transcript, ffmetadata_chapters, plan_release, ReleaseChapter,
-    ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US,
-    TRAILER_TARGET_US,
+    episode_chapters, episode_transcript, ffmetadata_chapters, plan_release, PictureStatus,
+    ReleaseChapter, ReleaseContext, ReleaseGates, ReleaseMemberKind, ReleaseMemberPlan,
+    ReleasePlan, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
 pub use renderer::{
-    build_audiogram_command, build_clip_command, build_cover_image_command,
+    build_audiogram_command, build_backdrop_command, build_clip_command, build_cover_image_command,
     build_loudness_analysis_command, build_podcast_audio_command, build_portrait_command,
     build_portrait_command_with_layout, build_proxy_command, build_thumbnail_command,
     build_trailer_command, build_waveform_command, parse_ffmpeg_progress, publish_atomic,
@@ -129,7 +135,8 @@ pub use service::{
     VisualAssetOrigin, VisualSourceReceipt,
 };
 pub use shots::{
-    plan_shots, shot_count_for, tile_shots, ShotPlan, CLIP_DURATION_US, MAX_SHOTS, MIN_SHOTS,
+    clip_canvas_for, default_shots_for_world, plan_shots, shot_count_for, tile_shots, ShotPlan,
+    CLIP_DURATION_US, MAX_SHOTS, MIN_SHOTS,
 };
 pub use sound::{
     assets_matching_tag, SoundAsset, SoundLayer, SoundPlacementKind, MAX_SOUND_ASSETS,
@@ -145,4 +152,8 @@ pub use visuals::{
     VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion,
     MAX_VISUAL_ASSETS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_LAYERS,
     MAX_VISUAL_PIXELS,
+};
+pub use vocal_events::{
+    events_of, normalize_cues, render_for_vocabulary, segments_of, words_of, CueParse,
+    RenderedLine, ScriptSegment, VocalEvent, VocalVocabulary,
 };

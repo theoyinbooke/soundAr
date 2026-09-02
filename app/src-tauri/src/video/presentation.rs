@@ -265,6 +265,8 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 "delivery": member.delivery,
                 "consent_reference_id": member.consent_reference_id,
                 "notes": member.notes,
+                "persona": member.persona,
+                "ensemble": member.ensemble,
                 "created_at": member.created_at,
             })
         })
@@ -494,6 +496,8 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
             "cast": cast,
             "dialogue": dialogue,
             "format_origin": manifest.format_origin,
+            "length_target": manifest.length_target,
+            "look": manifest.look,
             "lexicon": lexicon,
             "music_cues": music_cues,
             "sound_assets": sound_assets,
@@ -692,6 +696,7 @@ fn present_manifest_artifact(
         RenderArtifactRole::Trailer => "trailer",
         RenderArtifactRole::Audiogram => "audiogram",
         RenderArtifactRole::GeneratedClip => "generated-clip",
+        RenderArtifactRole::Backdrop => "backdrop",
         RenderArtifactRole::Thumbnail
         | RenderArtifactRole::Waveform
         | RenderArtifactRole::SceneSegment
@@ -1086,6 +1091,7 @@ fn artifact_title(artifact: &RenderArtifact) -> &'static str {
         RenderArtifactRole::Trailer => "Trailer",
         RenderArtifactRole::Audiogram => "Audiogram",
         RenderArtifactRole::GeneratedClip => "Generated clip",
+        RenderArtifactRole::Backdrop => "Backdrop",
         RenderArtifactRole::PublishPackage => "Publish package",
     }
 }

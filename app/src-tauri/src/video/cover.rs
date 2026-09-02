@@ -10,6 +10,7 @@
 //! artwork the user supplied.
 
 use super::cast::CastMember;
+use super::format::{normalize_hex_colour, Look, Mood};
 use sha2::{Digest, Sha256};
 
 /// Longest title drawn on a card. Past this a title stops being readable at a glance, and the
@@ -180,6 +181,255 @@ pub fn cover_palette(seed: &str) -> CoverPalette {
     COVER_PALETTES[usize::from(digest[0]) % COVER_PALETTES.len()]
 }
 
+/// Palettes a mood chooses between. Each is a dark ground, readable type, and one accent, in the
+/// temperature the mood names.
+pub fn mood_palettes(mood: Mood) -> &'static [CoverPalette] {
+    const WARM: [CoverPalette; 3] = [
+        CoverPalette {
+            background: "0x2B2118",
+            foreground: "0xF7F3EE",
+            muted: "0xB3A192",
+            accent: "0xF59E6B",
+        },
+        CoverPalette {
+            background: "0x301B14",
+            foreground: "0xFBF4EC",
+            muted: "0xC2A48B",
+            accent: "0xE8B44A",
+        },
+        CoverPalette {
+            background: "0x261C1C",
+            foreground: "0xF7F1F1",
+            muted: "0xB29A9A",
+            accent: "0xF87171",
+        },
+    ];
+    const COOL: [CoverPalette; 3] = [
+        CoverPalette {
+            background: "0x18232E",
+            foreground: "0xEFF4F8",
+            muted: "0x92A4B3",
+            accent: "0x60A5FA",
+        },
+        CoverPalette {
+            background: "0x1B2A24",
+            foreground: "0xF2F5F3",
+            muted: "0x93A79C",
+            accent: "0x6FCF97",
+        },
+        CoverPalette {
+            background: "0x162A2E",
+            foreground: "0xEDF6F7",
+            muted: "0x8FB0B4",
+            accent: "0x5EEAD4",
+        },
+    ];
+    const NEUTRAL: [CoverPalette; 2] = [
+        CoverPalette {
+            background: "0x1F2933",
+            foreground: "0xF5F5F4",
+            muted: "0x9AA5B1",
+            accent: "0xE8B44A",
+        },
+        CoverPalette {
+            background: "0x232323",
+            foreground: "0xF4F4F2",
+            muted: "0xA3A3A0",
+            accent: "0xD4D4D0",
+        },
+    ];
+    const ELECTRIC: [CoverPalette; 2] = [
+        CoverPalette {
+            background: "0x2A1F2D",
+            foreground: "0xF6F2F7",
+            muted: "0xAB9CB0",
+            accent: "0xC084FC",
+        },
+        CoverPalette {
+            background: "0x141A2E",
+            foreground: "0xF0F3FA",
+            muted: "0x8E9AC0",
+            accent: "0x22D3EE",
+        },
+    ];
+    const NOIR: [CoverPalette; 1] = [CoverPalette {
+        background: "0x0E0E10",
+        foreground: "0xF5F5F5",
+        muted: "0x8A8A8E",
+        accent: "0xE5E7EB",
+    }];
+    match mood {
+        Mood::Warm => &WARM,
+        Mood::Cool => &COOL,
+        Mood::Neutral => &NEUTRAL,
+        Mood::Electric => &ELECTRIC,
+        Mood::Noir => &NOIR,
+    }
+}
+
+/// The palette a show's look asks for: its own colours when it names them, otherwise one of its
+/// mood's, chosen by identity so an episode keeps its colour across renames.
+pub fn look_palette(look: Option<&Look>, seed: &str) -> OwnedPalette {
+    if let Some(palette) = look.and_then(|look| look.palette.as_ref()) {
+        if let [background, foreground, muted, accent] = palette
+            .iter()
+            .map(|colour| normalize_hex_colour(colour))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+            .as_slice()
+        {
+            return OwnedPalette {
+                background: background.clone(),
+                foreground: foreground.clone(),
+                muted: muted.clone(),
+                accent: accent.clone(),
+            };
+        }
+    }
+    let digest = Sha256::digest(seed.as_bytes());
+    let chosen = match look {
+        Some(look) => {
+            let family = mood_palettes(look.mood);
+            family[usize::from(digest[0]) % family.len()]
+        }
+        None => cover_palette(seed),
+    };
+    OwnedPalette::from(chosen)
+}
+
+/// A palette as strings, so a look's own colours and a built-in one are the same type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedPalette {
+    pub background: String,
+    pub foreground: String,
+    pub muted: String,
+    pub accent: String,
+}
+
+impl From<CoverPalette> for OwnedPalette {
+    fn from(palette: CoverPalette) -> Self {
+        Self {
+            background: palette.background.to_string(),
+            foreground: palette.foreground.to_string(),
+            muted: palette.muted.to_string(),
+            accent: palette.accent.to_string(),
+        }
+    }
+}
+
+/// Blend two `0xRRGGBB` colours; `amount` is how far from `from` towards `to`, in thousandths.
+pub fn mix_colours(from: &str, to: &str, amount_milli: u32) -> String {
+    let parse = |value: &str| -> [u32; 3] {
+        let digits = value.trim_start_matches("0x");
+        let channel = |offset: usize| {
+            u32::from_str_radix(digits.get(offset..offset + 2).unwrap_or("00"), 16).unwrap_or(0)
+        };
+        [channel(0), channel(2), channel(4)]
+    };
+    let (a, b) = (parse(from), parse(to));
+    let amount = amount_milli.min(1_000);
+    let mix = |index: usize| (a[index] * (1_000 - amount) + b[index] * amount) / 1_000;
+    format!("0x{:02X}{:02X}{:02X}", mix(0), mix(1), mix(2))
+}
+
+/// Everything needed to draw one motion backdrop, and nothing about how it is drawn.
+///
+/// A backdrop is the card's successor: the same derivation from what the episode knows about
+/// itself, but a moving picture rather than a flat one. It runs the length of the episode so it is
+/// placed once, as footage, and the title resolves over its first seconds and leaves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackdropSpec {
+    pub width: u32,
+    pub height: u32,
+    pub duration_us: i64,
+    pub frame_rate: (u32, u32),
+    pub title: String,
+    pub subtitle: String,
+    pub palette: OwnedPalette,
+    /// Seeds the gradient's shape, so two shows with one palette do not share a picture.
+    pub seed: u32,
+}
+
+impl BackdropSpec {
+    pub fn cache_key(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"backdrop-v1");
+        for field in [
+            self.width.to_string(),
+            self.height.to_string(),
+            self.duration_us.to_string(),
+            format!("{}/{}", self.frame_rate.0, self.frame_rate.1),
+            self.title.clone(),
+            self.subtitle.clone(),
+            self.palette.background.clone(),
+            self.palette.foreground.clone(),
+            self.palette.muted.clone(),
+            self.palette.accent.clone(),
+            self.seed.to_string(),
+            self.title_font_size().to_string(),
+        ] {
+            hasher.update([0x1f]);
+            hasher.update(field.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub fn title_font_size(&self) -> u32 {
+        let base = (self.width / 18).max(28);
+        let crowding = (self.title.chars().count().max(1) as u32)
+            .div_ceil(22)
+            .max(1);
+        (base / crowding).max(24)
+    }
+
+    pub fn subtitle_font_size(&self) -> u32 {
+        (self.title_font_size() / 2).max(18)
+    }
+
+    pub fn accent_height(&self) -> u32 {
+        (self.height / 160).clamp(4, 14)
+    }
+
+    /// The four gradient stops, from the ground through the accent back to shadow.
+    pub fn gradient_stops(&self) -> [String; 4] {
+        [
+            self.palette.background.clone(),
+            mix_colours(&self.palette.background, &self.palette.accent, 380),
+            mix_colours(&self.palette.background, &self.palette.accent, 720),
+            mix_colours(&self.palette.background, "0x000000", 550),
+        ]
+    }
+}
+
+/// Build the backdrop for one episode.
+pub fn backdrop_spec(
+    project_id: &str,
+    name: &str,
+    cast: &[CastMember],
+    look: Option<&Look>,
+    width: u32,
+    height: u32,
+    duration_us: i64,
+    frame_rate: (u32, u32),
+) -> BackdropSpec {
+    let title = clamp_text(name, MAX_COVER_TITLE_CHARS);
+    let digest = Sha256::digest(project_id.as_bytes());
+    BackdropSpec {
+        width,
+        height,
+        duration_us,
+        frame_rate,
+        title: if title.is_empty() {
+            "Untitled episode".to_string()
+        } else {
+            title
+        },
+        subtitle: cover_subtitle(cast),
+        palette: look_palette(look, project_id),
+        seed: u32::from_le_bytes([digest[1], digest[2], digest[3], digest[4]]) % 100_000,
+    }
+}
+
 /// Build the card for one episode.
 pub fn cover_spec(
     project_id: &str,
@@ -208,6 +458,55 @@ mod tests {
     use super::*;
     use crate::video::cast::CastDelivery;
 
+    #[test]
+    fn a_look_names_its_colours_or_its_mood_chooses_them() {
+        let named = Look {
+            world: "a club".into(),
+            mood: Mood::Warm,
+            palette: Some([
+                "#1b2a24".into(),
+                "0xF2F5F3".into(),
+                "93A79C".into(),
+                "#6FCF97".into(),
+            ]),
+        };
+        let palette = look_palette(Some(&named), "project-x");
+        assert_eq!(palette.background, "0x1B2A24");
+        assert_eq!(palette.muted, "0x93A79C");
+
+        let warm = Look {
+            world: "a club".into(),
+            mood: Mood::Warm,
+            palette: None,
+        };
+        let chosen = look_palette(Some(&warm), "project-x");
+        assert!(mood_palettes(Mood::Warm)
+            .iter()
+            .any(|candidate| OwnedPalette::from(*candidate) == chosen));
+        // Identity, not title, picks within the mood.
+        assert_eq!(chosen, look_palette(Some(&warm), "project-x"));
+    }
+
+    #[test]
+    fn colours_mix_by_thousandths_and_a_backdrop_is_addressed_by_everything_it_draws() {
+        assert_eq!(mix_colours("0x000000", "0xFFFFFF", 500), "0x7F7F7F");
+        assert_eq!(mix_colours("0x102030", "0x102030", 900), "0x102030");
+        let spec = backdrop_spec(
+            "project-a",
+            "The Needy Smart Home",
+            &[],
+            None,
+            1080,
+            1920,
+            30_000_000,
+            (30, 1),
+        );
+        let mut longer = spec.clone();
+        longer.duration_us = 31_000_000;
+        assert_ne!(spec.cache_key(), longer.cache_key());
+        assert_eq!(spec.gradient_stops()[0], spec.palette.background);
+    }
+
     fn member(id: &str, display_name: &str) -> CastMember {
         CastMember {
             id: id.to_string(),
@@ -218,6 +517,8 @@ mod tests {
             language: "en-US".to_string(),
             delivery: CastDelivery::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: "2026-08-30T00:00:00Z".to_string(),
         }

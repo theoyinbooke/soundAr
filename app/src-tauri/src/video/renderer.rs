@@ -1,4 +1,4 @@
-use super::cover::CoverSpec;
+use super::cover::{BackdropSpec, CoverSpec};
 use super::media::{is_executable_file, local_media_input_args, MediaError};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -457,6 +457,137 @@ pub fn build_clip_command(
         output: frame_pattern.to_path_buf(),
         encoder: VideoEncoder::Image,
         emits_progress: false,
+    })
+}
+
+/// Render one episode's motion backdrop.
+///
+/// Like the card, it is composed entirely from lavfi and text files: no source media, no image
+/// model, no network. Unlike the card, it moves - a radial field in the show's palette drifting
+/// under grain and a vignette - and its title resolves over the first seconds and leaves, so the
+/// frame reads as a designed opening rather than a held slide.
+pub fn build_backdrop_command(
+    ffmpeg: &Path,
+    spec: &BackdropSpec,
+    title_path: &Path,
+    subtitle_path: Option<&Path>,
+    output: &Path,
+) -> Result<RenderCommandPlan, MediaError> {
+    let paths = validate_plan_paths(ffmpeg, title_path, output)?;
+    let BackdropSpec {
+        width,
+        height,
+        duration_us,
+        frame_rate,
+        palette,
+        seed,
+        ..
+    } = spec;
+    let (width, height) = (*width, *height);
+    // The field is drawn larger than the canvas and cropped with a slow drift, which is what
+    // makes a still gradient read as a camera rather than a screen saver.
+    let over_width = width + width / 12;
+    let over_height = height + height / 12;
+    let margin_x = (over_width - width) / 2;
+    let margin_y = (over_height - height) / 2;
+    let stops = spec.gradient_stops();
+    let seconds = (*duration_us as f64 / 1_000_000.0).max(1.0);
+    let fps = format!("{}/{}", frame_rate.0.max(1), frame_rate.1.max(1));
+    let title_size = spec.title_font_size();
+    let accent = spec.accent_height();
+    let title_alpha =
+        "if(lt(t,0.5),0,if(lt(t,1.3),(t-0.5)/0.8,if(lt(t,4.6),1,if(lt(t,5.4),(5.4-t)/0.8,0))))";
+    let subtitle_alpha =
+        "if(lt(t,0.9),0,if(lt(t,1.7),(t-0.9)/0.8,if(lt(t,4.6),1,if(lt(t,5.4),(5.4-t)/0.8,0))))";
+
+    let mut filters = vec![
+        format!(
+            "crop={width}:{height}:x='{margin_x}+sin(t/7)*{drift_x}':y='{margin_y}+cos(t/9)*{drift_y}'",
+            drift_x = (margin_x / 2).max(1),
+            drift_y = (margin_y / 2).max(1)
+        ),
+        // Grain, so a gradient does not band; a vignette, so the eye is held in the middle.
+        "noise=alls=9:allf=t+u".to_string(),
+        "vignette=angle=PI/4.2".to_string(),
+        format!(
+            "drawbox=x=0:y=0:w={width}:h={accent}:color={}:t=fill",
+            palette.accent
+        ),
+        format!(
+            "drawtext=textfile='{}':expansion=none:fontcolor={}:fontsize={title_size}:x=(w-text_w)/2:y=h*0.42:alpha='{title_alpha}'",
+            escape_filter_text_path(&paths.input),
+            palette.foreground
+        ),
+    ];
+    if let Some(subtitle) = subtitle_path {
+        let subtitle = fs::canonicalize(subtitle).map_err(|error| {
+            MediaError::new(
+                "render_input_not_found",
+                "The backdrop subtitle could not be opened",
+            )
+            .detail(error.to_string())
+        })?;
+        filters.push(format!(
+            "drawtext=textfile='{}':expansion=none:fontcolor={}:fontsize={}:x=(w-text_w)/2:y=h*0.42+{}:alpha='{subtitle_alpha}'",
+            escape_filter_text_path(&subtitle),
+            palette.muted,
+            spec.subtitle_font_size(),
+            title_size + title_size / 2
+        ));
+    }
+    filters.push("format=yuv420p".to_string());
+
+    let args = vec![
+        OsString::from("-hide_banner"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-nostdin"),
+        OsString::from("-n"),
+        OsString::from("-f"),
+        OsString::from("lavfi"),
+        OsString::from("-i"),
+        OsString::from(format!(
+            "gradients=s={over_width}x{over_height}:c0={}:c1={}:c2={}:c3={}:n=4:type=radial:x0={}:y0={}:x1={}:y1={}:speed=0.006:seed={seed}:d={seconds:.3}:r={fps}",
+            stops[0],
+            stops[1],
+            stops[2],
+            stops[3],
+            over_width / 4 + (seed % 97) * over_width / 400,
+            over_height / 5,
+            over_width - over_width / 6,
+            over_height - over_height / 8,
+        )),
+        OsString::from("-vf"),
+        OsString::from(filters.join(",")),
+        OsString::from("-t"),
+        OsString::from(format!("{seconds:.3}")),
+        OsString::from("-an"),
+        OsString::from("-c:v"),
+        OsString::from("libx264"),
+        OsString::from("-preset"),
+        OsString::from("veryfast"),
+        OsString::from("-crf"),
+        OsString::from("20"),
+        OsString::from("-pix_fmt"),
+        OsString::from("yuv420p"),
+        OsString::from("-movflags"),
+        OsString::from("+faststart"),
+        // Name the container: the backdrop is written to an extensionless staging path first.
+        OsString::from("-f"),
+        OsString::from("mp4"),
+        paths.output.as_os_str().to_os_string(),
+    ];
+    Ok(RenderCommandPlan {
+        profile: RenderProfile::Final,
+        workload_class: RenderWorkloadClass::Medium,
+        primary: RenderCommand {
+            program: paths.ffmpeg,
+            args,
+            output: paths.output,
+            encoder: VideoEncoder::Libx264,
+            emits_progress: false,
+        },
+        software_fallback: None,
     })
 }
 

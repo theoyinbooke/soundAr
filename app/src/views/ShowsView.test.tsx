@@ -57,7 +57,7 @@ describe("ShowsView", () => {
     // Without a picture the episode cannot render at all, so the surface says that rather than
     // leaving an empty panel that reads as "nothing to do here".
     expect(within(picture).getByText(/cannot be rendered or packaged as video/i)).toBeVisible();
-    expect(within(picture).getByRole("button", { name: /Draw cover/ })).toBeEnabled();
+    expect(within(picture).getByRole("button", { name: /Draw backdrop/ })).toBeEnabled();
   });
 
   it("shows generated shots in place of a drawn card once an episode has them", async () => {
@@ -68,7 +68,7 @@ describe("ShowsView", () => {
     const picture = await screen.findByRole("region", { name: "Picture" });
 
     // With no generated shots the panel offers the drawn card, which is the fallback.
-    expect(within(picture).getByRole("button", { name: /Draw cover|Redraw cover/ })).toBeVisible();
+    expect(within(picture).getByRole("button", { name: /Draw backdrop|Redraw backdrop/ })).toBeVisible();
     // And it says where moving footage comes from, rather than leaving the user to guess.
     expect(within(picture).getByText(/cannot be rendered or packaged as video|assistant/i)).toBeVisible();
   });

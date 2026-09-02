@@ -282,11 +282,15 @@ impl VideoAgentOperation {
             }
             Self::EnsureEpisodeCover(request) => require_text(&request.project_id, "project_id"),
             Self::GenerateEpisodeClips(request) => {
+                // Blank shots are dropped by the planner and an empty list falls back to the
+                // show's look; a list of only blanks is a caller that meant to write something.
                 require_text(&request.project_id, "project_id")?;
-                if request.shots.iter().all(|shot| shot.trim().is_empty()) {
+                if !request.shots.is_empty()
+                    && request.shots.iter().all(|shot| shot.trim().is_empty())
+                {
                     return Err(VideoAgentToolError::new(
                         "video.shots_not_described",
-                        "Describe what each shot shows",
+                        "Describe what each shot shows, or send no shots to use the show's look",
                     ));
                 }
                 Ok(())
@@ -297,7 +301,10 @@ impl VideoAgentOperation {
             Self::CheckEpisodeQuality(request) => require_text(&request.project_id, "project_id"),
             Self::TranscribeAndCheckEpisode(request) => {
                 require_text(&request.project_id, "project_id")?;
-                require_text(&request.model_id, "model_id")
+                match request.model_id.as_deref() {
+                    Some(model_id) => require_text(model_id, "model_id"),
+                    None => Ok(()),
+                }
             }
             Self::ListenToEpisode(request) => require_text(&request.project_id, "project_id"),
             Self::PreviewLink(request) => {
@@ -637,7 +644,9 @@ pub(crate) struct ListenToEpisodeRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TranscribeAndCheckEpisodeRequest {
     pub(crate) project_id: String,
-    pub(crate) model_id: String,
+    /// Absent means the best installed recogniser, which soundAr chooses.
+    #[serde(default)]
+    pub(crate) model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -661,6 +670,13 @@ pub(crate) struct PlanEpisodeReleaseRequest {
     /// Notes are written, not derived, so the caller says whether they exist.
     #[serde(default)]
     pub(crate) has_show_notes: bool,
+    /// Release although the last quality check found blocking problems. A missing or stale
+    /// check cannot be accepted, only run.
+    #[serde(default)]
+    pub(crate) accept_findings: bool,
+    /// Release on the drawn backdrop although a video generator could have made footage.
+    #[serde(default)]
+    pub(crate) accept_backdrop: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -668,7 +684,9 @@ pub(crate) struct PlanEpisodeReleaseRequest {
 pub(crate) struct GenerateEpisodeClipsRequest {
     pub(crate) project_id: String,
     /// What each shot shows. Written, never derived: an episode's own words describe a
-    /// conversation, and a shot has to say what is on screen.
+    /// conversation, and a shot has to say what is on screen. Left empty, the show's look
+    /// supplies three views of its world.
+    #[serde(default)]
     pub(crate) shots: Vec<String>,
 }
 
@@ -1478,7 +1496,7 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "save_show_format",
-            "Create or update the reusable shape of a series: its cast, pronunciation rules, conversational timing, caption preset, canvas, loudness targets, usual episode length, and opening and closing music. soundAr owns the revision number. Editing a format never changes an episode that already exists - instantiation copies, so a shipped episode reproduces what it was made from. Requires Studio or Full access.",
+            "Create or update the reusable shape of a series: its cast with each character's persona, pronunciation rules, conversational timing, caption preset, canvas, loudness targets, target episode length with its tolerance, its look - the world the audience sees and the mood that colours it - and opening and closing music. soundAr owns the revision number. Editing a format never changes an episode that already exists - instantiation copies, so a shipped episode reproduces what it was made from. Requires Studio or Full access.",
             show_format_schema(),
         ),
         tool(
@@ -1500,18 +1518,18 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "generate_episode_clips",
-            "Generate this episode's moving shots and cut them across its narration, so a show performed by voices has something to look at. You write what each shot shows: describe the picture, not the conversation - \"a lighthouse beam sweeping across black water at night\" is a shot, \"two friends discussing a lighthouse keeper\" is not, and the second renders as nothing recognisable. A clip costs about a minute of local compute for under two seconds of footage, so supply a handful of shots and soundAr repeats them across the episode rather than generating one per second. Shots are content-addressed, so re-running with the same descriptions regenerates nothing. Requires the local video-generation model to be installed; where it is not, use ensure_episode_cover for a drawn card instead. Requires Studio or Full access.",
+            "Generate this episode's moving shots and cut them across its narration, so a show performed by voices has something to look at. You write what each shot shows: describe the picture, not the conversation - \"a lighthouse beam sweeping across black water at night\" is a shot, \"two friends discussing a lighthouse keeper\" is not, and the second renders as nothing recognisable. Shots are generated in the episode's own aspect and set in the show's world from its look, so describe what is in frame and let the look supply the place; leave shots empty and the look's world yields three views of it. A clip costs about a minute of local compute for under two seconds of footage, so supply a handful of shots and soundAr repeats them across the episode rather than generating one per second. Shots are content-addressed, so re-running with the same descriptions regenerates nothing. Generated shots replace the drawn backdrop. Requires the local video-generation model to be installed; where it is not, ensure_episode_cover draws a motion backdrop instead. Requires Studio or Full access.",
             object_schema(
-                &["project_id", "shots"],
+                &["project_id"],
                 properties([
                     ("project_id", string("Video Studio project id")),
-                    ("shots", json!({"type":"array","minItems":1,"maxItems":12,"items":{"type":"string","minLength":8,"maxLength":400},"description":"What each shot shows, as a visual description of the picture"})),
+                    ("shots", json!({"type":"array","minItems":0,"maxItems":12,"items":{"type":"string","minLength":8,"maxLength":400},"description":"What each shot shows, as a visual description of the picture. Empty means three views of the show's world."})),
                 ]),
             ),
         ),
         tool(
             "ensure_episode_cover",
-            "Draw this episode's cover so it can be packaged as video. A script performed by voices produces sound and nothing to look at, and every video deliverable needs a picture; this draws one from what the episode already knows about itself - its name, its cast, and its canvas - with no image model and no network. The card is derived, so the same episode always produces the same card, and it is always recorded as generated rather than as artwork the user supplied. An episode that already has a picture keeps it unless redraw is set. Requires Studio or Full access.",
+            "Draw this episode's motion backdrop so it can be packaged as video. A script performed by voices produces sound and nothing to look at, and every video deliverable needs a picture; this draws a moving one from what the episode already knows about itself - its name, its cast, its canvas, and its show's look - with no image model and no network: a slow-drifting field in the show's palette under grain and a vignette, with the title resolving over the first seconds, and a speaker card naming each character as they begin to speak. It is derived, so the same episode always produces the same backdrop, and it is recorded as generated rather than as artwork the user supplied. An episode that already has footage or a picture keeps it unless redraw is set. Where a video generator is installed, prefer generate_episode_clips: the release plan will ask for footage before shipping a backdrop. Requires Studio or Full access.",
             object_schema(
                 &["project_id"],
                 properties([
@@ -1534,12 +1552,12 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "transcribe_and_check_episode",
-            "Listen back to every narrated line with an installed local transcription model, measure the master's loudness, and check both against what the episode was asked to be. This is the measuring half of quality control: prefer it over check_episode_quality, which requires you to supply what was heard yourself. A line whose take cannot be transcribed is reported as unchecked rather than as passed. Requires Studio or Full access.",
+            "Listen back to every narrated line with an installed local transcription model, measure the master's loudness, and check both against what the episode was asked to be. This is the measuring half of quality control: prefer it over check_episode_quality, which requires you to supply what was heard yourself. Do not name a model unless the user did; soundAr picks the most accurate installed recogniser. A line whose take cannot be transcribed is reported as unchecked rather than as passed. Requires Studio or Full access.",
             object_schema(
-                &["project_id", "model_id"],
+                &["project_id"],
                 properties([
                     ("project_id", string("Video Studio project id")),
-                    ("model_id", string("An installed local transcription model id")),
+                    ("model_id", json!({"type":["string","null"],"description":"An installed local transcription model id. Leave it out: soundAr chooses the most accurate installed recogniser, and a small model mishears takes it should pass."})),
                 ]),
             ),
         ),
@@ -1558,23 +1576,27 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "export_episode_release",
-            "Produce and register every release deliverable this episode can supply: the audio episode carrying its chapter marks, a short vertical trailer cut from the moment the analyst chose in the episode's own narration, and a square audiogram. All three derive from the finished master, so a master is required, and a line still standing in with a draft take blocks the export outright. A member that cannot be produced is reported with its reason rather than omitted. Requires Studio or Full access.",
+            "Produce and register every release deliverable this episode can supply: the audio episode carrying its chapter marks, a short vertical trailer cut from the moment the analyst chose in the episode's own narration, and a square audiogram. All three derive from the finished master, so a master is required, and a line still standing in with a draft take blocks the export outright. The audio episode, the master, and the audiogram also wait for a current quality check: run transcribe_and_check_episode after the final render, fix what it finds or pass accept_findings, and only then export. A member that cannot be produced is reported with its reason rather than omitted. Requires Studio or Full access.",
             object_schema(
                 &["project_id"],
                 properties([
                     ("project_id", string("Video Studio project id")),
                     ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode"})),
+                    ("accept_findings", json!({"type":"boolean","description":"Release although the last quality check found blocking problems. A missing or stale check cannot be accepted; run transcribe_and_check_episode instead."})),
+                    ("accept_backdrop", json!({"type":"boolean","description":"Release on the drawn backdrop although a video generator is installed and could cut footage across the episode."})),
                 ]),
             ),
         ),
         tool(
             "plan_episode_release",
-            "Report what this episode's release would contain and what is still missing: the audio episode with its chapters, the video master, a short vertical trailer, the transcript, and show notes. The trailer moment is chosen by running soundAr's existing candidate analyst over the episode's own narration, so generated work is reviewed by the same deterministic rules as imported source. A blocked member always names its missing prerequisite instead of being quietly omitted. Read-only.",
+            "Report what this episode's release would contain and what is still missing: the audio episode with its chapters, the video master, a short vertical trailer, the transcript, and show notes. The trailer moment is chosen by running soundAr's existing candidate analyst over the episode's own narration, so generated work is reviewed by the same deterministic rules as imported source. A blocked member always names its missing prerequisite instead of being quietly omitted, including a quality check that is missing, stale, or blocking. Read-only.",
             object_schema(
                 &["project_id"],
                 properties([
                     ("project_id", string("Video Studio project id")),
                     ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode. Notes are written, not derived."})),
+                    ("accept_findings", json!({"type":"boolean","description":"Release although the last quality check found blocking problems. A missing or stale check cannot be accepted; run transcribe_and_check_episode instead."})),
+                    ("accept_backdrop", json!({"type":"boolean","description":"Release on the drawn backdrop although a video generator is installed and could cut footage across the episode."})),
                 ]),
             ),
         ),
@@ -1797,6 +1819,8 @@ fn cast_schema() -> Value {
                 },
                 "consent_reference_id": {"type": ["string", "null"], "description": "Required when a cloned managed voice performs this character"},
                 "notes": {"type": ["string", "null"]},
+                "persona": {"type": ["string", "null"], "maxLength": 600, "description": "Who this voice is, as a voice-design instruction: age, character, energy, delivery. Sent to an engine that follows instructions (Breeze TTS 2). Give every character one."},
+                "ensemble": {"type": "integer", "minimum": 1, "maximum": 4, "description": "Distinct takes layered for this character's reaction lines, so a crowd sounds like a crowd. 1 for a single voice."},
                 "created_at": {"type": "string", "description": "UTC RFC3339 timestamp"}
             }
         }
@@ -1925,7 +1949,11 @@ fn show_format_schema() -> Value {
             ),
             (
                 "target_duration_us",
-                json!({"type":"integer","minimum":1,"description":"How long an episode usually runs: a planning target, never a hard limit"}),
+                json!({"type":"integer","minimum":1,"description":"How long an episode of this show is meant to run. A performed episode outside the tolerance is a blocking quality finding until the writer accepts the length."}),
+            ),
+            (
+                "duration_tolerance_bp",
+                json!({"type":"integer","minimum":0,"maximum":10000,"description":"Allowed slack either side of the target, in basis points of it. Default 2000, a fifth."}),
             ),
             (
                 "opening",
@@ -1938,6 +1966,25 @@ fn show_format_schema() -> Value {
             (
                 "show_notes_style",
                 nullable_string("How show notes for this series are written"),
+            ),
+            (
+                "look",
+                json!({
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["world"],
+                            "properties": {
+                                "world": {"type": "string", "maxLength": 600, "description": "The place the audience sees, as a shot description: \"a small brick-wall comedy club, one microphone under a warm spotlight, an audience in shadow\". Every generated shot is set in it and the backdrop is coloured after it."},
+                                "mood": {"type": "string", "enum": ["warm", "cool", "neutral", "electric", "noir"], "description": "Picks the palette when none is named"},
+                                "palette": {"type": ["array", "null"], "minItems": 4, "maxItems": 4, "items": {"type": "string"}, "description": "Background, foreground, muted, accent as 0xRRGGBB. Overrides the mood."}
+                            }
+                        },
+                        {"type": "null"}
+                    ],
+                    "description": "What the audience sees when there is nothing to film. Give every show one."
+                }),
             ),
             (
                 "created_at",
@@ -1973,8 +2020,12 @@ fn video_script_schema() -> Value {
             (
                 "script",
                 string(
-                    "Speaker-attributed script. Each turn opens with `NAME:` naming a declared cast member; following lines continue it and a blank line closes it. A leading `(direction)` steers performance and is never spoken.",
+                    "Speaker-attributed script. Each turn opens with `NAME:` naming a declared cast member; following lines continue it and a blank line closes it. A leading `(direction)` steers performance and is never spoken. A vocal cue - (laughs), (sighs), (chuckles), (clears throat), (gasps), (applause) - may stand anywhere in a line and is performed, not read; a line that is only cues, such as an audience's `(laughs)`, is a reaction. Characters with cues must be cast on a voice that performs them; the tool refuses otherwise and names the voice that can.",
                 ),
+            ),
+            (
+                "accept_dropped_cues",
+                json!({"type":"boolean","description":"Proceed although some characters' voices cannot perform the cues written for them; those cues are removed, never spoken. Not accepted for a reaction line."}),
             ),
         ]),
     )

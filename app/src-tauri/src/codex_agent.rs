@@ -38,6 +38,14 @@ pub(crate) use video_tools::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_NAME: &str = "soundAr";
 
+/// The producer's standing instructions, sent as developer instructions when a thread starts.
+///
+/// Kept as a file rather than a string literal so the recipe a show is made by can be read and
+/// reviewed as prose, and so a test can hold it to the tool catalog it names.
+pub const PRODUCER_INSTRUCTIONS: &str = include_str!("../prompts/producer.md");
+/// The shorter continuation sent when a thread is resumed.
+pub const PRODUCER_RESUME_INSTRUCTIONS: &str = include_str!("../prompts/producer-resume.md");
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct EnrolledCodexBrokerIdentity {
@@ -1829,6 +1837,63 @@ mod tests {
     use serde_json::json;
     use std::{fs, os::unix::fs::symlink, path::PathBuf};
     use uuid::Uuid;
+
+    #[test]
+    fn the_producer_instructions_name_only_tools_that_exist_and_every_step_of_a_show() {
+        let names = dynamic_tools()
+            .as_array()
+            .expect("tool catalog")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>();
+        // Anything in the prompt that reads like a tool call must be one, or the model is sent
+        // looking for a tool that is not there.
+        let mentioned = super::PRODUCER_INSTRUCTIONS
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .filter(|token| {
+                token.contains('_') && token.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let known_parameters = [
+            "history_id",
+            "model_id",
+            "voice_id",
+            "__engine_default__",
+            "set_lexicon_entry",
+            "promote_turns_to_final",
+            "accept_findings",
+            "accept_backdrop",
+        ];
+        for token in &mentioned {
+            assert!(
+                names.contains(*token) || known_parameters.contains(token),
+                "the producer instructions mention {token}, which is neither a tool nor a known parameter"
+            );
+        }
+        for step in [
+            "save_show_format",
+            "create_episode",
+            "write_video_script",
+            "narrate_turns",
+            "listen_to_episode",
+            "video_runtime_status",
+            "generate_episode_clips",
+            "ensure_episode_cover",
+            "generate_cue_music",
+            "transcribe_and_check_episode",
+            "plan_episode_release",
+            "export_episode_release",
+            "get_video_project",
+        ] {
+            assert!(
+                super::PRODUCER_INSTRUCTIONS.contains(step),
+                "the producer instructions do not mention {step}"
+            );
+        }
+        assert!(super::PRODUCER_INSTRUCTIONS.contains("BreezeBlue/Breeze-TTS-2"));
+        assert!(super::PRODUCER_RESUME_INSTRUCTIONS.contains("transcribe_and_check_episode"));
+    }
 
     #[test]
     fn dynamic_tool_catalog_supports_access_changes_without_resetting_the_thread() {

@@ -7,10 +7,10 @@
 //! deterministic.
 
 use super::contracts::{
-    caption_bounds_for_scene, AudioMixTrack, CanvasMode, CaptionCue, CaptionPresetId, LayoutPlan,
-    LayoutRole, Microseconds, NormalizedRect, RationalRate, RenderArtifact, SourceAsset, TimeRange,
-    TimelineClip, TimelineTrack, TrackKind, VideoError, VideoErrorCode, VideoProjectManifest,
-    VideoResult, NORMALIZED_BASIS_POINTS,
+    caption_bounds_for_scene, AudioMixTrack, CanvasMode, CaptionCue, CaptionPresetId, DuckingSpec,
+    LayoutPlan, LayoutRole, Microseconds, NormalizedRect, RationalRate, RenderArtifact,
+    SourceAsset, TimeRange, TimelineClip, TimelineTrack, TrackKind, VideoError, VideoErrorCode,
+    VideoProjectManifest, VideoResult, NORMALIZED_BASIS_POINTS,
 };
 use super::media::local_media_input_args;
 use super::renderer::{
@@ -326,6 +326,52 @@ pub fn build_timeline_render_plan(
             )
         })?);
     }
+    // Sound design: each placed layer reads its whole managed source once; trimming, looping,
+    // and placement happen in the graph so one asset can be placed many times.
+    let mut sound_input_by_asset = BTreeMap::new();
+    for layer in &manifest.sound_layers {
+        if sound_input_by_asset.contains_key(layer.asset_id.as_str()) {
+            continue;
+        }
+        let asset = manifest
+            .sound_assets
+            .iter()
+            .find(|asset| asset.id == layer.asset_id)
+            .ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorCode::MissingReference,
+                    format!("sound layer {} has no registered sound", layer.id),
+                )
+            })?;
+        let path = resolved_sources
+            .get(&format!("sound:{}", asset.id))
+            .or_else(|| resolved_sources.get(&format!("source:{}", asset.source_asset_id)))
+            .or_else(|| resolved_sources.get(asset.source_asset_id.as_str()))
+            .ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorCode::MissingReference,
+                    format!("sound {} has no resolved managed file", asset.id),
+                )
+            })?;
+        let path = fs::canonicalize(path).map_err(|error| {
+            VideoError::new(
+                VideoErrorCode::InvalidAsset,
+                format!("sound {} could not be opened: {error}", asset.id),
+            )
+        })?;
+        let input_index =
+            input_by_clip.len() + visual_input_by_asset.len() + sound_input_by_asset.len();
+        sound_input_by_asset.insert(asset.id.as_str(), input_index);
+        args.extend(local_media_input_args(&path).map_err(|error| {
+            VideoError::new(
+                VideoErrorCode::InvalidAsset,
+                format!(
+                    "sound {} failed local-input policy: {}",
+                    asset.id, error.message
+                ),
+            )
+        })?);
+    }
     args.extend([
         OsString::from("-map_metadata"),
         OsString::from("-1"),
@@ -388,9 +434,10 @@ pub fn build_timeline_render_plan(
     // Imported A/V sources initially use one video track. Until planning splits
     // that media into canonical video + audio tracks, retain its embedded audio
     // without consulting scene metadata.
+    let mut audio_labels_fallback = Vec::new();
     if audio_labels.is_empty() {
         if let Some(track) = primary_video {
-            audio_labels.push(append_audio_track_filters(
+            audio_labels_fallback.push(append_audio_track_filters(
                 &mut filters,
                 track,
                 &manifest.gaps,
@@ -403,6 +450,106 @@ pub fn build_timeline_render_plan(
             )?);
         }
     }
+    // A bed ducks under the speech it plays under. The sidechain track is split so the mix still
+    // hears it, and the bed is compressed by a copy of it.
+    let mut label_by_track_id = audio_tracks
+        .iter()
+        .zip(audio_labels.iter())
+        .map(|(track, label)| (track.id.as_str(), label.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let speech_track_id = audio_tracks
+        .iter()
+        .find(|track| track.clips.iter().any(|clip| clip.turn_id.is_some()))
+        .or(audio_tracks.first())
+        .map(|track| track.id.as_str());
+    let mut ducking_requests: Vec<(String, &str, DuckingSpec)> = Vec::new();
+    for mix in &manifest.audio_mix.tracks {
+        if let Some(ducking) = &mix.ducking {
+            if label_by_track_id.contains_key(mix.track_id.as_str())
+                && label_by_track_id.contains_key(ducking.sidechain_track_id.as_str())
+            {
+                ducking_requests.push((
+                    mix.track_id.clone(),
+                    ducking.sidechain_track_id.as_str(),
+                    ducking.clone(),
+                ));
+            }
+        }
+    }
+    let mut sound_labels = Vec::new();
+    for (index, layer) in manifest.sound_layers.iter().enumerate() {
+        let Some(input_index) = sound_input_by_asset.get(layer.asset_id.as_str()) else {
+            continue;
+        };
+        let label = append_sound_layer_filters(&mut filters, layer, *input_index, index)?;
+        if layer.duck_under_speech {
+            if let Some(speech) = speech_track_id {
+                ducking_requests.push((label.clone(), speech, super::score::bed_ducking(speech)));
+            }
+        }
+        sound_labels.push(label);
+    }
+    let mut sidechain_copies: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, sidechain, _) in &ducking_requests {
+        *sidechain_copies.entry(sidechain).or_default() += 1;
+    }
+    let mut sidechain_labels: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (sidechain, copies) in &sidechain_copies {
+        let source = label_by_track_id[*sidechain].clone();
+        let main = format!("{source}main");
+        let taps = (0..*copies)
+            .map(|copy| format!("{source}sc{copy}"))
+            .collect::<Vec<_>>();
+        filters.push(format!(
+            "[{source}]asplit={}[{main}]{}",
+            copies + 1,
+            taps.iter()
+                .map(|tap| format!("[{tap}]"))
+                .collect::<String>()
+        ));
+        label_by_track_id.insert(sidechain, main);
+        sidechain_labels.insert(sidechain, taps);
+    }
+    let mut ducked_labels: BTreeMap<String, String> = BTreeMap::new();
+    for (ducked, sidechain, spec) in &ducking_requests {
+        let source = ducked_labels
+            .get(ducked)
+            .cloned()
+            .or_else(|| label_by_track_id.get(ducked.as_str()).cloned())
+            .unwrap_or_else(|| ducked.clone());
+        let tap = sidechain_labels
+            .get_mut(sidechain)
+            .and_then(|taps| taps.pop())
+            .expect("every ducking request was counted");
+        let output = format!("{source}ducked");
+        filters.push(format!(
+            "[{source}][{tap}]{}[{output}]",
+            sidechain_compress_filter(spec)
+        ));
+        ducked_labels.insert(ducked.clone(), output);
+    }
+    let audio_labels = audio_tracks
+        .iter()
+        .map(|track| {
+            ducked_labels
+                .get(track.id.as_str())
+                .cloned()
+                .unwrap_or_else(|| label_by_track_id[track.id.as_str()].clone())
+        })
+        .chain(sound_labels.iter().map(|label| {
+            ducked_labels
+                .get(label)
+                .cloned()
+                .unwrap_or_else(|| label.clone())
+        }))
+        .collect::<Vec<_>>();
+    // An imported source's embedded audio was appended after the named tracks; keep it.
+    let audio_labels = if audio_tracks.is_empty() {
+        audio_labels_fallback
+    } else {
+        audio_labels
+    };
+
     let mut assembled_audio = match audio_labels.as_slice() {
         [] => {
             filters.push(format!(
@@ -686,9 +833,81 @@ pub fn build_ass_document(
         }
     }
     if options.include_speaker_cards {
-        append_speaker_cards(&mut document, &manifest.captions)?;
+        // A performed script knows who is speaking from its own takes, which is a better source
+        // than captions that may not exist for it.
+        if manifest.dialogue.is_empty() {
+            append_speaker_cards(&mut document, &manifest.captions)?;
+        } else {
+            append_dialogue_speaker_cards(&mut document, manifest)?;
+        }
     }
     Ok(document)
+}
+
+/// Name the character speaking each time the voice changes, from the takes as placed.
+///
+/// A card is shown when a new character starts a line, and held for the first moment of it: long
+/// enough to read, short enough to leave the frame to the picture. Consecutive lines by one
+/// character get one card.
+fn append_dialogue_speaker_cards(
+    document: &mut String,
+    manifest: &VideoProjectManifest,
+) -> VideoResult<()> {
+    let names = manifest
+        .cast
+        .iter()
+        .map(|member| (member.id.as_str(), member.display_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let turns = manifest
+        .dialogue
+        .iter()
+        .map(|turn| (turn.id.as_str(), turn))
+        .collect::<BTreeMap<_, _>>();
+    let mut placed = manifest
+        .tracks
+        .iter()
+        .filter(|track| matches!(track.kind, TrackKind::Audio))
+        .flat_map(|track| track.clips.iter())
+        .filter_map(|clip| {
+            let turn = turns.get(clip.turn_id.as_deref()?)?;
+            Some((
+                clip.timeline_start_us,
+                clip.timeline_duration_us,
+                turn.character_id.as_str(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    placed.sort_by_key(|(start, duration, _)| (*start, *duration));
+    let mut prior: Option<&str> = None;
+    for (start, duration, character_id) in placed {
+        if prior == Some(character_id) {
+            continue;
+        }
+        let name = names
+            .get(character_id)
+            .copied()
+            .unwrap_or(character_id)
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+        let end = start
+            .checked_add(Microseconds(1_800_000))?
+            .min(start.checked_add(duration)?);
+        if end <= start {
+            continue;
+        }
+        document.push_str(&ass_dialogue(
+            30,
+            start,
+            end,
+            "Speaker",
+            name,
+            &format!("{{\\fad(80,180)}}{}", escape_ass_text(name)),
+        ));
+        prior = Some(character_id);
+    }
+    Ok(())
 }
 
 pub fn plan_caption_preview_pages(
@@ -1027,6 +1246,75 @@ fn append_audio_track_filters(
     chain.push_str(&format!("[{output}]"));
     filters.push(chain);
     Ok(output)
+}
+
+/// Place one sound-design layer on the timeline clock.
+///
+/// The source is read whole, trimmed or looped to the layer's span, faded at both ends, gained,
+/// and delayed to its start. Everything after the delay is silence, so the mix hears the sound
+/// only where it was placed.
+fn append_sound_layer_filters(
+    filters: &mut Vec<String>,
+    layer: &super::sound::SoundLayer,
+    input_index: usize,
+    layer_index: usize,
+) -> VideoResult<String> {
+    let duration = layer.range.duration()?;
+    let label = format!("sound{layer_index}");
+    let mut chain = format!(
+        "[{input_index}:a:0]asetpts=PTS-STARTPTS,aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+    );
+    if layer.loop_to_fill {
+        chain.push_str(",aloop=loop=-1:size=2147483647");
+    }
+    chain.push_str(&format!(
+        ",atrim=duration={},asetpts=PTS-STARTPTS",
+        ffmpeg_time(duration)
+    ));
+    if layer.fade_in_us.0 > 0 {
+        chain.push_str(&format!(
+            ",afade=t=in:st=0:d={}",
+            ffmpeg_time(layer.fade_in_us)
+        ));
+    }
+    if layer.fade_out_us.0 > 0 && layer.fade_out_us.0 < duration.0 {
+        chain.push_str(&format!(
+            ",afade=t=out:st={}:d={}",
+            ffmpeg_time(Microseconds(duration.0 - layer.fade_out_us.0)),
+            ffmpeg_time(layer.fade_out_us)
+        ));
+    }
+    chain.push_str(&format!(
+        ",volume={:.3}dB",
+        f64::from(layer.gain_db_milli) / 1_000.0
+    ));
+    let delay_ms = layer.range.start_us.0 / 1_000;
+    if delay_ms > 0 {
+        chain.push_str(&format!(",adelay={delay_ms}:all=1"));
+    }
+    chain.push_str(&format!("[{label}]"));
+    filters.push(chain);
+    Ok(label)
+}
+
+/// The compressor that lowers one signal while another is heard.
+///
+/// A compressor reduces by a share of how far the sidechain rises above its threshold, so the
+/// requested reduction is turned into a ratio against speech at a nominal level: a voice at
+/// about -20 dBFS over a threshold near -38 dBFS is eighteen decibels of headroom, and the ratio
+/// is chosen so that headroom yields the reduction the spec asks for.
+fn sidechain_compress_filter(spec: &DuckingSpec) -> String {
+    let reduction_db = f64::from(-spec.reduction_db_milli.min(0)) / 1_000.0;
+    let ratio = if reduction_db >= 17.0 {
+        20.0
+    } else {
+        (18.0 / (18.0 - reduction_db)).clamp(1.0, 20.0)
+    };
+    format!(
+        "sidechaincompress=threshold=0.0125:ratio={ratio:.3}:attack={}:release={}:makeup=1:level_sc=1:detection=rms",
+        (spec.attack_us.0.max(1_000) / 1_000).max(1),
+        (spec.release_us.0.max(1_000) / 1_000).max(1)
+    )
 }
 
 fn clip_media_has_audio(
@@ -3199,6 +3487,335 @@ mod tests {
             .unwrap();
         assert!(!filter.contains(":a:0]"));
         assert!(filter.contains("anullsrc=r=48000:cl=stereo"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Write a one-second stereo test signal: silence for the first half, a tone for the second.
+    fn write_half_tone(ffmpeg: &Path, path: &Path, frequency: u32) {
+        let status = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency={frequency}:sample_rate=48000:duration=2"),
+                "-af",
+                "volume=enable='lt(t,1)':volume=0,aformat=channel_layouts=stereo",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// Write a two-second stereo tone.
+    fn write_tone(ffmpeg: &Path, path: &Path, frequency: u32) {
+        let status = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency={frequency}:sample_rate=48000:duration=2"),
+                "-af",
+                "aformat=channel_layouts=stereo",
+                "-c:a",
+                "pcm_s16le",
+            ])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn audio_source(id: &str, path: &Path, duration_us: i64) -> SourceAsset {
+        SourceAsset {
+            id: id.into(),
+            kind: SourceAssetKind::LocalAudio,
+            managed_path: path.file_name().unwrap().to_string_lossy().into_owned(),
+            sha256: "b".repeat(64),
+            probe: MediaProbe {
+                duration_us: Microseconds(duration_us),
+                width: None,
+                height: None,
+                frame_rate: None,
+                has_video: false,
+                has_audio: true,
+                format_name: "wav".into(),
+            },
+            provenance: Provenance {
+                kind: ProvenanceKind::UserUpload,
+                original_uri: None,
+                imported_at: timestamp(),
+                producer: "assembly-test".into(),
+                producer_version: None,
+                metadata: BTreeMap::new(),
+            },
+            rights_confirmation_id: None,
+        }
+    }
+
+    /// A speech track (silent, then a voice-like tone) and a bed (a steady tone) two seconds
+    /// long, on a canvas with no video, rendered for real.
+    fn ducking_fixture(
+        ffmpeg: &Path,
+        root: &Path,
+    ) -> (VideoProjectManifest, BTreeMap<String, PathBuf>) {
+        let speech = root.join("speech.wav");
+        let bed = root.join("bed.wav");
+        write_half_tone(ffmpeg, &speech, 220);
+        write_tone(ffmpeg, &bed, 880);
+        let mut manifest = fixture_manifest(&root.join("unused.mp4"));
+        manifest.timeline_duration_us = Microseconds(2_000_000);
+        manifest.source_assets = vec![
+            audio_source("speech-source", &speech, 2_000_000),
+            audio_source("bed-source", &bed, 2_000_000),
+        ];
+        manifest.reviewed_scenes[0].source_asset_id = None;
+        manifest.reviewed_scenes[0].source_range = None;
+        manifest.reviewed_scenes[0].timeline_duration_us = Microseconds(2_000_000);
+        let clip = |id: &str, source: &str| TimelineClip {
+            id: id.into(),
+            scene_id: Some("scene-1".into()),
+            turn_id: None,
+            media: MediaReference {
+                source_asset_id: Some(source.into()),
+                render_artifact_id: None,
+            },
+            source_range: TimeRange::new(0, 2_000_000).unwrap(),
+            timeline_start_us: Microseconds::ZERO,
+            timeline_duration_us: Microseconds(2_000_000),
+            playback_rate: RationalRate::ONE,
+            gain_db_milli: 0,
+            muted: false,
+            crop: None,
+        };
+        manifest.tracks = vec![
+            TimelineTrack {
+                id: "audio-main".into(),
+                kind: TrackKind::Audio,
+                clips: vec![clip("speech-clip", "speech-source")],
+                preserve_gaps: true,
+            },
+            TimelineTrack {
+                id: "music-bed".into(),
+                kind: TrackKind::Audio,
+                clips: vec![clip("bed-clip", "bed-source")],
+                preserve_gaps: true,
+            },
+        ];
+        manifest.captions.clear();
+        manifest.audio_mix.tracks = vec![
+            AudioMixTrack {
+                track_id: "audio-main".into(),
+                gain_db_milli: 0,
+                pan_milli: 0,
+                ducking: None,
+            },
+            AudioMixTrack {
+                track_id: "music-bed".into(),
+                gain_db_milli: 0,
+                pan_milli: 0,
+                ducking: Some(crate::video::score::bed_ducking("audio-main")),
+            },
+        ];
+        manifest.validate_strict().unwrap();
+        let sources = BTreeMap::from([
+            ("source:speech-source".to_string(), speech),
+            ("source:bed-source".to_string(), bed),
+        ]);
+        (manifest, sources)
+    }
+
+    #[test]
+    fn a_bed_ducks_under_speech_in_the_rendered_master() {
+        let ffmpeg = Path::new("/usr/bin/ffmpeg");
+        if !ffmpeg.is_file() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("soundar-ducking-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let (manifest, sources) = ducking_fixture(ffmpeg, &root);
+        let output = root.join("output.mp4");
+        let plan = build_timeline_render_plan(
+            ffmpeg,
+            &manifest,
+            &sources,
+            None,
+            &output,
+            &AssemblyOptions::default(),
+            false,
+        )
+        .unwrap();
+        let filter = plan
+            .primary
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-filter_complex")
+            .map(|pair| pair[1].to_string_lossy().into_owned())
+            .unwrap();
+        assert!(filter.contains("asplit=2"), "{filter}");
+        assert!(filter.contains("sidechaincompress="), "{filter}");
+        let status = plan.primary.command().status().unwrap();
+        assert!(status.success(), "{}", plan.primary.display_summary());
+        // Isolate the bed: it is at 880 Hz, the voice at 220 Hz. A band-pass around the bed
+        // measured while the voice is silent and while it speaks shows the duck.
+        let level = |start: &str| {
+            let result = Command::new(ffmpeg)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "info",
+                    "-ss",
+                    start,
+                    "-t",
+                    "0.8",
+                    "-i",
+                ])
+                .arg(&output)
+                .args([
+                    "-vn",
+                    "-af",
+                    "bandpass=f=880:width_type=q:w=8,volumedetect",
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&result.stderr)
+                .lines()
+                .find_map(|line| {
+                    line.split("mean_volume:")
+                        .nth(1)?
+                        .trim()
+                        .split_whitespace()
+                        .next()?
+                        .parse::<f64>()
+                        .ok()
+                })
+                .expect("mean volume")
+        };
+        let quiet = level("0.1");
+        let speaking = level("1.1");
+        assert!(
+            quiet - speaking >= 6.0,
+            "the bed should drop under speech: {quiet:.1} dB alone, {speaking:.1} dB under the voice"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_placed_sound_reaches_the_master_where_it_was_placed() {
+        let ffmpeg = Path::new("/usr/bin/ffmpeg");
+        if !ffmpeg.is_file() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("soundar-sound-layer-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&root).unwrap();
+        let (mut manifest, mut sources) = ducking_fixture(ffmpeg, &root);
+        // Drop the bed; the sound design is the only thing besides the (half-silent) voice.
+        manifest.tracks.truncate(1);
+        manifest.audio_mix.tracks.truncate(1);
+        let effect = root.join("effect.wav");
+        write_tone(ffmpeg, &effect, 1_320);
+        manifest
+            .source_assets
+            .push(audio_source("effect-source", &effect, 2_000_000));
+        manifest.sound_assets.push(crate::video::sound::SoundAsset {
+            id: "sound-bell".into(),
+            name: "Bell".into(),
+            source_asset_id: "effect-source".into(),
+            tags: vec!["bell".into()],
+            created_at: timestamp(),
+        });
+        manifest.sound_layers.push(crate::video::sound::SoundLayer {
+            id: "layer-bell".into(),
+            asset_id: "sound-bell".into(),
+            kind: crate::video::sound::SoundPlacementKind::OneShot,
+            scene_id: Some("scene-1".into()),
+            turn_id: None,
+            // Placed in the first second only.
+            range: TimeRange::new(0, 900_000).unwrap(),
+            gain_db_milli: 0,
+            fade_in_us: Microseconds(20_000),
+            fade_out_us: Microseconds(100_000),
+            loop_to_fill: false,
+            duck_under_speech: false,
+        });
+        manifest.validate_strict().unwrap();
+        sources.insert("sound:sound-bell".into(), effect);
+        let output = root.join("output.mp4");
+        let plan = build_timeline_render_plan(
+            ffmpeg,
+            &manifest,
+            &sources,
+            None,
+            &output,
+            &AssemblyOptions::default(),
+            false,
+        )
+        .unwrap();
+        let filter = plan
+            .primary
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "-filter_complex")
+            .map(|pair| pair[1].to_string_lossy().into_owned())
+            .unwrap();
+        assert!(filter.contains("[sound0]"), "{filter}");
+        let status = plan.primary.command().status().unwrap();
+        assert!(status.success(), "{}", plan.primary.display_summary());
+        let level = |start: &str| {
+            let result = Command::new(ffmpeg)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "info",
+                    "-ss",
+                    start,
+                    "-t",
+                    "0.6",
+                    "-i",
+                ])
+                .arg(&output)
+                .args([
+                    "-vn",
+                    "-af",
+                    "bandpass=f=1320:width_type=q:w=8,volumedetect",
+                    "-f",
+                    "null",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&result.stderr)
+                .lines()
+                .find_map(|line| {
+                    let value = line.split("mean_volume:").nth(1)?.trim();
+                    let number = value.split_whitespace().next()?;
+                    Some(if number == "-inf" {
+                        f64::NEG_INFINITY
+                    } else {
+                        number.parse().ok()?
+                    })
+                })
+                .expect("mean volume")
+        };
+        let placed = level("0.2");
+        let after = level("1.2");
+        assert!(
+            placed - after >= 12.0,
+            "the bell should sound only where it was placed: {placed:.1} dB placed, {after:.1} dB after"
+        );
         fs::remove_dir_all(root).ok();
     }
 

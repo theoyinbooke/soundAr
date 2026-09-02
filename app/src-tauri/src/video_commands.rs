@@ -176,6 +176,10 @@ struct DurableNarrationRevisionRequest {
     actor: String,
     priority: String,
     title: String,
+    /// How the line is to be performed: the engine-rendered text, the instruction, and the
+    /// ensemble. Absent for a scene-scoped read, which has no character to take a persona from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    performance: Option<video::PerformanceRecord>,
 }
 
 /// Owns the complete prompt → local speech → registered Video Studio import pipeline. The
@@ -356,6 +360,12 @@ pub(crate) fn dispatch_video_operation(
             )
         }
         VideoAgentOperation::WriteVideoScript(request) => {
+            ensure_cast_can_perform(runtime, &request).map_err(|message| {
+                let (code, detail) = message
+                    .split_once(": ")
+                    .unwrap_or(("video.cast_cannot_perform", message.as_str()));
+                VideoAgentToolError::new(code, detail)
+            })?;
             let result = runtime
                 .video
                 .apply_script(request)
@@ -368,13 +378,23 @@ pub(crate) fn dispatch_video_operation(
             let unchanged = result.receipt.retained_turn_ids.len();
             let fresh = result.receipt.new_turn_ids.len();
             let dropped = result.receipt.dropped_binding_ids.len();
+            // A retained line whose delivery changed keeps its identity but not its take.
+            let stale = result
+                .project
+                .get("manifest")
+                .cloned()
+                .and_then(|manifest| {
+                    serde_json::from_value::<video::VideoProjectManifest>(manifest).ok()
+                })
+                .map(|manifest| stale_performance_turns(runtime, &manifest).len())
+                .unwrap_or_default();
             VideoAgentResult::project(
                 kind,
                 VideoAgentResultStatus::Completed,
                 // A retained line kept its identity, which is not the same as having a take.
                 // Reporting it as a valid take would tell the agent work exists that does not.
                 format!(
-                    "Cast and script committed: {fresh} new line(s), {unchanged} unchanged, {dropped} take(s) dropped. Narrate the lines that have no take yet."
+                    "Cast and script committed: {fresh} new line(s), {unchanged} unchanged, {dropped} take(s) dropped, {stale} take(s) stale because their delivery changed. Narrate the lines that have no current take."
                 ),
                 project,
                 Some(result.job_id),
@@ -504,9 +524,17 @@ pub(crate) fn dispatch_video_operation(
             ))
         }
         VideoAgentOperation::TranscribeAndCheckEpisode(request) => {
-            let report =
-                transcribe_and_check_episode(runtime, &request.project_id, &request.model_id)
-                    .map_err(VideoAgentToolError::from)?;
+            let model_id = match request.model_id.clone() {
+                Some(model_id) => model_id,
+                None => default_quality_recognizer(runtime).ok_or_else(|| {
+                    VideoAgentToolError::new(
+                        "video.transcriber_unavailable",
+                        "No local transcription model is installed; install one in Models before checking an episode",
+                    )
+                })?,
+            };
+            let report = transcribe_and_check_episode(runtime, &request.project_id, &model_id)
+                .map_err(VideoAgentToolError::from)?;
             let blocking = report
                 .get("findings")
                 .and_then(Value::as_array)
@@ -524,10 +552,28 @@ pub(crate) fn dispatch_video_operation(
                 .and_then(Value::as_array)
                 .map(Vec::len)
                 .unwrap_or_default();
+            let kinds = report
+                .get("findings")
+                .and_then(Value::as_array)
+                .map(|findings| {
+                    findings
+                        .iter()
+                        .filter(|finding| {
+                            finding.get("severity").and_then(Value::as_str) == Some("blocking")
+                        })
+                        .filter_map(|finding| finding.get("kind").and_then(Value::as_str))
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
             let summary = if blocking == 0 && unchecked == 0 {
-                "Every narrated line matches its script".to_string()
-            } else {
+                "Every narrated line matches its script and the episode is within its length; the check is recorded for release".to_string()
+            } else if kinds.is_empty() {
                 format!("{blocking} blocking finding(s), {unchecked} unchecked line(s)")
+            } else {
+                format!("{blocking} blocking finding(s) ({kinds}), {unchecked} unchecked line(s)")
             };
             Ok(VideoAgentResult::ready(kind, &summary, report))
         }
@@ -574,6 +620,7 @@ pub(crate) fn dispatch_video_operation(
                     &request.project_id,
                     "video-studio-producer",
                     request.has_show_notes,
+                    release_gates(runtime, request.accept_findings, request.accept_backdrop),
                 )
                 .map_err(VideoAgentToolError::from)?;
             let project = video::present_video_project(
@@ -599,7 +646,11 @@ pub(crate) fn dispatch_video_operation(
         VideoAgentOperation::PlanEpisodeRelease(request) => {
             let plan = runtime
                 .video
-                .plan_episode_release(&request.project_id, request.has_show_notes)
+                .plan_episode_release(
+                    &request.project_id,
+                    request.has_show_notes,
+                    release_gates(runtime, request.accept_findings, request.accept_backdrop),
+                )
                 .map_err(VideoAgentToolError::from)?;
             let summary = if plan.is_ready() {
                 "Every release member can be produced".to_string()
@@ -1098,6 +1149,41 @@ pub(crate) async fn listen_to_episode(
 /// This is the measuring half of quality control. A line whose take cannot be transcribed is left
 /// out of `heard`, which the check then reports as unchecked rather than as passed - a failed
 /// recognition must never read as a clean line.
+/// The most accurate installed recogniser, for listening back to takes.
+///
+/// A quality check is only as good as its ears. The order is by measured accuracy on this
+/// machine's kind of material - a small Whisper mishears enough that it would fail takes it
+/// should pass - and a model is offered only when its weights are actually present.
+pub(crate) fn default_quality_recognizer(runtime: &RuntimeState) -> Option<String> {
+    const PREFERENCE: [&str; 6] = [
+        "nvidia/parakeet-tdt-1.1b",
+        "openai/whisper-large-v3-turbo",
+        "CohereLabs/cohere-transcribe-03-2026",
+        "mistralai/Voxtral-Mini-3B-2507",
+        "openai/whisper-small",
+        "openai/whisper-tiny",
+    ];
+    let registry = read_json(runtime.model_registry_path.clone(), json!({ "models": [] }));
+    let models = registry.get("models").and_then(Value::as_array)?;
+    let ready = |wanted: &str| {
+        models.iter().any(|model| {
+            model.get("model_id").and_then(Value::as_str) == Some(wanted)
+                && registry_model_ready_for_task(model, "stt")
+        })
+    };
+    PREFERENCE
+        .iter()
+        .find(|candidate| ready(candidate))
+        .map(|candidate| candidate.to_string())
+        .or_else(|| {
+            models
+                .iter()
+                .filter(|model| registry_model_ready_for_task(model, "stt"))
+                .find_map(|model| model.get("model_id").and_then(Value::as_str))
+                .map(str::to_string)
+        })
+}
+
 pub(crate) fn transcribe_and_check_episode(
     runtime: &RuntimeState,
     project_id: &str,
@@ -1160,10 +1246,16 @@ pub(crate) fn transcribe_and_check_episode(
 pub(crate) async fn transcribe_and_check_episode_quality(
     state: tauri::State<'_, RuntimeState>,
     project_id: String,
-    model_id: String,
+    model_id: Option<String>,
 ) -> Result<Value, String> {
     let runtime = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let model_id = match model_id {
+            Some(model_id) => model_id,
+            None => default_quality_recognizer(&runtime).ok_or(
+                "video.transcriber_unavailable: No local transcription model is installed",
+            )?,
+        };
         transcribe_and_check_episode(&runtime, &project_id, &model_id)
     })
     .await
@@ -1206,9 +1298,15 @@ pub(crate) async fn export_episode_release(
 ) -> Result<Value, String> {
     let service = Arc::clone(&state.video);
     let video_root = state.store.video_artifacts_root();
+    let runtime = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let exported = service
-            .export_episode_release(&project_id, "video-studio-producer", has_show_notes)
+            .export_episode_release(
+                &project_id,
+                "video-studio-producer",
+                has_show_notes,
+                release_gates(&runtime, false, false),
+            )
             .map_err(service_error)?;
         let project = video::present_video_project(&exported.project, &video_root)
             .map_err(|error| error.to_string())?;
@@ -1253,9 +1351,14 @@ pub(crate) async fn plan_episode_release(
     has_show_notes: bool,
 ) -> Result<Value, String> {
     let service = Arc::clone(&state.video);
+    let runtime = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let plan = service
-            .plan_episode_release(&project_id, has_show_notes)
+            .plan_episode_release(
+                &project_id,
+                has_show_notes,
+                release_gates(&runtime, false, false),
+            )
             .map_err(service_error)?;
         serde_json::to_value(plan).map_err(|error| format!("video.invalid_request: {error}"))
     })
@@ -1386,7 +1489,9 @@ pub(crate) async fn write_video_script(
 ) -> Result<Value, String> {
     let service = Arc::clone(&state.video);
     let video_root = state.store.video_artifacts_root();
+    let runtime = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        ensure_cast_can_perform(&runtime, &request)?;
         let result = service.apply_script(request).map_err(service_error)?;
         let project = video::present_video_project(&result.project, &video_root)
             .map_err(|error| error.to_string())?;
@@ -1638,6 +1743,7 @@ fn revise_project(
             reference_audio_path: route.reference_audio_path,
             expected_revision: current_revision,
             expected_version_id: current_version_id,
+            performance: None,
             actor: actor.to_string(),
             priority: "normal".into(),
             title: format!("Regenerate narration · {}", scene.title),
@@ -1691,10 +1797,15 @@ pub(crate) fn narrate_turns(
                 .ok_or("video.invalid_manifest: Project manifest is missing")?,
         )
         .map_err(|error| format!("video.invalid_manifest: {error}"))?;
+        // A line with a take whose delivery no longer matches its persona, its direction, or its
+        // engine's vocabulary is re-read like a line with no take: what was recorded is not what
+        // the script now asks for.
+        let stale = stale_performance_turns(runtime, &manifest);
         let narrated = manifest
             .narration_bindings
             .iter()
             .filter_map(|binding| binding.turn_id.clone())
+            .filter(|turn_id| !stale.contains(turn_id))
             .collect::<BTreeSet<_>>();
         let Some(turn) = manifest
             .dialogue
@@ -1711,12 +1822,24 @@ pub(crate) fn narrate_turns(
             .cloned()
             .ok_or("video.unknown_speaker: That line's character is not in the cast")?;
 
-        // What the voice is actually asked to say.
+        // What the voice is actually asked to say, in canonical form: the words after their
+        // pronunciation rules, with every cue as a `(laugh)` token.
         let spoken = video::apply_lexicon(
             turn.spoken_text(),
             &video::effective_entries(&manifest.lexicon, &member.id),
         )
         .spoken_text;
+        // How it is to be performed: the cues in the engine's own vocabulary, the persona and
+        // direction as its instruction, and a reaction layered as many takes as the character
+        // declares. Decided here, once, and recorded on the take so a change re-reads the line.
+        let expressiveness = engine_expressiveness(runtime, &member.model_id);
+        let performance = plan_performance(&turn, &member, &spoken, &expressiveness);
+        if performance.rendered_text.trim().is_empty() {
+            return Err(format!(
+                "video.cast_cannot_perform: {} is cast on {}, which performs no vocal events, so the reaction \"{}\" would be silence. Cast this character on a voice that performs cues, such as Breeze TTS 2, and write the script again.",
+                member.display_name, member.model_id, turn.text
+            ));
+        }
         // The engine speaker is resolved from the installed voice library rather than assumed: a
         // preset route must name its preset voice, and a cloned one carries its reference.
         let route = resolve_voice_revision_route(
@@ -1751,6 +1874,7 @@ pub(crate) fn narrate_turns(
             actor: "video-studio-performer".to_string(),
             priority: "normal".into(),
             title: format!("{} · {}", member.display_name, turn.id),
+            performance: Some(performance),
         };
         let durable_value = serde_json::to_value(&durable)
             .map_err(|error| format!("video.invalid_request: {error}"))?;
@@ -2218,6 +2342,7 @@ fn narration_replacement_request(
             model_id: request.model_id.clone(),
             speaker: request.speaker.clone(),
             language: request.language.clone(),
+            performance: request.performance.clone(),
         }],
     }
 }
@@ -2346,12 +2471,24 @@ fn narration_synthesis_request(
     request: &DurableNarrationRevisionRequest,
     parent_job_id: &str,
 ) -> Value {
-    let seed = u32::from_str_radix(&request.script_sha256[..8], 16).unwrap_or(42_817);
-    json!({
+    // The seed follows the performance, not only the words: the same line delivered differently is
+    // a different take, and a re-read after a direction change must not land on the old audio.
+    let seed_source = request
+        .performance
+        .as_ref()
+        .map(|performance| performance.fingerprint.as_str())
+        .unwrap_or(request.script_sha256.as_str());
+    let seed = u32::from_str_radix(&seed_source[..8], 16).unwrap_or(42_817);
+    let mut synthesis = json!({
         "operation": "synthesize",
         "generation_kind": "speech",
         "model_id": request.model_id,
-        "text": request.script,
+        // The engine reads the rendered line: cues in its own vocabulary, or removed.
+        "text": request
+            .performance
+            .as_ref()
+            .map(|performance| performance.rendered_text.as_str())
+            .unwrap_or(request.script.as_str()),
         "input_mode": "text",
         "speaker": request.speaker,
         "language": request.language,
@@ -2365,7 +2502,265 @@ fn narration_synthesis_request(
         "video_parent_job_id": parent_job_id,
         "video_project_id": request.project_id,
         "video_scene_id": request.scene_id,
-    })
+    });
+    if let Some(performance) = &request.performance {
+        let object = synthesis
+            .as_object_mut()
+            .expect("synthesis request is an object");
+        if let Some(instruction) = &performance.instruction {
+            object.insert("instruction".into(), json!(instruction));
+            if let Some(cfg_scale) = performance.cfg_scale() {
+                object.insert("cfg_scale".into(), json!(cfg_scale));
+            }
+        }
+        if performance.ensemble > 1 {
+            object.insert("ensemble".into(), json!(performance.ensemble));
+        }
+        if let Some(exaggeration) = performance.exaggeration() {
+            object.insert("exaggeration".into(), json!(exaggeration));
+        }
+    }
+    synthesis
+}
+
+/// What one installed speech engine can do beyond reading words, as its manifest declares it.
+///
+/// Read from `data/engine_manifests.json` rather than assumed from the engine's name, so a new
+/// adapter declares its own expressiveness and an engine that gains an instruction channel is
+/// steered the moment its manifest says so.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct EngineExpressiveness {
+    pub(crate) engine: String,
+    pub(crate) instruction: bool,
+    pub(crate) instruction_cfg_scale: Option<f64>,
+    pub(crate) vocabulary: video::VocalVocabulary,
+    pub(crate) ensemble: bool,
+    pub(crate) energy_control: Option<String>,
+}
+
+pub(crate) fn engine_expressiveness(
+    runtime: &RuntimeState,
+    model_id: &str,
+) -> EngineExpressiveness {
+    let registry = read_json(runtime.model_registry_path.clone(), json!({ "models": [] }));
+    let engine = registry
+        .get("models")
+        .and_then(Value::as_array)
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.get("model_id").and_then(Value::as_str) == Some(model_id))
+        })
+        .and_then(|model| model.get("engine").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    let manifests = read_json(
+        runtime.runtime_root.join("data/engine_manifests.json"),
+        json!({ "engines": [] }),
+    );
+    let expressive = manifests
+        .get("engines")
+        .and_then(Value::as_array)
+        .and_then(|engines| {
+            engines.iter().find(|manifest| {
+                manifest.get("id").and_then(Value::as_str) == Some(engine.as_str())
+            })
+        })
+        .and_then(|manifest| manifest.get("expressive").cloned())
+        .unwrap_or(Value::Null);
+    EngineExpressiveness {
+        engine,
+        instruction: expressive
+            .get("instruction")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        instruction_cfg_scale: expressive
+            .get("instruction_cfg_scale")
+            .and_then(Value::as_f64),
+        vocabulary: expressive
+            .get("vocal_events")
+            .and_then(Value::as_str)
+            .and_then(video::VocalVocabulary::parse)
+            .unwrap_or_default(),
+        ensemble: expressive
+            .get("ensemble")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        energy_control: expressive
+            .get("energy_control")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    }
+}
+
+/// Decide how one line is performed by one character on one engine.
+///
+/// The instruction is the character's persona followed by the line's direction, because that is
+/// the order a director gives them: who you are, then what this moment needs. A character with no
+/// persona falls back to its cast notes, which is what the writer already said about the voice.
+pub(crate) fn plan_performance(
+    turn: &video::DialogueTurn,
+    member: &video::CastMember,
+    spoken: &str,
+    expressiveness: &EngineExpressiveness,
+) -> video::PerformanceRecord {
+    let rendered = video::render_for_vocabulary(spoken, expressiveness.vocabulary);
+    let instruction = if expressiveness.instruction {
+        let mut parts = Vec::new();
+        if let Some(persona) = member
+            .persona
+            .as_deref()
+            .or(member.notes.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(persona.trim_end_matches('.').to_string());
+        }
+        if let Some(direction) = turn
+            .direction
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(direction.trim_end_matches('.').to_string());
+        }
+        (!parts.is_empty()).then(|| format!("{}.", parts.join(". ")))
+    } else {
+        None
+    };
+    let ensemble = if turn.is_reaction() && expressiveness.ensemble {
+        member.ensemble.max(1)
+    } else {
+        1
+    };
+    let cfg_scale_milli = instruction
+        .as_ref()
+        .and(expressiveness.instruction_cfg_scale)
+        .map(|scale| (scale * 1000.0).round() as i32);
+    // An engine with an emotion strength takes it from the character's declared energy: natural
+    // energy is the engine's own midpoint, so a plain character is not made to overact.
+    let exaggeration_milli = expressiveness
+        .energy_control
+        .as_deref()
+        .filter(|control| *control == "exaggeration")
+        .map(|_| (member.delivery.energy_milli / 2).clamp(0, 1_000));
+    video::PerformanceRecord::new(
+        rendered.text,
+        instruction,
+        expressiveness.vocabulary,
+        ensemble,
+        rendered.dropped,
+        cfg_scale_milli,
+        exaggeration_milli,
+    )
+}
+
+/// Refuse a cast that cannot perform its own script.
+///
+/// A character whose lines carry vocal events must be on an engine that reads them; otherwise the
+/// cue is either dropped or, on an engine that reads everything as words, narrated. A writer may
+/// accept dropped cues for a spoken line and hear it without them, but a reaction - a line that is
+/// only cues - has nothing left to say and is refused outright.
+pub(crate) fn ensure_cast_can_perform(
+    runtime: &RuntimeState,
+    request: &video::VideoScriptRequest,
+) -> Result<(), String> {
+    let turns = video::parse_dialogue_script(&request.script, &request.cast)
+        .map_err(|error| error.to_string())?;
+    let mut expressiveness_by_model: std::collections::BTreeMap<String, EngineExpressiveness> =
+        std::collections::BTreeMap::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for turn in &turns {
+        let parsed = video::normalize_cues(&turn.text);
+        let events = parsed.events();
+        if events.is_empty() {
+            continue;
+        }
+        let Some(member) = request
+            .cast
+            .iter()
+            .find(|member| member.id == turn.character_id)
+        else {
+            continue;
+        };
+        let expressiveness = expressiveness_by_model
+            .entry(member.model_id.clone())
+            .or_insert_with(|| engine_expressiveness(runtime, &member.model_id));
+        if expressiveness.vocabulary.performs_events() {
+            continue;
+        }
+        let cues = events
+            .iter()
+            .map(|event| format!("({event})"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if parsed.is_reaction() {
+            return Err(format!(
+                "video.cast_cannot_perform: {} is cast on {}, which performs no vocal events, so line {} \"{}\" would be silence. Cast this character on a voice that performs cues - Breeze TTS 2 reads (laugh), (sigh), (applause) - or rewrite the reaction as words.",
+                member.display_name, member.model_id, turn.source_line, cues
+            ));
+        }
+        dropped.push(format!(
+            "line {} ({}): {}",
+            turn.source_line, member.display_name, cues
+        ));
+    }
+    if !dropped.is_empty() && !request.accept_dropped_cues {
+        return Err(format!(
+            "video.cast_cannot_perform: These cues would be dropped because their voices perform no vocal events: {}. Cast those characters on a voice that performs cues, such as Breeze TTS 2, or pass accept_dropped_cues to hear the lines without them.",
+            dropped.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+/// Lines whose recorded take was performed under a delivery the script no longer asks for.
+pub(crate) fn stale_performance_turns(
+    runtime: &RuntimeState,
+    manifest: &video::VideoProjectManifest,
+) -> BTreeSet<String> {
+    let mut expressiveness_by_model: std::collections::BTreeMap<String, EngineExpressiveness> =
+        std::collections::BTreeMap::new();
+    let mut stale = BTreeSet::new();
+    for binding in &manifest.narration_bindings {
+        let Some(turn_id) = binding.turn_id.as_deref() else {
+            continue;
+        };
+        let Some(turn) = manifest.dialogue.iter().find(|turn| turn.id == turn_id) else {
+            continue;
+        };
+        let Some(member) = manifest
+            .cast
+            .iter()
+            .find(|member| member.id == turn.character_id)
+        else {
+            continue;
+        };
+        let expressiveness = expressiveness_by_model
+            .entry(member.model_id.clone())
+            .or_insert_with(|| engine_expressiveness(runtime, &member.model_id))
+            .clone();
+        let spoken = video::apply_lexicon(
+            turn.spoken_text(),
+            &video::effective_entries(&manifest.lexicon, &member.id),
+        )
+        .spoken_text;
+        let expected = plan_performance(turn, member, &spoken, &expressiveness);
+        let recorded = binding
+            .performance
+            .as_ref()
+            .map(|performance| performance.fingerprint.as_str());
+        // A take recorded before delivery reached the engine is stale only if delivery would now
+        // change it: a plain line on a plain voice was, and is, read the same way.
+        let plain = expected.instruction.is_none()
+            && expected.ensemble == 1
+            && expected.rendered_text == spoken
+            && turn.vocal_events().is_empty();
+        if recorded != Some(expected.fingerprint.as_str()) && !(recorded.is_none() && plain) {
+            stale.insert(turn_id.to_string());
+        }
+    }
+    stale
 }
 
 fn run_narration_synthesis_child(
@@ -3276,6 +3671,25 @@ fn selected_revision_scene<'a>(
 /// never fetched by the model downloader: the user installs them deliberately. soundAr therefore
 /// looks where such an installation actually lands - an explicit setting first, then the managed
 /// model directory, then the registry for anyone who recorded it there.
+/// Whether this machine can cut footage for an episode right now: the generator binary and a
+/// usable set of weights are both present.
+pub(crate) fn clip_generator_ready(runtime: &RuntimeState) -> bool {
+    runtime.video.clip_generator_present() && clip_model_directory(runtime).is_some()
+}
+
+/// The gates a release is planned against, with the machine's own capability filled in.
+pub(crate) fn release_gates(
+    runtime: &RuntimeState,
+    accept_findings: bool,
+    accept_backdrop: bool,
+) -> video::ReleaseGates {
+    video::ReleaseGates {
+        accept_findings,
+        accept_backdrop,
+        generator_ready: clip_generator_ready(runtime),
+    }
+}
+
 pub(crate) fn clip_model_directory(runtime: &RuntimeState) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(configured) = std::env::var_os("SOUNDAR_H3_MODEL_DIR") {
@@ -3310,6 +3724,10 @@ pub(crate) fn clip_model_directory(runtime: &RuntimeState) -> Option<PathBuf> {
 fn sha256_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
+
+/// The voice id a character declares to be performed by an engine's own designed voice rather
+/// than a library entry. The assistant's speech tool uses the same token.
+pub(crate) const ENGINE_DEFAULT_VOICE_ID: &str = "__engine_default__";
 
 fn resolve_voice_revision_route(
     runtime: &RuntimeState,
@@ -3347,6 +3765,52 @@ fn resolve_voice_revision_route(
             "video.language_unsupported: {} does not support {}",
             selection.model_id, selection.language
         ));
+    }
+    // An engine that designs its voice from an instruction has no library voice to pick: Breeze
+    // is cast as itself, and the character's persona is what makes it someone. The route names
+    // the engine's own default speaker, and no library entry is consulted or required.
+    if selection.voice_id == ENGINE_DEFAULT_VOICE_ID || selection.voice_id == "default" {
+        let engine = model
+            .get("engine")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let manifests = read_json(
+            runtime.runtime_root.join("data/engine_manifests.json"),
+            json!({ "engines": [] }),
+        );
+        let designs_its_voice = manifests
+            .get("engines")
+            .and_then(Value::as_array)
+            .and_then(|engines| {
+                engines.iter().find(|manifest| {
+                    manifest.get("id").and_then(Value::as_str) == Some(engine.as_str())
+                })
+            })
+            .and_then(|manifest| manifest.get("voice_modes"))
+            .and_then(Value::as_array)
+            .is_some_and(|modes| modes.iter().any(|mode| mode.as_str() == Some("default")));
+        if !designs_its_voice {
+            return Err(format!(
+                "video.voice_unavailable: {} has no engine-default voice; choose a preset or consent-backed library voice for it",
+                selection.model_id
+            ));
+        }
+        let voice_name = format!(
+            "{} default voice",
+            model
+                .get("display_name")
+                .and_then(Value::as_str)
+                .unwrap_or(selection.model_id.as_str())
+        );
+        return Ok(ResolvedVoiceRoute {
+            selection: VoiceRevisionSelection {
+                speaker: "default".to_string(),
+                ..selection
+            },
+            voice_name,
+            reference_audio_path: None,
+        });
     }
     let voice = runtime
         .store
@@ -6485,6 +6949,7 @@ mod tests {
             actor: "codex-agent".into(),
             priority: "normal".into(),
             title: "Regenerate narration".into(),
+            performance: None,
         };
         let encoded = serde_json::to_value(&durable).unwrap();
         let decoded: DurableNarrationRevisionRequest = serde_json::from_value(encoded).unwrap();
@@ -6559,6 +7024,7 @@ mod tests {
             speaker: "af_heart".into(),
             language: "en-US".into(),
             script_sha256: sha256_text(&script),
+            performance: None,
             created_at: "2026-08-27T20:00:00.000Z".into(),
         });
         advance_manifest_revision(
@@ -6597,6 +7063,7 @@ mod tests {
             actor: "test-suite".into(),
             priority: "normal".into(),
             title: "Regenerate opening".into(),
+            performance: None,
         };
         let asset = json!({
             "id": artifact.id,
@@ -6744,6 +7211,7 @@ mod tests {
             actor: "test-suite".into(),
             priority: "normal".into(),
             title: "Regenerate opening".into(),
+            performance: None,
         };
         let parent_job_id = runtime
             .store
@@ -6874,6 +7342,7 @@ mod tests {
                 speaker: request.speaker.clone(),
                 language: request.language.clone(),
                 script_sha256: request.script_sha256.clone(),
+                performance: None,
                 created_at: utc_now(),
             });
         let changed_paths = vec![
@@ -7880,6 +8349,7 @@ mod tests {
             speaker: "af_heart".into(),
             language: "en-US".into(),
             script_sha256: sha256_text("A concise opening statement."),
+            performance: None,
             created_at: "2026-08-27T20:00:00.000Z".into(),
         });
         let paths = manifest_diff_paths(&before, &after).unwrap();

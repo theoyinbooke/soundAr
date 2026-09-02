@@ -253,6 +253,51 @@ class EngineContractTests(unittest.TestCase):
                 "prompt": "warm pads", "duration_seconds": 8, "output_format": "wav",
             })
 
+    def test_expressiveness_is_declared_per_engine(self) -> None:
+        breeze = self.registry.expressiveness("breeze")
+        self.assertTrue(breeze["instruction"])
+        self.assertEqual(breeze["vocal_events"], "parenthesis")
+        self.assertEqual(breeze["instruction_cfg_scale"], 4.0)
+        self.assertTrue(breeze["ensemble"])
+        self.assertEqual(self.registry.expressiveness("chatterbox-turbo")["vocal_events"], "bracket")
+        kokoro = self.registry.expressiveness("kokoro")
+        self.assertFalse(kokoro["instruction"])
+        self.assertEqual(kokoro["vocal_events"], "none")
+        self.assertFalse(kokoro["ensemble"])
+
+    def test_an_instruction_is_refused_by_an_engine_that_does_not_follow_one(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not follow a voice instruction"):
+            self.registry.validate_synthesis("kokoro", {
+                "text": "hello",
+                "language": "en",
+                "output_format": "wav",
+                "speed": 1.0,
+                "instruction": "A warm voice.",
+            })
+
+    def test_an_ensemble_is_bounded_and_declared(self) -> None:
+        self.registry.validate_synthesis("breeze", {
+            "text": "(laugh)",
+            "language": "en",
+            "output_format": "wav",
+            "ensemble": 3,
+        })
+        with self.assertRaisesRegex(ValueError, "between 1 and 4"):
+            self.registry.validate_synthesis("breeze", {
+                "text": "(laugh)",
+                "language": "en",
+                "output_format": "wav",
+                "ensemble": 9,
+            })
+        with self.assertRaisesRegex(ValueError, "does not layer ensemble"):
+            self.registry.validate_synthesis("kokoro", {
+                "text": "hello",
+                "language": "en",
+                "output_format": "wav",
+                "speed": 1.0,
+                "ensemble": 2,
+            })
+
 
 if __name__ == "__main__":
     unittest.main()

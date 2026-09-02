@@ -5,30 +5,30 @@
 //! [`Store`] and deterministic media planning to the sibling video modules.
 
 use super::{
-    apply_dialogue_script, apply_lexicon, apply_timeline_edit, build_ass_document,
-    build_audiogram_command, build_cover_image_command, build_loudness_analysis_command,
+    apply_dialogue_script, apply_lexicon, apply_timeline_edit, backdrop_spec, build_ass_document,
+    build_audiogram_command, build_backdrop_command, build_loudness_analysis_command,
     build_podcast_audio_command, build_portrait_command_with_layout, build_proxy_command,
     build_report, build_thumbnail_command, build_timeline_render_plan, build_trailer_command,
-    build_waveform_command, cover_spec, diff_spoken_words, discover_media_runtime,
-    effective_entries, episode_transcript, ffmetadata_chapters, findings_for_dead_air,
-    findings_for_loudness, findings_for_turn, identify_clip_candidates, instantiate_format,
-    listen_to_episode, local_media_input_args, parse_loudness_analysis, plan_release,
-    preflight_import_url_destination, probe_media, profile_dimensions, publish_atomic,
-    sibling_staging_path, terminate_process_group, validate_import_url, write_ass_document_atomic,
-    AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage, CandidatePolicy, CaptionTheme,
-    CastMember, ClipModelPaths, DialogueScriptRequest, EpisodeListening, FfmpegProgressParser,
-    GapReason, LayoutRole, LoudnessMeasurement, MediaError, MediaRuntimeStatus, Microseconds,
-    NarrationBinding, NormalizedRect, PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy,
-    PublicationState, QcReport, RationalFrameRate, RationalRate, ReleaseMemberKind,
+    build_waveform_command, discover_media_runtime, effective_entries, episode_transcript,
+    ffmetadata_chapters, findings_for_dead_air, findings_for_loudness, identify_clip_candidates,
+    instantiate_format, listen_to_episode, local_media_input_args, parse_loudness_analysis,
+    plan_release, preflight_import_url_destination, probe_media, profile_dimensions,
+    publish_atomic, sibling_staging_path, terminate_process_group, validate_import_url,
+    write_ass_document_atomic, AdmissionOutcome, AssemblyOptions, CacheKeyBuilder, CacheStage,
+    CandidatePolicy, CaptionTheme, CastMember, ClipModelPaths, DialogueScriptRequest,
+    EpisodeListening, FfmpegProgressParser, GapReason, LayoutRole, LoudnessMeasurement, MediaError,
+    MediaRuntimeStatus, Microseconds, NarrationBinding, PerformanceRecord, PictureStatus,
+    PortraitLayout, Provenance, ProvenanceKind, PublicHttpsProxy, PublicationState, QcReport,
+    RationalFrameRate, RationalRate, ReleaseContext, ReleaseGates, ReleaseMemberKind,
     ReleaseMemberPlan, ReleasePlan, RenderArtifact, RenderArtifactRole, RenderCommand,
     RenderCommandPlan, RenderProfile, RenderWorkloadClass, ResourceClass, ResourceRequest,
     ResourceScheduler, ReviewState, ReviewedScene, RevisionRecord, RevisionStage, RightsBasis,
     RightsConfirmation, RuntimeMediaProbe, ShowFormat, SourceAsset, SourceAssetKind, TakeFidelity,
     TimeRange, TimelineClip, TimelineGap, TimelineTrack, TrackKind, Validate, VideoEncoder,
     VideoError, VideoProjectManifest, VideoTimelineChangeReceipt, VideoTimelineEditRequest,
-    VisualAsset, VisualEasing, VisualFit, VisualLayer, VisualMimeType, VisualMotion, CLIP_FPS,
-    MAX_SHOW_FORMATS, MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS,
-    TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
+    VisualAsset, VisualFit, VisualLayer, VisualMimeType, VisualMotion, CLIP_FPS, MAX_SHOW_FORMATS,
+    MAX_VISUAL_ASSET_BYTES, MAX_VISUAL_DIMENSION, MAX_VISUAL_PIXELS, TRAILER_MAXIMUM_US,
+    TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
 use crate::store::Store;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -85,14 +85,12 @@ const DISK_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 /// A cover is one frame with no encode. Anything slower than this is a stuck process, not a
-/// slow render.
-const COVER_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 /// One clip takes about a minute on a consumer card. Anything past this is a stuck process.
 const CLIP_GENERATION_TIMEOUT: Duration = Duration::from_secs(900);
 const CLIP_ENCODE_TIMEOUT: Duration = Duration::from_secs(120);
-/// The canvas soundAr generates clips at: the largest that fits a 12 GB card with room for the
-/// compute buffer, measured rather than assumed.
-const CLIP_CANVAS: (u32, u32) = (864, 480);
+/// A backdrop is a software encode of the whole episode at final canvas; a long episode on a slow
+/// machine is still minutes, not hours.
+const BACKDROP_RENDER_TIMEOUT: Duration = Duration::from_secs(1_200);
 /// Appended to every generated shot, so an episode's clips look like one piece of work.
 const CLIP_STYLE: &str = "cinematic, shallow depth of field, natural light, film grain";
 const SHAREABLE_FILE_MODE: u32 = 0o644;
@@ -613,6 +611,11 @@ pub struct VideoScriptRequest {
     pub operation_id: String,
     pub cast: Vec<CastMember>,
     pub script: String,
+    /// Proceed although some characters are cast on voices that cannot perform the cues written
+    /// for them. The cues are removed rather than spoken; the writer has chosen to hear the lines
+    /// without them.
+    #[serde(default)]
+    pub accept_dropped_cues: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -965,6 +968,10 @@ pub struct NarrationReplacement {
     pub model_id: String,
     pub speaker: String,
     pub language: String,
+    /// How the take was performed, recorded on its binding so a later change of persona,
+    /// direction, or engine vocabulary re-reads exactly the lines it affects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance: Option<PerformanceRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3263,17 +3270,6 @@ fn validate_timeline_render_contract(
             )
             .details(json!({ "scene_id": scene.id })));
         }
-    }
-    if manifest
-        .audio_mix
-        .tracks
-        .iter()
-        .any(|track| track.ducking.is_some())
-    {
-        return Err(VideoServiceError::new(
-            "video.timeline_feature_unsupported",
-            "Sidechain ducking needs a compatible render plan",
-        ));
     }
     Ok(())
 }
@@ -6283,6 +6279,8 @@ mod tests {
                 language: "en-US".to_string(),
                 delivery: super::super::CastDelivery::default(),
                 consent_reference_id: None,
+                persona: None,
+                ensemble: 1,
                 notes: None,
                 created_at: utc_now(),
             },
@@ -6295,6 +6293,8 @@ mod tests {
                 language: "en-US".to_string(),
                 delivery: super::super::CastDelivery::default(),
                 consent_reference_id: None,
+                persona: None,
+                ensemble: 1,
                 notes: None,
                 created_at: utc_now(),
             },
@@ -6322,9 +6322,11 @@ mod tests {
             target_lufs_milli: -16_000,
             true_peak_db_milli: -1_000,
             target_duration_us: Microseconds(600_000_000),
+            duration_tolerance_bp: 2_000,
             opening: None,
             closing: None,
             show_notes_style: None,
+            look: None,
             created_at: utc_now(),
             updated_at: utc_now(),
         }
@@ -6345,6 +6347,8 @@ mod tests {
             language: "en-US".to_string(),
             delivery: Default::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: utc_now(),
         });
@@ -6432,20 +6436,22 @@ mod tests {
     }
 
     #[test]
-    fn a_cover_is_drawn_once_redrawn_on_request_and_replaced_when_its_file_goes_missing() {
+    fn a_backdrop_is_drawn_once_redrawn_on_request_and_replaced_when_its_file_goes_missing() {
         let workspace = TestWorkspace::new();
-        // Drawing needs FFmpeg; without it there is nothing to assert about a drawn card.
-        if !workspace.service.runtime_status(false).ffmpeg.available {
+        // Drawing needs FFmpeg; without it there is nothing to assert about a drawn backdrop.
+        let runtime = workspace.service.runtime_status(false);
+        if !runtime.ffmpeg.available || !runtime.ffprobe.available {
             return;
         }
         let project_id = format!("project-{}", new_id());
         let mut manifest = empty_manifest(&project_id, "The Quiet Server");
-        // A card covers a performance, so the episode needs one to cover.
+        // A backdrop covers a performance, so the episode needs one to cover. Short, because the
+        // backdrop is encoded for real.
         manifest.reviewed_scenes.push(ReviewedScene {
-            timeline_duration_us: Microseconds(17_580_000),
+            timeline_duration_us: Microseconds(2_500_000),
             ..scene_for_dialogue()
         });
-        manifest.timeline_duration_us = Microseconds(17_580_000);
+        manifest.timeline_duration_us = Microseconds(2_500_000);
         workspace
             .service
             .create_project(CreateVideoProjectRequest {
@@ -6459,25 +6465,35 @@ mod tests {
         let first = workspace
             .service
             .ensure_episode_cover(&project_id, "service-test", false)
-            .expect("draw the cover");
+            .expect("draw the backdrop");
         let manifest: VideoProjectManifest =
             serde_json::from_value(first.get("manifest").cloned().expect("manifest"))
                 .expect("decode manifest");
-        let card = manifest
-            .visual_assets
+        let backdrop = manifest
+            .render_artifacts
             .iter()
-            .find(|asset| asset.id.starts_with("cover-"))
-            .expect("a card was drawn");
-        // Recorded as generated, so it is never mistaken for artwork the user supplied.
-        assert!(matches!(
-            card.provenance.kind,
-            ProvenanceKind::GeneratedLocally
-        ));
-        let card_path = workspace
+            .find(|artifact| matches!(artifact.role, RenderArtifactRole::Backdrop))
+            .expect("a backdrop was drawn");
+        assert!(backdrop.id.starts_with("backdrop-"));
+        // It is placed as the picture: a muted video track spanning the episode.
+        let track = manifest
+            .tracks
+            .iter()
+            .find(|track| track.id == VideoStudioService::BACKDROP_TRACK_ID)
+            .expect("the backdrop track");
+        assert_eq!(track.clips.len(), 1);
+        assert!(track.clips[0].muted);
+        assert_eq!(
+            track.clips[0].media.render_artifact_id.as_deref(),
+            Some(backdrop.id.as_str())
+        );
+        let picture = VideoStudioService::picture_status(&manifest);
+        assert!(picture.has_backdrop && !picture.has_footage && !picture.own_picture);
+        let backdrop_path = workspace
             .service
-            .resolve_managed_path(&card.managed_path)
-            .expect("resolve the card");
-        assert!(card_path.is_file());
+            .resolve_managed_path(&backdrop.managed_path)
+            .expect("resolve the backdrop");
+        assert!(backdrop_path.is_file());
         let revision_after_first = value_i64(&first, "revision").expect("revision");
 
         // Asking again for an unchanged episode must not churn the revision: the file would be
@@ -6493,20 +6509,23 @@ mod tests {
 
         // A manifest entry pointing at a file that is gone is not a picture, so it is drawn again
         // rather than reported as present.
-        fs::remove_file(&card_path).expect("remove the card");
+        fs::remove_file(&backdrop_path).expect("remove the backdrop");
         workspace
             .service
             .ensure_episode_cover(&project_id, "service-test", false)
             .expect("redraw after the file went missing");
-        assert!(card_path.is_file(), "a missing card was not drawn again");
+        assert!(
+            backdrop_path.is_file(),
+            "a missing backdrop was not drawn again"
+        );
 
-        // An explicit redraw draws even when the card is present and unchanged.
-        fs::remove_file(&card_path).expect("remove the card again");
+        // An explicit redraw draws even when the backdrop is present and unchanged.
+        fs::remove_file(&backdrop_path).expect("remove the backdrop again");
         workspace
             .service
             .ensure_episode_cover(&project_id, "service-test", true)
             .expect("explicit redraw");
-        assert!(card_path.is_file());
+        assert!(backdrop_path.is_file());
     }
 
     #[test]
@@ -6597,6 +6616,7 @@ mod tests {
             base_version_id: version_id,
             operation_id: "script-draft-1".to_string(),
             cast: script_cast(),
+            accept_dropped_cues: false,
             script: script.to_string(),
         };
 
@@ -6663,6 +6683,7 @@ mod tests {
                 operation_id: "script-draft-2".to_string(),
                 cast: script_cast(),
                 script: script.replace("She did not answer.", "She said nothing at all."),
+                accept_dropped_cues: false,
             })
             .expect("commit the revised script");
         assert_eq!(revised.receipt.new_turn_ids.len(), 1);
@@ -8277,6 +8298,7 @@ mod tests {
                 model_id: "test/voice-model".to_string(),
                 speaker: "speaker-new".to_string(),
                 language: "en".to_string(),
+                performance: None,
             }],
         };
         let replacement = workspace
@@ -8402,6 +8424,7 @@ mod tests {
                 model_id: "test/voice-model".to_string(),
                 speaker: "speaker-new".to_string(),
                 language: "en".to_string(),
+                performance: None,
             }],
         };
         let cancellation_observed = Arc::new(AtomicBool::new(false));
@@ -9170,9 +9193,30 @@ mod tests {
             })
             .expect("commit the master");
 
+        // A release waits for the check that listened to it; this one records a check and then
+        // accepts what it found, because the fixture is about deliverables, not findings.
+        workspace
+            .service
+            .check_episode_quality(
+                &project_id,
+                &std::collections::BTreeMap::new(),
+                Some(LoudnessMeasurement {
+                    integrated_lufs_milli: -16_000,
+                    true_peak_db_milli: -1_500,
+                }),
+            )
+            .expect("record a quality check");
         let exported = workspace
             .service
-            .export_episode_release(&project_id, "service-test", true)
+            .export_episode_release(
+                &project_id,
+                "service-test",
+                true,
+                ReleaseGates {
+                    accept_findings: true,
+                    ..ReleaseGates::default()
+                },
+            )
             .expect("export the release");
 
         // The audio episode and the audiogram always derive from the master; the trailer needs a
@@ -9240,7 +9284,15 @@ mod tests {
         // No master at all: the one hard prerequisite is named rather than failing later.
         let error = workspace
             .service
-            .export_episode_release(&project_id, "service-test", true)
+            .export_episode_release(
+                &project_id,
+                "service-test",
+                true,
+                ReleaseGates {
+                    accept_findings: true,
+                    ..ReleaseGates::default()
+                },
+            )
             .expect_err("a release without a master is refused");
         assert_eq!(error.code, "video.final_master_required");
     }
@@ -13191,6 +13243,30 @@ impl VideoStudioService {
     /// replaced by a generated one.
     /// The track generated clips are laid on. Named so it can be recognised and replaced whole.
     const CLIP_TRACK_ID: &'static str = "generated-clips";
+    /// The track soundAr's own drawn backdrop plays on. Footage replaces it outright.
+    const BACKDROP_TRACK_ID: &'static str = "generated-backdrop";
+
+    /// Whether the local video generator's binary is installed. Whether its weights are is the
+    /// caller's question, because the weights live outside managed media.
+    pub fn clip_generator_present(&self) -> bool {
+        let runtime = self.runtime_status(false);
+        required_tool_path(&runtime.sd_cli, "video.sd_cli_unavailable", "").is_ok()
+    }
+
+    /// What this episode has to look at.
+    pub fn picture_status(manifest: &VideoProjectManifest) -> PictureStatus {
+        let track_has_clips = |id: &str| {
+            manifest
+                .tracks
+                .iter()
+                .any(|track| track.id == id && !track.clips.is_empty())
+        };
+        PictureStatus {
+            own_picture: episode_has_own_picture(manifest),
+            has_footage: track_has_clips(Self::CLIP_TRACK_ID),
+            has_backdrop: track_has_clips(Self::BACKDROP_TRACK_ID),
+        }
+    }
 
     /// Whether this machine can generate moving clips at all.
     pub fn clip_generation_available(&self, models: Option<&Path>) -> bool {
@@ -13253,12 +13329,32 @@ impl VideoStudioService {
         let models = super::media::resolve_clip_models(model_directory)
             .map_err(|error| VideoServiceError::new("video.clip_model_missing", error.message))?;
 
-        let (width, height) = CLIP_CANVAS;
-        let shots = super::shots::plan_shots(descriptions, span_us, CLIP_STYLE);
+        // Footage is generated in the episode's own aspect, and every shot is set in the show's
+        // world, so a portrait comedy set gets portrait shots of a comedy club rather than the
+        // middle third of a landscape frame of nowhere in particular.
+        let (width, height) = super::shots::clip_canvas_for(
+            manifest.layout.canvas.width,
+            manifest.layout.canvas.height,
+        );
+        let world = manifest.look.as_ref().map(|look| look.world.as_str());
+        let authored = descriptions
+            .iter()
+            .any(|description| !description.trim().is_empty());
+        let implied;
+        let descriptions = if authored {
+            descriptions
+        } else {
+            implied = world
+                .map(super::shots::default_shots_for_world)
+                .unwrap_or_default();
+            implied.as_slice()
+        };
+        let shots =
+            super::shots::plan_shots(descriptions, span_us, CLIP_STYLE, world, (width, height));
         if shots.is_empty() {
             return Err(VideoServiceError::new(
                 "video.shots_not_described",
-                "Describe what each shot shows before generating clips",
+                "Describe what each shot shows before generating clips, or give the show a look whose world implies them",
             ));
         }
 
@@ -13343,12 +13439,16 @@ impl VideoStudioService {
             move |manifest: &mut VideoProjectManifest| {
                 // Replace the previous set outright: a regenerated episode gets one clip track,
                 // never last run's cuts with this run's stacked on top.
-                manifest
-                    .render_artifacts
-                    .retain(|existing| !matches!(existing.role, RenderArtifactRole::GeneratedClip));
-                manifest
-                    .tracks
-                    .retain(|track| track.id != Self::CLIP_TRACK_ID);
+                manifest.render_artifacts.retain(|existing| {
+                    !matches!(
+                        existing.role,
+                        RenderArtifactRole::GeneratedClip | RenderArtifactRole::Backdrop
+                    )
+                });
+                // Footage replaces the drawn backdrop as well as last run's cuts.
+                manifest.tracks.retain(|track| {
+                    track.id != Self::CLIP_TRACK_ID && track.id != Self::BACKDROP_TRACK_ID
+                });
                 // Moving shots replace a drawn card. The card is a full-canvas layer, so leaving
                 // it in place would paint it straight over the clips it was standing in for.
                 let cards = manifest
@@ -13502,18 +13602,12 @@ impl VideoStudioService {
         }
     }
 
-    /// The id a generated cover claims for one exact card, so regenerating an unchanged episode
-    /// finds its existing asset instead of stacking a second identical one.
-    fn cover_asset_id(cache_key: &str) -> String {
-        format!("cover-{}", &cache_key[..24])
-    }
-
-    /// Draw and attach this episode's cover, so an episode with nothing to look at still has a
-    /// picture and can therefore be packaged as video.
+    /// Draw and attach this episode's motion backdrop, so an episode with nothing to look at still
+    /// has a picture and can therefore be packaged as video.
     ///
-    /// The card is derived from the episode - its name, its cast, its canvas - so it is stable,
-    /// cacheable, and reproducible. It is registered as generated, never as user artwork, and it is
-    /// placed underneath everything else so a real image added later simply covers it.
+    /// The backdrop is derived from the episode - its name, its cast, its canvas, its show's look -
+    /// so it is stable, cacheable, and reproducible. It is registered as generated, never as user
+    /// artwork, and it is placed as a muted video track that footage replaces outright.
     pub fn ensure_episode_cover(
         &self,
         project_id: &str,
@@ -13529,54 +13623,74 @@ impl VideoStudioService {
         )
         .map_err(json_error)?;
 
-        // An episode that already has something to look at is left alone. A drawn card is a floor
-        // for episodes that have no picture, never a replacement for one the user chose.
-        if !redraw && episode_has_own_picture(&manifest) {
+        // An episode that already has something to look at is left alone. A drawn backdrop is a
+        // floor for episodes that have no picture, never a replacement for one the user chose or
+        // for footage the machine already cut.
+        let picture = Self::picture_status(&manifest);
+        if picture.own_picture || picture.has_footage {
             return Ok(record);
-        }
-
-        // A card is drawn at the canvas it will be composited onto, so it is never upscaled.
-        let (width, height) = profile_dimensions(RenderProfile::Final, &manifest.layout);
-        let spec = cover_spec(project_id, &manifest.name, &manifest.cast, width, height);
-        let cache_key = spec.cache_key();
-        let asset_id = Self::cover_asset_id(&cache_key);
-        // An unchanged episode keeps the card it already has. Redrawing it would churn the
-        // revision and invalidate renders for a file that would be byte-identical. A card whose
-        // file has gone missing is not a card, so it is drawn again rather than left as a manifest
-        // entry pointing at nothing.
-        let existing = manifest
-            .visual_assets
-            .iter()
-            .find(|asset| asset.id == asset_id);
-        if !redraw {
-            if let Some(existing) = existing {
-                if self
-                    .resolve_managed_path(&existing.managed_path)
-                    .is_ok_and(|path| path.is_file())
-                {
-                    return Ok(record);
-                }
-            }
         }
 
         let span_us = self.episode_span_us(&manifest);
         if span_us <= 0 {
             return Err(VideoServiceError::new(
                 "video.cover_span_unknown",
-                "This episode has no duration yet, so a cover has nothing to cover",
+                "This episode has no duration yet, so a backdrop has nothing to cover",
             ));
+        }
+
+        // A backdrop is drawn at the canvas it will be composited onto, so it is never upscaled.
+        let (width, height) = profile_dimensions(RenderProfile::Final, &manifest.layout);
+        let spec = backdrop_spec(
+            project_id,
+            &manifest.name,
+            &manifest.cast,
+            manifest.look.as_ref(),
+            width,
+            height,
+            span_us,
+            (
+                manifest.frame_rate.numerator,
+                manifest.frame_rate.denominator,
+            ),
+        );
+        let cache_key = spec.cache_key();
+        let artifact_id = format!("backdrop-{}", &cache_key[..24]);
+        // An unchanged episode keeps the backdrop it already has. Redrawing it would churn the
+        // revision and invalidate renders for a file that would be byte-identical. A backdrop
+        // whose file has gone missing is not a backdrop, so it is drawn again rather than left as
+        // a manifest entry pointing at nothing.
+        if !redraw {
+            if let Some(existing) = manifest
+                .render_artifacts
+                .iter()
+                .find(|artifact| artifact.id == artifact_id)
+            {
+                if self
+                    .resolve_managed_path(&existing.managed_path)
+                    .is_ok_and(|path| path.is_file())
+                    && picture.has_backdrop
+                {
+                    return Ok(record);
+                }
+            }
         }
 
         let runtime = self.runtime_status(false);
         let ffmpeg = required_tool_path(
             &runtime.ffmpeg,
             "video.ffmpeg_unavailable",
-            "FFmpeg is required to draw a cover",
+            "FFmpeg is required to draw a backdrop",
+        )?;
+        let ffprobe = required_tool_path(
+            &runtime.ffprobe,
+            "video.ffprobe_unavailable",
+            "FFprobe is required to measure a backdrop",
         )?;
 
-        let output = self.cache_path("cover", &cache_key, "png")?;
+        let output = self.cache_path("backdrop", &cache_key, "mp4")?;
         if !output.is_file() {
-            let text_dir = self.video_root.join("cache").join("cover");
+            let text_dir = self.video_root.join("cache").join("backdrop");
             self.secure_managed_directory(&text_dir)?;
             // Title and cast reach FFmpeg as files, never as filter arguments: a name containing a
             // comma or a quote is text, and must not be able to become filter syntax.
@@ -13587,95 +13701,77 @@ impl VideoStudioService {
                 Some(self.write_cover_text(&text_dir, &cache_key, "cast", &spec.subtitle)?)
             };
             let staging = sibling_staging_path(&output)?;
-            let plan = build_cover_image_command(
+            let plan = build_backdrop_command(
                 ffmpeg,
                 &spec,
                 &title_path,
                 subtitle_path.as_deref(),
                 &staging,
-            )?;
-            self.run_cover_plan(&plan)?;
-            publish_atomic(&staging, &output, validate_image_file)?;
-        } else {
-            validate_image_file(&output)?;
+            )
+            .map_err(|error| VideoServiceError::new("video.cover_failed", error.message))?;
+            self.run_generator(&plan.primary, BACKDROP_RENDER_TIMEOUT)
+                .map_err(|error| VideoServiceError::new("video.cover_failed", error.message))?;
+            publish_atomic(&staging, &output, |candidate| {
+                if fs::metadata(candidate).is_ok_and(|metadata| metadata.len() > 1024) {
+                    Ok(())
+                } else {
+                    Err(MediaError::new(
+                        "backdrop_empty",
+                        "The drawn backdrop was empty",
+                    ))
+                }
+            })?;
         }
 
-        let size_bytes = fs::metadata(&output)
-            .map_err(|error| {
-                VideoServiceError::io(
-                    "video.cover_failed",
-                    "The generated cover could not be measured",
-                    error,
-                )
-            })?
-            .len();
-        let sha256 = sha256_file(&output)?;
-        let managed_path = self.relative_managed_path(&output)?;
+        let probe = probe_media(&output, ffprobe)?;
         let created_at = utc_now();
-        let asset = VisualAsset {
-            id: asset_id.clone(),
-            managed_path,
-            sha256,
-            mime_type: VisualMimeType::Png,
-            width,
-            height,
-            has_alpha: false,
-            size_bytes,
-            provenance: Provenance {
-                // Generated, and recorded as such: a drawn card must never be mistaken for
-                // artwork the user supplied.
-                kind: ProvenanceKind::GeneratedLocally,
-                original_uri: None,
-                imported_at: created_at.clone(),
-                producer: "soundAr cover".to_string(),
-                producer_version: Some(SERVICE_VERSION.to_string()),
-                metadata: BTreeMap::from([
-                    ("cache_key".to_string(), json!(cache_key)),
-                    ("title".to_string(), json!(spec.title)),
-                    ("cast_line".to_string(), json!(spec.subtitle)),
-                ]),
-            },
+        let artifact = RenderArtifact {
+            id: artifact_id.clone(),
+            role: RenderArtifactRole::Backdrop,
+            scene_id: None,
+            managed_path: self.relative_managed_path(&output)?,
+            sha256: sha256_file(&output)?,
+            cache_key: cache_key.clone(),
+            mime_type: "video/mp4".to_string(),
+            duration_us: Some(Microseconds(probe.duration_us)),
+            width: Some(width),
+            height: Some(height),
+            publication_state: PublicationState::Published,
             created_at: created_at.clone(),
         };
-        asset.validate()?;
-
-        let full_canvas = NormalizedRect {
-            x_bp: 0,
-            y_bp: 0,
-            width_bp: 10_000,
-            height_bp: 10_000,
-        };
-        let layer = VisualLayer {
-            id: format!("cover-layer-{}", &cache_key[..16]),
-            asset_id,
+        artifact.validate()?;
+        let clip = TimelineClip {
+            id: format!("backdrop-cut-{}", &cache_key[..12]),
             scene_id: None,
-            range: TimeRange::new(0, span_us)?,
-            fit: VisualFit::Cover,
-            crop: None,
-            // Underneath everything: a generated card is a floor, not a decision about the frame.
-            z_index: -128,
-            motion: VisualMotion {
-                start_bounds: full_canvas,
-                end_bounds: full_canvas,
-                start_opacity_milli: 1_000,
-                end_opacity_milli: 1_000,
-                start_rotation_milli_degrees: 0,
-                end_rotation_milli_degrees: 0,
-                easing: VisualEasing::Linear,
+            turn_id: None,
+            media: super::MediaReference {
+                source_asset_id: None,
+                render_artifact_id: Some(artifact.id.clone()),
             },
-            transition_in_us: Microseconds::ZERO,
-            transition_out_us: Microseconds::ZERO,
+            source_range: TimeRange::new(0, span_us.min(probe.duration_us.max(1)))?,
+            timeline_start_us: Microseconds::ZERO,
+            timeline_duration_us: Microseconds(span_us.min(probe.duration_us.max(1))),
+            playback_rate: RationalRate::ONE,
+            gain_db_milli: 0,
+            // The backdrop is picture only; the episode's narration is the sound.
+            muted: true,
+            crop: None,
         };
-        layer.validate()?;
+        clip.validate()?;
 
         let expectation = project_expectation(&record)?;
         self.commit_manifest_mutation_at_if_parent_active(
             project_id,
             &expectation,
             actor,
-            "Draw a cover for an episode with no picture",
+            "Draw a backdrop for an episode with no picture",
             None,
-            vec!["/visual_assets".to_string(), "/visual_layers".to_string()],
+            vec![
+                "/render_artifacts".to_string(),
+                "/tracks".to_string(),
+                "/visual_assets".to_string(),
+                "/visual_layers".to_string(),
+            ],
             BTreeSet::from([
                 RevisionStage::SceneRender,
                 RevisionStage::Preview,
@@ -13684,27 +13780,44 @@ impl VideoStudioService {
             ]),
             None,
             move |manifest: &mut VideoProjectManifest| {
-                // Replace any previous generated cover rather than accumulating one per rename.
-                let stale = manifest
+                // Replace any previous backdrop rather than accumulating one per rename, and
+                // retire the flat card this backdrop succeeds: the card was a full-canvas layer,
+                // and left in place it would paint over the picture standing in for it.
+                manifest
+                    .render_artifacts
+                    .retain(|existing| !matches!(existing.role, RenderArtifactRole::Backdrop));
+                manifest
+                    .tracks
+                    .retain(|track| track.id != Self::BACKDROP_TRACK_ID);
+                let cards = manifest
                     .visual_assets
                     .iter()
-                    .filter(|existing| existing.id.starts_with("cover-"))
-                    .map(|existing| existing.id.clone())
+                    .filter(|asset| asset.id.starts_with("cover-"))
+                    .map(|asset| asset.id.clone())
                     .collect::<Vec<_>>();
                 manifest
                     .visual_layers
-                    .retain(|existing| !stale.contains(&existing.asset_id));
+                    .retain(|layer| !cards.contains(&layer.asset_id));
                 manifest
                     .visual_assets
-                    .retain(|existing| !existing.id.starts_with("cover-"));
-                manifest.visual_assets.push(asset.clone());
-                manifest.visual_layers.push(layer.clone());
+                    .retain(|asset| !asset.id.starts_with("cover-"));
+                manifest.render_artifacts.push(artifact.clone());
+                // The backdrop sits first among video tracks, which is what makes it the picture:
+                // the assembler takes the first video track as the frame.
+                manifest.tracks.insert(
+                    0,
+                    TimelineTrack {
+                        id: Self::BACKDROP_TRACK_ID.to_string(),
+                        kind: TrackKind::Video,
+                        preserve_gaps: false,
+                        clips: vec![clip.clone()],
+                    },
+                );
                 Ok(())
             },
         )
     }
 
-    /// How long this episode runs, measured from what has actually been placed on its clock.
     fn episode_span_us(&self, manifest: &VideoProjectManifest) -> i64 {
         let scene_end = manifest
             .reviewed_scenes
@@ -13768,53 +13881,6 @@ impl VideoStudioService {
             }
         })?;
         Ok(path)
-    }
-
-    /// Run a cover card render.
-    ///
-    /// A single frame with no encode has no progress to report and finishes in well under a
-    /// second, so it runs directly under a hard deadline rather than through the job and progress
-    /// machinery that exists for renders a user waits on.
-    fn run_cover_plan(&self, plan: &RenderCommandPlan) -> ServiceResult<()> {
-        let mut child = plan.primary.command().spawn().map_err(|error| {
-            VideoServiceError::io(
-                "video.cover_failed",
-                "The cover render could not start",
-                error,
-            )
-        })?;
-        let deadline = Instant::now() + COVER_RENDER_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                Ok(Some(_)) => {
-                    let mut stderr = String::new();
-                    if let Some(mut pipe) = child.stderr.take() {
-                        let _ = pipe.read_to_string(&mut stderr);
-                    }
-                    return Err(VideoServiceError::new(
-                        "video.cover_failed",
-                        "The cover could not be drawn",
-                    )
-                    .details(json!({ "stderr": truncate_chars(stderr.trim(), 400) })));
-                }
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = terminate_process_group(&mut child, Duration::from_secs(2));
-                    return Err(VideoServiceError::new(
-                        "video.cover_failed",
-                        "The cover render exceeded its time budget",
-                    ));
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(20)),
-                Err(error) => {
-                    return Err(VideoServiceError::io(
-                        "video.cover_failed",
-                        "The cover render could not be supervised",
-                        error,
-                    ))
-                }
-            }
-        }
     }
 
     pub fn ensure_dialogue_scene(&self, project_id: &str, actor: &str) -> ServiceResult<Value> {
@@ -14016,20 +14082,42 @@ impl VideoStudioService {
             }
             match heard.get(&turn.id) {
                 Some(spoken) => {
-                    // The comparison is against what the voice was asked to say, which is the
-                    // scripted line after its pronunciation rules were applied.
+                    // The comparison is against what the voice was asked to perform, which is
+                    // the scripted line after its pronunciation rules were applied, cues and all:
+                    // a laugh heard as "ha ha" is the cue performed, and "laughter" is it read.
                     let asked = apply_lexicon(
                         turn.spoken_text(),
                         &effective_entries(&manifest.lexicon, &turn.character_id),
                     )
                     .spoken_text;
-                    findings.extend(findings_for_turn(
-                        &turn.id,
-                        &diff_spoken_words(&asked, spoken),
+                    findings.extend(super::quality::findings_for_performed_line(
+                        &turn.id, &asked, spoken,
                     ));
                     checked_turns.push(turn.id.clone());
                 }
                 None => unchecked_turns.push(turn.id.clone()),
+            }
+            // A cue the cast voice could not perform was removed before the take was made. That
+            // is recorded on the take, and reported here so nobody assumes the room laughed.
+            if let Some(dropped) = manifest
+                .narration_bindings
+                .iter()
+                .find(|binding| binding.turn_id.as_deref() == Some(turn.id.as_str()))
+                .and_then(|binding| binding.performance.as_ref())
+                .map(|performance| performance.dropped_events.as_slice())
+                .filter(|dropped| !dropped.is_empty())
+            {
+                findings.extend(super::quality::findings_for_dropped_cues(&turn.id, dropped));
+            }
+        }
+
+        // The length the show asked for, against the length that was performed.
+        if let Some(target) = &manifest.length_target {
+            if !manifest.narration_bindings.is_empty() {
+                findings.extend(super::quality::findings_for_length(
+                    target,
+                    manifest.timeline_duration_us,
+                ));
             }
         }
 
@@ -14063,12 +14151,41 @@ impl VideoStudioService {
             ));
         }
 
-        Ok(build_report(
-            findings,
-            checked_turns,
-            unchecked_turns,
-            loudness.is_some(),
-        )?)
+        let report = build_report(findings, checked_turns, unchecked_turns, loudness.is_some())?;
+        // The check is recorded against exactly what it listened to, so a release can ask whether
+        // this episode - not an earlier cut of it - was checked.
+        let quality = super::quality::QualityRecord {
+            project_id: project_id.to_string(),
+            version_id: project_expectation(&record)?.version_id,
+            revision: manifest.revision,
+            fingerprint: super::quality::quality_fingerprint(&manifest),
+            checked_at: utc_now(),
+            report: report.clone(),
+        };
+        self.store
+            .save_video_quality_record(
+                project_id,
+                &serde_json::to_value(&quality).map_err(json_error)?,
+            )
+            .map_err(VideoServiceError::store)?;
+        Ok(report)
+    }
+
+    /// The last quality check as it relates to the episode now.
+    pub fn quality_status(
+        &self,
+        manifest: &VideoProjectManifest,
+    ) -> ServiceResult<super::quality::QualityStatus> {
+        let Some(stored) = self
+            .store
+            .video_quality_record(&manifest.project_id)
+            .map_err(VideoServiceError::store)?
+        else {
+            return Ok(super::quality::QualityStatus::Unchecked);
+        };
+        let record: super::quality::QualityRecord =
+            serde_json::from_value(stored).map_err(json_error)?;
+        Ok(record.status_for(manifest))
     }
 
     /// Render one deliverable, publish it atomically, and measure what was actually produced.
@@ -14220,8 +14337,9 @@ impl VideoStudioService {
         project_id: &str,
         actor: &str,
         has_show_notes: bool,
+        gates: ReleaseGates,
     ) -> ServiceResult<ReleaseExportResult> {
-        let plan = self.plan_episode_release(project_id, has_show_notes)?;
+        let plan = self.plan_episode_release(project_id, has_show_notes, gates)?;
         let record = self.get_project(project_id)?;
         let manifest: VideoProjectManifest = serde_json::from_value(
             record
@@ -14504,6 +14622,7 @@ impl VideoStudioService {
         &self,
         project_id: &str,
         has_show_notes: bool,
+        gates: ReleaseGates,
     ) -> ServiceResult<ReleasePlan> {
         let record = self.get_project(project_id)?;
         let manifest: VideoProjectManifest = serde_json::from_value(
@@ -14531,7 +14650,17 @@ impl VideoStudioService {
             .map(|candidate| candidate.source_range),
             None => None,
         };
-        Ok(plan_release(&manifest, trailer_range, has_show_notes)?)
+        let context = ReleaseContext {
+            quality: self.quality_status(&manifest)?,
+            picture: Self::picture_status(&manifest),
+            gates,
+        };
+        Ok(plan_release(
+            &manifest,
+            trailer_range,
+            has_show_notes,
+            &context,
+        )?)
     }
 
     /// Every saved show format, validated on the way out so a corrupted document cannot reach a
@@ -17815,6 +17944,7 @@ impl VideoStudioService {
                 speaker: replacement.speaker.clone(),
                 language: replacement.language.clone(),
                 script_sha256: script_sha,
+                performance: replacement.performance.clone(),
                 created_at: utc_now(),
             };
             binding.validate()?;
@@ -18964,6 +19094,44 @@ impl VideoStudioService {
                     "A managed visual asset no longer matches its manifest checksum",
                 )
                 .details(json!({ "visual_asset_id": visual.id })));
+            }
+            render_key_builder = render_key_builder.artifact(resolved_key.clone(), actual_sha256);
+            resolved_sources.insert(resolved_key, path);
+        }
+
+        // Sound design reaches the master: every placed sound's managed source is resolved and
+        // checksummed like any other media the render reads.
+        let placed_sound_ids = manifest
+            .sound_layers
+            .iter()
+            .map(|layer| layer.asset_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for sound in manifest
+            .sound_assets
+            .iter()
+            .filter(|sound| placed_sound_ids.contains(sound.id.as_str()))
+        {
+            self.ensure_not_cancelled(cancel)?;
+            let source = manifest
+                .source_assets
+                .iter()
+                .find(|source| source.id == sound.source_asset_id)
+                .ok_or_else(|| {
+                    VideoServiceError::new(
+                        "video.source_not_found",
+                        "A placed sound references a source that is no longer in the project",
+                    )
+                    .details(json!({ "sound_asset_id": sound.id }))
+                })?;
+            let resolved_key = format!("sound:{}", sound.id);
+            let path = self.resolve_managed_path(&source.managed_path)?;
+            let actual_sha256 = sha256_file(&path)?;
+            if actual_sha256 != source.sha256 {
+                return Err(VideoServiceError::new(
+                    "video.integrity_failed",
+                    "A placed sound's source no longer matches its manifest checksum",
+                )
+                .details(json!({ "sound_asset_id": sound.id })));
             }
             render_key_builder = render_key_builder.artifact(resolved_key.clone(), actual_sha256);
             resolved_sources.insert(resolved_key, path);

@@ -1320,6 +1320,8 @@ pub enum RenderArtifactRole {
     Audiogram,
     /// One locally generated moving shot, cut across an episode that has no footage of its own.
     GeneratedClip,
+    /// A drawn motion backdrop: what an episode with no footage and no generator looks at.
+    Backdrop,
     PublishPackage,
 }
 
@@ -1446,7 +1448,128 @@ pub struct NarrationBinding {
     pub character_id: Option<String>,
     pub language: String,
     pub script_sha256: String,
+    /// How the take was performed: the instruction the voice was steered with, the vocabulary its
+    /// cues were written in, and the cues it could not perform. Takes recorded before delivery
+    /// reached the engine carry none, which is also how they were made.
+    #[serde(default)]
+    pub performance: Option<PerformanceRecord>,
     pub created_at: String,
+}
+
+/// What a voice was asked to do beyond the words: the delivery a take was produced under.
+///
+/// A take whose performance no longer matches its character's persona, its line's direction, or
+/// the vocabulary its engine reads is stale in exactly the way a take of changed words is stale.
+/// The fingerprint is what makes that comparison one string.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceRecord {
+    /// The instruction sent to the engine: persona, then direction. `None` when the engine does
+    /// not follow one.
+    #[serde(default)]
+    pub instruction: Option<String>,
+    /// The vocabulary the line's cues were rendered in.
+    #[serde(default)]
+    pub vocabulary: super::vocal_events::VocalVocabulary,
+    /// Distinct takes layered into this one.
+    #[serde(default = "one_take")]
+    pub ensemble: u8,
+    /// Cues the line asked for that this voice cannot perform, and therefore did not.
+    #[serde(default)]
+    pub dropped_events: Vec<super::vocal_events::VocalEvent>,
+    /// The text the engine was handed, after cue rendering.
+    pub rendered_text: String,
+    /// Guidance strength for the instruction, in thousandths, where the engine declares one.
+    #[serde(default)]
+    pub cfg_scale_milli: Option<i32>,
+    /// Emotion strength for an engine that takes one, in thousandths of its 0..1 range.
+    #[serde(default)]
+    pub exaggeration_milli: Option<i32>,
+    /// SHA-256 over rendered text, instruction, vocabulary, ensemble, and engine controls.
+    pub fingerprint: String,
+}
+
+fn one_take() -> u8 {
+    1
+}
+
+impl PerformanceRecord {
+    /// Describe a performance before it happens, so the same inputs always name the same take.
+    pub fn new(
+        rendered_text: impl Into<String>,
+        instruction: Option<String>,
+        vocabulary: super::vocal_events::VocalVocabulary,
+        ensemble: u8,
+        dropped_events: Vec<super::vocal_events::VocalEvent>,
+        cfg_scale_milli: Option<i32>,
+        exaggeration_milli: Option<i32>,
+    ) -> Self {
+        let rendered_text = rendered_text.into();
+        let instruction = instruction.filter(|value| !value.trim().is_empty());
+        let mut hasher = Sha256::new();
+        hasher.update(b"performance-v1");
+        for field in [
+            rendered_text.as_str(),
+            instruction.as_deref().unwrap_or_default(),
+            vocabulary.as_str(),
+            &ensemble.to_string(),
+            &cfg_scale_milli
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            &exaggeration_milli
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ] {
+            hasher.update([0x1f]);
+            hasher.update(field.as_bytes());
+        }
+        Self {
+            instruction,
+            vocabulary,
+            ensemble,
+            dropped_events,
+            rendered_text,
+            cfg_scale_milli,
+            exaggeration_milli,
+            fingerprint: format!("{:x}", hasher.finalize()),
+        }
+    }
+
+    pub fn cfg_scale(&self) -> Option<f64> {
+        self.cfg_scale_milli.map(|value| f64::from(value) / 1000.0)
+    }
+
+    pub fn exaggeration(&self) -> Option<f64> {
+        self.exaggeration_milli
+            .map(|value| f64::from(value) / 1000.0)
+    }
+}
+
+impl Validate for PerformanceRecord {
+    fn validate(&self) -> VideoResult<()> {
+        if let Some(instruction) = &self.instruction {
+            if instruction.trim().is_empty() || instruction.len() > 1_200 {
+                return Err(VideoError::new(
+                    VideoErrorCode::InvalidNarration,
+                    "a performance instruction must be non-empty and at most 1200 bytes",
+                )
+                .at("narration_bindings.performance.instruction"));
+            }
+        }
+        if !(1..=super::cast::MAX_ENSEMBLE).contains(&self.ensemble) {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidNarration,
+                "a performance layers between 1 and 4 takes",
+            )
+            .at("narration_bindings.performance.ensemble"));
+        }
+        validate_sha256(
+            &self.fingerprint,
+            "narration_bindings.performance.fingerprint",
+            VideoErrorCode::InvalidNarration,
+        )?;
+        Ok(())
+    }
 }
 
 impl Validate for NarrationBinding {
@@ -1479,6 +1602,9 @@ impl Validate for NarrationBinding {
             "narration_bindings.script_sha256",
             VideoErrorCode::InvalidNarration,
         )?;
+        if let Some(performance) = &self.performance {
+            performance.validate()?;
+        }
         validate_timestamp_text(&self.created_at, "narration_bindings.created_at")?;
         Ok(())
     }
@@ -1583,10 +1709,70 @@ pub struct VideoProjectManifest {
     pub turn_beats: Vec<TurnBeat>,
     #[serde(default)]
     pub narration_bindings: Vec<NarrationBinding>,
+    /// How long this episode is meant to run, inherited from its show. The performed length is
+    /// measured against it; nothing here stretches or cuts the performance to fit.
+    #[serde(default)]
+    pub length_target: Option<LengthTarget>,
+    /// What the audience sees when there is nothing to film, inherited from the show.
+    #[serde(default)]
+    pub look: Option<super::format::Look>,
     pub render_artifacts: Vec<RenderArtifact>,
     pub revision_history: Vec<RevisionRecord>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// The length an episode was asked to be, with the slack a writer is allowed around it.
+///
+/// A target is a contract, not an estimate: a thirty-second show that runs sixty-three seconds
+/// has not met it, and the report says so in seconds rather than letting the overrun pass
+/// because every gate that existed was about something else.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LengthTarget {
+    pub target_us: Microseconds,
+    /// Allowed distance either side of the target, in basis points of the target.
+    pub tolerance_bp: u32,
+}
+
+impl LengthTarget {
+    pub fn tolerance_us(&self) -> Microseconds {
+        Microseconds(
+            self.target_us
+                .0
+                .saturating_mul(i64::from(self.tolerance_bp))
+                / 10_000,
+        )
+    }
+
+    /// Signed distance from target: positive when the episode runs long.
+    pub fn delta_us(&self, actual_us: Microseconds) -> Microseconds {
+        Microseconds(actual_us.0 - self.target_us.0)
+    }
+
+    pub fn accepts(&self, actual_us: Microseconds) -> bool {
+        self.delta_us(actual_us).0.abs() <= self.tolerance_us().0
+    }
+}
+
+impl Validate for LengthTarget {
+    fn validate(&self) -> VideoResult<()> {
+        if !(1..=MAX_TIMELINE_DURATION_US).contains(&self.target_us.0) {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidShowFormat,
+                "a length target must be between one microsecond and six hours",
+            )
+            .at("length_target.target_us"));
+        }
+        if self.tolerance_bp > 10_000 {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidShowFormat,
+                "a length tolerance cannot exceed the target itself",
+            )
+            .at("length_target.tolerance_bp"));
+        }
+        Ok(())
+    }
 }
 
 impl VideoProjectManifest {
@@ -1642,6 +1828,8 @@ impl VideoProjectManifest {
             performance_clock: PerformanceClock::default(),
             turn_beats: Vec::new(),
             narration_bindings: Vec::new(),
+            length_target: None,
+            look: None,
             render_artifacts: Vec::new(),
             revision_history: Vec::new(),
             created_at: created_at.clone(),
@@ -2928,6 +3116,8 @@ mod tests {
             performance_clock: PerformanceClock::default(),
             turn_beats: vec![],
             narration_bindings: vec![],
+            length_target: None,
+            look: None,
             render_artifacts: vec![],
             revision_history: vec![],
             created_at: timestamp(),
@@ -3173,6 +3363,8 @@ mod tests {
             language: "en-US".into(),
             delivery: super::super::cast::CastDelivery::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: timestamp(),
         });
@@ -3185,6 +3377,8 @@ mod tests {
             language: "en-US".into(),
             delivery: super::super::cast::CastDelivery::default(),
             consent_reference_id: None,
+            persona: None,
+            ensemble: 1,
             notes: None,
             created_at: timestamp(),
         });
@@ -3240,6 +3434,7 @@ mod tests {
                 "{:x}",
                 Sha256::digest("The harmattan came early.".as_bytes())
             ),
+            performance: None,
             created_at: timestamp(),
         });
         manifest
@@ -3518,6 +3713,7 @@ mod tests {
             speaker: "af_heart".into(),
             language: "en-US".into(),
             script_sha256: format!("{:x}", Sha256::digest(script.as_bytes())),
+            performance: None,
             created_at: timestamp(),
         });
         manifest.validate_strict().unwrap();

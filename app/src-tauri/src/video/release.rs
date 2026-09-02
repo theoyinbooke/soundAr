@@ -16,6 +16,7 @@ use super::contracts::{
     TranscriptSegment, TranscriptTimingSource, TranscriptVersion, Validate, VideoError,
     VideoErrorCode, VideoProjectManifest, VideoResult,
 };
+use super::quality::QualityStatus;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -270,11 +271,70 @@ fn escape_ffmetadata(value: &str) -> String {
 ///
 /// `has_show_notes` is supplied by the caller because notes are written, not derived: the contract
 /// can record whether they exist but has no business inventing them.
+/// What an episode has to look at, as the release planner sees it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PictureStatus {
+    /// Imported video, or a still the user supplied or generated deliberately.
+    pub own_picture: bool,
+    /// Generated shots cut across the narration.
+    pub has_footage: bool,
+    /// soundAr's own drawn backdrop, standing in for footage.
+    pub has_backdrop: bool,
+}
+
+/// What the caller accepts, and what the machine can do, when a release is planned.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseGates {
+    /// Release although the last quality check found blocking problems.
+    #[serde(default)]
+    pub accept_findings: bool,
+    /// Release on the drawn backdrop although a video generator could have made footage.
+    #[serde(default)]
+    pub accept_backdrop: bool,
+    /// A local video generator and its weights are installed.
+    #[serde(default)]
+    pub generator_ready: bool,
+}
+
+/// Everything a release plan is judged against besides the manifest.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseContext {
+    pub quality: QualityStatus,
+    pub picture: PictureStatus,
+    pub gates: ReleaseGates,
+}
+
+impl ReleaseContext {
+    /// A context with nothing to object to: the check is clear and the picture is the user's own.
+    /// For tests of the other gates, and for callers that have already judged these.
+    pub fn unguarded() -> Self {
+        Self {
+            quality: QualityStatus::Clear,
+            picture: PictureStatus {
+                own_picture: true,
+                has_footage: false,
+                has_backdrop: false,
+            },
+            gates: ReleaseGates::default(),
+        }
+    }
+}
+
 pub fn plan_release(
     manifest: &VideoProjectManifest,
     trailer_range: Option<TimeRange>,
     has_show_notes: bool,
+    context: &ReleaseContext,
 ) -> VideoResult<ReleasePlan> {
+    let ReleaseContext {
+        quality,
+        picture,
+        gates,
+    } = *context;
+    let accept_findings = gates.accept_findings;
     let transcript = episode_transcript(manifest)?;
     let has_master = manifest.render_artifacts.iter().any(|artifact| {
         matches!(artifact.role, RenderArtifactRole::FinalMaster)
@@ -292,6 +352,39 @@ pub fn plan_release(
         drafts.len()
     );
 
+    // A release is what leaves soundAr, so it waits for the check that listened to it. The
+    // writer may accept what the check found; they may not skip the check by not running it.
+    let quality_reason = match quality {
+        QualityStatus::Unchecked => Some(
+            "No quality check has been recorded; run transcribe_and_check_episode first".to_string(),
+        ),
+        QualityStatus::Stale => Some(
+            "The episode changed after its last quality check; run transcribe_and_check_episode again"
+                .to_string(),
+        ),
+        QualityStatus::Blocking {
+            findings,
+            unchecked_turns,
+        } if !accept_findings => Some(format!(
+            "The last quality check found {findings} blocking finding(s) and {unchecked_turns} unchecked line(s); fix them or accept them explicitly"
+        )),
+        QualityStatus::Unmeasured if !accept_findings => Some(
+            "The last quality check did not measure the master's loudness; render a final master and check again, or accept the unmeasured master explicitly"
+                .to_string(),
+        ),
+        _ => None,
+    };
+    let quality_clear = quality_reason.is_none();
+    // A show with nothing to film is shown footage where the machine can make it. Shipping the
+    // drawn backdrop instead is a choice the writer makes, not a default the machine falls into.
+    let backdrop_reason = (!picture.own_picture
+        && !picture.has_footage
+        && gates.generator_ready
+        && !gates.accept_backdrop)
+        .then_some(
+            "This episode shows only a drawn backdrop while a video generator is installed; call generate_episode_clips (the show's look supplies default shots) or accept the backdrop explicitly",
+        );
+
     let member = |kind: ReleaseMemberKind, ready: bool, reason: &str| ReleaseMemberPlan {
         kind,
         ready,
@@ -301,9 +394,20 @@ pub fn plan_release(
             Some(reason.to_string())
         },
     };
+    let listened = |kind: ReleaseMemberKind, ready: bool, reason: &str| {
+        if ready {
+            member(
+                kind,
+                quality_clear,
+                quality_reason.as_deref().unwrap_or_default(),
+            )
+        } else {
+            member(kind, false, reason)
+        }
+    };
 
     let members = vec![
-        member(
+        listened(
             ReleaseMemberKind::PodcastAudio,
             narrated && no_drafts,
             if narrated {
@@ -312,21 +416,31 @@ pub fn plan_release(
                 "No line has been narrated yet, so there is no audio episode to publish"
             },
         ),
-        member(
-            ReleaseMemberKind::VideoMaster,
-            has_master && no_drafts,
-            if has_master {
-                &draft_reason
-            } else {
-                "Render a final master for the current timeline first"
-            },
-        ),
-        member(
-            ReleaseMemberKind::Trailer,
-            trailer_range.is_some(),
-            "No narrated moment is long enough to cut a trailer from",
-        ),
-        member(
+        match backdrop_reason {
+            Some(reason) if has_master && no_drafts => {
+                member(ReleaseMemberKind::VideoMaster, false, reason)
+            }
+            _ => listened(
+                ReleaseMemberKind::VideoMaster,
+                has_master && no_drafts,
+                if has_master {
+                    &draft_reason
+                } else {
+                    "Render a final master for the current timeline first"
+                },
+            ),
+        },
+        match backdrop_reason {
+            Some(reason) if trailer_range.is_some() => {
+                member(ReleaseMemberKind::Trailer, false, reason)
+            }
+            _ => member(
+                ReleaseMemberKind::Trailer,
+                trailer_range.is_some(),
+                "No narrated moment is long enough to cut a trailer from",
+            ),
+        },
+        listened(
             ReleaseMemberKind::Audiogram,
             has_master && no_drafts,
             if has_master {
@@ -407,6 +521,8 @@ mod tests {
                 language: "en-US".into(),
                 delivery: CastDelivery::default(),
                 consent_reference_id: None,
+                persona: None,
+                ensemble: 1,
                 notes: None,
                 created_at: NOW.into(),
             });
@@ -604,13 +720,15 @@ mod tests {
                             format!("This is line number {index} of the episode.").as_bytes()
                         )
                     ),
+                    performance: None,
                     created_at: NOW.into(),
                 });
         }
         manifest.validate_strict().unwrap();
 
         let trailer = TimeRange::new(0, TRAILER_TARGET_US).unwrap();
-        let plan = plan_release(&manifest, Some(trailer), true).unwrap();
+        let plan =
+            plan_release(&manifest, Some(trailer), true, &ReleaseContext::unguarded()).unwrap();
         let blocked = plan
             .blocked()
             .into_iter()
@@ -680,7 +798,7 @@ mod tests {
     #[test]
     fn a_release_names_what_is_missing_rather_than_quietly_omitting_it() {
         let bare = manifest();
-        let plan = plan_release(&bare, None, false).unwrap();
+        let plan = plan_release(&bare, None, false, &ReleaseContext::unguarded()).unwrap();
         assert!(!plan.is_ready());
         assert_eq!(plan.blocked().len(), ReleaseMemberKind::ALL.len());
         for member in plan.blocked() {
@@ -712,7 +830,8 @@ mod tests {
         });
 
         let trailer = TimeRange::new(0, TRAILER_TARGET_US).unwrap();
-        let plan = plan_release(&manifest, Some(trailer), true).unwrap();
+        let plan =
+            plan_release(&manifest, Some(trailer), true, &ReleaseContext::unguarded()).unwrap();
         assert!(plan.is_ready(), "blocked: {:?}", plan.blocked());
         assert_eq!(plan.trailer_range, Some(trailer));
 
@@ -723,8 +842,186 @@ mod tests {
             .last_mut()
             .unwrap()
             .publication_state = PublicationState::Staged;
-        let plan = plan_release(&staged, Some(trailer), true).unwrap();
+        let plan =
+            plan_release(&staged, Some(trailer), true, &ReleaseContext::unguarded()).unwrap();
         assert!(!plan.is_ready());
         assert_eq!(plan.blocked()[0].kind, ReleaseMemberKind::VideoMaster);
+    }
+
+    #[test]
+    fn a_release_waits_for_the_check_that_listened_to_it() {
+        let mut manifest = manifest();
+        narrate(&mut manifest, 8);
+        manifest.render_artifacts.push(RenderArtifact {
+            id: "master".into(),
+            role: RenderArtifactRole::FinalMaster,
+            scene_id: None,
+            managed_path: "renders/master.mp4".into(),
+            sha256: "f".repeat(64),
+            cache_key: "e".repeat(64),
+            mime_type: "video/mp4".into(),
+            duration_us: Some(Microseconds(40_000_000)),
+            width: Some(1080),
+            height: Some(1920),
+            publication_state: PublicationState::Published,
+            created_at: NOW.into(),
+        });
+        let trailer = TimeRange::new(0, TRAILER_TARGET_US).unwrap();
+
+        for (status, expected) in [
+            (QualityStatus::Unchecked, "No quality check"),
+            (QualityStatus::Stale, "changed after its last quality check"),
+            (
+                QualityStatus::Blocking {
+                    findings: 2,
+                    unchecked_turns: 0,
+                },
+                "2 blocking finding(s)",
+            ),
+        ] {
+            let context = ReleaseContext {
+                quality: status,
+                ..ReleaseContext::unguarded()
+            };
+            let plan = plan_release(&manifest, Some(trailer), true, &context).unwrap();
+            let blocked = plan.blocked();
+            let kinds = blocked.iter().map(|member| member.kind).collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                vec![
+                    ReleaseMemberKind::PodcastAudio,
+                    ReleaseMemberKind::VideoMaster,
+                    ReleaseMemberKind::Audiogram
+                ],
+                "{status:?}"
+            );
+            assert!(
+                blocked[0]
+                    .blocked_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(expected)),
+                "{status:?}: {:?}",
+                blocked[0].blocked_reason
+            );
+        }
+
+        // Findings may be accepted; the absence of a check may not.
+        let accepting = ReleaseGates {
+            accept_findings: true,
+            ..ReleaseGates::default()
+        };
+        let accepted = plan_release(
+            &manifest,
+            Some(trailer),
+            true,
+            &ReleaseContext {
+                quality: QualityStatus::Blocking {
+                    findings: 2,
+                    unchecked_turns: 0,
+                },
+                gates: accepting,
+                ..ReleaseContext::unguarded()
+            },
+        )
+        .unwrap();
+        assert!(accepted.is_ready(), "blocked: {:?}", accepted.blocked());
+        let skipped = plan_release(
+            &manifest,
+            Some(trailer),
+            true,
+            &ReleaseContext {
+                quality: QualityStatus::Unchecked,
+                gates: accepting,
+                ..ReleaseContext::unguarded()
+            },
+        )
+        .unwrap();
+        assert!(!skipped.is_ready());
+    }
+
+    #[test]
+    fn a_backdrop_is_not_shipped_by_default_where_footage_could_be_made() {
+        let mut manifest = manifest();
+        narrate(&mut manifest, 8);
+        manifest.render_artifacts.push(RenderArtifact {
+            id: "master".into(),
+            role: RenderArtifactRole::FinalMaster,
+            scene_id: None,
+            managed_path: "renders/master.mp4".into(),
+            sha256: "f".repeat(64),
+            cache_key: "e".repeat(64),
+            mime_type: "video/mp4".into(),
+            duration_us: Some(Microseconds(40_000_000)),
+            width: Some(1080),
+            height: Some(1920),
+            publication_state: PublicationState::Published,
+            created_at: NOW.into(),
+        });
+        let trailer = TimeRange::new(0, TRAILER_TARGET_US).unwrap();
+        let on_backdrop = PictureStatus {
+            own_picture: false,
+            has_footage: false,
+            has_backdrop: true,
+        };
+
+        // A generator is installed: the master and trailer wait for footage or for the writer.
+        let plan = plan_release(
+            &manifest,
+            Some(trailer),
+            true,
+            &ReleaseContext {
+                picture: on_backdrop,
+                gates: ReleaseGates {
+                    generator_ready: true,
+                    ..ReleaseGates::default()
+                },
+                ..ReleaseContext::unguarded()
+            },
+        )
+        .unwrap();
+        let blocked = plan
+            .blocked()
+            .iter()
+            .map(|member| member.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blocked,
+            vec![ReleaseMemberKind::VideoMaster, ReleaseMemberKind::Trailer]
+        );
+        assert!(plan.blocked()[0]
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("generate_episode_clips")));
+
+        // No generator: the backdrop is the picture, and nothing objects.
+        let plan = plan_release(
+            &manifest,
+            Some(trailer),
+            true,
+            &ReleaseContext {
+                picture: on_backdrop,
+                ..ReleaseContext::unguarded()
+            },
+        )
+        .unwrap();
+        assert!(plan.is_ready(), "blocked: {:?}", plan.blocked());
+
+        // The writer may keep the backdrop on purpose.
+        let plan = plan_release(
+            &manifest,
+            Some(trailer),
+            true,
+            &ReleaseContext {
+                picture: on_backdrop,
+                gates: ReleaseGates {
+                    generator_ready: true,
+                    accept_backdrop: true,
+                    ..ReleaseGates::default()
+                },
+                ..ReleaseContext::unguarded()
+            },
+        )
+        .unwrap();
+        assert!(plan.is_ready(), "blocked: {:?}", plan.blocked());
     }
 }
