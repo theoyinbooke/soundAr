@@ -38,6 +38,18 @@ pub struct PerformanceClock {
     pub pre_reveal_us: Microseconds,
     /// Across a scene boundary.
     pub scene_boundary_us: Microseconds,
+    /// The longest a reaction - a laugh, applause - may run before it is faded out. A voice
+    /// model asked for a big laugh will happily laugh for fifteen seconds; a room does not.
+    #[serde(default = "default_reaction_max_us")]
+    pub reaction_max_us: Microseconds,
+}
+
+/// Three and a half seconds: long enough for a real laugh to land and settle, short enough that
+/// the next line arrives while the room is still warm.
+pub const DEFAULT_REACTION_MAX_US: i64 = 3_500_000;
+
+fn default_reaction_max_us() -> Microseconds {
+    Microseconds(DEFAULT_REACTION_MAX_US)
 }
 
 impl Default for PerformanceClock {
@@ -47,12 +59,20 @@ impl Default for PerformanceClock {
             turn_of_thought_us: Microseconds(600_000),
             pre_reveal_us: Microseconds(1_200_000),
             scene_boundary_us: Microseconds(900_000),
+            reaction_max_us: Microseconds(DEFAULT_REACTION_MAX_US),
         }
     }
 }
 
 impl Validate for PerformanceClock {
     fn validate(&self) -> VideoResult<()> {
+        if !(500_000..=30_000_000).contains(&self.reaction_max_us.0) {
+            return Err(VideoError::new(
+                VideoErrorCode::InvalidPerformance,
+                "a reaction may run between half a second and thirty seconds",
+            )
+            .at("performance_clock.reaction_max_us"));
+        }
         for (value, field) in [
             (
                 self.intra_exchange_us,

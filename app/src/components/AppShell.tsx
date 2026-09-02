@@ -167,8 +167,12 @@ export function AppShell({
   const availableVram = Math.max(0, system.vram_total_mb - system.vram_used_mb) / 1024;
   const settingsMode = current === "settings";
   const normalizedRecentQuery = recentQuery.trim().toLowerCase();
+  // A performed line's take is titled `Name · turn-0000-abcdef123456` by the narration path. Those
+  // belong to their episode, which Recent already lists as a video project; showing each line as
+  // well buries everything else under one episode's cast.
+  const isEpisodeTake = (item: HistoryItem) => /· turn-\d{4}-[0-9a-f]{12}$/.test(item.title ?? "");
   const recentItems = [
-    ...history.map((item) => ({ kind: "audio" as const, id: item.id, title: item.title || item.text.slice(0, 48) || "Untitled generation", detail: item.generation_kind === "music" ? "Music" : item.voice || "Voice", updatedAt: item.created_at })),
+    ...history.filter((item) => !isEpisodeTake(item)).map((item) => ({ kind: "audio" as const, id: item.id, title: item.title || item.text.slice(0, 48) || "Untitled generation", detail: item.generation_kind === "music" ? "Music" : item.voice || "Voice", updatedAt: item.created_at })),
     ...videoProjects.map((project) => ({ kind: "video" as const, id: project.id, title: project.name || "Untitled video", detail: project.master ? "Video" : "Video draft", updatedAt: project.updated_at })),
   ].filter((item) => `${item.title} ${item.detail}`.toLowerCase().includes(normalizedRecentQuery))
     .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))

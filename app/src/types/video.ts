@@ -338,6 +338,8 @@ export interface VideoProjectManifest {
   music_cues?: VideoMusicCue[];
   /** Set when this episode was started from a saved show format. */
   format_origin?: VideoFormatOrigin | null;
+  /** The length the show asked for, with its tolerance in basis points of the target. */
+  length_target?: { target_us: number; tolerance_bp: number } | null;
   /** Present on current manifests; optional only for migration-era project compatibility. */
   sound_assets?: VideoSoundAsset[];
   /** Present on current manifests; optional only for migration-era project compatibility. */
@@ -845,6 +847,8 @@ export interface VideoShowFormat {
     turn_of_thought_us: number;
     pre_reveal_us: number;
     scene_boundary_us: number;
+    /** The longest a reaction may run before it is faded out. Default 3.5 s. */
+    reaction_max_us?: number;
   };
   caption_preset_id: string;
   canvas_mode: "portrait" | "landscape" | "square" | "custom";

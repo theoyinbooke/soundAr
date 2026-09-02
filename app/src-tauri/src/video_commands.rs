@@ -1833,7 +1833,17 @@ pub(crate) fn narrate_turns(
         // direction as its instruction, and a reaction layered as many takes as the character
         // declares. Decided here, once, and recorded on the take so a change re-reads the line.
         let expressiveness = engine_expressiveness(runtime, &member.model_id);
-        let performance = plan_performance(&turn, &member, &spoken, &expressiveness);
+        let placements = reaction_placements(
+            &manifest.dialogue,
+            manifest.performance_clock.reaction_max_us.0,
+        );
+        let performance = plan_performance(
+            &turn,
+            &member,
+            &spoken,
+            &expressiveness,
+            placements.get(&turn.id).copied(),
+        );
         if performance.rendered_text.trim().is_empty() {
             return Err(format!(
                 "video.cast_cannot_perform: {} is cast on {}, which performs no vocal events, so the reaction \"{}\" would be silence. Cast this character on a voice that performs cues, such as Breeze TTS 2, and write the script again.",
@@ -2603,8 +2613,18 @@ pub(crate) fn plan_performance(
     member: &video::CastMember,
     spoken: &str,
     expressiveness: &EngineExpressiveness,
+    reaction: Option<ReactionPlacement>,
 ) -> video::PerformanceRecord {
     let rendered = video::render_for_vocabulary(spoken, expressiveness.vocabulary);
+    // A reaction is shaped by where it falls: the first laugh in a set is a short, warm burst;
+    // the last is the big one; the ones between build. Two identical `(laugh)` lines would
+    // otherwise be the same seed, the same instruction, and the same audio twice, which is a
+    // laugh track, not a room.
+    let shape = reaction.map(|placement| reaction_shape(turn, placement));
+    let rendered_text = match &shape {
+        Some(shape) => shape.render(&rendered.text, expressiveness.vocabulary),
+        None => rendered.text.clone(),
+    };
     let instruction = if expressiveness.instruction {
         let mut parts = Vec::new();
         if let Some(persona) = member
@@ -2623,6 +2643,9 @@ pub(crate) fn plan_performance(
             .filter(|value| !value.is_empty())
         {
             parts.push(direction.trim_end_matches('.').to_string());
+        } else if let Some(shape) = &shape {
+            // No direction written for this reaction: the shape says how this one goes.
+            parts.push(shape.direction.to_string());
         }
         (!parts.is_empty()).then(|| format!("{}.", parts.join(". ")))
     } else {
@@ -2644,15 +2667,143 @@ pub(crate) fn plan_performance(
         .as_deref()
         .filter(|control| *control == "exaggeration")
         .map(|_| (member.delivery.energy_milli / 2).clamp(0, 1_000));
-    video::PerformanceRecord::new(
-        rendered.text,
+    let mut record = video::PerformanceRecord::new(
+        rendered_text,
         instruction,
         expressiveness.vocabulary,
         ensemble,
         rendered.dropped,
         cfg_scale_milli,
         exaggeration_milli,
-    )
+    );
+    if let Some(placement) = reaction {
+        // The same reaction written twice is two moments, not one; the seed follows the moment,
+        // and the room's ceiling on a reaction is part of how it was performed.
+        record = record.with_occurrence(placement.index, placement.cap_us);
+    }
+    record
+}
+
+/// Where a reaction falls among its character's reactions in the episode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReactionPlacement {
+    /// This reaction's position among the character's reactions, from zero.
+    pub(crate) index: usize,
+    /// How many reactions the character has in the episode.
+    pub(crate) count: usize,
+    /// The longest the reaction may run, from the show's clock.
+    pub(crate) cap_us: i64,
+}
+
+/// Find where each reaction turn sits among its character's reactions.
+pub(crate) fn reaction_placements(
+    dialogue: &[video::DialogueTurn],
+    cap_us: i64,
+) -> std::collections::BTreeMap<String, ReactionPlacement> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut indices = Vec::new();
+    for turn in dialogue.iter().filter(|turn| turn.is_reaction()) {
+        let index = counts.entry(turn.character_id.as_str()).or_default();
+        indices.push((turn.id.clone(), turn.character_id.as_str(), *index));
+        *index += 1;
+    }
+    indices
+        .into_iter()
+        .map(|(id, character, index)| {
+            (
+                id,
+                ReactionPlacement {
+                    index,
+                    count: counts[character],
+                    cap_us,
+                },
+            )
+        })
+        .collect()
+}
+
+/// How one reaction goes: the events it performs and the way it is delivered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReactionShape {
+    pub(crate) events: Vec<video::VocalEvent>,
+    pub(crate) direction: &'static str,
+}
+
+impl ReactionShape {
+    /// The rendered line for this shape: the shape's events in the engine's vocabulary, or the
+    /// line as written when the engine performs nothing.
+    fn render(&self, written: &str, vocabulary: video::VocalVocabulary) -> String {
+        if !vocabulary.performs_events() {
+            return written.to_string();
+        }
+        let tokens = self
+            .events
+            .iter()
+            .filter_map(|event| vocabulary.render(*event))
+            .collect::<Vec<_>>();
+        if tokens.is_empty() {
+            written.to_string()
+        } else {
+            tokens.join(" ")
+        }
+    }
+}
+
+/// Decide how a reaction goes from where it falls and what it asks for.
+///
+/// A set of laughs is a shape over the episode: an opening that is short and warm, a middle that
+/// builds, a close that is the biggest. Applause, when the writer asked for it, arrives on the
+/// bigger beats. The writer's own direction on a line always wins over this.
+pub(crate) fn reaction_shape(
+    turn: &video::DialogueTurn,
+    placement: ReactionPlacement,
+) -> ReactionShape {
+    use video::VocalEvent::{Applause, Chuckle, Giggle, Laugh};
+    let written = turn.vocal_events();
+    let wants_applause = written.contains(&Applause);
+    let laughs = written
+        .iter()
+        .any(|event| matches!(event, Laugh | Chuckle | Giggle));
+    if !laughs {
+        return ReactionShape {
+            events: written,
+            direction: "genuine and natural",
+        };
+    }
+    let last = placement.count.saturating_sub(1);
+    let position = if placement.count <= 1 {
+        2
+    } else if placement.index == 0 {
+        0
+    } else if placement.index == last {
+        3
+    } else if placement.index * 2 < last {
+        1
+    } else {
+        2
+    };
+    let (mut events, direction): (Vec<video::VocalEvent>, &'static str) = match position {
+        0 => (
+            vec![Chuckle, Laugh],
+            "a short, warm burst of laughter that starts as a chuckle and opens up, then settles",
+        ),
+        1 => (
+            vec![Laugh, Laugh],
+            "an easy rolling laugh, a few people catching it a beat late",
+        ),
+        2 => (
+            vec![Laugh, Giggle, Laugh],
+            "a big laugh that breaks into giggles and comes back, delighted",
+        ),
+        _ => (
+            vec![Laugh, Laugh, Laugh],
+            "the biggest laugh of the night, loud and long, with a whoop in it",
+        ),
+    };
+    if wants_applause {
+        events.push(Applause);
+    }
+    ReactionShape { events, direction }
 }
 
 /// Refuse a cast that cannot perform its own script.
@@ -2722,6 +2873,10 @@ pub(crate) fn stale_performance_turns(
     let mut expressiveness_by_model: std::collections::BTreeMap<String, EngineExpressiveness> =
         std::collections::BTreeMap::new();
     let mut stale = BTreeSet::new();
+    let placements = reaction_placements(
+        &manifest.dialogue,
+        manifest.performance_clock.reaction_max_us.0,
+    );
     for binding in &manifest.narration_bindings {
         let Some(turn_id) = binding.turn_id.as_deref() else {
             continue;
@@ -2745,7 +2900,13 @@ pub(crate) fn stale_performance_turns(
             &video::effective_entries(&manifest.lexicon, &member.id),
         )
         .spoken_text;
-        let expected = plan_performance(turn, member, &spoken, &expressiveness);
+        let expected = plan_performance(
+            turn,
+            member,
+            &spoken,
+            &expressiveness,
+            placements.get(&turn.id).copied(),
+        );
         let recorded = binding
             .performance
             .as_ref()
@@ -3308,7 +3469,9 @@ fn render_project(
                     variation: 0,
                     include_title_cards: true,
                     include_speaker_cards: true,
-                    burn_captions: !manifest.captions.is_empty(),
+                    // The subtitle layer carries the title and the speaker cards as well as the
+                    // captions, so a performed script with no captions still burns it.
+                    burn_captions: !manifest.captions.is_empty() || !manifest.dialogue.is_empty(),
                 },
                 variations: (0..variations).collect(),
             },
@@ -6535,6 +6698,122 @@ fn utc_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reaction_turn(id: &str, order: u32, text: &str) -> video::DialogueTurn {
+        video::DialogueTurn {
+            id: id.into(),
+            scene_id: None,
+            order,
+            character_id: "audience".into(),
+            text: text.into(),
+            direction: None,
+            source_line: order + 1,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn a_set_of_laughs_is_shaped_so_no_two_are_the_same() {
+        let dialogue = vec![
+            reaction_turn("r0", 0, "(laugh)"),
+            reaction_turn("r1", 1, "(laugh)"),
+            reaction_turn("r2", 2, "(laugh) (applause)"),
+            reaction_turn("r3", 3, "(laugh) (applause)"),
+        ];
+        let placements = reaction_placements(&dialogue, 4_500_000);
+        assert_eq!(placements["r0"].index, 0);
+        assert_eq!(placements["r3"].count, 4);
+
+        let shapes = dialogue
+            .iter()
+            .map(|turn| reaction_shape(turn, placements[&turn.id]))
+            .collect::<Vec<_>>();
+        // Opening, building, and closing laughs differ in what they perform and how.
+        assert_ne!(shapes[0], shapes[1]);
+        assert_ne!(shapes[1], shapes[3]);
+        assert!(shapes[3].direction.contains("biggest"));
+        // Applause arrives only where the writer asked for it.
+        assert!(!shapes[0].events.contains(&video::VocalEvent::Applause));
+        assert!(shapes[2].events.contains(&video::VocalEvent::Applause));
+        assert!(shapes[3].events.contains(&video::VocalEvent::Applause));
+
+        let member = video::CastMember {
+            id: "audience".into(),
+            name: "AUDIENCE".into(),
+            display_name: "Club Audience".into(),
+            voice_id: "__engine_default__".into(),
+            model_id: "BreezeBlue/Breeze-TTS-2".into(),
+            language: "en-US".into(),
+            delivery: video::CastDelivery::default(),
+            consent_reference_id: None,
+            notes: None,
+            persona: Some("A warm comedy-club crowd".into()),
+            ensemble: 3,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let breeze = EngineExpressiveness {
+            engine: "breeze".into(),
+            instruction: true,
+            instruction_cfg_scale: Some(4.0),
+            vocabulary: video::VocalVocabulary::Parenthesis,
+            ensemble: true,
+            energy_control: None,
+        };
+        let takes = dialogue
+            .iter()
+            .map(|turn| {
+                plan_performance(
+                    turn,
+                    &member,
+                    &turn.text,
+                    &breeze,
+                    placements.get(&turn.id).copied(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Two identical `(laugh)` lines are two different takes: different text, instruction, and seed.
+        assert_ne!(takes[0].rendered_text, takes[1].rendered_text);
+        assert_ne!(takes[0].instruction, takes[1].instruction);
+        assert_ne!(takes[0].fingerprint, takes[1].fingerprint);
+        assert_ne!(takes[2].fingerprint, takes[3].fingerprint);
+        assert!(takes[3].rendered_text.contains("(applause)"));
+        assert_eq!(takes[0].ensemble, 3);
+    }
+
+    #[test]
+    fn a_writers_own_direction_on_a_reaction_wins_over_the_shape() {
+        let mut turn = reaction_turn("r0", 0, "(laugh)");
+        turn.direction = Some("a single dry snort".into());
+        let placement = ReactionPlacement {
+            index: 0,
+            count: 3,
+            cap_us: 4_500_000,
+        };
+        let breeze = EngineExpressiveness {
+            engine: "breeze".into(),
+            instruction: true,
+            instruction_cfg_scale: Some(4.0),
+            vocabulary: video::VocalVocabulary::Parenthesis,
+            ensemble: true,
+            energy_control: None,
+        };
+        let member = video::CastMember {
+            id: "audience".into(),
+            name: "AUDIENCE".into(),
+            display_name: "Audience".into(),
+            voice_id: "__engine_default__".into(),
+            model_id: "BreezeBlue/Breeze-TTS-2".into(),
+            language: "en-US".into(),
+            delivery: video::CastDelivery::default(),
+            consent_reference_id: None,
+            notes: None,
+            persona: None,
+            ensemble: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let take = plan_performance(&turn, &member, &turn.text, &breeze, Some(placement));
+        assert_eq!(take.instruction.as_deref(), Some("a single dry snort."));
+    }
     use std::collections::BTreeMap;
 
     #[test]

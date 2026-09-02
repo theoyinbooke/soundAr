@@ -230,3 +230,20 @@ than fault; and Whisper-tiny is not a quality-control recogniser on this machine
 Closed in a second pass the same day: a music bed now renders and ducks under speech, placed sound
 design reaches the master, the quality check picks the most accurate installed recogniser itself,
 and the MiniMax catalog link is correct.
+
+## 7. Second pass (2026-09-02, 0.1.5)
+
+Re-running the same episode after the user heard the first cut:
+
+| Step | What happened |
+| --- | --- |
+| Laughs | Two identical `(laughs)` lines had been the same seed and the same audio. Reactions are now shaped by their place in the set (chuckle-then-laugh to open, rolling in the middle, the biggest at the close, applause only where written) and every occurrence is its own take |
+| Ceiling | Breeze, asked for a big laugh, laughed for fifteen seconds. A show's clock now caps a reaction (3.5 s default; this episode inherited 4.5 s) and fades it out |
+| Re-layout | A re-read take used to be squeezed into its old slot. A performed line now takes its measured length and the lines after it move; generated shots are re-cut and a backdrop refitted |
+| Retired takes | Rewriting a line left its old take's audio on the timeline under the new one. A retired line's clip now leaves with it |
+| Masters | A re-render sat beside the old master and the release took the first one. A base render now retires earlier masters; a release takes the newest |
+| Speaker cards | Burned only when captions existed. Now burned for any performed script; verified by eye in the master |
+| Names | `the-needy-smart-home-harness-cut-trailer.mp4`, `-audio.m4a`, `-audiogram.mp4`; the master is titled after the episode |
+| Length | 37.4 s against 30 s with 20 % tolerance after one line was trimmed: reported as blocking, accepted explicitly for this cut |
+| Recogniser | Parakeet chosen automatically; Whisper-tiny no longer needs to be named away |
+| Runtime | Foundation moved to torch 2.9.1 (CUDA 12.6) and transformers 5.10.1; Kokoro, Chatterbox Turbo, Parakeet, and Whisper smoke-tested on it |

@@ -2,7 +2,7 @@ PyQt6>=6.6.0
 PyQt6-Charts>=6.6.0
 torch>=2.4.0
 torchaudio>=2.4.0
-transformers==5.5.0
+transformers==5.10.1
 accelerate>=0.30.0
 sentencepiece>=0.2.0
 protobuf>=4.25.0

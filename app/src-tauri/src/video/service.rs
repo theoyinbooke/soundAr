@@ -13883,6 +13883,165 @@ impl VideoStudioService {
         Ok(path)
     }
 
+    /// Lay the performed lines out again on the clock, in script order, each after the last with
+    /// its beat's lead-in. Called whenever a take's length changed, so a re-read laugh that runs
+    /// longer pushes the next line rather than being cut to the old one's length.
+    fn relay_dialogue_track(manifest: &mut VideoProjectManifest) -> ServiceResult<()> {
+        let order = manifest
+            .dialogue
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| (turn.id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let lead_ins = manifest
+            .turn_beats
+            .iter()
+            .map(|beat| (beat.turn_id.clone(), beat.lead_in_us.0 - beat.overlap_us.0))
+            .collect::<BTreeMap<_, _>>();
+        let Some(track) = manifest
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == DIALOGUE_TRACK_ID)
+        else {
+            return Ok(());
+        };
+        // A take whose line was rewritten out of the script is not part of the episode any more;
+        // left on the track it would play under the line that replaced it.
+        track.clips.retain(|clip| {
+            clip.turn_id
+                .as_deref()
+                .is_some_and(|id| order.contains_key(id))
+        });
+        track.clips.sort_by_key(|clip| {
+            clip.turn_id
+                .as_deref()
+                .and_then(|id| order.get(id))
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        // A line's lead-in is its beat where the script derived one - that is the author's and
+        // the clock's decision about the pause before it - and otherwise the gap it already had, so
+        // a scene laid out by hand keeps its spacing and only moves when a take before it changed
+        // length.
+        let mut previous_end: Option<i64> = None;
+        let mut cursor = 0_i64;
+        for clip in track.clips.iter_mut().filter(|clip| clip.turn_id.is_some()) {
+            let beat = clip
+                .turn_id
+                .as_deref()
+                .and_then(|id| lead_ins.get(id))
+                .copied();
+            let lead_in = match (beat, previous_end) {
+                (Some(beat), _) => beat,
+                (None, Some(end)) => (clip.timeline_start_us.0 - end).max(0),
+                (None, None) => clip.timeline_start_us.0.max(0),
+            };
+            previous_end = Some(clip.timeline_start_us.0 + clip.timeline_duration_us.0);
+            clip.timeline_start_us = Microseconds((cursor + lead_in).max(0));
+            cursor = clip.timeline_start_us.0 + clip.timeline_duration_us.0;
+        }
+        let spoken_end = cursor;
+        if spoken_end > manifest.timeline_duration_us.0 {
+            let previous_end = manifest.timeline_duration_us.0;
+            manifest.timeline_duration_us = Microseconds(spoken_end);
+            let extended = manifest
+                .tracks
+                .iter()
+                .filter(|track| track.preserve_gaps)
+                .map(|track| track.id.clone())
+                .collect::<Vec<_>>();
+            for track_id in extended {
+                manifest.gaps.push(TimelineGap {
+                    id: format!("gap-{track_id}-{previous_end:012}"),
+                    track_id,
+                    range: TimeRange::new(previous_end, spoken_end)?,
+                    reason: GapReason::Padding,
+                    source_asset_id: None,
+                    source_range: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep the picture covering the performance after its length changed: generated shots are
+    /// cut again across the new span from the clips already made, and a backdrop that is long
+    /// enough is stretched to it, while one that is too short is retired so it is drawn again.
+    fn refit_picture_to_span(
+        manifest: &mut VideoProjectManifest,
+        span_us: i64,
+    ) -> ServiceResult<()> {
+        let clip_artifacts = manifest
+            .render_artifacts
+            .iter()
+            .filter(|artifact| matches!(artifact.role, RenderArtifactRole::GeneratedClip))
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(track) = manifest
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == Self::CLIP_TRACK_ID)
+        {
+            if !clip_artifacts.is_empty() {
+                let placements = super::shots::tile_shots(clip_artifacts.len(), span_us);
+                track.clips = placements
+                    .iter()
+                    .enumerate()
+                    .map(|(position, (shot_index, start, duration))| {
+                        let artifact = &clip_artifacts[*shot_index];
+                        Ok(TimelineClip {
+                            id: format!("clip-cut-{position:04}"),
+                            scene_id: None,
+                            turn_id: None,
+                            media: super::MediaReference {
+                                source_asset_id: None,
+                                render_artifact_id: Some(artifact.id.clone()),
+                            },
+                            source_range: TimeRange::new(0, duration.0)?,
+                            timeline_start_us: *start,
+                            timeline_duration_us: *duration,
+                            playback_rate: RationalRate::ONE,
+                            gain_db_milli: 0,
+                            muted: true,
+                            crop: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, VideoError>>()?;
+            }
+        }
+        let backdrop_length = manifest
+            .render_artifacts
+            .iter()
+            .find(|artifact| matches!(artifact.role, RenderArtifactRole::Backdrop))
+            .and_then(|artifact| artifact.duration_us)
+            .map(|duration| duration.0);
+        let mut retire_backdrop = false;
+        if let Some(track) = manifest
+            .tracks
+            .iter_mut()
+            .find(|track| track.id == Self::BACKDROP_TRACK_ID)
+        {
+            match backdrop_length {
+                Some(length) if length >= span_us => {
+                    for clip in &mut track.clips {
+                        clip.timeline_duration_us = Microseconds(span_us);
+                        clip.source_range = TimeRange::new(0, span_us)?;
+                    }
+                }
+                _ => retire_backdrop = true,
+            }
+        }
+        if retire_backdrop {
+            manifest
+                .tracks
+                .retain(|track| track.id != Self::BACKDROP_TRACK_ID);
+            manifest
+                .render_artifacts
+                .retain(|artifact| !matches!(artifact.role, RenderArtifactRole::Backdrop));
+        }
+        Ok(())
+    }
+
     pub fn ensure_dialogue_scene(&self, project_id: &str, actor: &str) -> ServiceResult<Value> {
         let record = self.get_project(project_id)?;
         let manifest: VideoProjectManifest = serde_json::from_value(
@@ -13947,6 +14106,9 @@ impl VideoStudioService {
             vec![
                 "/reviewed_scenes".to_string(),
                 "/timeline_duration_us".to_string(),
+                "/tracks".to_string(),
+                "/render_artifacts".to_string(),
+                "/gaps".to_string(),
             ],
             BTreeSet::from([
                 RevisionStage::Plan,
@@ -13959,6 +14121,17 @@ impl VideoStudioService {
             ]),
             None,
             move |manifest: &mut VideoProjectManifest| {
+                // Lines are laid out again first, so a take retired with its line is gone before
+                // the scene is measured.
+                Self::relay_dialogue_track(manifest)?;
+                let spoken_end = manifest
+                    .tracks
+                    .iter()
+                    .flat_map(|track| track.clips.iter())
+                    .filter(|clip| clip.turn_id.is_some())
+                    .map(|clip| clip.timeline_start_us.0 + clip.timeline_duration_us.0)
+                    .max()
+                    .unwrap_or(spoken_end);
                 // Replace rather than append: re-narrating a script must leave one scene that
                 // matches the performance, not a second one stacked on the first.
                 manifest
@@ -13981,6 +14154,16 @@ impl VideoStudioService {
                 // runs - a target, never a measurement - so a 17-second conversation rendered as
                 // ten minutes of silence with a picture held over it.
                 manifest.timeline_duration_us = Microseconds(spoken_end);
+                // Nothing declared may run past the performance the episode now ends with.
+                manifest
+                    .gaps
+                    .retain(|gap| gap.range.start_us.0 < spoken_end);
+                for gap in &mut manifest.gaps {
+                    if gap.range.end_us.0 > spoken_end {
+                        gap.range = TimeRange::new(gap.range.start_us.0, spoken_end)?;
+                    }
+                }
+                Self::refit_picture_to_span(manifest, spoken_end)?;
                 Ok(())
             },
         )
@@ -14363,13 +14546,16 @@ impl VideoStudioService {
             ));
         }
 
+        // The master is the newest published one: a re-render supersedes the master before it,
+        // and a release derived from the older cut would not be the episode as it now stands.
         let master = manifest
             .render_artifacts
             .iter()
-            .find(|artifact| {
+            .filter(|artifact| {
                 matches!(artifact.role, RenderArtifactRole::FinalMaster)
                     && matches!(artifact.publication_state, PublicationState::Published)
             })
+            .max_by(|left, right| left.created_at.cmp(&right.created_at))
             .cloned()
             .ok_or_else(|| {
                 VideoServiceError::new(
@@ -14449,6 +14635,20 @@ impl VideoStudioService {
 
         let deliverables_dir = self.project_dir(project_id)?.join("release");
         self.secure_managed_directory(&deliverables_dir)?;
+        // Deliverables are named after the episode, not after their stage: nobody wants a folder
+        // of files called final.
+        let stem = super::presentation::file_stem(&manifest.name);
+        // Deliverables from an earlier cut of this episode are superseded, not kept beside the new
+        // ones; a release folder holds one release.
+        if let Ok(entries) = fs::read_dir(&deliverables_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".mp4") || name.ends_with(".m4a") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
         let mut produced = Vec::new();
         let mut artifacts = Vec::new();
 
@@ -14485,7 +14685,7 @@ impl VideoStudioService {
                         })
                 })
         })?;
-        let podcast_path = deliverables_dir.join("episode.m4a");
+        let podcast_path = deliverables_dir.join(format!("{stem}-audio.m4a"));
         let podcast = self.render_release_member(
             job_id,
             project_id,
@@ -14519,7 +14719,7 @@ impl VideoStudioService {
 
         // The trailer, cut from the moment the analyst chose in the episode's own narration.
         if let Some(range) = plan.trailer_range {
-            let trailer_path = deliverables_dir.join("trailer.mp4");
+            let trailer_path = deliverables_dir.join(format!("{stem}-trailer.mp4"));
             let trailer = self.render_release_member(
                 job_id,
                 project_id,
@@ -14556,7 +14756,7 @@ impl VideoStudioService {
         }
 
         // The audiogram, for feeds where only video plays.
-        let audiogram_path = deliverables_dir.join("audiogram.mp4");
+        let audiogram_path = deliverables_dir.join(format!("{stem}-audiogram.mp4"));
         let audiogram = self.render_release_member(
             job_id,
             project_id,
@@ -17156,8 +17356,8 @@ impl VideoStudioService {
                 "job_id": job_id,
                 "kind": output_kind,
                 "label": match (request.profile, request.variation) {
-                    (RenderProfile::Final, 0) => "Final master".to_string(),
-                    (RenderProfile::Final, variation) => format!("Final variation {variation}"),
+                    (RenderProfile::Final, 0) => manifest.name.trim().to_string(),
+                    (RenderProfile::Final, variation) => format!("{} variation {variation}", manifest.name.trim()),
                     (_, 0) => "Video preview".to_string(),
                     (_, variation) => format!("Preview variation {variation}"),
                 },
@@ -17224,6 +17424,12 @@ impl VideoStudioService {
                     "The portrait artifact revision could not be advanced",
                 )
             })?;
+            if matches!(artifact.role, RenderArtifactRole::FinalMaster) {
+                // A new master supersedes the one before it.
+                next_manifest
+                    .render_artifacts
+                    .retain(|existing| !matches!(existing.role, RenderArtifactRole::FinalMaster));
+            }
             next_manifest.render_artifacts.push(artifact);
             let created_at = utc_now();
             let parent_id = next_manifest
@@ -17755,13 +17961,20 @@ impl VideoStudioService {
                 })
                 .unwrap_or_else(|| script.to_string());
             let spoken_sha = sha256_bytes(spoken.as_bytes());
+            // A performed take may have been handed a rendering of the line rather than the line:
+            // cues in the engine's vocabulary, a reaction shaped for its place. That rendering
+            // travels with the replacement, and the generated speech must match one or the other.
+            let performed_sha = replacement
+                .performance
+                .as_ref()
+                .map(|performance| sha256_bytes(performance.rendered_text.as_bytes()));
+            let generated_sha = history
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| sha256_bytes(text.as_bytes()));
             if (turn.is_some() || scene.is_some())
-                && history
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(|text| sha256_bytes(text.as_bytes()))
-                    .as_deref()
-                    != Some(spoken_sha.as_str())
+                && generated_sha.as_deref() != Some(spoken_sha.as_str())
+                && generated_sha != performed_sha
             {
                 return Err(VideoServiceError::new(
                     "video.narration_script_mismatch",
@@ -17777,11 +17990,23 @@ impl VideoStudioService {
             }
             validate_media_duration(source_probe.duration_us)?;
             let source_sha = sha256_file_with_cancel(&source_path, Some(cancel))?;
-            // A replaced line keeps its existing slot so the timeline does not move under it; a
-            // first performance takes the take's own measured length.
-            let target_duration_us = existing_clip
-                .as_ref()
-                .map_or(source_probe.duration_us, |clip| clip.timeline_duration_us.0);
+            // A replaced scene keeps its existing slot so the timeline does not move under it; a
+            // performed line takes the take's own measured length, first time or re-read, and
+            // the lines after it are re-laid on the clock at commit. A bigger laugh must not be
+            // squeezed into the slot of a smaller one.
+            // A reaction runs no longer than the show's clock allows; past that it is faded out
+            // rather than sped up, so a laugh trails off instead of chattering.
+            let reaction_cap_us = turn
+                .filter(|turn| turn.is_reaction())
+                .map(|_| manifest.performance_clock.reaction_max_us.0);
+            let (target_duration_us, trim_tail) =
+                match (&existing_clip, replacement.turn_id.as_deref()) {
+                    (Some(clip), None) => (clip.timeline_duration_us.0, false),
+                    _ => match reaction_cap_us {
+                        Some(cap) if source_probe.duration_us > cap => (cap, true),
+                        _ => (source_probe.duration_us, false),
+                    },
+                };
             let cache_key = CacheKeyBuilder::new(
                 CacheStage::Speech,
                 format!("{SERVICE_VERSION}:narration-conform-v1"),
@@ -17841,6 +18066,7 @@ impl VideoStudioService {
                         &staging,
                         source_probe.duration_us,
                         target_duration_us,
+                        trim_tail,
                     )?;
                     let progress_start =
                         0.08 + (index as f64 / request.replacements.len() as f64) * 0.7;
@@ -18082,6 +18308,12 @@ impl VideoStudioService {
                         if clip.id == replacement.clip_id {
                             clip.media.source_asset_id = None;
                             clip.media.render_artifact_id = Some(replacement.artifact.id.clone());
+                            // A line's clip follows its take; a scene's keeps its slot.
+                            if clip.turn_id.is_some() {
+                                if let Some(duration) = replacement.artifact.duration_us {
+                                    clip.timeline_duration_us = duration;
+                                }
+                            }
                             clip.source_range = TimeRange::new(0, clip.timeline_duration_us.0)?;
                             clip.playback_rate = RationalRate::ONE;
                             found = true;
@@ -18164,6 +18396,7 @@ impl VideoStudioService {
                         .narration_bindings
                         .push(replacement.binding.clone());
                 }
+                Self::relay_dialogue_track(manifest)?;
                 Ok(())
             },
         )?;
@@ -18214,6 +18447,7 @@ impl VideoStudioService {
         output: &Path,
         input_duration_us: i64,
         target_duration_us: i64,
+        trim_tail: bool,
     ) -> ServiceResult<RenderCommandPlan> {
         if input_duration_us <= 0 || target_duration_us <= 0 {
             return Err(VideoServiceError::new(
@@ -18235,12 +18469,21 @@ impl VideoStudioService {
                 "The narration staging output already exists",
             ));
         }
-        let tempo = input_duration_us as f64 / target_duration_us as f64;
-        let filter = format!(
-            "{},apad,atrim=duration={:.6},asetpts=N/SR/TB",
-            atempo_filter_chain(tempo)?,
-            target_duration_us as f64 / 1_000_000.0,
-        );
+        let target_seconds = target_duration_us as f64 / 1_000_000.0;
+        let filter = if trim_tail {
+            // Cut to length and fade the last moment out: the take keeps its pace and simply ends.
+            let fade = 0.35_f64.min(target_seconds / 2.0);
+            format!(
+                "atrim=duration={target_seconds:.6},afade=t=out:st={:.6}:d={fade:.6},asetpts=N/SR/TB",
+                target_seconds - fade
+            )
+        } else {
+            let tempo = input_duration_us as f64 / target_duration_us as f64;
+            format!(
+                "{},apad,atrim=duration={target_seconds:.6},asetpts=N/SR/TB",
+                atempo_filter_chain(tempo)?,
+            )
+        };
         let mut args = vec![
             OsString::from("-hide_banner"),
             OsString::from("-loglevel"),
@@ -18418,8 +18661,8 @@ impl VideoStudioService {
                     "job_id": job_id,
                     "kind": output_kind,
                     "label": match (render.request.profile, render.request.variation) {
-                        (TimelineRenderProfile::Final, 0) => "Final master".to_string(),
-                        (TimelineRenderProfile::Final, variation) => format!("Final variation {variation}"),
+                        (TimelineRenderProfile::Final, 0) => frozen_manifest.name.trim().to_string(),
+                        (TimelineRenderProfile::Final, variation) => format!("{} variation {variation}", frozen_manifest.name.trim()),
                         (TimelineRenderProfile::Preview, 0) => "Timeline preview".to_string(),
                         (TimelineRenderProfile::Preview, variation) => format!("Preview variation {variation}"),
                     },
@@ -19469,8 +19712,8 @@ impl VideoStudioService {
                 "job_id": job_id,
                 "kind": output_kind,
                 "label": match (request.profile, request.variation) {
-                    (TimelineRenderProfile::Final, 0) => "Final master".to_string(),
-                    (TimelineRenderProfile::Final, variation) => format!("Final variation {variation}"),
+                    (TimelineRenderProfile::Final, 0) => manifest.name.trim().to_string(),
+                    (TimelineRenderProfile::Final, variation) => format!("{} variation {variation}", manifest.name.trim()),
                     (TimelineRenderProfile::Preview, 0) => "Timeline preview".to_string(),
                     (TimelineRenderProfile::Preview, variation) => format!("Preview variation {variation}"),
                 },
@@ -19523,6 +19766,15 @@ impl VideoStudioService {
                 next_manifest.render_artifacts.push(caption_artifact);
             }
             if !has_render_artifact {
+                // A new master supersedes the one before it. Variations of the same batch arrive
+                // after their base render and are kept beside it; only the base retires the past.
+                if matches!(render_artifact.role, RenderArtifactRole::FinalMaster)
+                    && request.variation == 0
+                {
+                    next_manifest.render_artifacts.retain(|artifact| {
+                        !matches!(artifact.role, RenderArtifactRole::FinalMaster)
+                    });
+                }
                 next_manifest.render_artifacts.push(render_artifact);
             }
             let next_revision = next_manifest.revision.checked_add(1).ok_or_else(|| {

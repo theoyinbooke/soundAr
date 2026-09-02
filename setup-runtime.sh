@@ -45,7 +45,7 @@ requirement_hash="$(sha256sum "$REQUIREMENTS" | cut -d' ' -f1)"
 if [[ -x "$VENV/bin/python" && -f "$RUNTIME_DIR/runtime.json" ]] && \
    grep -q "\"schema_version\": $RUNTIME_SCHEMA" "$RUNTIME_DIR/runtime.json" && \
    grep -q "\"requirements_sha256\": \"$requirement_hash\"" "$RUNTIME_DIR/runtime.json" && \
-   "$VENV/bin/python" -c 'import kokoro, soundfile, torch, transformers; assert transformers.__version__ == "5.5.0"' >/dev/null 2>&1; then
+   "$VENV/bin/python" -c 'import kokoro, soundfile, torch, transformers; assert transformers.__version__ == "5.10.1"' >/dev/null 2>&1; then
   progress "Local inference runtime is already ready."
   exit 0
 fi
@@ -82,12 +82,12 @@ progress "Installing the speech inference foundation..."
 "$PYTHON" -m pip install --progress-bar off setuptools==80.9.0
 
 if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
-  progress "Installing the CUDA 12.4 acceleration stack..."
-  "$PYTHON" -m pip install --progress-bar off torch==2.6.0+cu124 torchaudio==2.6.0+cu124 \
-    --extra-index-url https://download.pytorch.org/whl/cu124
+  progress "Installing the CUDA 12.6 acceleration stack..."
+  "$PYTHON" -m pip install --progress-bar off torch==2.9.1+cu126 torchaudio==2.9.1+cu126 \
+    --extra-index-url https://download.pytorch.org/whl/cu126
 else
   progress "Installing the CPU inference stack..."
-  "$PYTHON" -m pip install --progress-bar off torch==2.6.0+cpu torchaudio==2.6.0+cpu \
+  "$PYTHON" -m pip install --progress-bar off torch==2.9.1+cpu torchaudio==2.9.1+cpu \
     --extra-index-url https://download.pytorch.org/whl/cpu
 fi
 
@@ -119,8 +119,8 @@ cat > "$RUNTIME_DIR/runtime.json" <<EOF
 {
   "schema_version": $RUNTIME_SCHEMA,
   "python": "3.11",
-  "torch": "2.6.0",
-  "transformers": "5.5.0",
+  "torch": "2.9.1",
+  "transformers": "5.10.1",
   "requirements_sha256": "$requirement_hash"
 }
 EOF

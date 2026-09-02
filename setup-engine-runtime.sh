@@ -69,7 +69,7 @@ progress "Installing pinned $ENGINE dependencies..."
 "$PYTHON" -m pip install --progress-bar off --requirement "$REQUIREMENTS"
 case "$ENGINE" in
   kokoro) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps kokoro==0.9.4 ;;
-  transformers|speaker-verification|alignment|speecht5|musicgen) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps transformers==5.5.0 accelerate==1.14.0 ;;
+  transformers|speaker-verification|alignment|speecht5|musicgen) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps transformers==5.10.1 accelerate==1.14.0 ;;
   acestep)
     "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps diffusers==0.38.0 transformers==4.57.6 accelerate==1.14.0 safetensors==0.8.0
     command -v curl >/dev/null || fail "curl is required to install the pinned ACE-Step Studio source."
@@ -195,8 +195,8 @@ shutil.rmtree(destination)
 archive.unlink()
 PY
     ;;
-  chatterbox|chatterbox-turbo) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps chatterbox-tts==0.1.7 transformers==5.5.0 diffusers==0.38.0 ;;
-  coqui) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps coqui-tts==0.27.5 transformers==5.5.0 ;;
+  chatterbox|chatterbox-turbo) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps chatterbox-tts==0.1.7 transformers==5.10.1 diffusers==0.38.0 ;;
+  coqui) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps coqui-tts==0.27.5 transformers==5.10.1 ;;
   nemo) "$PYTHON" -m pip install --progress-bar off --ignore-installed --no-deps nemo-toolkit==3.0.0 ;;
 esac
 
@@ -226,7 +226,7 @@ cat > "$ENGINE_ROOT/runtime.json" <<EOF
   "engine": "$ENGINE",
   "isolation": "$([[ "$ENGINE" == "breeze" || "$ENGINE" == "fish-speech" ]] && printf standalone || printf layered)",
   "python": "3.11",
-  "torch": "$([[ "$ENGINE" == "breeze" ]] && printf 2.9.1 || ([[ "$ENGINE" == "fish-speech" ]] && printf 2.4.1 || printf 2.6.0))",
+  "torch": "$([[ "$ENGINE" == "breeze" ]] && printf 2.9.1 || ([[ "$ENGINE" == "fish-speech" ]] && printf 2.4.1 || printf 2.9.1))",
   "requirements_sha256": "$requirement_hash"
 }
 EOF
