@@ -1864,6 +1864,7 @@ mod tests {
             "promote_turns_to_final",
             "accept_findings",
             "accept_backdrop",
+            "reaction_max_us",
         ];
         for token in &mentioned {
             assert!(

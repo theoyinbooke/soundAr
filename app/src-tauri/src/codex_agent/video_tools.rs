@@ -1904,7 +1904,8 @@ fn show_format_schema() -> Value {
                         "intra_exchange_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Between two characters trading lines: the fastest beat"},
                         "turn_of_thought_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"When the same character continues"},
                         "pre_reveal_us":{"type":"integer","minimum":0,"maximum":10000000,"description":"Before a line the script marks as landing"},
-                        "scene_boundary_us":{"type":"integer","minimum":0,"maximum":10000000}
+                        "scene_boundary_us":{"type":"integer","minimum":0,"maximum":10000000},
+                        "reaction_max_us":{"type":"integer","minimum":500000,"maximum":30000000,"description":"The longest a reaction such as a laugh may run before it is faded out. Default 3500000 (3.5 s)."}
                     }
                 }),
             ),

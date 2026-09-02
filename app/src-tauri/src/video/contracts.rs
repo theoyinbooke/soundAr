@@ -1535,6 +1535,21 @@ impl PerformanceRecord {
         }
     }
 
+    /// Fold which occurrence of a repeated reaction this is into the fingerprint, so two
+    /// identical reaction lines are two different takes.
+    pub fn with_occurrence(mut self, occurrence: usize, cap_us: i64) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"occurrence-v2");
+        hasher.update([0x1f]);
+        hasher.update(self.fingerprint.as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(occurrence.to_string().as_bytes());
+        hasher.update([0x1f]);
+        hasher.update(cap_us.to_string().as_bytes());
+        self.fingerprint = format!("{:x}", hasher.finalize());
+        self
+    }
+
     pub fn cfg_scale(&self) -> Option<f64> {
         self.cfg_scale_milli.map(|value| f64::from(value) / 1000.0)
     }

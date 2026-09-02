@@ -86,6 +86,7 @@ pub fn present_video_project(record: &Value, video_root: &Path) -> VideoResult<V
                 artifact,
                 &project_id,
                 &version_id,
+                &manifest.name,
                 video_root,
             ));
         }
@@ -685,6 +686,7 @@ fn present_manifest_artifact(
     artifact: &RenderArtifact,
     project_id: &str,
     version_id: &str,
+    project_name: &str,
     video_root: &Path,
 ) -> Value {
     let role = match artifact.role {
@@ -704,16 +706,31 @@ fn present_manifest_artifact(
         | RenderArtifactRole::Transcript => "variation",
     };
     let path = managed_path(video_root, &artifact.managed_path);
+    // A finished thing is named after the work, not after its stage: the master of "The Needy
+    // Smart Home" is called that, and saves as that, rather than as "final" or as a hash.
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    let deliverable_name =
+        deliverable_name(artifact.role, project_name).map(|stem| format!("{stem}.{extension}"));
+    let title = match artifact.role {
+        RenderArtifactRole::FinalMaster => project_name.trim().to_string(),
+        RenderArtifactRole::PodcastAudio => format!("{} (audio)", project_name.trim()),
+        RenderArtifactRole::Trailer => format!("{} trailer", project_name.trim()),
+        RenderArtifactRole::Audiogram => format!("{} audiogram", project_name.trim()),
+        _ => artifact_title(artifact).to_string(),
+    };
     json!({
         "id": artifact.id,
         "project_id": project_id,
         "version_id": version_id,
         "role": role,
-        "title": artifact_title(artifact),
+        "title": title,
         "mime_type": artifact.mime_type,
         "format": format_label(&artifact.mime_type, &artifact.managed_path),
         "local_path": path,
-        "download_name": path.file_name().and_then(|name| name.to_str()),
+        "download_name": deliverable_name.or_else(|| path.file_name().and_then(|name| name.to_str()).map(str::to_string)),
         "duration_ms": artifact.duration_us.map(micros_to_millis),
         "width": artifact.width,
         "height": artifact.height,
@@ -1074,6 +1091,48 @@ fn provenance_label(source: &SourceAsset) -> &'static str {
         SourceAssetKind::SoundArMusic => "existing soundAr music",
         SourceAssetKind::SoundArProject => "existing soundAr project",
         SourceAssetKind::Generated => "generated locally",
+    }
+}
+
+/// The file stem a finished deliverable is saved under: the work's name, plus what kind of
+/// deliverable it is when the work has several.
+pub fn deliverable_name(role: RenderArtifactRole, project_name: &str) -> Option<String> {
+    let stem = file_stem(project_name);
+    Some(match role {
+        RenderArtifactRole::FinalMaster => stem,
+        RenderArtifactRole::PodcastAudio => format!("{stem}-audio"),
+        RenderArtifactRole::Trailer => format!("{stem}-trailer"),
+        RenderArtifactRole::Audiogram => format!("{stem}-audiogram"),
+        RenderArtifactRole::PublishPackage => format!("{stem}-package"),
+        _ => return None,
+    })
+}
+
+/// A name as a file stem: lower case, words joined by hyphens, nothing a filesystem objects to.
+pub fn file_stem(value: &str) -> String {
+    let collapsed = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        "episode".to_string()
+    } else {
+        collapsed
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .trim_end_matches('-')
+            .to_string()
     }
 }
 

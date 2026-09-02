@@ -127,6 +127,20 @@ export function ShowsView() {
         <h3 className="shows-section-heading">Script</h3>
         {dialogue.length ? <>
           {/* The three line states are what decide what to do next. */}
+          {/* The performed length against the show's target is what decides whether the writer
+              cuts or extends; it is shown here rather than left inside a tool result. */}
+          {episode?.manifest.length_target && episode.duration_ms ? (() => {
+            const target = episode.manifest.length_target;
+            const targetSeconds = target.target_us / 1e6;
+            const toleranceSeconds = targetSeconds * (target.tolerance_bp / 10000);
+            const actualSeconds = episode.duration_ms / 1000;
+            const delta = actualSeconds - targetSeconds;
+            const within = Math.abs(delta) <= toleranceSeconds;
+            return <p className={`shows-length ${within ? "is-within" : "is-off"}`}>
+              Runs {actualSeconds.toFixed(1)}s against a {targetSeconds.toFixed(0)}s target
+              {within ? " (within tolerance)" : ` (${Math.abs(delta).toFixed(1)}s ${delta > 0 ? "too long" : "too short"})`}
+            </p>;
+          })() : null}
           <p className="shows-counts">
             <span><CircleCheck aria-hidden="true" size={12} />{performed} performed</span>
             <span><TriangleAlert aria-hidden="true" size={12} />{drafts} draft</span>

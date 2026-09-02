@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.1.5 - 2026-09-02
+
+- Made a room laugh like a room. Two identical `(laughs)` lines used to produce the same seed, the
+  same instruction, and the same audio twice: a laugh track. A set of reactions is now shaped by
+  where each falls in the episode - an opening that is short and warm, a middle that builds, the
+  biggest laugh at the close, applause only where the writer asked for it - and every occurrence
+  is its own take. A direction the writer puts on a reaction line always wins over the shape.
+- Gave a reaction a ceiling. A show's clock now carries the longest a laugh or a round of applause
+  may run (3.5 seconds by default); a take past it is cut to length and faded out rather than sped
+  up, so a laugh trails off and the next line arrives while the room is still warm.
+- Let a re-read line take its own length. A replaced take used to be squeezed into the slot of
+  the take before it, so a bigger laugh could not land; a performed line now takes its measured
+  length and the lines after it are laid out again on the clock, with the generated shots re-cut
+  and the backdrop refitted to the new span.
+- Retired a rewritten line's take with the line. Re-applying a script that changed a line's words
+  dropped the old take's binding but left its audio on the timeline, where the new take then
+  landed on top of it.
+- Made a new master supersede the old one. A final render was appended beside the previous
+  master and the release took whichever came first, so a re-rendered episode could ship its
+  earlier cut and its quality check read as stale. A base final render now retires the masters
+  before it, and a release always takes the newest published master.
+- Named finished things after the work. A master, an audio episode, a trailer, an audiogram, and
+  a publish package are titled and saved as the episode's name - "the-needy-smart-home-trailer.mp4",
+  never "final" or a hash - and a render's label is the work's name rather than "Final master".
+- Burned the speaker cards. The final render only burned the subtitle layer when the episode had
+  captions, so a performed script with none lost its title and its speaker name cards. It now
+  burns whenever there is dialogue.
+- Tidied Recent. A performed line's take no longer appears in the sidebar as its own item; the
+  episode it belongs to is listed there already.
+- Showed the performed length against the show's target on the episode screen.
+- Raised the idle greeting on a tall full-screen window and removed the History rail entry, which
+  duplicated Recent.
+- Moved the shared inference foundation and every layered engine to transformers 5.10.1, closing
+  the high-severity advisories against 5.5.0. The three standalone runtimes (Breeze, Fish Speech,
+  ACE-Step) stay on the versions their upstream code pins; their remaining advisories are recorded
+  as accepted risk with the reason, because those runtimes perform no network I/O and load only
+  revision-pinned local weights.
+- Repaired the release workflow, which had defined `args` twice since 30 August and so could not
+  publish any release of the reset version line; the pre-reset releases were retired so 0.1.x is
+  the line that updates come from.
+
 ## 0.1.4 - 2026-09-01
 
 - Performed vocal cues instead of reading them. A comedy episode wrote its audience as

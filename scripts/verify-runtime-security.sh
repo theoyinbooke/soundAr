@@ -107,7 +107,7 @@ if search_regex 'trust_remote_code[[:space:]]*=[[:space:]]*True' \
 fi
 
 for requirement in \
-  'transformers==5.5.0' \
+  'transformers==5.10.1' \
   'diffusers==0.38.0' \
   'coqui-tts==0.27.5'; do
   contains_fixed "$requirement" requirements.txt requirements-runtime.txt requirements-engines \
