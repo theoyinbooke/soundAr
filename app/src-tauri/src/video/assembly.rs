@@ -686,9 +686,81 @@ pub fn build_ass_document(
         }
     }
     if options.include_speaker_cards {
-        append_speaker_cards(&mut document, &manifest.captions)?;
+        // A performed script knows who is speaking from its own takes, which is a better source
+        // than captions that may not exist for it.
+        if manifest.dialogue.is_empty() {
+            append_speaker_cards(&mut document, &manifest.captions)?;
+        } else {
+            append_dialogue_speaker_cards(&mut document, manifest)?;
+        }
     }
     Ok(document)
+}
+
+/// Name the character speaking each time the voice changes, from the takes as placed.
+///
+/// A card is shown when a new character starts a line, and held for the first moment of it: long
+/// enough to read, short enough to leave the frame to the picture. Consecutive lines by one
+/// character get one card.
+fn append_dialogue_speaker_cards(
+    document: &mut String,
+    manifest: &VideoProjectManifest,
+) -> VideoResult<()> {
+    let names = manifest
+        .cast
+        .iter()
+        .map(|member| (member.id.as_str(), member.display_name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let turns = manifest
+        .dialogue
+        .iter()
+        .map(|turn| (turn.id.as_str(), turn))
+        .collect::<BTreeMap<_, _>>();
+    let mut placed = manifest
+        .tracks
+        .iter()
+        .filter(|track| matches!(track.kind, TrackKind::Audio))
+        .flat_map(|track| track.clips.iter())
+        .filter_map(|clip| {
+            let turn = turns.get(clip.turn_id.as_deref()?)?;
+            Some((
+                clip.timeline_start_us,
+                clip.timeline_duration_us,
+                turn.character_id.as_str(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    placed.sort_by_key(|(start, duration, _)| (*start, *duration));
+    let mut prior: Option<&str> = None;
+    for (start, duration, character_id) in placed {
+        if prior == Some(character_id) {
+            continue;
+        }
+        let name = names
+            .get(character_id)
+            .copied()
+            .unwrap_or(character_id)
+            .trim();
+        if name.is_empty() {
+            continue;
+        }
+        let end = start
+            .checked_add(Microseconds(1_800_000))?
+            .min(start.checked_add(duration)?);
+        if end <= start {
+            continue;
+        }
+        document.push_str(&ass_dialogue(
+            30,
+            start,
+            end,
+            "Speaker",
+            name,
+            &format!("{{\\fad(80,180)}}{}", escape_ass_text(name)),
+        ));
+        prior = Some(character_id);
+    }
+    Ok(())
 }
 
 pub fn plan_caption_preview_pages(

@@ -63,13 +63,15 @@ export function ShowsView() {
 
   const dialogue = episode?.manifest.dialogue ?? [];
   const cast = episode?.manifest.cast ?? [];
-  // A drawn card records itself as generated, which is how the UI can tell soundAr's fallback
-  // apart from a picture the user chose.
+  // A drawn backdrop registers as a generated artifact, which is how the UI can tell soundAr's
+  // fallback apart from a picture the user chose. A legacy drawn card is a generated visual asset.
   const visuals = episode?.manifest.visual_assets ?? [];
-  const cover = visuals.find((asset) => asset.provenance?.kind === "generated_locally");
   const ownPicture = visuals.find((asset) => asset.provenance?.kind !== "generated_locally");
-  // Generated shots replace a drawn card, so the panel shows whichever this episode actually has.
-  const clips = (episode?.manifest.artifacts ?? []).filter((artifact) => artifact.role === "generated-clip");
+  const artifacts = episode?.manifest.artifacts ?? [];
+  const cover = artifacts.find((artifact) => artifact.role === "backdrop")
+    ?? visuals.find((asset) => asset.provenance?.kind === "generated_locally");
+  // Generated shots replace a drawn backdrop, so the panel shows whichever this episode actually has.
+  const clips = artifacts.filter((artifact) => artifact.role === "generated-clip");
 
   const drawCover = useCallback(async (redraw: boolean) => {
     if (!service || !selectedId) return;
@@ -164,9 +166,9 @@ export function ShowsView() {
             : null}
           <p className="shows-panel-empty">
             {ownPicture
-              ? "This episode has its own artwork, so no cover is drawn for it."
+              ? "This episode has its own artwork, so no backdrop is drawn for it."
               : cover
-                ? "Drawn by soundAr from this episode's name and cast. Ask the assistant for generated shots to replace it with moving footage."
+                ? "A motion backdrop drawn by soundAr from this episode's name, cast, and the show's look. Ask the assistant for generated shots to replace it with footage."
                 : "No picture yet. Without one this episode cannot be rendered or packaged as video."}
           </p>
           <button
@@ -176,7 +178,7 @@ export function ShowsView() {
             onClick={() => void drawCover(Boolean(cover || ownPicture))}
           >
             {drawing ? <LoaderCircle className="spin" aria-hidden="true" size={13} /> : <ImageIcon aria-hidden="true" size={13} />}
-            {cover || ownPicture ? "Redraw cover" : "Draw cover"}
+            {cover || ownPicture ? "Redraw backdrop" : "Draw backdrop"}
           </button>
         </>}
       </Panel>

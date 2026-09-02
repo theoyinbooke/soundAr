@@ -694,6 +694,7 @@ fn present_manifest_artifact(
         RenderArtifactRole::Trailer => "trailer",
         RenderArtifactRole::Audiogram => "audiogram",
         RenderArtifactRole::GeneratedClip => "generated-clip",
+        RenderArtifactRole::Backdrop => "backdrop",
         RenderArtifactRole::Thumbnail
         | RenderArtifactRole::Waveform
         | RenderArtifactRole::SceneSegment
@@ -1088,6 +1089,7 @@ fn artifact_title(artifact: &RenderArtifact) -> &'static str {
         RenderArtifactRole::Trailer => "Trailer",
         RenderArtifactRole::Audiogram => "Audiogram",
         RenderArtifactRole::GeneratedClip => "Generated clip",
+        RenderArtifactRole::Backdrop => "Backdrop",
         RenderArtifactRole::PublishPackage => "Publish package",
     }
 }

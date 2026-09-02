@@ -1320,6 +1320,8 @@ pub enum RenderArtifactRole {
     Audiogram,
     /// One locally generated moving shot, cut across an episode that has no footage of its own.
     GeneratedClip,
+    /// A drawn motion backdrop: what an episode with no footage and no generator looks at.
+    Backdrop,
     PublishPackage,
 }
 
@@ -1711,6 +1713,9 @@ pub struct VideoProjectManifest {
     /// measured against it; nothing here stretches or cuts the performance to fit.
     #[serde(default)]
     pub length_target: Option<LengthTarget>,
+    /// What the audience sees when there is nothing to film, inherited from the show.
+    #[serde(default)]
+    pub look: Option<super::format::Look>,
     pub render_artifacts: Vec<RenderArtifact>,
     pub revision_history: Vec<RevisionRecord>,
     pub created_at: String,
@@ -1824,6 +1829,7 @@ impl VideoProjectManifest {
             turn_beats: Vec::new(),
             narration_bindings: Vec::new(),
             length_target: None,
+            look: None,
             render_artifacts: Vec::new(),
             revision_history: Vec::new(),
             created_at: created_at.clone(),
@@ -3111,6 +3117,7 @@ mod tests {
             turn_beats: vec![],
             narration_bindings: vec![],
             length_target: None,
+            look: None,
             render_artifacts: vec![],
             revision_history: vec![],
             created_at: timestamp(),

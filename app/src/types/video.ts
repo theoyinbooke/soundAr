@@ -30,6 +30,7 @@ export type VideoArtifactRole =
   | "master"
   | "variation"
   | "generated-clip"
+  | "backdrop"
   | "publish-package";
 export type VideoCaptionStyle =
   | "clean-white"
@@ -854,6 +855,12 @@ export interface VideoShowFormat {
   target_duration_us: number;
   /** Allowed slack either side of the target, in basis points of it. Default 2000. */
   duration_tolerance_bp?: number;
+  /** What the audience sees when there is nothing to film. */
+  look?: {
+    world: string;
+    mood?: "warm" | "cool" | "neutral" | "electric" | "noir";
+    palette?: [string, string, string, string] | null;
+  } | null;
   opening?: VideoCueTemplate | null;
   closing?: VideoCueTemplate | null;
   show_notes_style?: string | null;

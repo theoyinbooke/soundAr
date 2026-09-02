@@ -47,7 +47,8 @@ pub use cast::{
 };
 pub use contracts::*;
 pub use cover::{
-    cover_palette, cover_spec, cover_subtitle, CoverPalette, CoverSpec, COVER_PALETTES,
+    backdrop_spec, cover_palette, cover_spec, cover_subtitle, look_palette, mix_colours,
+    mood_palettes, BackdropSpec, CoverPalette, CoverSpec, OwnedPalette, COVER_PALETTES,
 };
 pub use dialogue::{apply_dialogue_script, AppliedDialogueScript, DialogueScriptRequest};
 pub use editor::{
@@ -55,8 +56,8 @@ pub use editor::{
     VideoTimelineEditRequest, VideoTimelineOperation,
 };
 pub use format::{
-    instantiate_format, materialize_format_cues, CueTemplate, FormatOrigin, ShowFormat,
-    DEFAULT_DURATION_TOLERANCE_BP, MAX_SHOW_FORMATS,
+    instantiate_format, materialize_format_cues, normalize_hex_colour, CueTemplate, FormatOrigin,
+    Look, Mood, ShowFormat, DEFAULT_DURATION_TOLERANCE_BP, MAX_LOOK_WORLD_BYTES, MAX_SHOW_FORMATS,
 };
 pub use intelligence::{
     apply_scene_plan, identify_clip_candidates, plan_reviewed_timeline, source_range_fingerprint,
@@ -95,12 +96,12 @@ pub use quality::{
     QualityRecord, QualityStatus, WordDifference,
 };
 pub use release::{
-    episode_chapters, episode_transcript, ffmetadata_chapters, plan_release, ReleaseChapter,
-    ReleaseMemberKind, ReleaseMemberPlan, ReleasePlan, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US,
-    TRAILER_TARGET_US,
+    episode_chapters, episode_transcript, ffmetadata_chapters, plan_release, PictureStatus,
+    ReleaseChapter, ReleaseContext, ReleaseGates, ReleaseMemberKind, ReleaseMemberPlan,
+    ReleasePlan, TRAILER_MAXIMUM_US, TRAILER_MINIMUM_US, TRAILER_TARGET_US,
 };
 pub use renderer::{
-    build_audiogram_command, build_clip_command, build_cover_image_command,
+    build_audiogram_command, build_backdrop_command, build_clip_command, build_cover_image_command,
     build_loudness_analysis_command, build_podcast_audio_command, build_portrait_command,
     build_portrait_command_with_layout, build_proxy_command, build_thumbnail_command,
     build_trailer_command, build_waveform_command, parse_ffmpeg_progress, publish_atomic,
@@ -134,7 +135,8 @@ pub use service::{
     VisualAssetOrigin, VisualSourceReceipt,
 };
 pub use shots::{
-    plan_shots, shot_count_for, tile_shots, ShotPlan, CLIP_DURATION_US, MAX_SHOTS, MIN_SHOTS,
+    clip_canvas_for, default_shots_for_world, plan_shots, shot_count_for, tile_shots, ShotPlan,
+    CLIP_DURATION_US, MAX_SHOTS, MIN_SHOTS,
 };
 pub use sound::{
     assets_matching_tag, SoundAsset, SoundLayer, SoundPlacementKind, MAX_SOUND_ASSETS,

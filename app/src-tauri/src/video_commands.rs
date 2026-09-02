@@ -612,7 +612,7 @@ pub(crate) fn dispatch_video_operation(
                     &request.project_id,
                     "video-studio-producer",
                     request.has_show_notes,
-                    request.accept_findings,
+                    release_gates(runtime, request.accept_findings, request.accept_backdrop),
                 )
                 .map_err(VideoAgentToolError::from)?;
             let project = video::present_video_project(
@@ -641,7 +641,7 @@ pub(crate) fn dispatch_video_operation(
                 .plan_episode_release(
                     &request.project_id,
                     request.has_show_notes,
-                    request.accept_findings,
+                    release_gates(runtime, request.accept_findings, request.accept_backdrop),
                 )
                 .map_err(VideoAgentToolError::from)?;
             let summary = if plan.is_ready() {
@@ -1249,9 +1249,15 @@ pub(crate) async fn export_episode_release(
 ) -> Result<Value, String> {
     let service = Arc::clone(&state.video);
     let video_root = state.store.video_artifacts_root();
+    let runtime = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let exported = service
-            .export_episode_release(&project_id, "video-studio-producer", has_show_notes, false)
+            .export_episode_release(
+                &project_id,
+                "video-studio-producer",
+                has_show_notes,
+                release_gates(&runtime, false, false),
+            )
             .map_err(service_error)?;
         let project = video::present_video_project(&exported.project, &video_root)
             .map_err(|error| error.to_string())?;
@@ -1296,9 +1302,14 @@ pub(crate) async fn plan_episode_release(
     has_show_notes: bool,
 ) -> Result<Value, String> {
     let service = Arc::clone(&state.video);
+    let runtime = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let plan = service
-            .plan_episode_release(&project_id, has_show_notes, false)
+            .plan_episode_release(
+                &project_id,
+                has_show_notes,
+                release_gates(&runtime, false, false),
+            )
             .map_err(service_error)?;
         serde_json::to_value(plan).map_err(|error| format!("video.invalid_request: {error}"))
     })
@@ -3611,6 +3622,25 @@ fn selected_revision_scene<'a>(
 /// never fetched by the model downloader: the user installs them deliberately. soundAr therefore
 /// looks where such an installation actually lands - an explicit setting first, then the managed
 /// model directory, then the registry for anyone who recorded it there.
+/// Whether this machine can cut footage for an episode right now: the generator binary and a
+/// usable set of weights are both present.
+pub(crate) fn clip_generator_ready(runtime: &RuntimeState) -> bool {
+    runtime.video.clip_generator_present() && clip_model_directory(runtime).is_some()
+}
+
+/// The gates a release is planned against, with the machine's own capability filled in.
+pub(crate) fn release_gates(
+    runtime: &RuntimeState,
+    accept_findings: bool,
+    accept_backdrop: bool,
+) -> video::ReleaseGates {
+    video::ReleaseGates {
+        accept_findings,
+        accept_backdrop,
+        generator_ready: clip_generator_ready(runtime),
+    }
+}
+
 pub(crate) fn clip_model_directory(runtime: &RuntimeState) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(configured) = std::env::var_os("SOUNDAR_H3_MODEL_DIR") {

@@ -665,6 +665,9 @@ pub(crate) struct PlanEpisodeReleaseRequest {
     /// check cannot be accepted, only run.
     #[serde(default)]
     pub(crate) accept_findings: bool,
+    /// Release on the drawn backdrop although a video generator could have made footage.
+    #[serde(default)]
+    pub(crate) accept_backdrop: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -672,7 +675,9 @@ pub(crate) struct PlanEpisodeReleaseRequest {
 pub(crate) struct GenerateEpisodeClipsRequest {
     pub(crate) project_id: String,
     /// What each shot shows. Written, never derived: an episode's own words describe a
-    /// conversation, and a shot has to say what is on screen.
+    /// conversation, and a shot has to say what is on screen. Left empty, the show's look
+    /// supplies three views of its world.
+    #[serde(default)]
     pub(crate) shots: Vec<String>,
 }
 
@@ -1482,7 +1487,7 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "save_show_format",
-            "Create or update the reusable shape of a series: its cast, pronunciation rules, conversational timing, caption preset, canvas, loudness targets, usual episode length, and opening and closing music. soundAr owns the revision number. Editing a format never changes an episode that already exists - instantiation copies, so a shipped episode reproduces what it was made from. Requires Studio or Full access.",
+            "Create or update the reusable shape of a series: its cast with each character's persona, pronunciation rules, conversational timing, caption preset, canvas, loudness targets, target episode length with its tolerance, its look - the world the audience sees and the mood that colours it - and opening and closing music. soundAr owns the revision number. Editing a format never changes an episode that already exists - instantiation copies, so a shipped episode reproduces what it was made from. Requires Studio or Full access.",
             show_format_schema(),
         ),
         tool(
@@ -1504,18 +1509,18 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
         ),
         tool(
             "generate_episode_clips",
-            "Generate this episode's moving shots and cut them across its narration, so a show performed by voices has something to look at. You write what each shot shows: describe the picture, not the conversation - \"a lighthouse beam sweeping across black water at night\" is a shot, \"two friends discussing a lighthouse keeper\" is not, and the second renders as nothing recognisable. A clip costs about a minute of local compute for under two seconds of footage, so supply a handful of shots and soundAr repeats them across the episode rather than generating one per second. Shots are content-addressed, so re-running with the same descriptions regenerates nothing. Requires the local video-generation model to be installed; where it is not, use ensure_episode_cover for a drawn card instead. Requires Studio or Full access.",
+            "Generate this episode's moving shots and cut them across its narration, so a show performed by voices has something to look at. You write what each shot shows: describe the picture, not the conversation - \"a lighthouse beam sweeping across black water at night\" is a shot, \"two friends discussing a lighthouse keeper\" is not, and the second renders as nothing recognisable. Shots are generated in the episode's own aspect and set in the show's world from its look, so describe what is in frame and let the look supply the place; leave shots empty and the look's world yields three views of it. A clip costs about a minute of local compute for under two seconds of footage, so supply a handful of shots and soundAr repeats them across the episode rather than generating one per second. Shots are content-addressed, so re-running with the same descriptions regenerates nothing. Generated shots replace the drawn backdrop. Requires the local video-generation model to be installed; where it is not, ensure_episode_cover draws a motion backdrop instead. Requires Studio or Full access.",
             object_schema(
-                &["project_id", "shots"],
+                &["project_id"],
                 properties([
                     ("project_id", string("Video Studio project id")),
-                    ("shots", json!({"type":"array","minItems":1,"maxItems":12,"items":{"type":"string","minLength":8,"maxLength":400},"description":"What each shot shows, as a visual description of the picture"})),
+                    ("shots", json!({"type":"array","minItems":0,"maxItems":12,"items":{"type":"string","minLength":8,"maxLength":400},"description":"What each shot shows, as a visual description of the picture. Empty means three views of the show's world."})),
                 ]),
             ),
         ),
         tool(
             "ensure_episode_cover",
-            "Draw this episode's cover so it can be packaged as video. A script performed by voices produces sound and nothing to look at, and every video deliverable needs a picture; this draws one from what the episode already knows about itself - its name, its cast, and its canvas - with no image model and no network. The card is derived, so the same episode always produces the same card, and it is always recorded as generated rather than as artwork the user supplied. An episode that already has a picture keeps it unless redraw is set. Requires Studio or Full access.",
+            "Draw this episode's motion backdrop so it can be packaged as video. A script performed by voices produces sound and nothing to look at, and every video deliverable needs a picture; this draws a moving one from what the episode already knows about itself - its name, its cast, its canvas, and its show's look - with no image model and no network: a slow-drifting field in the show's palette under grain and a vignette, with the title resolving over the first seconds, and a speaker card naming each character as they begin to speak. It is derived, so the same episode always produces the same backdrop, and it is recorded as generated rather than as artwork the user supplied. An episode that already has footage or a picture keeps it unless redraw is set. Where a video generator is installed, prefer generate_episode_clips: the release plan will ask for footage before shipping a backdrop. Requires Studio or Full access.",
             object_schema(
                 &["project_id"],
                 properties([
@@ -1569,6 +1574,7 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                     ("project_id", string("Video Studio project id")),
                     ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode"})),
                     ("accept_findings", json!({"type":"boolean","description":"Release although the last quality check found blocking problems. A missing or stale check cannot be accepted; run transcribe_and_check_episode instead."})),
+                    ("accept_backdrop", json!({"type":"boolean","description":"Release on the drawn backdrop although a video generator is installed and could cut footage across the episode."})),
                 ]),
             ),
         ),
@@ -1581,6 +1587,7 @@ pub(crate) fn tool_catalog() -> Vec<Value> {
                     ("project_id", string("Video Studio project id")),
                     ("has_show_notes", json!({"type":"boolean","description":"Whether show notes have been written for this episode. Notes are written, not derived."})),
                     ("accept_findings", json!({"type":"boolean","description":"Release although the last quality check found blocking problems. A missing or stale check cannot be accepted; run transcribe_and_check_episode instead."})),
+                    ("accept_backdrop", json!({"type":"boolean","description":"Release on the drawn backdrop although a video generator is installed and could cut footage across the episode."})),
                 ]),
             ),
         ),
@@ -1950,6 +1957,25 @@ fn show_format_schema() -> Value {
             (
                 "show_notes_style",
                 nullable_string("How show notes for this series are written"),
+            ),
+            (
+                "look",
+                json!({
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["world"],
+                            "properties": {
+                                "world": {"type": "string", "maxLength": 600, "description": "The place the audience sees, as a shot description: \"a small brick-wall comedy club, one microphone under a warm spotlight, an audience in shadow\". Every generated shot is set in it and the backdrop is coloured after it."},
+                                "mood": {"type": "string", "enum": ["warm", "cool", "neutral", "electric", "noir"], "description": "Picks the palette when none is named"},
+                                "palette": {"type": ["array", "null"], "minItems": 4, "maxItems": 4, "items": {"type": "string"}, "description": "Background, foreground, muted, accent as 0xRRGGBB. Overrides the mood."}
+                            }
+                        },
+                        {"type": "null"}
+                    ],
+                    "description": "What the audience sees when there is nothing to film. Give every show one."
+                }),
             ),
             (
                 "created_at",
