@@ -17,14 +17,14 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-cpal = "0.15"
+cpal = "0.18"
 csv = "1"
 hound = "3"
-rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
